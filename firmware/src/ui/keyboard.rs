@@ -76,22 +76,15 @@ pub const KEYBOARD_ADDR: u8 = 0x55;
 /// PWM duty (0–255; `0` = off). See the module docs' "Backlight" section.
 const CMD_SET_BACKLIGHT: u8 = 0x01;
 
-/// Duty byte sent for "backlight on" (full brightness; the co-processor's
-/// duty range is 0–255).
-const BACKLIGHT_ON_DUTY: u8 = 255;
-
-/// Map "backlight on/off" to the co-processor's duty byte.
-///
-/// Pure (host-testable) so the on/off→duty mapping has a regression guard
-/// independent of the I2C transaction — same rationale as `key_text` and
-/// `crate::ui::touch_wake_transition` being pulled out as plain functions.
-fn backlight_duty(on: bool) -> u8 {
-    if on {
-        BACKLIGHT_ON_DUTY
-    } else {
-        0
-    }
-}
+// `backlight_duty` is pure Rust with no I2C/hardware dependency — it now
+// lives in `firmware_core::ui::keyboard` so its test executes under `cargo
+// test --workspace` (this crate is a detached, cross-compiled workspace —
+// see `Cargo.toml`'s doc comment — so a `#[cfg(test)]` block written here
+// would type-check but never run). `key_text` below stays: it constructs
+// `slint::platform::Key`/`SharedString` values directly, and firmware-core's
+// boundary is deliberately `slint`-free — see that module's doc for the
+// full reclassification note. See `docs/adr/0005-firmware-core-extraction.md`.
+use firmware_core::ui::keyboard::backlight_duty;
 
 /// Driver for the T-Deck Plus QWERTY keyboard co-processor.
 ///
@@ -252,9 +245,6 @@ mod tests {
         assert!(key_text(0x1F).is_none());
     }
 
-    #[test]
-    fn backlight_duty_maps_on_to_full_and_off_to_zero() {
-        assert_eq!(backlight_duty(true), BACKLIGHT_ON_DUTY);
-        assert_eq!(backlight_duty(false), 0);
-    }
+    // `backlight_duty`'s test moved to `firmware-core/src/ui/keyboard.rs`
+    // alongside the function — see this file's module-level move note above.
 }

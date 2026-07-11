@@ -28,12 +28,19 @@
 //! Each module here is the pure-logic half of a firmware module that also has
 //! an impure, hardware-owning half left behind in `firmware/src/`:
 //!
-//! | This crate       | Firmware hardware half (stays in `firmware/src/`)             |
+//! | This crate       | Firmware hardware/Slint half (stays in `firmware/src/`)        |
 //! |-------------------|----------------------------------------------------------------|
 //! | [`dispatcher`]    | *(none — this module is already 100% pure)*                    |
 //! | [`pin_menu`]      | *(none — this module is already 100% pure)*                    |
 //! | [`notification`]  | `ui::BuzzerDriver` (I2S tone playback)                          |
 //! | [`ui::gps_status`]| `ui::screens::gps_status::GpsStatusScreen` (the `slint!{}` view) |
+//! | [`ui::contact_list`] | `ui::screens::contact_list::{ContactListScreen, ContactItem}` (the `slint!{}` view) |
+//! | [`ui::admin_menu`] | `ui::screens::admin_menu::AdminMenuScreen` (the `slint!{}` view) |
+//! | [`ui::message_view`] | `ui::screens::message_view::{MessageViewScreen, MessageItem}` (the `slint!{}` view) |
+//! | [`ui::compose`]   | `ui::screens::compose::ComposeScreen` (the `slint!{}` view)     |
+//! | [`ui::touch`]     | `ui::touch::TouchDriver` (GT911 I2C driver)                     |
+//! | [`ui::keyboard`]  | `ui::keyboard::KeyboardDriver` + `key_text` (Slint `Key`-coupled; see that module's doc) |
+//! | [`ui::theme`]     | *(none — this module is already 100% pure)*                    |
 //! | [`gps`]           | `gps::GpsDriver` (UART1, baud probing, NVS baud cache)          |
 //! | [`battery`]       | `battery::BatteryDriver` (ADC1 sampling)                        |
 //! | [`runtime_settings_store`] | `runtime_settings_store::{load, save}` (`EspNvs`)     |

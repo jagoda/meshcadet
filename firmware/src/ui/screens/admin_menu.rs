@@ -453,29 +453,17 @@ slint::slint! {
 /// regardless of what step size the widget uses.
 const SCREEN_SLEEP_STEP_S: i32 = 5;
 
-/// Format the screen-sleep seconds value for display: `0` → "Never", else `"<n>s"`.
-fn format_screen_sleep(seconds: i32) -> String {
-    if seconds <= 0 {
-        "Never".to_string()
-    } else {
-        format!("{seconds}s")
-    }
-}
-
-/// Format the battery row from a shared [`crate::battery::BatteryStatus`]:
-/// `"<n>% (charging)"` when charging, else `"<n>%"`. Same formatting
-/// convention as the host `status` command's `format_battery` — both read the
-/// identical two fields (percent, charging) so the numbers always agree.
-///
-/// `pub(crate)`: also called from `ui::mod::UiRuntime::set_battery_status` to
-/// push a live-refreshed value into an already-open AdminMenu screen.
-pub(crate) fn format_battery_display(status: crate::battery::BatteryStatus) -> String {
-    if status.charging {
-        format!("{}% (charging)", status.percent)
-    } else {
-        format!("{}%", status.percent)
-    }
-}
+// `format_screen_sleep`/`format_battery_display` are pure Rust with no
+// Slint dependency — they now live in `firmware_core::ui::admin_menu` so
+// their tests execute under `cargo test --workspace` (this crate is a
+// detached, cross-compiled workspace — see `Cargo.toml`'s doc comment — so
+// a `#[cfg(test)]` block written here would type-check but never run).
+// Only this Slint-backed view wrapper stays. `pub(crate) use` preserves
+// `format_battery_display`'s original crate-visible re-export (also called
+// from `ui::mod::UiRuntime::set_battery_status`). See
+// `docs/adr/0005-firmware-core-extraction.md`.
+use firmware_core::ui::admin_menu::format_screen_sleep;
+pub(crate) use firmware_core::ui::admin_menu::format_battery_display;
 
 /// Rust-side wrapper.
 pub struct AdminMenuScreen {
@@ -625,38 +613,6 @@ impl AdminMenuScreen {
     pub fn hide(&self) { self.component.hide().ok(); }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn format_zero_is_never() {
-        assert_eq!(format_screen_sleep(0), "Never");
-    }
-
-    #[test]
-    fn format_negative_is_never() {
-        // Defensive: the widget clamps at 0 before display, but the formatter
-        // itself must not panic or show a negative number if ever called directly.
-        assert_eq!(format_screen_sleep(-5), "Never");
-    }
-
-    #[test]
-    fn format_positive_appends_s() {
-        assert_eq!(format_screen_sleep(30), "30s");
-        assert_eq!(format_screen_sleep(120), "120s");
-    }
-
-    #[test]
-    fn format_battery_not_charging_is_bare_percent() {
-        let s = crate::battery::BatteryStatus { percent: 63, charging: false, raw_mv: 0, held_raw_mv: 0 };
-        assert_eq!(format_battery_display(s), "63%");
-    }
-
-    #[test]
-    fn format_battery_charging_appends_suffix() {
-        let s = crate::battery::BatteryStatus { percent: 9, charging: true, raw_mv: 0, held_raw_mv: 0 };
-        assert_eq!(format_battery_display(s), "9% (charging)");
-    }
-}
+// `format_screen_sleep`/`format_battery_display`'s tests moved to
+// `firmware-core/src/ui/admin_menu.rs` alongside the functions — see this
+// file's module-level move note above.
