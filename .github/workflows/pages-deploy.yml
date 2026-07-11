@@ -70,7 +70,13 @@ jobs:
           # per_page=100 (single page, no --paginate) comfortably covers
           # max_versions=8 plus any drafts/prereleases filtered out below —
           # revisit if this project ever accumulates 100+ releases.
-          tags=$(gh api "repos/${{ github.repository }}/releases" -F per_page=100 \
+          #
+          # --method GET is required here: gh api defaults to POST as soon as
+          # any -f/-F field is attached (see `gh api --help`), which routes
+          # this call at the release-creation endpoint instead of the
+          # releases-list endpoint and 422s on a missing tag_name. Without
+          # --method GET, switching -F to -f alone does NOT fix this.
+          tags=$(gh api --method GET "repos/${{ github.repository }}/releases" -f per_page=100 \
             --jq '[.[] | select(.draft == false and .prerelease == false and (.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")))]
                   | sort_by(.published_at) | reverse | .[:'"$max_versions"'] | .[].tag_name')
 
