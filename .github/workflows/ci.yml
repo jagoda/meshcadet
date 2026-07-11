@@ -1,45 +1,46 @@
 name: CI
 
-# Runs the full host-native test suite + static checks on every PR and on
-# every push to main. Toolchain version is NOT pinned in this file — it is
-# pinned exactly once, at the repo root in `rust-toolchain.toml` (channel
-# "stable" + the rustfmt/clippy components), and `rustup show` below just
-# forces that pin to resolve/install before the cache and build steps run.
+# Runs the full host-native test suite + static checks, PLUS a firmware
+# cross-compile build gate, on every PR and on every push to main. Toolchain
+# version for the host jobs is NOT pinned in this file — it is pinned exactly
+# once, at the repo root in `rust-toolchain.toml` (channel "stable" + the
+# rustfmt/clippy components), and `rustup show` below just forces that pin to
+# resolve/install before the cache and build steps run.
 #
-# ── Scope: host-testable crates + fmt + clippy only (no firmware job) ───────
+# ── Scope: host-testable crates + fmt + clippy, plus a separate firmware job ─
 #
 # `protocol`, `host`, `xtask`, `ui_sim`, and `ui_perf` are the root Cargo
 # workspace's members (see workspace/Cargo.toml's own doc comment) — they
 # build and test on stable Rust with no extra tooling, which is exactly what
-# this workflow exercises.
+# the `test`/`fmt`/`clippy` jobs below exercise.
 #
 # `firmware/` is deliberately a DETACHED workspace (its own `[workspace]`
 # table in firmware/Cargo.toml) that cross-compiles for
 # `xtensa-esp32s3-espidf` under the Espressif `esp` rustc fork, and its
 # build.rs additionally shells out to a native C/FreeType toolchain to
 # generate the bundled emoji font and pulls down a full ESP-IDF sysroot via
-# `embuild`/`esp-idf-sys`. None of that is a "stock GitHub runner can't do
-# this" hard blocker in principle (espup + the esp-rs GH Actions exist), but
-# it was scoped OUT of this workflow rather than silently dropped:
-#   - `espup install` + the ESP-IDF v5.2.2 sysroot clone/build is a heavy,
-#     slow, network-dependent install (independent of this repo's own code)
-#     that would dominate every PR's CI time and turn transient
-#     Espressif-side network/version hiccups into spurious red X's on
-#     unrelated host-crate changes.
-#   - The workspace split above exists FOR THIS REASON already (see the
-#     Cargo.toml comment): keeping `cargo test`/`cargo fmt`/`cargo clippy` at
-#     the repo root fast and toolchain-independent was a deliberate design
-#     choice, and a firmware CI job would reintroduce the exact coupling
-#     that split was meant to avoid.
-#   - The project already has a dedicated, documented firmware build gate
-#     that covers every feature combination:
+# `embuild`/`esp-idf-sys`. That toolchain weight is exactly why firmware gets
+# its OWN job (`firmware`, below) instead of being folded into `test`/
+# `clippy`: a transient Espressif-side install hiccup should never block the
+# fast host lane, and the host lane should never wait on the slower firmware
+# toolchain bootstrap. The `firmware` job:
+#   - installs the Espressif Rust fork via `esp-rs/xtensa-toolchain` (pinned
+#     action version) + `ldproxy` (the linker firmware/.cargo/config.toml
+#     requires) + the same native build.rs prerequisites as the host jobs
+#     (FreeType/DejaVu for the bundled emoji-font gen step, which firmware's
+#     build.rs also runs);
+#   - caches the ESP-IDF sysroot (`~/.espressif`, `firmware/.embuild`) and the
+#     firmware `target/` dir, since ESP-IDF v5.2.2 — pinned once, in
+#     firmware/.cargo/config.toml's `ESP_IDF_VERSION`, not here — rebuilds
+#     from source on every cold run without it;
+#   - runs the project's existing, documented firmware build gate verbatim:
 #     `cd firmware && bash check-all-features.sh` (see CONTRIBUTING.md
-#     "Building and testing"). It requires the `esp` toolchain + ESP-IDF
-#     locally and is run by a human before landing firmware changes.
-# If firmware CI becomes worth the cost later (e.g. a self-hosted runner
-# with the esp toolchain pre-baked, or acceptance of the first-run install
-# tax via aggressive caching), the natural shape is a fourth job here that
-# runs `check-all-features.sh` — not a change to the jobs below.
+#     "Building and testing"). That script builds every feature combination
+#     (default + diagnostics; the hil combos auto-skip when the
+#     hardware-only, gitignored `src/hil_keys.rs` is absent, which it always
+#     is on a CI runner) — CI and the manual gate a human runs before landing
+#     firmware changes are now the same command, not a re-implementation of
+#     it.
 
 on:
   pull_request:
@@ -119,3 +120,62 @@ jobs:
 
       - name: cargo clippy --workspace --all-targets -- -D warnings
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  firmware:
+    name: firmware build gate (check-all-features.sh)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same native build.rs prerequisites as the host jobs (see comment
+      # above `test`) — firmware/build.rs runs the identical FreeType/DejaVu
+      # emoji-font gen step.
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libfreetype6-dev fonts-dejavu-core
+
+      # Installs the Espressif `esp` Rust fork (Xtensa target support) via
+      # espup, restricted to esp32s3 since that's the only MCU this project
+      # targets (see firmware/.cargo/config.toml). `GITHUB_TOKEN` avoids
+      # espup's unauthenticated-GitHub-API rate limit (see the action's own
+      # README).
+      - name: Install Rust for Xtensa (esp toolchain)
+        uses: esp-rs/xtensa-toolchain@v1.7.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          default: true
+          buildtargets: esp32s3
+
+      # firmware/.cargo/config.toml's [target.xtensa-esp32s3-espidf] linker
+      # is `ldproxy` — same install command README.md documents for local
+      # dev setup.
+      - name: Install ldproxy
+        run: cargo install ldproxy --locked
+
+      # ESP-IDF v5.2.2 is pinned once, in firmware/.cargo/config.toml's
+      # ESP_IDF_VERSION (not re-pinned here) — esp-idf-sys bootstraps that
+      # sysroot into ~/.espressif and firmware/.embuild on first build.
+      # Without caching it, every run rebuilds the sysroot from source.
+      - name: Cache ESP-IDF sysroot
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.espressif
+            firmware/.embuild
+          key: esp-idf-${{ runner.os }}-${{ hashFiles('firmware/.cargo/config.toml', 'firmware/Cargo.lock') }}
+          restore-keys: |
+            esp-idf-${{ runner.os }}-
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "firmware -> target"
+
+      # The canonical firmware build gate — same command CONTRIBUTING.md
+      # documents for a human to run manually before landing firmware
+      # changes. Builds default (production) + diagnostics; the hil combos
+      # auto-skip since src/hil_keys.rs is gitignored/absent on a CI runner.
+      - name: cd firmware && bash check-all-features.sh
+        run: cd firmware && bash check-all-features.sh
