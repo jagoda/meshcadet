@@ -295,50 +295,10 @@ impl<'d> TouchDriver<'d> {
     }
 }
 
-/// Pure decision function for the release-by-silence debounce in
-/// [`TouchDriver::poll_event`]'s `status & 0x80 == 0` arm — extracted so this
-/// regression-causing logic is covered by a host-runnable unit test
-/// independent of the I2C/hardware stack, same rationale as
-/// `touch_wake_transition` in `ui/mod.rs`.
-///
-/// Returns `true` once `now_ms` is at least `debounce_ms` past
-/// `last_update_ms` (saturating, so a clock that hasn't advanced — or has
-/// wrapped — never spuriously asserts a release).
-fn silence_implies_release(now_ms: u64, last_update_ms: u64, debounce_ms: u64) -> bool {
-    now_ms.saturating_sub(last_update_ms) >= debounce_ms
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ── silence_implies_release ─────────────────────────────────────────────
-    // Pure debounce arithmetic — see the function's doc for why isolating it
-    // from the I2C/hardware stack matters here. NOTE: this crate's `[[bin]]` target sets
-    // `harness = false` (see `ui/mod.rs`'s test-module doc for the full
-    // explanation) so `cargo test` on host only type-checks this module; the
-    // hardware-runner path in `.cargo/config.toml` is what actually executes
-    // it.
-
-    #[test]
-    fn silence_implies_release_false_within_debounce_window() {
-        // This is the exact regression scenario: back-to-back polls within
-        // the same `step()`'s drain loop are microseconds apart, i.e.
-        // `now_ms == last_update_ms` — must NOT infer a release.
-        assert!(!silence_implies_release(1_000, 1_000, 40));
-        assert!(!silence_implies_release(1_020, 1_000, 40));
-    }
-
-    #[test]
-    fn silence_implies_release_true_once_debounce_elapsed() {
-        assert!(silence_implies_release(1_040, 1_000, 40));
-        assert!(silence_implies_release(5_000, 1_000, 40));
-    }
-
-    #[test]
-    fn silence_implies_release_never_fires_on_backwards_clock() {
-        // `saturating_sub` must not wrap into a huge elapsed value if
-        // `now_ms` is somehow behind `last_update_ms`.
-        assert!(!silence_implies_release(500, 1_000, 40));
-    }
-}
+// `silence_implies_release` is pure Rust with no I2C/hardware dependency —
+// it now lives in `firmware_core::ui::touch` so its tests execute under
+// `cargo test --workspace` (this crate is a detached, cross-compiled
+// workspace — see `Cargo.toml`'s doc comment — so a `#[cfg(test)]` block
+// written here would type-check but never run). Only `TouchDriver` (real
+// I2C I/O) stays. See `docs/adr/0005-firmware-core-extraction.md`.
+use firmware_core::ui::touch::silence_implies_release;
