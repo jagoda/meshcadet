@@ -73,6 +73,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Provisioning-codec golden-vector generator — see `golden`'s module doc.
+pub mod golden;
+
 /// One known, already-documented, deliberately-deferred gap — see
 /// `firmware/gen_emoji_font.c`'s `EMOJI_SIZES` doc comment ("KNOWN, DEFERRED
 /// GAP") for the full rationale: `unprovisioned.rs` shows 📻 at 28px (pre-

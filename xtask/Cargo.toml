@@ -4,11 +4,23 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "MeshCadet host-side glyph-coverage verification harness."
+description = "MeshCadet host-side glyph-coverage verification harness + provisioning-codec golden-vector generator."
 
 [[bin]]
 name = "xtask"
 path = "src/main.rs"
 
+# `cargo run -p xtask --bin gen-prov-golden-vectors` — emits the provisioning
+# codec's golden-vector JSON to stdout, derived straight from
+# `protocol::provisioning`/`protocol::history` (see `src/golden.rs`). Consumed
+# by `pages-check.yml`'s JS-codec conformance step and by
+# `site/provisioner/codec.conformance.test.mjs` locally.
+[[bin]]
+name = "gen-prov-golden-vectors"
+path = "src/bin/gen_prov_golden_vectors.rs"
+
 [dependencies]
 regex = "1"
+protocol.workspace = true
+# Hex encode/decode for golden-vector JSON fields (pubkeys, secrets, frame bytes).
+hex = "0.4"
