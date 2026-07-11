@@ -1,0 +1,320 @@
+/* styles.css — MeshCadet landing page.
+ *
+ * Color tokens are lifted 1:1 from firmware/src/ui/theme.slint's `Theme`
+ * global ("Mission Control" dark-space + cyan radio-signal palette) so the
+ * web presence and the on-device UI read as the same product. If theme.slint
+ * ever changes its palette, update the custom properties below to match.
+ */
+
+:root {
+  --bg-space: #0d1117;
+  --surface: #161e28;
+  --surface-raised: #1e2a38;
+  --surface-alt: #2a3442;
+  --brand-signal: #00b4ff;
+  --brand-signal-bright: #33c4ff;
+  --text-primary: #e8ecf0;
+  --text-secondary: #a0a8b0;
+  --text-muted: #606870;
+  --nebula-violet: #7c5cff;
+  --star-gold: #ffd66b;
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  background: var(--bg-space);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  line-height: 1.55;
+}
+
+.wrap {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 0 24px;
+}
+
+.wrap-narrow {
+  max-width: 720px;
+}
+
+a {
+  color: var(--brand-signal-bright);
+}
+
+/* ── Top bar ────────────────────────────────────────────────────────── */
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: rgba(13, 17, 23, 0.85);
+  backdrop-filter: blur(6px);
+  border-bottom: 1px solid var(--surface-alt);
+}
+
+.topbar-inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 56px;
+}
+
+.wordmark {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 16px;
+  color: var(--text-primary);
+  text-decoration: none;
+  letter-spacing: 0.02em;
+}
+
+.wordmark span {
+  color: var(--brand-signal);
+}
+
+.topnav {
+  display: flex;
+  gap: 24px;
+}
+
+.topnav a {
+  color: var(--text-secondary);
+  text-decoration: none;
+  font-size: 14px;
+}
+
+.topnav a:hover {
+  color: var(--brand-signal-bright);
+}
+
+/* ── Hero ───────────────────────────────────────────────────────────── */
+
+.hero {
+  position: relative;
+  overflow: hidden;
+  background: var(--bg-space);
+  padding: 72px 0 96px;
+}
+
+.hero-starfield {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: 0.7;
+  pointer-events: none;
+}
+
+.hero-horizon {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  height: auto;
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+.hero-inner {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 32px;
+  flex-wrap: wrap;
+}
+
+.hero-copy {
+  max-width: 620px;
+}
+
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--star-gold);
+  margin: 0 0 12px;
+}
+
+.hero h1 {
+  font-size: 44px;
+  margin: 0 0 16px;
+  letter-spacing: -0.01em;
+}
+
+.hero h1 span {
+  color: var(--brand-signal);
+}
+
+.tagline {
+  color: var(--text-secondary);
+  font-size: 16px;
+  margin: 0 0 28px;
+}
+
+.cta-row {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.btn {
+  display: inline-block;
+  padding: 10px 20px;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 600;
+  text-decoration: none;
+  border: 1px solid transparent;
+}
+
+.btn-primary {
+  background: var(--brand-signal);
+  color: #06141f;
+}
+
+.btn-primary:hover {
+  background: var(--brand-signal-bright);
+}
+
+.btn-ghost {
+  background: transparent;
+  border-color: var(--surface-alt);
+  color: var(--text-primary);
+}
+
+.btn-ghost:hover {
+  border-color: var(--brand-signal);
+  color: var(--brand-signal-bright);
+}
+
+.hero-art {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.hero-art img {
+  width: 128px;
+  height: 128px;
+  image-rendering: pixelated;
+}
+
+/* ── Sections ───────────────────────────────────────────────────────── */
+
+.section {
+  padding: 72px 0;
+}
+
+.section-alt {
+  background: var(--surface);
+  border-top: 1px solid var(--surface-alt);
+  border-bottom: 1px solid var(--surface-alt);
+}
+
+.section h2 {
+  font-size: 28px;
+  margin: 0 0 32px;
+}
+
+.muted {
+  color: var(--text-muted);
+  font-size: 14px;
+}
+
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 24px;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--surface-alt);
+  border-radius: 10px;
+  padding: 24px;
+}
+
+.card img {
+  width: 32px;
+  height: 32px;
+  image-rendering: pixelated;
+  margin-bottom: 12px;
+}
+
+.card h3 {
+  font-size: 16px;
+  margin: 0 0 8px;
+  color: var(--text-primary);
+}
+
+.card p {
+  font-size: 14px;
+  color: var(--text-secondary);
+  margin: 0;
+}
+
+.card code {
+  font-family: var(--font-mono);
+  background: var(--surface-alt);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 13px;
+}
+
+/* ── Footer ─────────────────────────────────────────────────────────── */
+
+.footer {
+  border-top: 1px solid var(--surface-alt);
+  padding: 32px 0 48px;
+}
+
+.footer-inner p {
+  color: var(--text-muted);
+  font-size: 13px;
+  margin: 0 0 12px;
+}
+
+.footer-links {
+  display: flex;
+  gap: 20px;
+}
+
+.footer-links a {
+  color: var(--text-secondary);
+  text-decoration: none;
+}
+
+.footer-links a:hover {
+  color: var(--brand-signal-bright);
+}
+
+/* ── Responsive ─────────────────────────────────────────────────────── */
+
+@media (max-width: 640px) {
+  .hero h1 {
+    font-size: 32px;
+  }
+
+  .hero-inner {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .topnav {
+    gap: 14px;
+  }
+}

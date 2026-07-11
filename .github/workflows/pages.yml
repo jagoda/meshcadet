@@ -1,0 +1,49 @@
+name: Deploy Pages
+
+# Publishes site/ (the GitHub Pages project-site landing page, see
+# site/README.md) via GitHub Actions' native Pages deployment — no gh-pages
+# branch, no Jekyll. Triggered on pushes to main that touch the site source
+# or this workflow, plus manual dispatch for a same-content redeploy.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one Pages deployment at a time; never cancel one mid-flight in favor
+# of a newer push, to avoid ever publishing a torn/partial site.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload site/ as the Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

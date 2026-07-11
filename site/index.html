@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MeshCadet — mesh-radio messaging firmware for the LilyGo T-Deck Plus</title>
+  <meta name="description" content="MeshCadet is a polished, deliberately-limited MeshCore-interop firmware for the LilyGo T-Deck Plus: allowlist-only contacts, no advertising, pull-only telemetry, on a byte-exact MeshCore protocol port." />
+
+  <!-- All paths below are relative (no leading "/") — this is a GitHub Pages
+       PROJECT site served under /meshcadet/, not a root site. A root-rooted
+       path like "/styles.css" would 404 there. Keep it that way. -->
+  <link rel="icon" type="image/png" href="assets/favicon.png" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <header class="topbar">
+    <div class="wrap topbar-inner">
+      <a class="wordmark" href="#top">Mesh<span>Cadet</span></a>
+      <nav class="topnav">
+        <a href="#about">What it does</a>
+        <a href="#design">Design</a>
+        <a href="https://github.com/jagoda/meshcadet" target="_blank" rel="noopener">GitHub&nbsp;↗</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="top">
+
+    <!-- ── Hero ─────────────────────────────────────────────────────────── -->
+    <section class="hero">
+      <img class="hero-starfield" src="assets/starfield.png" alt="" aria-hidden="true" />
+      <div class="wrap hero-inner">
+        <div class="hero-copy">
+          <p class="eyebrow">Mission Control // LilyGo T-Deck Plus</p>
+          <h1>Mesh<span>Cadet</span></h1>
+          <p class="tagline">
+            A polished, deliberately-limited <strong>MeshCore-interop</strong> firmware —
+            a fully compliant citizen on the mesh, with a constrained policy layer
+            on top: allowlist-only contacts, no advertising or discovery, pull-only
+            telemetry, and a curated emoji set.
+          </p>
+          <div class="cta-row">
+            <a class="btn btn-primary" href="https://github.com/jagoda/meshcadet" target="_blank" rel="noopener">View on GitHub</a>
+            <a class="btn btn-ghost" href="https://github.com/jagoda/meshcadet/blob/main/docs/adr/0001-charter.md" target="_blank" rel="noopener">Read the charter</a>
+          </div>
+        </div>
+        <div class="hero-art">
+          <img src="assets/cadet-wave.png" alt="MeshCadet's pixel-art cadet mascot, waving" width="128" height="128" />
+        </div>
+      </div>
+      <img class="hero-horizon" src="assets/planet-horizon.png" alt="" aria-hidden="true" />
+    </section>
+
+    <!-- ── About / what it does ────────────────────────────────────────── -->
+    <section id="about" class="section">
+      <div class="wrap">
+        <h2>What it does</h2>
+        <div class="card-grid">
+          <div class="card">
+            <img src="assets/rocket.png" alt="" aria-hidden="true" />
+            <h3>Byte-exact MeshCore interop</h3>
+            <p>Talks real MeshCore over LoRa (SX1262) — DMs, channel messages,
+              ACKs, and pull-only location telemetry — on the air alongside any
+              other MeshCore node.</p>
+          </div>
+          <div class="card">
+            <img src="assets/crescent-moon.png" alt="" aria-hidden="true" />
+            <h3>Allowlist-only, no discovery</h3>
+            <p>An admin provisions every contact and channel over USB. The
+              device never auto-adds anyone and never advertises itself on
+              the mesh.</p>
+          </div>
+          <div class="card">
+            <img src="assets/planet-corner.png" alt="" aria-hidden="true" />
+            <h3>Touch UI for contacts &amp; messages</h3>
+            <p>A Slint touch-screen interface for contacts, conversations, and
+              composing messages with a curated <code>:shortcode:</code>
+              emoji set.</p>
+          </div>
+          <div class="card">
+            <img src="assets/comet.png" alt="" aria-hidden="true" />
+            <h3>PIN-gated admin menu</h3>
+            <p>Lightweight on-device runtime toggles behind a PIN, plus a USB
+              host CLI for provisioning, PIN reset, and history export.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Design / scope note ─────────────────────────────────────────── -->
+    <section id="design" class="section section-alt">
+      <div class="wrap wrap-narrow">
+        <h2>A deliberately limited device</h2>
+        <p>
+          MeshCadet grew out of wanting a simple, controlled way to stay in
+          touch with my kids over a MeshCore mesh. All of its constrained
+          behavior — allowlist-only contacts, no advertising, pull-only
+          telemetry — lives in a policy and UI layer on top of a byte-exact
+          protocol port, so the device never has to fork or weaken the
+          underlying protocol to apply those limits. These are deliberate
+          design choices for a controlled, minimal comms device, not anything
+          the underlying protocol requires.
+        </p>
+        <p class="muted">
+          MeshCadet is provided as-is, with no warranty and no guarantee of
+          safety — read the full disclaimer in the
+          <a href="https://github.com/jagoda/meshcadet#-disclaimer--no-warranty-no-guarantee-of-safety-use-at-your-own-risk" target="_blank" rel="noopener">project README</a>
+          before you build, flash, or rely on it.
+        </p>
+      </div>
+    </section>
+
+    <!-- Future section: hardware & build gallery -->
+    <!-- Future section: roadmap / status -->
+
+  </main>
+
+  <footer class="footer">
+    <div class="wrap footer-inner">
+      <p>
+        Licensed <a href="https://github.com/jagoda/meshcadet/blob/main/LICENSE" target="_blank" rel="noopener">GPLv3</a>.
+        MeshCore, MeshCadet, T-Deck, LILYGO, ESP32, Espressif, LoRa, and
+        Semtech are trademarks of their respective owners; use here is
+        nominative and implies no affiliation or endorsement.
+      </p>
+      <p class="footer-links">
+        <a href="https://github.com/jagoda/meshcadet/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">Contributing</a>
+        <a href="https://github.com/jagoda/meshcadet/blob/main/SECURITY.md" target="_blank" rel="noopener">Security</a>
+        <a href="https://github.com/jagoda/meshcadet/blob/main/CODE_OF_CONDUCT.md" target="_blank" rel="noopener">Code of Conduct</a>
+      </p>
+    </div>
+  </footer>
+
+</body>
+</html>
