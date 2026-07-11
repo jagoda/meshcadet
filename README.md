@@ -121,6 +121,7 @@ DM / ACK / channel-message / pull-telemetry paths. Before relying on it:
 | Crate | Role | Builds with |
 |-------|------|-------------|
 | `protocol/` | MeshCore v1.15 wire port (framing, crypto, codec); shared | stable, host-native |
+| `firmware-core/` | Decoupled, host-testable half of firmware logic (dispatcher, PIN-menu, notifications, GPS/battery/runtime-settings parsing+codecs) — no `esp-idf-*`/Slint dep; also a `path` dep of `firmware/` (see ADR-0005) | stable, host-native |
 | `firmware/` | T-Deck device app (radio, GPS, touch UI, storage, admin menu) | `esp` toolchain, `xtensa-esp32s3-espidf` |
 | `host/` | Admin CLI (`meshcadet`): USB provisioning, history export, PIN reset | stable, host-native |
 | `xtask/` | Host-side glyph-coverage verification harness | stable, host-native |
@@ -134,7 +135,7 @@ test`. Toolchain layout is recorded in [ADR-0001](docs/adr/0001-charter.md).
 
 ## Building from a fresh clone
 
-### 1. Host-native crates (`protocol`, `host`, `xtask`, `ui_sim`, `ui_perf`)
+### 1. Host-native crates (`protocol`, `firmware-core`, `host`, `xtask`, `ui_sim`, `ui_perf`)
 
 These build and test on stable Rust with no special toolchain:
 

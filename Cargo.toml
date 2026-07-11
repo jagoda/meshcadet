@@ -1,15 +1,26 @@
 # MeshCadet Cargo workspace.
 #
-# Three host-native crates live in this workspace; the firmware crate is a
+# Several host-native crates live in this workspace; the firmware crate is a
 # DETACHED workspace (it declares its own `[workspace]` table in
 # firmware/Cargo.toml) because it cross-compiles for ESP32-S3 / Xtensa under
 # the `esp` toolchain and the esp-idf (std) sysroot. Keeping it out of the
 # root member set means `cargo build` / `cargo test` from the repo root only
-# touches `protocol` + `host` + `xtask` and stays buildable on stable rustc
+# touches this workspace's root members and stays buildable on stable rustc
 # with no espup / ESP-IDF installed.
 #
-#   cargo test                 # protocol + host + xtask (stable, native)
+#   cargo test                 # root workspace (stable, native)
 #   cd firmware && cargo build # firmware (esp toolchain, xtensa-esp32s3-espidf)
+#
+# `firmware-core` is pure Rust, `std`, depending only on `protocol` — the
+# decoupled, host-testable half of firmware logic that has no `esp-idf-*`/
+# Slint dependency (dispatcher/dedup, PIN-menu, notification model, GPS/
+# battery/runtime-settings pure parsing+codecs, …). It follows the exact
+# pattern `protocol` already uses: a root-workspace member that is ALSO a
+# `path` dependency of the detached `firmware` crate below, so it compiles
+# for both host (tests execute here) and xtensa (as a firmware dependency).
+# `firmware/src/<module>.rs` re-consumes each moved module via a thin
+# `pub use firmware_core::<module>::*;` shim. See
+# `docs/adr/0005-firmware-core-extraction.md`.
 #
 # `xtask` is the host-side glyph-coverage verification harness: it statically
 # scans `firmware/src/ui/screens/*.rs` for every (codepoint, font-size) pair
@@ -37,7 +48,7 @@
 # baseline.md` for the full methodology + ledger.
 [workspace]
 resolver = "2"
-members = ["protocol", "host", "xtask", "ui_sim", "ui_perf"]
+members = ["protocol", "firmware-core", "host", "xtask", "ui_sim", "ui_perf"]
 
 [workspace.package]
 edition = "2021"
