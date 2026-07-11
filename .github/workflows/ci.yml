@@ -42,10 +42,38 @@ name: CI
 #     firmware changes are now the same command, not a re-implementation of
 #     it.
 
+#
+# ── Path filter: skip entirely on site-only changes ──────────────────────
+#
+# All five jobs below build/test/lint the Rust workspace or the firmware
+# cross-compile — none of them touch `site/` or `pages.yml`, so a PR whose
+# diff is scoped to the GitHub Pages landing site gets nothing useful from
+# running them. `paths-ignore` skips the WHOLE workflow (all five jobs) when
+# every changed file matches the ignore list; any change outside it (any
+# Rust/firmware file, or ci.yml itself) still triggers the full suite
+# unchanged. `pages.yml`'s own `check` job already covers site-only PRs.
+#
+# This is a plain skip, not a "companion job reports success" shim, because
+# it doesn't need to be: ruleset `main` (id 18807600, see
+# `gh api repos/jagoda/meshcadet/rulesets/18807600`) has no
+# `required_status_checks` rule — only `pull_request`, `required_signatures`,
+# `non_fast_forward`, `deletion`. None of these five jobs are GitHub-required
+# checks today, so skipping them leaves nothing in "Expected — waiting for
+# status" and a site-only PR stays mergeable. If a `required_status_checks`
+# rule is ever added to 18807600 naming one of these jobs, this filter would
+# reintroduce that deadlock on site-only PRs — switch to a companion
+# always-green job (or per-job `if:` guards that still report a conclusion)
+# at that point instead of a bare `paths-ignore`.
 on:
   pull_request:
+    paths-ignore:
+      - "site/**"
+      - ".github/workflows/pages.yml"
   push:
     branches: [main]
+    paths-ignore:
+      - "site/**"
+      - ".github/workflows/pages.yml"
   # Lets a maintainer (or CI verification tooling) kick a run on-demand from
   # any branch without needing an open PR — `gh workflow run ci.yml --ref
   # <branch>`. Purely additive to the required pull_request/push triggers.
