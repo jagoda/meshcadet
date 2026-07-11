@@ -1,5 +1,7 @@
 # MeshCadet
 
+🌐 **[Project website](https://jagoda.github.io/meshcadet/)**
+
 A polished, deliberately-limited **MeshCore-interop firmware** for the
 **LilyGo T-Deck Plus**, written in Rust (esp-idf / std, ESP32-S3 / Xtensa).
 
