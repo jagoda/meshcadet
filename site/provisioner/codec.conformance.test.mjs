@@ -93,6 +93,68 @@ check("decodeFrame rejects a CRC mismatch", () => {
   assert.throws(() => codec.decodeFrame(frame), (err) => err instanceof codec.ProvError && err.kind === "CrcMismatch");
 });
 
+// Payload-decode error paths beyond frame-level errors — not wire-format
+// drift risks (the golden vectors above already pin the byte layout), but a
+// real correctness property future provisioner-page code depends on to
+// surface actionable errors on a corrupt/malicious payload rather than
+// silently mis-parsing one.
+
+check("decodeRspIdentity rejects an over-length name_len", () => {
+  // name_len byte (offset 33) claims 33 bytes, one past MAX_NAME_LEN (32).
+  const payload = new Uint8Array(34);
+  payload[33] = codec.MAX_NAME_LEN + 1;
+  assert.throws(
+    () => codec.decodeRspIdentity(payload),
+    (err) => err instanceof codec.ProvError && err.kind === "NameTooLong",
+  );
+});
+
+check("decodeRspContact rejects an over-length name_len", () => {
+  const payload = new Uint8Array(35);
+  payload[34] = codec.MAX_NAME_LEN + 1;
+  assert.throws(
+    () => codec.decodeRspContact(payload),
+    (err) => err instanceof codec.ProvError && err.kind === "NameTooLong",
+  );
+});
+
+check("decodeRspChannel rejects an over-length name_len", () => {
+  const payload = new Uint8Array(5);
+  payload[4] = codec.MAX_NAME_LEN + 1;
+  assert.throws(
+    () => codec.decodeRspChannel(payload),
+    (err) => err instanceof codec.ProvError && err.kind === "NameTooLong",
+  );
+});
+
+check("decodeRspStatus rejects a payload shorter than the legacy 55-byte floor", () => {
+  assert.throws(
+    () => codec.decodeRspStatus(new Uint8Array(54)),
+    (err) => err instanceof codec.ProvError && err.kind === "TruncatedPayload",
+  );
+});
+
+check("decodeRspError rejects a msg_len claiming more bytes than are present", () => {
+  const payload = new Uint8Array([0, 5, 0x61, 0x62]); // error_code=0, msg_len=5, only 2 bytes of msg follow
+  assert.throws(
+    () => codec.decodeRspError(payload),
+    (err) => err instanceof codec.ProvError && err.kind === "TruncatedPayload",
+  );
+});
+
+check("decodeRspHistoryEntry returns null (not throw) on a truncated payload", () => {
+  // Mirrors protocol::history::decode_rsp_history_entry's Option contract —
+  // there is no ProvError variant for this codec (it lives outside
+  // protocol::provisioning).
+  assert.equal(codec.decodeRspHistoryEntry(new Uint8Array(8)), null);
+});
+
+check("decodeRspHistoryEntry returns null on an unrecognised msg_type byte", () => {
+  const payload = new Uint8Array(9);
+  payload[2] = 0xff; // neither HISTORY_MSG_TYPE_DM (0) nor HISTORY_MSG_TYPE_GRP_TXT (1)
+  assert.equal(codec.decodeRspHistoryEntry(payload), null);
+});
+
 // ── Golden-vector conformance ─────────────────────────────────────────────────
 
 const ENCODE_OPS = {

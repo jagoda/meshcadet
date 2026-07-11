@@ -214,11 +214,8 @@ fn frame_only_vector(name: &'static str, frame_type: u8) -> Vector {
 //    serialize the DECODED struct — never the hand-picked inputs — as
 //    `expect`. ─────────────────────────────────────────────────────────────
 
-fn rsp_status_vector(name: &'static str, payload_in: RspStatusPayload) -> Vector {
-    let mut buf = [0u8; 64];
-    let plen = encode_rsp_status(&payload_in, &mut buf);
-    let d = decode_rsp_status(&buf[..plen]).expect("golden generator: rsp_status self-decode");
-    let expect = Json::Obj(vec![
+fn rsp_status_expect_json(d: &RspStatusPayload) -> Json {
+    Json::Obj(vec![
         ("provisioned", b(d.provisioned)),
         ("pubkey", hexj(&d.pubkey)),
         ("contact_count", n(d.contact_count as i64)),
@@ -236,8 +233,41 @@ fn rsp_status_vector(name: &'static str, payload_in: RspStatusPayload) -> Vector
         ("battery_charging", b(d.battery_charging)),
         ("battery_raw_mv", n(d.battery_raw_mv as i64)),
         ("battery_held_raw_mv", n(d.battery_held_raw_mv as i64)),
-    ]);
+    ])
+}
+
+fn rsp_status_vector(name: &'static str, payload_in: RspStatusPayload) -> Vector {
+    let mut buf = [0u8; 64];
+    let plen = encode_rsp_status(&payload_in, &mut buf);
+    let d = decode_rsp_status(&buf[..plen]).expect("golden generator: rsp_status self-decode");
+    let expect = rsp_status_expect_json(&d);
     decode_vector(name, "rsp_status", FRAME_RSP_STATUS, &buf[..plen], expect)
+}
+
+/// Builds a golden vector for `decode_rsp_status`'s legacy short-payload
+/// backward-compatibility path (ADR-0002's staged-rollout amendments): a
+/// firmware/host pairing where one side predates `battery_raw_mv` (55-byte
+/// payload) or `battery_held_raw_mv` (57-byte payload) must still decode,
+/// with the missing trailing field(s) defaulting to `0` — see
+/// `protocol::provisioning::decode_rsp_status`'s own doc comment and its
+/// `rsp_status_legacy_*_byte_payload_decodes_with_zero_*` tests, which this
+/// mirrors on the JS side.
+fn rsp_status_truncated_vector(
+    name: &'static str,
+    payload_in: RspStatusPayload,
+    truncate_to: usize,
+) -> Vector {
+    let mut buf = [0u8; 64];
+    let plen = encode_rsp_status(&payload_in, &mut buf);
+    assert!(
+        truncate_to <= plen,
+        "{name}: truncate_to exceeds encoded length"
+    );
+    let truncated = &buf[..truncate_to];
+    let d = decode_rsp_status(truncated)
+        .expect("golden generator: rsp_status legacy-length self-decode");
+    let expect = rsp_status_expect_json(&d);
+    decode_vector(name, "rsp_status", FRAME_RSP_STATUS, truncated, expect)
 }
 
 fn rsp_identity_vector(name: &'static str, pubkey: [u8; 32], device_name: &[u8]) -> Vector {
@@ -615,6 +645,47 @@ fn build_vectors() -> Vec<Vector> {
             battery_raw_mv: 4142,
             battery_held_raw_mv: 3775,
         },
+    ));
+
+    v.push(rsp_status_truncated_vector(
+        "rsp_status_legacy_55_byte_zero_raw_mv",
+        RspStatusPayload {
+            provisioned: true,
+            pubkey: [0x11u8; 32],
+            contact_count: 1,
+            channel_count: 1,
+            gps_has_fix: false,
+            gps_lat_e7: 0,
+            gps_lon_e7: 0,
+            gps_fix_age_secs: 0,
+            gps_clock_synced: false,
+            gps_clock_sync_age_secs: 0,
+            battery_percent: 50,
+            battery_charging: false,
+            battery_raw_mv: 0,
+            battery_held_raw_mv: 0,
+        },
+        55,
+    ));
+    v.push(rsp_status_truncated_vector(
+        "rsp_status_legacy_57_byte_zero_held_raw_mv",
+        RspStatusPayload {
+            provisioned: true,
+            pubkey: [0x22u8; 32],
+            contact_count: 0,
+            channel_count: 0,
+            gps_has_fix: false,
+            gps_lat_e7: 0,
+            gps_lon_e7: 0,
+            gps_fix_age_secs: 0,
+            gps_clock_synced: false,
+            gps_clock_sync_age_secs: 0,
+            battery_percent: 82,
+            battery_charging: false,
+            battery_raw_mv: 4180,
+            battery_held_raw_mv: 0,
+        },
+        57,
     ));
 
     v.push(rsp_identity_vector(
