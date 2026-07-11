@@ -68,8 +68,14 @@ fn redraw_scope_and_alloc_baseline() {
         }
     }
     print_stats("RocketOnSend peak dirty frame", rocket_peak);
-    eprintln!("  RocketOnSend: {} dirty ticks over its one-shot transition", rocket_ticks);
-    assert!(rocket_ticks > 0, "RocketOnSend's play=true must dirty at least one frame");
+    eprintln!(
+        "  RocketOnSend: {} dirty ticks over its one-shot transition",
+        rocket_ticks
+    );
+    assert!(
+        rocket_ticks > 0,
+        "RocketOnSend's play=true must dirty at least one frame"
+    );
     assert!(
         rocket_peak.lines_touched < 240,
         "RocketOnSend is a small nested motif — it must never force a full-window repaint \
@@ -94,8 +100,14 @@ fn redraw_scope_and_alloc_baseline() {
         }
     }
     print_stats("CometOnNotify peak dirty frame", comet_peak);
-    eprintln!("  CometOnNotify: {} dirty ticks over its one-shot transition", comet_ticks);
-    assert!(comet_ticks > 0, "CometOnNotify's play=true must dirty at least one frame");
+    eprintln!(
+        "  CometOnNotify: {} dirty ticks over its one-shot transition",
+        comet_ticks
+    );
+    assert!(
+        comet_ticks > 0,
+        "CometOnNotify's play=true must dirty at least one frame"
+    );
     assert!(
         comet_peak.lines_touched < 240,
         "CometOnNotify is a header-strip-height motif — it must never force a full-window \

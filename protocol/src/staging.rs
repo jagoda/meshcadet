@@ -132,13 +132,19 @@ pub struct ProvisioningStaging {
     channel_count: usize,
 }
 
+impl Default for ProvisioningStaging {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProvisioningStaging {
     /// Create a new, empty staging buffer.
     pub fn new() -> Self {
         Self {
-            contacts:      [StagingContact::NULL; MAX_STAGING_CONTACTS],
+            contacts: [StagingContact::NULL; MAX_STAGING_CONTACTS],
             contact_count: 0,
-            channels:      [StagingChannel::NULL; MAX_STAGING_CHANNELS],
+            channels: [StagingChannel::NULL; MAX_STAGING_CHANNELS],
             channel_count: 0,
         }
     }
@@ -146,10 +152,14 @@ impl ProvisioningStaging {
     // ── Accessors ─────────────────────────────────────────────────────────────
 
     /// Number of staged contacts.
-    pub fn contact_count(&self) -> usize { self.contact_count }
+    pub fn contact_count(&self) -> usize {
+        self.contact_count
+    }
 
     /// Number of staged channels.
-    pub fn channel_count(&self) -> usize { self.channel_count }
+    pub fn channel_count(&self) -> usize {
+        self.channel_count
+    }
 
     /// Slice of the live (non-null) staged contacts.
     pub fn contacts(&self) -> &[StagingContact] {
@@ -297,7 +307,10 @@ mod tests {
     fn contact(key_byte: u8) -> StagingContact {
         let mut pubkey = [0u8; 32];
         pubkey[0] = key_byte;
-        StagingContact { pubkey, ..StagingContact::NULL }
+        StagingContact {
+            pubkey,
+            ..StagingContact::NULL
+        }
     }
 
     fn contact_tele(key_byte: u8, telemetry: bool) -> StagingContact {
@@ -309,7 +322,11 @@ mod tests {
     fn channel(secret_byte: u8, primary: bool) -> StagingChannel {
         let mut secret = [0u8; 32];
         secret[0] = secret_byte;
-        StagingChannel { secret, primary, ..StagingChannel::NULL }
+        StagingChannel {
+            secret,
+            primary,
+            ..StagingChannel::NULL
+        }
     }
 
     // ── ADD_CONTACT ───────────────────────────────────────────────────────────
@@ -340,7 +357,11 @@ mod tests {
         for i in 0..MAX_STAGING_CONTACTS {
             let mut pk = [0u8; 32];
             pk[0] = i as u8;
-            s.add_contact(StagingContact { pubkey: pk, ..StagingContact::NULL }).unwrap();
+            s.add_contact(StagingContact {
+                pubkey: pk,
+                ..StagingContact::NULL
+            })
+            .unwrap();
         }
         assert_eq!(s.contact_count(), MAX_STAGING_CONTACTS);
         let result = s.add_contact(contact(0xFF));
@@ -419,8 +440,12 @@ mod tests {
     fn add_del_contact_round_trip() {
         let mut s = ProvisioningStaging::new();
         let key = [0xA1_u8; 32];
-        s.add_contact(StagingContact { pubkey: key, telemetry_enable: true, ..StagingContact::NULL })
-            .unwrap();
+        s.add_contact(StagingContact {
+            pubkey: key,
+            telemetry_enable: true,
+            ..StagingContact::NULL
+        })
+        .unwrap();
         s.del_contact(&key).unwrap();
         assert_eq!(s.contact_count(), 0);
     }
@@ -451,12 +476,18 @@ mod tests {
         // Adding a second primary channel must clear the existing one.
         s.add_channel(channel(0x30, true)).unwrap();
 
-        assert!(!s.channels()[0].primary,
-            "ch[0] must lose primary flag when a new primary is added");
-        assert!(!s.channels()[1].primary,
-            "ch[1] (already non-primary) must remain non-primary");
-        assert!(s.channels()[2].primary,
-            "ch[2] (newly added) must hold the primary flag");
+        assert!(
+            !s.channels()[0].primary,
+            "ch[0] must lose primary flag when a new primary is added"
+        );
+        assert!(
+            !s.channels()[1].primary,
+            "ch[1] (already non-primary) must remain non-primary"
+        );
+        assert!(
+            s.channels()[2].primary,
+            "ch[2] (newly added) must hold the primary flag"
+        );
     }
 
     #[test]
@@ -478,7 +509,11 @@ mod tests {
         for i in 0..MAX_STAGING_CHANNELS {
             let mut sec = [0u8; 32];
             sec[0] = i as u8;
-            s.add_channel(StagingChannel { secret: sec, ..StagingChannel::NULL }).unwrap();
+            s.add_channel(StagingChannel {
+                secret: sec,
+                ..StagingChannel::NULL
+            })
+            .unwrap();
         }
         assert_eq!(s.channel_count(), MAX_STAGING_CHANNELS);
         let result = s.add_channel(channel(0xFF, false));
@@ -503,7 +538,11 @@ mod tests {
 
         assert_eq!(s.channel_count(), 2);
         assert_eq!(s.channels()[0].secret[0], 0x10, "ch[0] must remain");
-        assert_eq!(s.channels()[1].secret[0], 0x30, "ch[2] must shift to index 1");
+        assert_eq!(
+            s.channels()[1].secret[0],
+            0x30,
+            "ch[2] must shift to index 1"
+        );
     }
 
     #[test]
@@ -543,7 +582,12 @@ mod tests {
     fn add_del_channel_round_trip() {
         let mut s = ProvisioningStaging::new();
         let secret = [0xCC_u8; 32];
-        s.add_channel(StagingChannel { secret, primary: true, ..StagingChannel::NULL }).unwrap();
+        s.add_channel(StagingChannel {
+            secret,
+            primary: true,
+            ..StagingChannel::NULL
+        })
+        .unwrap();
         s.del_channel(&secret).unwrap();
         assert_eq!(s.channel_count(), 0);
     }
@@ -557,7 +601,12 @@ mod tests {
         secret[0] = secret_byte;
         let mut name = [0u8; MAX_NAME_LEN];
         name[0] = name_byte;
-        StagingChannel { secret, primary, name, name_len: 1 }
+        StagingChannel {
+            secret,
+            primary,
+            name,
+            name_len: 1,
+        }
     }
 
     /// Regression: re-adding the SAME key updates in place — count stays put,
@@ -566,7 +615,10 @@ mod tests {
     #[test]
     fn upsert_channel_same_key_updates_in_place_no_duplicate() {
         let mut s = ProvisioningStaging::new();
-        assert_eq!(s.upsert_channel(named_channel(0x98, false, b'a')), Ok(ChannelUpsert::Added));
+        assert_eq!(
+            s.upsert_channel(named_channel(0x98, false, b'a')),
+            Ok(ChannelUpsert::Added)
+        );
         assert_eq!(s.channel_count(), 1);
 
         // Re-add the same secret seven more times — must never grow the list.
@@ -592,15 +644,25 @@ mod tests {
         let outcome = s.upsert_channel(named_channel(0x42, false, b'y')).unwrap();
         assert_eq!(outcome, ChannelUpsert::Updated);
         assert_eq!(s.channel_count(), 1, "rename must not append a sibling");
-        assert_eq!(s.channels()[0].name[0], b'y', "name must be updated in place");
+        assert_eq!(
+            s.channels()[0].name[0],
+            b'y',
+            "name must be updated in place"
+        );
     }
 
     /// A new/unseen key still appends normally and increments the count.
     #[test]
     fn upsert_channel_new_key_appends() {
         let mut s = ProvisioningStaging::new();
-        assert_eq!(s.upsert_channel(named_channel(0x10, false, b'a')), Ok(ChannelUpsert::Added));
-        assert_eq!(s.upsert_channel(named_channel(0x20, false, b'b')), Ok(ChannelUpsert::Added));
+        assert_eq!(
+            s.upsert_channel(named_channel(0x10, false, b'a')),
+            Ok(ChannelUpsert::Added)
+        );
+        assert_eq!(
+            s.upsert_channel(named_channel(0x20, false, b'b')),
+            Ok(ChannelUpsert::Added)
+        );
         assert_eq!(s.channel_count(), 2);
         assert_eq!(s.channels()[0].secret[0], 0x10);
         assert_eq!(s.channels()[1].secret[0], 0x20);
@@ -650,7 +712,8 @@ mod tests {
     fn upsert_channel_capacity_only_blocks_new_keys() {
         let mut s = ProvisioningStaging::new();
         for i in 0..MAX_STAGING_CHANNELS {
-            s.upsert_channel(named_channel(i as u8, false, b'a')).unwrap();
+            s.upsert_channel(named_channel(i as u8, false, b'a'))
+                .unwrap();
         }
         assert_eq!(s.channel_count(), MAX_STAGING_CHANNELS);
 
@@ -679,18 +742,38 @@ mod tests {
         let mut s = ProvisioningStaging::new();
 
         let alice = [0xA1_u8; 32];
-        let bob   = [0xB0_u8; 32];
+        let bob = [0xB0_u8; 32];
         let family_sec = [0xFA_u8; 32];
         let backup_sec = [0xBB_u8; 32];
 
         // Add two contacts.
-        s.add_contact(StagingContact { pubkey: alice, telemetry_enable: true, ..StagingContact::NULL }).unwrap();
-        s.add_contact(StagingContact { pubkey: bob, telemetry_enable: false, ..StagingContact::NULL }).unwrap();
+        s.add_contact(StagingContact {
+            pubkey: alice,
+            telemetry_enable: true,
+            ..StagingContact::NULL
+        })
+        .unwrap();
+        s.add_contact(StagingContact {
+            pubkey: bob,
+            telemetry_enable: false,
+            ..StagingContact::NULL
+        })
+        .unwrap();
         assert_eq!(s.contact_count(), 2);
 
         // Add a primary channel, then a non-primary.
-        s.add_channel(StagingChannel { secret: family_sec, primary: true, ..StagingChannel::NULL }).unwrap();
-        s.add_channel(StagingChannel { secret: backup_sec, primary: false, ..StagingChannel::NULL }).unwrap();
+        s.add_channel(StagingChannel {
+            secret: family_sec,
+            primary: true,
+            ..StagingChannel::NULL
+        })
+        .unwrap();
+        s.add_channel(StagingChannel {
+            secret: backup_sec,
+            primary: false,
+            ..StagingChannel::NULL
+        })
+        .unwrap();
         assert_eq!(s.channel_count(), 2);
         assert!(s.channels()[0].primary, "family must be primary");
         assert!(!s.channels()[1].primary, "backup must be non-primary");
@@ -703,7 +786,12 @@ mod tests {
         // Remove backup channel, add a new primary (which must steal primary from family).
         s.del_channel(&backup_sec).unwrap();
         let mesh_sec = [0xCC_u8; 32];
-        s.add_channel(StagingChannel { secret: mesh_sec, primary: true, ..StagingChannel::NULL }).unwrap();
+        s.add_channel(StagingChannel {
+            secret: mesh_sec,
+            primary: true,
+            ..StagingChannel::NULL
+        })
+        .unwrap();
 
         assert_eq!(s.channel_count(), 2);
         assert!(!s.channels()[0].primary, "family must have lost primary");

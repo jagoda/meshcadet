@@ -42,7 +42,10 @@ fn space_backdrop_and_planet_horizon_render_over_splash() {
             }
         }
     }
-    assert!(backdrop_painted, "SpaceBackdrop did not paint any pixel above the content block");
+    assert!(
+        backdrop_painted,
+        "SpaceBackdrop did not paint any pixel above the content block"
+    );
 
     // `PlanetHorizon` occupies the lower band: some pixel at/after y=200
     // must differ from the bare background fill — i.e. the horizon line art
@@ -56,7 +59,10 @@ fn space_backdrop_and_planet_horizon_render_over_splash() {
             }
         }
     }
-    assert!(horizon_painted, "PlanetHorizon did not paint any pixel in the lower band");
+    assert!(
+        horizon_painted,
+        "PlanetHorizon did not paint any pixel in the lower band"
+    );
 
     // THE ABORT-CONDITION CHECK: the version string's own measured row span
     // (y=185..194 — the last painted text row

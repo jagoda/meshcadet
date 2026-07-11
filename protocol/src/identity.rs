@@ -63,7 +63,7 @@ impl Identity {
         // X25519 clamping (identical to Ed25519 scalar clamping)
         scalar_bytes[0] &= 248; // clear bits 0, 1, 2
         scalar_bytes[31] &= 127; // clear bit 7
-        scalar_bytes[31] |= 64;  // set bit 6
+        scalar_bytes[31] |= 64; // set bit 6
         let x25519_secret = StaticSecret::from(scalar_bytes);
 
         // Step 2: Convert remote Ed25519 pub key (Edwards compressed) to X25519 (Montgomery)
@@ -143,7 +143,10 @@ mod tests {
 
         let sab = id_a.ecdh_shared_secret(&id_b.pubkey);
         let sac = id_a.ecdh_shared_secret(&id_c.pubkey);
-        assert_ne!(sab, sac, "different peers must give different shared secrets");
+        assert_ne!(
+            sab, sac,
+            "different peers must give different shared secrets"
+        );
     }
 
     #[test]

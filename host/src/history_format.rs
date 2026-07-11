@@ -105,8 +105,8 @@ pub fn format_history_line(
         HistoryMsgType::GrpTxt => "GRP",
     };
     let dir_str = if is_ours { "SENT" } else { "RECV" };
-    let text = std::str::from_utf8(&entry.text[..entry.text_len as usize])
-        .unwrap_or("<invalid utf-8>");
+    let text =
+        std::str::from_utf8(&entry.text[..entry.text_len as usize]).unwrap_or("<invalid utf-8>");
     let from = format!("0x{:02X}", entry.sender_hash);
     format!(
         "{:<iw$}{sep}{:<tw$}{sep}{:<yw$}{sep}{:<dw$}{sep}{:<fw$}{sep}{}",
@@ -131,12 +131,18 @@ mod tests {
 
     #[test]
     fn format_local_timestamp_is_deterministic() {
-        assert_eq!(format_local_timestamp(1_700_000_000), format_local_timestamp(1_700_000_000));
+        assert_eq!(
+            format_local_timestamp(1_700_000_000),
+            format_local_timestamp(1_700_000_000)
+        );
     }
 
     #[test]
     fn format_local_timestamp_distinguishes_different_epochs() {
-        assert_ne!(format_local_timestamp(0), format_local_timestamp(1_700_000_000));
+        assert_ne!(
+            format_local_timestamp(0),
+            format_local_timestamp(1_700_000_000)
+        );
     }
 
     #[test]
@@ -152,11 +158,22 @@ mod tests {
         assert_eq!(s.as_bytes()[23], b':');
     }
 
-    fn make_entry(sender_hash: u8, msg_type: HistoryMsgType, timestamp: u32, text: &[u8]) -> HistoryEntry {
+    fn make_entry(
+        sender_hash: u8,
+        msg_type: HistoryMsgType,
+        timestamp: u32,
+        text: &[u8],
+    ) -> HistoryEntry {
         let text_len = text.len() as u8;
         let mut text_buf = [0u8; protocol::history::MAX_HISTORY_TEXT_LEN];
         text_buf[..text.len()].copy_from_slice(text);
-        HistoryEntry { sender_hash, msg_type, timestamp, text: text_buf, text_len }
+        HistoryEntry {
+            sender_hash,
+            msg_type,
+            timestamp,
+            text: text_buf,
+            text_len,
+        }
     }
 
     /// Slice out the fixed-width column starting at byte `start`, trimming
@@ -186,7 +203,10 @@ mod tests {
         let line = format_history_line(3, &entry, false, iw);
         let (idx_off, ts_off, ty_off, dr_off, fr_off, tx_off) = offsets(iw);
         assert_eq!(column_at(&line, idx_off, iw), "3");
-        assert_eq!(column_at(&line, ts_off, TIMESTAMP_WIDTH), format_local_timestamp(1_700_000_000));
+        assert_eq!(
+            column_at(&line, ts_off, TIMESTAMP_WIDTH),
+            format_local_timestamp(1_700_000_000)
+        );
         assert_eq!(column_at(&line, ty_off, TYPE_WIDTH), "DM");
         assert_eq!(column_at(&line, dr_off, DIR_WIDTH), "RECV");
         assert_eq!(column_at(&line, fr_off, FROM_WIDTH), "0xAB");
@@ -227,7 +247,10 @@ mod tests {
         assert_eq!(column_at(&header, idx_off, iw), "idx");
         assert_eq!(column_at(&line, idx_off, iw), "10");
         assert_eq!(column_at(&header, ts_off, TIMESTAMP_WIDTH), "timestamp");
-        assert_eq!(column_at(&line, ts_off, TIMESTAMP_WIDTH), format_local_timestamp(1_700_000_000));
+        assert_eq!(
+            column_at(&line, ts_off, TIMESTAMP_WIDTH),
+            format_local_timestamp(1_700_000_000)
+        );
         assert_eq!(column_at(&header, ty_off, TYPE_WIDTH), "type");
         assert_eq!(column_at(&line, ty_off, TYPE_WIDTH), "DM");
         assert_eq!(column_at(&header, dr_off, DIR_WIDTH), "dir");
@@ -256,8 +279,14 @@ mod tests {
         let entry = make_entry(0x01, HistoryMsgType::Dm, 0, b"x");
         let iw = idx_width(1);
         let header = history_header(iw);
-        assert!(header.contains("  "), "expected two-space column separator in header");
+        assert!(
+            header.contains("  "),
+            "expected two-space column separator in header"
+        );
         let line = format_history_line(0, &entry, false, iw);
-        assert!(line.contains("  "), "expected two-space column separator in data row");
+        assert!(
+            line.contains("  "),
+            "expected two-space column separator in data row"
+        );
     }
 }

@@ -243,7 +243,10 @@ fn main() -> anyhow::Result<()> {
             let s = session.query_status()?;
             let pubkey_hex = hex::encode(s.pubkey);
             println!("pubkey   : {}", pubkey_hex);
-            println!("pub_hash : 0x{:02X}  (routing hash = pubkey[0])", s.pubkey[0]);
+            println!(
+                "pub_hash : 0x{:02X}  (routing hash = pubkey[0])",
+                s.pubkey[0]
+            );
             println!(
                 "name     : {}",
                 session.last_device_name().unwrap_or("(unnamed)")
@@ -282,7 +285,10 @@ fn main() -> anyhow::Result<()> {
                     println!("Scan with a MeshCore companion app to add this node as a contact.");
                 }
                 Err(e) => {
-                    eprintln!("warning: could not render QR code ({}); use the URI above.", e);
+                    eprintln!(
+                        "warning: could not render QR code ({}); use the URI above.",
+                        e
+                    );
                 }
             }
         }
@@ -330,7 +336,11 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        Cmd::AddContact { pubkey, name, telemetry } => {
+        Cmd::AddContact {
+            pubkey,
+            name,
+            telemetry,
+        } => {
             let pk = parse_32bytes_hex(&pubkey, "pubkey")?;
             let name_bytes = name.as_deref().unwrap_or("").as_bytes().to_vec();
             session.add_contact(&pk, telemetry, &name_bytes)?;
@@ -338,7 +348,8 @@ fn main() -> anyhow::Result<()> {
                 "contact added: {} (telemetry={}{})",
                 hex_short(&pk),
                 telemetry,
-                name.map(|n| format!(", name=\"{}\"", n)).unwrap_or_default()
+                name.map(|n| format!(", name=\"{}\"", n))
+                    .unwrap_or_default()
             );
             // The on-air dispatcher's allowlist + telemetry gate is a boot-time
             // snapshot of the provisioned config (see firmware/src/main.rs). A
@@ -357,7 +368,11 @@ fn main() -> anyhow::Result<()> {
             println!("contact removed: {}", hex_short(&pk));
         }
 
-        Cmd::AddChannel { secret, name, primary } => {
+        Cmd::AddChannel {
+            secret,
+            name,
+            primary,
+        } => {
             let (sec, key_len) = parse_channel_secret_hex(&secret)?;
             let name_bytes = name.as_deref().unwrap_or("").as_bytes().to_vec();
             session.add_channel(&sec, key_len, primary, &name_bytes)?;
@@ -366,7 +381,8 @@ fn main() -> anyhow::Result<()> {
                 hex_short(&sec),
                 key_len as u32 * 8,
                 primary,
-                name.map(|n| format!(", name=\"{}\"", n)).unwrap_or_default()
+                name.map(|n| format!(", name=\"{}\"", n))
+                    .unwrap_or_default()
             );
         }
 
@@ -378,7 +394,10 @@ fn main() -> anyhow::Result<()> {
 
         Cmd::SetNotifDefaults { visual, audible } => {
             session.set_notif_defaults(visual, audible)?;
-            println!("notification defaults set: visual={}, audible={}", visual, audible);
+            println!(
+                "notification defaults set: visual={}, audible={}",
+                visual, audible
+            );
         }
 
         Cmd::SetPin { pin } => {
@@ -404,7 +423,10 @@ fn main() -> anyhow::Result<()> {
                 let iw = host::history_format::idx_width(entries.len());
                 println!("{}", host::history_format::history_header(iw));
                 for (i, (e, is_ours)) in entries.iter().enumerate() {
-                    println!("{}", host::history_format::format_history_line(i, e, *is_ours, iw));
+                    println!(
+                        "{}",
+                        host::history_format::format_history_line(i, e, *is_ours, iw)
+                    );
                 }
             }
         }
@@ -427,8 +449,7 @@ fn main() -> anyhow::Result<()> {
 /// For channel secrets (which may be 16 or 32 bytes), use
 /// [`parse_channel_secret_hex`] instead.
 fn parse_32bytes_hex(s: &str, label: &str) -> anyhow::Result<[u8; 32]> {
-    let bytes = hex::decode(s)
-        .map_err(|e| anyhow::anyhow!("invalid {} hex: {}", label, e))?;
+    let bytes = hex::decode(s).map_err(|e| anyhow::anyhow!("invalid {} hex: {}", label, e))?;
     if bytes.len() != 32 {
         anyhow::bail!(
             "{} must be exactly 32 bytes (64 hex chars); got {} bytes",
@@ -454,8 +475,7 @@ fn parse_32bytes_hex(s: &str, label: &str) -> anyhow::Result<[u8; 32]> {
 /// - 128-bit: `SHA-256(secret[0..16])[0]`
 /// - 256-bit: `SHA-256(secret)[0]`
 fn parse_channel_secret_hex(s: &str) -> anyhow::Result<([u8; 32], u8)> {
-    let bytes = hex::decode(s)
-        .map_err(|e| anyhow::anyhow!("invalid secret hex: {}", e))?;
+    let bytes = hex::decode(s).map_err(|e| anyhow::anyhow!("invalid secret hex: {}", e))?;
     match bytes.len() {
         16 => {
             let mut arr = [0u8; 32];
@@ -510,7 +530,11 @@ fn url_encode(s: &str) -> String {
 
 /// Format the `gps fix` line: `"yes"` / `"no"`.
 fn format_gps_fix(s: &protocol::provisioning::RspStatusPayload) -> &'static str {
-    if s.gps_has_fix { "yes" } else { "no" }
+    if s.gps_has_fix {
+        "yes"
+    } else {
+        "no"
+    }
 }
 
 /// Format the `gps coords` line: `"<lat>, <lon> (age <n>s)"`, or an em-dash
@@ -521,7 +545,10 @@ fn format_gps_coords(s: &protocol::provisioning::RspStatusPayload) -> String {
     }
     let lat_deg = s.gps_lat_e7 as f64 / 10_000_000.0;
     let lon_deg = s.gps_lon_e7 as f64 / 10_000_000.0;
-    format!("{:.6}, {:.6} (age {}s)", lat_deg, lon_deg, s.gps_fix_age_secs)
+    format!(
+        "{:.6}, {:.6} (age {}s)",
+        lat_deg, lon_deg, s.gps_fix_age_secs
+    )
 }
 
 /// Format the `gps clock` line: `"synced (age <n>s)"` or `"not synced"`.
@@ -758,7 +785,9 @@ mod tests {
             pubkey_hex,
         );
         assert!(uri.starts_with("meshcore://contact/add?name="));
-        assert!(uri.contains("&public_key=abababababababababababababababababababababababababababababababab"));
+        assert!(uri.contains(
+            "&public_key=abababababababababababababababababababababababababababababababab"
+        ));
         assert!(uri.ends_with("&type=1"));
         assert!(!uri.contains(' '), "URI must not contain raw spaces");
         // Must encode as a QR code (byte mode); the companion app scans this.

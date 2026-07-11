@@ -37,10 +37,26 @@ pub struct EmojiEntry {
 /// Broadly recognisable.  No violence, adult content, or ambiguous sentiment.
 pub const EMOJI_TABLE: &[EmojiEntry] = &[
     // ── Faces ────────────────────────────────────────────────────────────────
-    EmojiEntry { shortcode: "smile",    codepoint: '😊', label: "Smile"      },
-    EmojiEntry { shortcode: "laugh",    codepoint: '😂', label: "Laugh"      },
-    EmojiEntry { shortcode: "wink",     codepoint: '😉', label: "Wink"       },
-    EmojiEntry { shortcode: "cool",     codepoint: '😎', label: "Cool"       },
+    EmojiEntry {
+        shortcode: "smile",
+        codepoint: '😊',
+        label: "Smile",
+    },
+    EmojiEntry {
+        shortcode: "laugh",
+        codepoint: '😂',
+        label: "Laugh",
+    },
+    EmojiEntry {
+        shortcode: "wink",
+        codepoint: '😉',
+        label: "Wink",
+    },
+    EmojiEntry {
+        shortcode: "cool",
+        codepoint: '😎',
+        label: "Cool",
+    },
     // BUG FIX: U+1F914 (🤔) is
     // outside the coverage of the bundled `NotoEmoji-Regular.ttf` (it only
     // covers emoji through ~Unicode 8.0; 🤔/🤗 are Unicode 9.0 additions) —
@@ -48,52 +64,196 @@ pub const EMOJI_TABLE: &[EmojiEntry] = &[
     // fails the build on it. Swapped for 😕 (U+1F615,
     // confirmed present in the bundled font), the closest
     // "hmm/not sure" analog available. Shortcode/label unchanged.
-    EmojiEntry { shortcode: "think",    codepoint: '😕', label: "Hmm"        },
-    EmojiEntry { shortcode: "wow",      codepoint: '😲', label: "Wow"        },
-    EmojiEntry { shortcode: "sleepy",   codepoint: '😴', label: "Sleepy"     },
-    EmojiEntry { shortcode: "silly",    codepoint: '😜', label: "Silly"      },
-    EmojiEntry { shortcode: "happy",    codepoint: '😁', label: "Happy"      },
-    EmojiEntry { shortcode: "sad",      codepoint: '😢', label: "Sad"        },
+    EmojiEntry {
+        shortcode: "think",
+        codepoint: '😕',
+        label: "Hmm",
+    },
+    EmojiEntry {
+        shortcode: "wow",
+        codepoint: '😲',
+        label: "Wow",
+    },
+    EmojiEntry {
+        shortcode: "sleepy",
+        codepoint: '😴',
+        label: "Sleepy",
+    },
+    EmojiEntry {
+        shortcode: "silly",
+        codepoint: '😜',
+        label: "Silly",
+    },
+    EmojiEntry {
+        shortcode: "happy",
+        codepoint: '😁',
+        label: "Happy",
+    },
+    EmojiEntry {
+        shortcode: "sad",
+        codepoint: '😢',
+        label: "Sad",
+    },
     // ── Gestures ─────────────────────────────────────────────────────────────
-    EmojiEntry { shortcode: "wave",     codepoint: '👋', label: "Wave"       },
-    EmojiEntry { shortcode: "thumbsup", codepoint: '👍', label: "Thumbs Up"  },
-    EmojiEntry { shortcode: "clap",     codepoint: '👏', label: "Clap"       },
-    EmojiEntry { shortcode: "highfive", codepoint: '🙏', label: "High Five"  },
-    EmojiEntry { shortcode: "fist",     codepoint: '✊', label: "Fist Bump"  },
-    EmojiEntry { shortcode: "point",    codepoint: '👆', label: "Point Up"   },
-    EmojiEntry { shortcode: "ok",       codepoint: '👌', label: "OK"         },
+    EmojiEntry {
+        shortcode: "wave",
+        codepoint: '👋',
+        label: "Wave",
+    },
+    EmojiEntry {
+        shortcode: "thumbsup",
+        codepoint: '👍',
+        label: "Thumbs Up",
+    },
+    EmojiEntry {
+        shortcode: "clap",
+        codepoint: '👏',
+        label: "Clap",
+    },
+    EmojiEntry {
+        shortcode: "highfive",
+        codepoint: '🙏',
+        label: "High Five",
+    },
+    EmojiEntry {
+        shortcode: "fist",
+        codepoint: '✊',
+        label: "Fist Bump",
+    },
+    EmojiEntry {
+        shortcode: "point",
+        codepoint: '👆',
+        label: "Point Up",
+    },
+    EmojiEntry {
+        shortcode: "ok",
+        codepoint: '👌',
+        label: "OK",
+    },
     // ── Love / Feelings ──────────────────────────────────────────────────────
-    EmojiEntry { shortcode: "heart",    codepoint: '❤',  label: "Heart"      },
+    EmojiEntry {
+        shortcode: "heart",
+        codepoint: '❤',
+        label: "Heart",
+    },
     // BUG FIX: same font-coverage
     // gap as "think" above — U+1F917 (🤗) is a Unicode 9.0 addition absent
     // from the bundled emoji font. Swapped for 😘 (U+1F618, confirmed
     // present), the closest available affectionate face. Shortcode/label
     // unchanged.
-    EmojiEntry { shortcode: "hug",      codepoint: '😘', label: "Hug"        },
-    EmojiEntry { shortcode: "sparkles", codepoint: '✨', label: "Sparkles"   },
-    EmojiEntry { shortcode: "star",     codepoint: '⭐', label: "Star"       },
-    EmojiEntry { shortcode: "rainbow",  codepoint: '🌈', label: "Rainbow"    },
+    EmojiEntry {
+        shortcode: "hug",
+        codepoint: '😘',
+        label: "Hug",
+    },
+    EmojiEntry {
+        shortcode: "sparkles",
+        codepoint: '✨',
+        label: "Sparkles",
+    },
+    EmojiEntry {
+        shortcode: "star",
+        codepoint: '⭐',
+        label: "Star",
+    },
+    EmojiEntry {
+        shortcode: "rainbow",
+        codepoint: '🌈',
+        label: "Rainbow",
+    },
     // ── Nature ───────────────────────────────────────────────────────────────
-    EmojiEntry { shortcode: "sun",      codepoint: '☀',  label: "Sun"        },
-    EmojiEntry { shortcode: "moon",     codepoint: '🌙', label: "Moon"       },
-    EmojiEntry { shortcode: "cloud",    codepoint: '⛅', label: "Cloud"      },
-    EmojiEntry { shortcode: "flower",   codepoint: '🌸', label: "Flower"     },
-    EmojiEntry { shortcode: "tree",     codepoint: '🌲', label: "Tree"       },
-    EmojiEntry { shortcode: "leaf",     codepoint: '🍃', label: "Leaf"       },
-    EmojiEntry { shortcode: "dog",      codepoint: '🐶', label: "Dog"        },
-    EmojiEntry { shortcode: "cat",      codepoint: '🐱', label: "Cat"        },
-    EmojiEntry { shortcode: "rabbit",   codepoint: '🐰', label: "Rabbit"     },
+    EmojiEntry {
+        shortcode: "sun",
+        codepoint: '☀',
+        label: "Sun",
+    },
+    EmojiEntry {
+        shortcode: "moon",
+        codepoint: '🌙',
+        label: "Moon",
+    },
+    EmojiEntry {
+        shortcode: "cloud",
+        codepoint: '⛅',
+        label: "Cloud",
+    },
+    EmojiEntry {
+        shortcode: "flower",
+        codepoint: '🌸',
+        label: "Flower",
+    },
+    EmojiEntry {
+        shortcode: "tree",
+        codepoint: '🌲',
+        label: "Tree",
+    },
+    EmojiEntry {
+        shortcode: "leaf",
+        codepoint: '🍃',
+        label: "Leaf",
+    },
+    EmojiEntry {
+        shortcode: "dog",
+        codepoint: '🐶',
+        label: "Dog",
+    },
+    EmojiEntry {
+        shortcode: "cat",
+        codepoint: '🐱',
+        label: "Cat",
+    },
+    EmojiEntry {
+        shortcode: "rabbit",
+        codepoint: '🐰',
+        label: "Rabbit",
+    },
     // ── Objects / Fun ────────────────────────────────────────────────────────
-    EmojiEntry { shortcode: "music",    codepoint: '🎵', label: "Music"      },
-    EmojiEntry { shortcode: "game",     codepoint: '🎮', label: "Game"       },
-    EmojiEntry { shortcode: "ball",     codepoint: '⚽', label: "Ball"       },
-    EmojiEntry { shortcode: "cake",     codepoint: '🎂', label: "Cake"       },
-    EmojiEntry { shortcode: "pizza",    codepoint: '🍕', label: "Pizza"      },
-    EmojiEntry { shortcode: "rocket",   codepoint: '🚀', label: "Rocket"     },
-    EmojiEntry { shortcode: "fire",     codepoint: '🔥', label: "Fire"       },
+    EmojiEntry {
+        shortcode: "music",
+        codepoint: '🎵',
+        label: "Music",
+    },
+    EmojiEntry {
+        shortcode: "game",
+        codepoint: '🎮',
+        label: "Game",
+    },
+    EmojiEntry {
+        shortcode: "ball",
+        codepoint: '⚽',
+        label: "Ball",
+    },
+    EmojiEntry {
+        shortcode: "cake",
+        codepoint: '🎂',
+        label: "Cake",
+    },
+    EmojiEntry {
+        shortcode: "pizza",
+        codepoint: '🍕',
+        label: "Pizza",
+    },
+    EmojiEntry {
+        shortcode: "rocket",
+        codepoint: '🚀',
+        label: "Rocket",
+    },
+    EmojiEntry {
+        shortcode: "fire",
+        codepoint: '🔥',
+        label: "Fire",
+    },
     // ── Communication ────────────────────────────────────────────────────────
-    EmojiEntry { shortcode: "radio",    codepoint: '📻', label: "Radio"      },
-    EmojiEntry { shortcode: "check",    codepoint: '✅', label: "Done"       },
+    EmojiEntry {
+        shortcode: "radio",
+        codepoint: '📻',
+        label: "Radio",
+    },
+    EmojiEntry {
+        shortcode: "check",
+        codepoint: '✅',
+        label: "Done",
+    },
 ];
 
 /// Look up an emoji entry by shortcode.
@@ -149,8 +309,7 @@ pub fn expand_shortcodes(input: &[u8], out: &mut [u8]) -> Option<usize> {
                     if out_pos + encoded_bytes.len() > out.len() {
                         return None; // output buffer exhausted
                     }
-                    out[out_pos..out_pos + encoded_bytes.len()]
-                        .copy_from_slice(encoded_bytes);
+                    out[out_pos..out_pos + encoded_bytes.len()].copy_from_slice(encoded_bytes);
                     out_pos += encoded_bytes.len();
                     in_pos = end + 1; // skip past the closing ':'
                     continue;
@@ -180,10 +339,7 @@ pub fn expand_shortcodes(input: &[u8], out: &mut [u8]) -> Option<usize> {
 /// Returns the number of matches written into `found` (a caller-supplied
 /// buffer of shortcode `str` references).  Use this in the compose screen
 /// to show completion candidates as the user types.
-pub fn shortcode_completions<'a>(
-    prefix: &str,
-    found: &mut [&'static str],
-) -> usize {
+pub fn shortcode_completions(prefix: &str, found: &mut [&'static str]) -> usize {
     let mut count = 0;
     for entry in EMOJI_TABLE {
         if count >= found.len() {
@@ -213,7 +369,11 @@ mod tests {
         for (i, a) in EMOJI_TABLE.iter().enumerate() {
             for (j, b) in EMOJI_TABLE.iter().enumerate() {
                 if i != j {
-                    assert_ne!(a.shortcode, b.shortcode, "duplicate shortcode: {}", a.shortcode);
+                    assert_ne!(
+                        a.shortcode, b.shortcode,
+                        "duplicate shortcode: {}",
+                        a.shortcode
+                    );
                 }
             }
         }
@@ -276,7 +436,10 @@ mod tests {
         let n = shortcode_completions("s", &mut found);
         assert!(n > 0);
         for &sc in &found[..n] {
-            assert!(sc.starts_with('s'), "completion {sc:?} doesn't start with 's'");
+            assert!(
+                sc.starts_with('s'),
+                "completion {sc:?} doesn't start with 's'"
+            );
         }
     }
 

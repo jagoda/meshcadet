@@ -176,7 +176,7 @@ pub fn channel_hash(channel_secret: &[u8; 32]) -> u8 {
 /// MeshCore hashes the channel over exactly `secret_len` bytes (recon doc §9):
 ///   - 256-bit channel: pass the full 32-byte secret  → `SHA256(secret)[0]`
 ///   - 128-bit channel: pass `secret[0:16]`           → `SHA256(secret[0:16])[0]`
-/// (`BaseChatMesh.cpp:896`). The caller selects the convention by slicing.
+///     (`BaseChatMesh.cpp:896`). The caller selects the convention by slicing.
 pub fn channel_hash_var(channel_secret: &[u8]) -> u8 {
     sha256(channel_secret)[0]
 }
@@ -220,7 +220,8 @@ pub fn encode_grp_txt_var(
     aes_key.copy_from_slice(&channel_secret[..16]);
 
     out[0] = channel_hash_var(channel_secret);
-    let mac_ct_len = encrypt_then_mac_var(&aes_key, channel_secret, &pt_buf[..pt_len], &mut out[1..]);
+    let mac_ct_len =
+        encrypt_then_mac_var(&aes_key, channel_secret, &pt_buf[..pt_len], &mut out[1..]);
     1 + mac_ct_len
 }
 
@@ -402,7 +403,12 @@ pub fn decode_path_return_plaintext(
         PathExtra::None
     };
 
-    Ok(ReturnPath { path_len_byte, path, path_byte_count, extra })
+    Ok(ReturnPath {
+        path_len_byte,
+        path,
+        path_byte_count,
+        extra,
+    })
 }
 
 /// Full PATH-return packet decode: outer DM envelope + inner path plaintext.
@@ -411,8 +417,7 @@ pub fn decode_path_return(
     payload: &[u8],
     plaintext_buf: &mut [u8; 256],
 ) -> Result<(u8, u8, ReturnPath), CodecError> {
-    let (dest_hash, src_hash, pt_len) =
-        decode_dm_payload(shared_secret, payload, plaintext_buf)?;
+    let (dest_hash, src_hash, pt_len) = decode_dm_payload(shared_secret, payload, plaintext_buf)?;
     let rp = decode_path_return_plaintext(plaintext_buf, pt_len)?;
     Ok((dest_hash, src_hash, rp))
 }
@@ -444,7 +449,7 @@ mod tests {
         // Independently compute expected: SHA256(01_00_00_00 || 00 || "hi" || [0;32])
         let mut h = Sha256::new();
         h.update([0x01, 0x00, 0x00, 0x00]); // timestamp LE
-        h.update([0x00]);                    // txt_type_attempt
+        h.update([0x00]); // txt_type_attempt
         h.update(b"hi");
         h.update([0u8; 32]);
         let full = h.finalize();
@@ -482,7 +487,7 @@ mod tests {
         // computes after decrypt + zero-padding trim. This is what closes the
         // firmware DM+ACK loop; if it ever diverges the loop silently breaks.
         let originator = Identity::from_seed([0x11u8; 32]); // bench seed A
-        let responder = Identity::from_seed([0x42u8; 32]);  // bench seed B
+        let responder = Identity::from_seed([0x42u8; 32]); // bench seed B
         let shared_o = originator.ecdh_shared_secret(&responder.pubkey);
         let shared_r = responder.ecdh_shared_secret(&originator.pubkey);
 
@@ -498,13 +503,16 @@ mod tests {
         let pt_len = encode_txt_msg_plaintext(ts, 0, 0, text, &mut pt);
         let mut dm = [0u8; 256];
         let dm_len = encode_dm_payload(
-            &shared_o, responder.pub_hash(), originator.pub_hash(), &pt[..pt_len], &mut dm,
+            &shared_o,
+            responder.pub_hash(),
+            originator.pub_hash(),
+            &pt[..pt_len],
+            &mut dm,
         );
 
         // Responder decrypts and recovers ts / type / text (padding trimmed).
         let mut dec = [0u8; 256];
-        let (_dest, _src, dec_len) =
-            decode_dm_payload(&shared_r, &dm[..dm_len], &mut dec).unwrap();
+        let (_dest, _src, dec_len) = decode_dm_payload(&shared_r, &dm[..dm_len], &mut dec).unwrap();
         let rx_ts = u32::from_le_bytes([dec[0], dec[1], dec[2], dec[3]]);
         let rx_type = dec[4];
         let rx_text_region = &dec[5..dec_len];
@@ -515,7 +523,10 @@ mod tests {
 
         // Responder computes the ACK keyed on the ORIGINATOR's pubkey.
         let responder_ack = compute_ack_hash(rx_ts, rx_type, rx_text, &originator.pubkey);
-        assert_eq!(responder_ack, expected, "DM+ACK hash must agree across nodes");
+        assert_eq!(
+            responder_ack, expected,
+            "DM+ACK hash must agree across nodes"
+        );
     }
 
     // ── DM encode/decode round-trip ──────────────────────────────────────
@@ -531,7 +542,13 @@ mod tests {
 
         // Encode DM payload
         let mut dm_buf = [0u8; 256];
-        let dm_len = encode_dm_payload(&shared, b.pub_hash(), a.pub_hash(), &pt_buf[..pt_len], &mut dm_buf);
+        let dm_len = encode_dm_payload(
+            &shared,
+            b.pub_hash(),
+            a.pub_hash(),
+            &pt_buf[..pt_len],
+            &mut dm_buf,
+        );
 
         // Decode
         let mut dec_buf = [0u8; 256];
@@ -543,8 +560,7 @@ mod tests {
         assert_eq!(actual_pt_len, ceil_16(pt_len));
 
         // Verify plaintext fields
-        let (ts, txt_type, attempt, text_off) =
-            decode_txt_msg_plaintext(&dec_buf, pt_len).unwrap();
+        let (ts, txt_type, attempt, text_off) = decode_txt_msg_plaintext(&dec_buf, pt_len).unwrap();
         assert_eq!(ts, 0x0102_0304);
         assert_eq!(txt_type, 0x00);
         assert_eq!(attempt, 0);
@@ -561,7 +577,13 @@ mod tests {
         let pt_len = encode_txt_msg_plaintext(1, 0, 0, b"secret", &mut pt_buf);
 
         let mut dm_buf = [0u8; 256];
-        let dm_len = encode_dm_payload(&shared_ab, b.pub_hash(), a.pub_hash(), &pt_buf[..pt_len], &mut dm_buf);
+        let dm_len = encode_dm_payload(
+            &shared_ab,
+            b.pub_hash(),
+            a.pub_hash(),
+            &pt_buf[..pt_len],
+            &mut dm_buf,
+        );
 
         let mut dec_buf = [0u8; 256];
         let result = decode_dm_payload(&shared_wrong, &dm_buf[..dm_len], &mut dec_buf);
@@ -597,15 +619,21 @@ mod tests {
         let n1 = encode_at(30, &mut boot1);
         let mut boot2 = [0u8; 256];
         let n2 = encode_at(30, &mut boot2);
-        assert_eq!((n1, &boot1[..n1]), (n2, &boot2[..n2]),
-            "AES-ECB determinism: identical (timestamp,text) ⇒ identical packet (replay)");
+        assert_eq!(
+            (n1, &boot1[..n1]),
+            (n2, &boot2[..n2]),
+            "AES-ECB determinism: identical (timestamp,text) ⇒ identical packet (replay)"
+        );
 
         // Seeding the timestamp with a per-boot base makes the packet unique, which
         // is exactly what defeats the mesh/app replay filter.
         let mut seeded = [0u8; 256];
         let ns = encode_at(0xA1B2_C3D4u32.wrapping_add(30), &mut seeded);
-        assert_ne!(&seeded[..ns], &boot1[..n1],
-            "a per-boot timestamp base must produce a distinct, never-before-seen packet");
+        assert_ne!(
+            &seeded[..ns],
+            &boot1[..n1],
+            "a per-boot timestamp base must produce a distinct, never-before-seen packet"
+        );
     }
 
     // ── GRP_TXT known-answer + round-trip ────────────────────────────────
@@ -623,7 +651,14 @@ mod tests {
         let channel_secret = [0x77u8; 32];
 
         let mut enc_buf = [0u8; 256];
-        let n = encode_grp_txt(&channel_secret, 0xDEAD, 0x00, 0, b"channel msg", &mut enc_buf);
+        let n = encode_grp_txt(
+            &channel_secret,
+            0xDEAD,
+            0x00,
+            0,
+            b"channel msg",
+            &mut enc_buf,
+        );
 
         // First byte must be the channel hash
         assert_eq!(enc_buf[0], channel_hash(&channel_secret));
@@ -662,7 +697,9 @@ mod tests {
         assert_eq!(channel_hash_var(secret16), sha256(secret16)[0]);
         // The two conventions differ for a non-uniform secret.
         let mut s2 = [0u8; 32];
-        for (i, b) in s2.iter_mut().enumerate() { *b = i as u8; }
+        for (i, b) in s2.iter_mut().enumerate() {
+            *b = i as u8;
+        }
         assert_ne!(channel_hash_var(&s2[..16]), channel_hash_var(&s2[..]));
     }
 
@@ -774,11 +811,16 @@ mod tests {
         // path_len=0x42 (2B hash, 2 hops), path=[0xAA,0xBB,0xCC,0xDD],
         // extra_type=0x03 (ACK), ack_hash=[1,2,3,4]
         let mut pt = [0u8; 64];
-        pt[0] = 0x42;                     // path_len
-        pt[1] = 0xAA; pt[2] = 0xBB;     // hop 0 hash
-        pt[3] = 0xCC; pt[4] = 0xDD;     // hop 1 hash
-        pt[5] = 0x03;                     // extra_type = ACK
-        pt[6] = 0x01; pt[7] = 0x02; pt[8] = 0x03; pt[9] = 0x04; // ack_hash
+        pt[0] = 0x42; // path_len
+        pt[1] = 0xAA;
+        pt[2] = 0xBB; // hop 0 hash
+        pt[3] = 0xCC;
+        pt[4] = 0xDD; // hop 1 hash
+        pt[5] = 0x03; // extra_type = ACK
+        pt[6] = 0x01;
+        pt[7] = 0x02;
+        pt[8] = 0x03;
+        pt[9] = 0x04; // ack_hash
 
         let rp = decode_path_return_plaintext(&pt, 10).unwrap();
         assert_eq!(rp.path_len_byte, 0x42);
@@ -807,16 +849,27 @@ mod tests {
 
         // Build a PATH inner plaintext
         let mut inner_pt = [0u8; 16];
-        inner_pt[0] = 0x42;                              // path_len: 2B-hash, 2 hops
-        inner_pt[1] = 0x11; inner_pt[2] = 0x22;        // hop 0
-        inner_pt[3] = 0x33; inner_pt[4] = 0x44;        // hop 1
-        inner_pt[5] = 0x03;                              // extra = ACK
-        inner_pt[6] = 0xAA; inner_pt[7] = 0xBB; inner_pt[8] = 0xCC; inner_pt[9] = 0xDD;
+        inner_pt[0] = 0x42; // path_len: 2B-hash, 2 hops
+        inner_pt[1] = 0x11;
+        inner_pt[2] = 0x22; // hop 0
+        inner_pt[3] = 0x33;
+        inner_pt[4] = 0x44; // hop 1
+        inner_pt[5] = 0x03; // extra = ACK
+        inner_pt[6] = 0xAA;
+        inner_pt[7] = 0xBB;
+        inner_pt[8] = 0xCC;
+        inner_pt[9] = 0xDD;
         let inner_len = 10;
 
         // Wrap in DM envelope (b→a)
         let mut pkt = [0u8; 256];
-        let pkt_len = encode_dm_payload(&shared, a.pub_hash(), b.pub_hash(), &inner_pt[..inner_len], &mut pkt);
+        let pkt_len = encode_dm_payload(
+            &shared,
+            a.pub_hash(),
+            b.pub_hash(),
+            &inner_pt[..inner_len],
+            &mut pkt,
+        );
 
         // Decode
         let mut dec_buf = [0u8; 256];
@@ -825,7 +878,6 @@ mod tests {
         assert_eq!(rp.path_byte_count, 4);
         assert_eq!(&rp.path[..4], &[0x11, 0x22, 0x33, 0x44]);
         assert_eq!(rp.extra, PathExtra::Ack([0xAA, 0xBB, 0xCC, 0xDD]));
-    
     }
 
     // ── UI send path (acceptance criterion: DM and GRP_TXT roundtrip) ────────
@@ -841,15 +893,15 @@ mod tests {
     /// enqueues a real encrypted DM frame to a provisioned contact."
     #[test]
     fn ui_send_dm_roundtrip() {
-        let sender   = Identity::from_seed([0x11u8; 32]); // "our" device
+        let sender = Identity::from_seed([0x11u8; 32]); // "our" device
         let receiver = Identity::from_seed([0x42u8; 32]); // provisioned contact
 
         let shared_tx = sender.ecdh_shared_secret(&receiver.pubkey);
         let shared_rx = receiver.ecdh_shared_secret(&sender.pubkey);
 
-        let text      = b"hello from the compose screen";
+        let text = b"hello from the compose screen";
         let timestamp: u32 = 0xDEAD_BEEF;
-        let type_byte: u8  = 0;
+        let type_byte: u8 = 0;
 
         // ── Encode (mirrors build_ui_dm) ──────────────────────────────────
         let mut pt_buf = [0u8; 128];
@@ -872,24 +924,34 @@ mod tests {
         let (dest_hash, src_hash, dec_len) =
             decode_dm_payload(&shared_rx, &dm_buf[..dm_len], &mut dec_buf).unwrap();
 
-        assert_eq!(dest_hash, receiver.pub_hash(), "dest hash must route to receiver");
-        assert_eq!(src_hash,  sender.pub_hash(),   "src hash must identify sender");
+        assert_eq!(
+            dest_hash,
+            receiver.pub_hash(),
+            "dest hash must route to receiver"
+        );
+        assert_eq!(src_hash, sender.pub_hash(), "src hash must identify sender");
         assert!(dec_len >= 5, "plaintext must include timestamp + type byte");
 
-        let rx_ts   = u32::from_le_bytes([dec_buf[0], dec_buf[1], dec_buf[2], dec_buf[3]]);
+        let rx_ts = u32::from_le_bytes([dec_buf[0], dec_buf[1], dec_buf[2], dec_buf[3]]);
         let rx_type = dec_buf[4];
         let text_region = &dec_buf[5..dec_len];
         // Trim AES zero-padding (mirrors firmware c_str helper).
-        let text_end = text_region.iter().position(|&b| b == 0).unwrap_or(text_region.len());
+        let text_end = text_region
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(text_region.len());
         let rx_text = &text_region[..text_end];
 
-        assert_eq!(rx_ts,   timestamp, "timestamp must survive encrypt/decrypt");
+        assert_eq!(rx_ts, timestamp, "timestamp must survive encrypt/decrypt");
         assert_eq!(rx_type, type_byte, "type byte must survive encrypt/decrypt");
-        assert_eq!(rx_text, text,      "text must survive encrypt/decrypt");
+        assert_eq!(rx_text, text, "text must survive encrypt/decrypt");
 
         // Receiver computes ACK keyed on SENDER pubkey (v1.15 §7.1).
         let rx_ack = compute_ack_hash(rx_ts, rx_type, rx_text, &sender.pubkey);
-        assert_eq!(rx_ack, expected_ack, "ACK hash must agree — closes the DM+ACK loop");
+        assert_eq!(
+            rx_ack, expected_ack,
+            "ACK hash must agree — closes the DM+ACK loop"
+        );
     }
 
     /// Simulate `build_ui_grp_txt`: encode a UI-originated group message and
@@ -900,38 +962,44 @@ mod tests {
     #[test]
     fn ui_send_grp_txt_roundtrip() {
         let channel_secret = [0x6du8; 32]; // 'm' — same as HIL_TEST_CHANNEL_SECRET
-        let text      = b"hi from the group compose screen";
+        let text = b"hi from the group compose screen";
         let timestamp: u32 = 0xCAFE_BABE;
 
         // ── Encode (mirrors build_ui_grp_txt) ────────────────────────────
         let mut frame_payload = [0u8; 253];
-        let payload_len = encode_grp_txt_var(
-            &channel_secret,
-            timestamp,
-            0, 0,
-            text,
-            &mut frame_payload,
-        );
+        let payload_len =
+            encode_grp_txt_var(&channel_secret, timestamp, 0, 0, text, &mut frame_payload);
         assert!(payload_len > 0, "encode must produce non-empty payload");
 
         // Channel hash must be the first byte of the payload.
         let ch = frame_payload[0];
         let expected_ch = channel_hash_var(&channel_secret);
-        assert_eq!(ch, expected_ch, "channel hash in payload must match the channel secret");
+        assert_eq!(
+            ch, expected_ch,
+            "channel hash in payload must match the channel secret"
+        );
 
         // ── Decode (mirrors handle_grp_txt) ──────────────────────────────
         let mut pt_buf = [0u8; 256];
-        let fields = decode_grp_txt_var(
-            &channel_secret,
-            &frame_payload[..payload_len],
-            &mut pt_buf,
-        ).expect("GRP_TXT decode must succeed");
+        let fields =
+            decode_grp_txt_var(&channel_secret, &frame_payload[..payload_len], &mut pt_buf)
+                .expect("GRP_TXT decode must succeed");
 
-        assert_eq!(fields.timestamp, timestamp, "timestamp must survive encrypt/decrypt");
+        assert_eq!(
+            fields.timestamp, timestamp,
+            "timestamp must survive encrypt/decrypt"
+        );
         let rx_text = &pt_buf[fields.text_offset..fields.text_offset + fields.text_len];
         // Trim AES zero-padding.
-        let text_end = rx_text.iter().position(|&b| b == 0).unwrap_or(rx_text.len());
-        assert_eq!(&rx_text[..text_end], text, "text must survive encrypt/decrypt");
+        let text_end = rx_text
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(rx_text.len());
+        assert_eq!(
+            &rx_text[..text_end],
+            text,
+            "text must survive encrypt/decrypt"
+        );
     }
 
     /// Policy guard: an outbound DM to an unknown contact must be silently
@@ -1009,7 +1077,7 @@ mod tests {
     #[test]
     fn grp_txt_wrong_channel_secret_breaks_hash_and_decode() {
         let provisioned = [0x11u8; 32];
-        let hardcoded   = [0x6du8; 32]; // mirrors the old HIL_TEST_CHANNEL_SECRET
+        let hardcoded = [0x6du8; 32]; // mirrors the old HIL_TEST_CHANNEL_SECRET
 
         assert_ne!(
             channel_hash_var(&provisioned),

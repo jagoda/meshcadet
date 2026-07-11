@@ -91,8 +91,10 @@ impl PolicyFilter {
     /// receive loop.
     pub const fn new() -> Self {
         Self {
-            contacts: [PolicyContact { pubkey: [0u8; 32], telemetry: false };
-                       MAX_POLICY_CONTACTS],
+            contacts: [PolicyContact {
+                pubkey: [0u8; 32],
+                telemetry: false,
+            }; MAX_POLICY_CONTACTS],
             count: 0,
         }
     }
@@ -107,7 +109,10 @@ impl PolicyFilter {
     /// practice the provisioning store deduplicates by pubkey.
     pub fn add_contact(&mut self, pubkey: &[u8; 32], telemetry: bool) {
         if self.count < MAX_POLICY_CONTACTS {
-            self.contacts[self.count] = PolicyContact { pubkey: *pubkey, telemetry };
+            self.contacts[self.count] = PolicyContact {
+                pubkey: *pubkey,
+                telemetry,
+            };
             self.count += 1;
         }
     }
@@ -225,7 +230,8 @@ mod tests {
         for hash in [0x00u8, 0x11, 0x42, 0xFF] {
             assert!(
                 !policy.allow_inbound_dm(hash),
-                "empty filter must block src_hash 0x{:02x}", hash
+                "empty filter must block src_hash 0x{:02x}",
+                hash
             );
         }
     }
@@ -245,9 +251,9 @@ mod tests {
         // Acceptance: "known-contact DMs are ACKed" (policy gate passes → ACK path reached)
         let mut policy = PolicyFilter::new();
         let pk_alice = pubkey_with_hash(0x11);
-        let pk_bob   = pubkey_with_hash(0x42);
+        let pk_bob = pubkey_with_hash(0x42);
         policy.add_contact(&pk_alice, false);
-        policy.add_contact(&pk_bob,   true);
+        policy.add_contact(&pk_bob, true);
 
         assert!(
             policy.allow_inbound_dm(0x11),
@@ -268,8 +274,15 @@ mod tests {
         policy.add_contact(&pk, false);
 
         let found = policy.contact_pubkey(0x55);
-        assert!(found.is_some(), "contact_pubkey must return Some for known hash");
-        assert_eq!(*found.unwrap(), pk, "returned pubkey must match the registered one");
+        assert!(
+            found.is_some(),
+            "contact_pubkey must return Some for known hash"
+        );
+        assert_eq!(
+            *found.unwrap(),
+            pk,
+            "returned pubkey must match the registered one"
+        );
     }
 
     #[test]
@@ -302,7 +315,8 @@ mod tests {
         for pt in [0x02u8, 0x03, 0x05, 0x07, 0x08] {
             assert!(
                 !PolicyFilter::is_advert_type(pt),
-                "payload type 0x{:02x} incorrectly flagged as advert", pt
+                "payload type 0x{:02x} incorrectly flagged as advert",
+                pt
             );
         }
     }
@@ -321,13 +335,19 @@ mod tests {
     #[test]
     fn telemetry_flag_respected() {
         let mut policy = PolicyFilter::new();
-        let no_telem  = pubkey_with_hash(0xAA);
+        let no_telem = pubkey_with_hash(0xAA);
         let yes_telem = pubkey_with_hash(0xBB);
-        policy.add_contact(&no_telem,  false);
+        policy.add_contact(&no_telem, false);
         policy.add_contact(&yes_telem, true);
 
-        assert!(!policy.telemetry_enabled(0xAA), "telemetry=false contact must be denied");
-        assert!( policy.telemetry_enabled(0xBB), "telemetry=true contact must be allowed");
+        assert!(
+            !policy.telemetry_enabled(0xAA),
+            "telemetry=false contact must be denied"
+        );
+        assert!(
+            policy.telemetry_enabled(0xBB),
+            "telemetry=true contact must be allowed"
+        );
     }
 
     #[test]
@@ -342,7 +362,7 @@ mod tests {
         let mut policy = PolicyFilter::new();
         let pk = pubkey_with_hash(0x33);
         policy.add_contact(&pk, false); // stale entry first
-        policy.add_contact(&pk, true);  // "enabled" re-add appended as a duplicate
+        policy.add_contact(&pk, true); // "enabled" re-add appended as a duplicate
         assert!(
             !policy.telemetry_enabled(0x33),
             "first-match-wins: the stale telemetry=false entry shadows the later \
@@ -363,7 +383,11 @@ mod tests {
 
         // One more — should not panic; just silently ignored
         policy.add_contact(&pubkey_with_hash(0xFF), false);
-        assert_eq!(policy.contact_count(), MAX_POLICY_CONTACTS, "count must not exceed capacity");
+        assert_eq!(
+            policy.contact_count(),
+            MAX_POLICY_CONTACTS,
+            "count must not exceed capacity"
+        );
     }
 
     // ── contact_count ─────────────────────────────────────────────────────────

@@ -27,7 +27,7 @@
 //! 2. **FALLBACK embed path** — a build.rs-generated RGB565 byte array
 //!    (`build.rs` in this crate) fed to a runtime `SharedPixelBuffer<Rgb8Pixel>`
 //!    + `slint::Image::from_rgb8`, set as an `in property <image>` — exercised
-//!    here by the small "moon" swatch standing in for the mascot position.
+//!      here by the small "moon" swatch standing in for the mascot position.
 //!
 //! Both paths render into the SAME one-frame host-sim capture
 //! (`render_host_sim_frame`), proving both compile AND actually paint pixels
@@ -226,14 +226,21 @@ pub fn render_host_sim_frame() -> Vec<Rgb565Pixel> {
     let rendered = window.draw_if_needed(|renderer| {
         renderer.render(&mut framebuffer, WIDTH as usize);
     });
-    assert!(rendered, "host-sim frame was not dirty on first render — nothing painted");
+    assert!(
+        rendered,
+        "host-sim frame was not dirty on first render — nothing painted"
+    );
 
     framebuffer
 }
 
 /// Convert a rendered RGB565 framebuffer to an `image::RgbImage` (RGB8) for
 /// PNG export — the host-sim render deliverable.
-pub fn framebuffer_to_rgb_image(framebuffer: &[Rgb565Pixel], width: u32, height: u32) -> image::RgbImage {
+pub fn framebuffer_to_rgb_image(
+    framebuffer: &[Rgb565Pixel],
+    width: u32,
+    height: u32,
+) -> image::RgbImage {
     let mut img = image::RgbImage::new(width, height);
     for (i, px) in framebuffer.iter().enumerate() {
         let r5 = (px.0 >> 11) & 0x1F;
@@ -258,7 +265,11 @@ mod tests {
         let r5 = (px.0 >> 11) & 0x1F;
         let g6 = (px.0 >> 5) & 0x3F;
         let b5 = px.0 & 0x1F;
-        (((r5 << 3) | (r5 >> 2)) as u8, ((g6 << 2) | (g6 >> 4)) as u8, ((b5 << 3) | (b5 >> 2)) as u8)
+        (
+            ((r5 << 3) | (r5 >> 2)) as u8,
+            ((g6 << 2) | (g6 >> 4)) as u8,
+            ((b5 << 3) | (b5 >> 2)) as u8,
+        )
     }
 
     /// RGB565 is lossy (5/6/5 bits per channel): round an 8-bit-per-channel
@@ -269,7 +280,11 @@ mod tests {
         let r5 = r >> 3;
         let g6 = g >> 2;
         let b5 = b >> 3;
-        (((r5 << 3) | (r5 >> 2)), ((g6 << 2) | (g6 >> 4)), ((b5 << 3) | (b5 >> 2)))
+        (
+            ((r5 << 3) | (r5 >> 2)),
+            ((g6 << 2) | (g6 >> 4)),
+            ((b5 << 3) | (b5 >> 2)),
+        )
     }
 
     /// Single test (see module doc + `render_host_sim_frame`'s panic note):
@@ -286,19 +301,30 @@ mod tests {
         // Background (space-deep) must be visible somewhere the images
         // don't cover, e.g. bottom-left corner.
         let bg = rgb_at(&fb, 4, HEIGHT - 4);
-        assert_eq!(bg, space_deep, "space-deep background did not render at (4, {})", HEIGHT - 4);
+        assert_eq!(
+            bg,
+            space_deep,
+            "space-deep background did not render at (4, {})",
+            HEIGHT - 4
+        );
 
         // PRIMARY path #1 — starfield header strip must contain at least one
         // non-background (star) pixel: proves the @image-url PNG actually
         // decoded and painted, not just "compiled to a blank/placeholder".
         let starfield_has_content =
             (0..320u32).any(|x| (0..40u32).any(|y| rgb_at(&fb, x, y) != space_deep));
-        assert!(starfield_has_content, "starfield.png region is entirely blank/background");
+        assert!(
+            starfield_has_content,
+            "starfield.png region is entirely blank/background"
+        );
 
         // PRIMARY path #2 — corner planet region must contain its
         // planet-warm body color somewhere near its center.
         let planet_center = rgb_at(&fb, 320 - 40 - 8 + 20, 8 + 20);
-        assert_ne!(planet_center, space_deep, "planet_corner.png did not paint over the backdrop");
+        assert_ne!(
+            planet_center, space_deep,
+            "planet_corner.png did not paint over the backdrop"
+        );
 
         // FALLBACK path — the build.rs-generated moon-silver swatch must be
         // visible at its known center (proves SharedPixelBuffer::from_rgb8

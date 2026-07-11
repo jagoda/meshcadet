@@ -77,8 +77,7 @@ fn run_fade(h: &mut Harness, throttled: bool) -> (usize, usize, u64) {
     // navigation full paint every screen pays regardless of the fade.
     let settle = h.frame().expect("first frame must paint");
     assert_eq!(
-        settle.lines_flushed,
-        HEIGHT as usize,
+        settle.lines_flushed, HEIGHT as usize,
         "navigation is always a full-window first paint, fade or not"
     );
 
@@ -110,7 +109,11 @@ fn run_fade(h: &mut Harness, throttled: bool) -> (usize, usize, u64) {
         render_settling = h.has_active_animations();
     }
 
-    (full_window_frames, total_frames_rendered, h.framebuffer_hash())
+    (
+        full_window_frames,
+        total_frames_rendered,
+        h.framebuffer_hash(),
+    )
 }
 
 #[test]

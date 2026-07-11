@@ -3,7 +3,7 @@
 //!
 //! Spec §1–§2 (src/Packet.h @ dee3e26a).
 
-use crate::{PayloadType, RouteType, constants};
+use crate::{constants, PayloadType, RouteType};
 
 /// The 1-byte MeshCore packet header.
 ///
@@ -191,8 +191,8 @@ mod tests {
 
     #[test]
     fn path_len_new_rejects_bad_inputs() {
-        assert!(PathLen::new(0, 0).is_none());  // hash_size=0 invalid
-        assert!(PathLen::new(5, 0).is_none());  // hash_size=5 invalid
+        assert!(PathLen::new(0, 0).is_none()); // hash_size=0 invalid
+        assert!(PathLen::new(5, 0).is_none()); // hash_size=5 invalid
         assert!(PathLen::new(1, 64).is_none()); // hop_count=64 invalid
         assert!(PathLen::new(2, 32).is_some()); // max valid for 2-byte mode
     }

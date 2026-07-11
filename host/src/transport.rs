@@ -97,7 +97,8 @@ impl Transport for SerialTransport {
     }
 
     fn flush_input(&mut self) -> anyhow::Result<()> {
-        self.port.clear(serialport::ClearBuffer::Input)
+        self.port
+            .clear(serialport::ClearBuffer::Input)
             .map_err(|e| anyhow::anyhow!("serial flush_input: {}", e))
     }
 }

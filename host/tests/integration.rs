@@ -18,21 +18,21 @@
 use std::collections::VecDeque;
 
 use protocol::channel_hash_var;
-use protocol::provisioning::{
-    decode_add_channel, decode_add_contact, decode_del_channel, decode_del_contact,
-    decode_frame, decode_set_device_name, decode_set_notif_defaults, decode_set_pin,
-    encode_frame, encode_rsp_channel, encode_rsp_contact, encode_rsp_error,
-    encode_rsp_identity, encode_rsp_status,
-    RspStatusPayload,
-    FRAME_ADD_CHANNEL, FRAME_ADD_CONTACT, FRAME_CLEAR_HISTORY, FRAME_COMMIT_PROVISIONING,
-    FRAME_DEL_CHANNEL, FRAME_DEL_CONTACT, FRAME_EXPORT_HISTORY, FRAME_QUERY_CHANNELS,
-    FRAME_QUERY_CONTACTS, FRAME_QUERY_STATUS, FRAME_RSP_CHANNEL, FRAME_RSP_CHANNELS_DONE,
-    FRAME_RSP_CONTACT, FRAME_RSP_CONTACTS_DONE, FRAME_RSP_ERROR, FRAME_RSP_HISTORY_DONE,
-    FRAME_RSP_HISTORY_ENTRY, FRAME_RSP_IDENTITY, FRAME_RSP_OK, FRAME_RSP_STATUS,
-    FRAME_SET_DEVICE_NAME, FRAME_SET_NOTIF_DEFAULTS, FRAME_SET_PIN,
+use protocol::history::{
+    encode_rsp_history_entry, HistoryEntry, HistoryMsgType, MAX_HISTORY_TEXT_LEN,
+    MAX_RSP_HISTORY_ENTRY_PAYLOAD,
 };
-use protocol::history::{HistoryEntry, HistoryMsgType, MAX_HISTORY_TEXT_LEN,
-    encode_rsp_history_entry, MAX_RSP_HISTORY_ENTRY_PAYLOAD};
+use protocol::provisioning::{
+    decode_add_channel, decode_add_contact, decode_del_channel, decode_del_contact, decode_frame,
+    decode_set_device_name, decode_set_notif_defaults, decode_set_pin, encode_frame,
+    encode_rsp_channel, encode_rsp_contact, encode_rsp_error, encode_rsp_identity,
+    encode_rsp_status, RspStatusPayload, FRAME_ADD_CHANNEL, FRAME_ADD_CONTACT, FRAME_CLEAR_HISTORY,
+    FRAME_COMMIT_PROVISIONING, FRAME_DEL_CHANNEL, FRAME_DEL_CONTACT, FRAME_EXPORT_HISTORY,
+    FRAME_QUERY_CHANNELS, FRAME_QUERY_CONTACTS, FRAME_QUERY_STATUS, FRAME_RSP_CHANNEL,
+    FRAME_RSP_CHANNELS_DONE, FRAME_RSP_CONTACT, FRAME_RSP_CONTACTS_DONE, FRAME_RSP_ERROR,
+    FRAME_RSP_HISTORY_DONE, FRAME_RSP_HISTORY_ENTRY, FRAME_RSP_IDENTITY, FRAME_RSP_OK,
+    FRAME_RSP_STATUS, FRAME_SET_DEVICE_NAME, FRAME_SET_NOTIF_DEFAULTS, FRAME_SET_PIN,
+};
 
 // Pull in the host crate's public types.
 use host::session::Session;
@@ -119,8 +119,8 @@ impl MockDevice {
         match frame_type {
             FRAME_QUERY_STATUS => {
                 let status = RspStatusPayload {
-                    provisioned:   self.provisioned,
-                    pubkey:        self.pubkey,
+                    provisioned: self.provisioned,
+                    pubkey: self.pubkey,
                     contact_count: self.contacts.len() as u8,
                     channel_count: self.channels.len() as u8,
                     // Mock device has no GPS hardware; mirrors an unprovisioned
@@ -154,77 +154,70 @@ impl MockDevice {
                 response
             }
 
-            FRAME_ADD_CONTACT => {
-                match decode_add_contact(payload) {
-                    Ok(c) => {
-                        self.last_contact_telemetry = Some(c.telemetry_enable);
-                        let name = c.display_name[..c.display_name_len as usize].to_vec();
-                        self.last_contact_name = Some(name.clone());
-                        self.contacts.push(ContactRec {
-                            pubkey: c.pubkey,
-                            telemetry: c.telemetry_enable,
-                            name,
-                        });
+            FRAME_ADD_CONTACT => match decode_add_contact(payload) {
+                Ok(c) => {
+                    self.last_contact_telemetry = Some(c.telemetry_enable);
+                    let name = c.display_name[..c.display_name_len as usize].to_vec();
+                    self.last_contact_name = Some(name.clone());
+                    self.contacts.push(ContactRec {
+                        pubkey: c.pubkey,
+                        telemetry: c.telemetry_enable,
+                        name,
+                    });
+                    ok_frame()
+                }
+                Err(e) => error_frame(1, &format!("{:?}", e)),
+            },
+
+            FRAME_DEL_CONTACT => match decode_del_contact(payload) {
+                Ok(d) => match self.contacts.iter().position(|c| c.pubkey == d.pubkey) {
+                    Some(idx) => {
+                        self.contacts.remove(idx);
                         ok_frame()
                     }
-                    Err(e) => error_frame(1, &format!("{:?}", e)),
-                }
-            }
+                    None => error_frame(3, "contact not found"),
+                },
+                Err(e) => error_frame(1, &format!("{:?}", e)),
+            },
 
-            FRAME_DEL_CONTACT => {
-                match decode_del_contact(payload) {
-                    Ok(d) => match self.contacts.iter().position(|c| c.pubkey == d.pubkey) {
-                        Some(idx) => {
-                            self.contacts.remove(idx);
-                            ok_frame()
+            FRAME_ADD_CHANNEL => match decode_add_channel(payload) {
+                Ok(ch) => {
+                    self.last_channel_primary = Some(ch.primary);
+                    let name = ch.name[..ch.name_len as usize].to_vec();
+                    self.last_channel_name = Some(name.clone());
+                    if ch.primary {
+                        for existing in self.channels.iter_mut() {
+                            existing.primary = false;
                         }
-                        None => error_frame(3, "contact not found"),
-                    },
-                    Err(e) => error_frame(1, &format!("{:?}", e)),
+                    }
+                    self.channels.push(ChannelRec {
+                        secret: ch.secret,
+                        key_len: ch.key_len,
+                        primary: ch.primary,
+                        name,
+                    });
+                    ok_frame()
                 }
-            }
+                Err(e) => error_frame(1, &format!("{:?}", e)),
+            },
 
-            FRAME_ADD_CHANNEL => {
-                match decode_add_channel(payload) {
-                    Ok(ch) => {
-                        self.last_channel_primary = Some(ch.primary);
-                        let name = ch.name[..ch.name_len as usize].to_vec();
-                        self.last_channel_name = Some(name.clone());
-                        if ch.primary {
-                            for existing in self.channels.iter_mut() {
-                                existing.primary = false;
-                            }
-                        }
-                        self.channels.push(ChannelRec {
-                            secret: ch.secret,
-                            key_len: ch.key_len,
-                            primary: ch.primary,
-                            name,
-                        });
+            FRAME_DEL_CHANNEL => match decode_del_channel(payload) {
+                Ok(d) => match self.channels.iter().position(|ch| ch.secret == d.secret) {
+                    Some(idx) => {
+                        self.channels.remove(idx);
                         ok_frame()
                     }
-                    Err(e) => error_frame(1, &format!("{:?}", e)),
-                }
-            }
-
-            FRAME_DEL_CHANNEL => {
-                match decode_del_channel(payload) {
-                    Ok(d) => match self.channels.iter().position(|ch| ch.secret == d.secret) {
-                        Some(idx) => {
-                            self.channels.remove(idx);
-                            ok_frame()
-                        }
-                        None => error_frame(4, "channel not found"),
-                    },
-                    Err(e) => error_frame(1, &format!("{:?}", e)),
-                }
-            }
+                    None => error_frame(4, "channel not found"),
+                },
+                Err(e) => error_frame(1, &format!("{:?}", e)),
+            },
 
             FRAME_QUERY_CONTACTS => {
                 let mut response: Vec<u8> = Vec::new();
                 for (idx, c) in self.contacts.iter().enumerate() {
                     let mut pbuf = [0u8; 80];
-                    let plen = encode_rsp_contact(idx as u8, &c.pubkey, c.telemetry, &c.name, &mut pbuf);
+                    let plen =
+                        encode_rsp_contact(idx as u8, &c.pubkey, c.telemetry, &c.name, &mut pbuf);
                     let mut fbuf = [0u8; 128];
                     let n = encode_frame(FRAME_RSP_CONTACT, &pbuf[..plen], &mut fbuf);
                     response.extend_from_slice(&fbuf[..n]);
@@ -240,7 +233,9 @@ impl MockDevice {
                 for (idx, ch) in self.channels.iter().enumerate() {
                     let hash = channel_hash_var(&ch.secret[..ch.key_len as usize]);
                     let mut pbuf = [0u8; 80];
-                    let plen = encode_rsp_channel(idx as u8, hash, ch.key_len, ch.primary, &ch.name, &mut pbuf);
+                    let plen = encode_rsp_channel(
+                        idx as u8, hash, ch.key_len, ch.primary, &ch.name, &mut pbuf,
+                    );
                     let mut fbuf = [0u8; 128];
                     let n = encode_frame(FRAME_RSP_CHANNEL, &pbuf[..plen], &mut fbuf);
                     response.extend_from_slice(&fbuf[..n]);
@@ -251,32 +246,26 @@ impl MockDevice {
                 response
             }
 
-            FRAME_SET_NOTIF_DEFAULTS => {
-                match decode_set_notif_defaults(payload) {
-                    Ok(_) => ok_frame(),
-                    Err(e) => error_frame(1, &format!("{:?}", e)),
-                }
-            }
+            FRAME_SET_NOTIF_DEFAULTS => match decode_set_notif_defaults(payload) {
+                Ok(_) => ok_frame(),
+                Err(e) => error_frame(1, &format!("{:?}", e)),
+            },
 
-            FRAME_SET_PIN => {
-                match decode_set_pin(payload) {
-                    Ok(p) => {
-                        self.last_pin = Some(p.pin[..p.pin_len as usize].to_vec());
-                        ok_frame()
-                    }
-                    Err(e) => error_frame(1, &format!("{:?}", e)),
+            FRAME_SET_PIN => match decode_set_pin(payload) {
+                Ok(p) => {
+                    self.last_pin = Some(p.pin[..p.pin_len as usize].to_vec());
+                    ok_frame()
                 }
-            }
+                Err(e) => error_frame(1, &format!("{:?}", e)),
+            },
 
-            FRAME_SET_DEVICE_NAME => {
-                match decode_set_device_name(payload) {
-                    Ok(n) => {
-                        self.device_name = n.name[..n.name_len as usize].to_vec();
-                        ok_frame()
-                    }
-                    Err(e) => error_frame(1, &format!("{:?}", e)),
+            FRAME_SET_DEVICE_NAME => match decode_set_device_name(payload) {
+                Ok(n) => {
+                    self.device_name = n.name[..n.name_len as usize].to_vec();
+                    ok_frame()
                 }
-            }
+                Err(e) => error_frame(1, &format!("{:?}", e)),
+            },
 
             FRAME_COMMIT_PROVISIONING => {
                 self.provisioned = true;
@@ -452,7 +441,9 @@ fn test_set_device_name_persists_across_reboot() {
         .set_device_name(b"Alex's MeshCadet")
         .expect("set_device_name should succeed");
 
-    session.query_status().expect("query_status after set_device_name");
+    session
+        .query_status()
+        .expect("query_status after set_device_name");
     assert_eq!(session.last_device_name(), Some("Alex's MeshCadet"));
 
     // "Reboot": fresh session, fresh mock device pre-loaded with the
@@ -478,11 +469,15 @@ fn test_set_device_name_empty_clears() {
     let pubkey = [0x44_u8; 32];
     let mut session = make_session_v2(pubkey);
 
-    session.set_device_name(b"Temporary").expect("set_device_name should succeed");
+    session
+        .set_device_name(b"Temporary")
+        .expect("set_device_name should succeed");
     session.query_status().expect("query_status after set");
     assert_eq!(session.last_device_name(), Some("Temporary"));
 
-    session.set_device_name(b"").expect("set_device_name (clear) should succeed");
+    session
+        .set_device_name(b"")
+        .expect("set_device_name (clear) should succeed");
     session.query_status().expect("query_status after clear");
     assert_eq!(session.last_device_name(), None);
 }
@@ -494,9 +489,15 @@ fn test_set_device_name_does_not_affect_other_identity_fields() {
     let pubkey = [0x55_u8; 32];
     let mut session = make_session_v2(pubkey);
 
-    let before = session.query_status().expect("query_status before set_device_name");
-    session.set_device_name(b"Naming Things").expect("set_device_name should succeed");
-    let after = session.query_status().expect("query_status after set_device_name");
+    let before = session
+        .query_status()
+        .expect("query_status before set_device_name");
+    session
+        .set_device_name(b"Naming Things")
+        .expect("set_device_name should succeed");
+    let after = session
+        .query_status()
+        .expect("query_status after set_device_name");
 
     assert_eq!(before.pubkey, after.pubkey);
     assert_eq!(before.provisioned, after.provisioned);
@@ -515,7 +516,9 @@ fn test_add_contact() {
         .expect("add_contact should succeed");
 
     // Status should now reflect 1 contact.
-    let status = session.query_status().expect("query_status after add_contact");
+    let status = session
+        .query_status()
+        .expect("query_status after add_contact");
     assert_eq!(status.contact_count, 1);
 }
 
@@ -536,12 +539,16 @@ fn test_add_channel() {
         .expect("add_channel should succeed");
 
     // Status should now reflect 1 channel.
-    let status = session.query_status().expect("query_status after add_channel");
+    let status = session
+        .query_status()
+        .expect("query_status after add_channel");
     assert_eq!(status.channel_count, 1);
 
     // …and that channel must be enumerable: list-channels returns exactly the
     // one we added, with a count matching status (no status/list mismatch).
-    let channels = session.list_channels().expect("list_channels after add_channel");
+    let channels = session
+        .list_channels()
+        .expect("list_channels after add_channel");
     assert_eq!(channels.len() as u8, status.channel_count);
     assert_eq!(channels.len(), 1);
     let ch = &channels[0];
@@ -600,7 +607,10 @@ fn test_list_channels_multiple_matches_status() {
         channels[1].channel_hash,
         "128-bit channel hashes over the first 16 secret bytes",
     );
-    assert_eq!(&channels[1].name[..channels[1].name_len as usize], b"scouts");
+    assert_eq!(
+        &channels[1].name[..channels[1].name_len as usize],
+        b"scouts"
+    );
 }
 
 /// Regression guard for the exact HIL acceptance sequence:
@@ -627,12 +637,19 @@ fn test_add_channel_then_list_then_commit_no_timeout() {
     // list-channels must enumerate the just-added channel, and its count must
     // equal what status reports — the precise "empty vs count" invariant.
     let status = session.query_status().expect("status after add_channel");
-    let channels = session.list_channels().expect("list_channels after add_channel");
+    let channels = session
+        .list_channels()
+        .expect("list_channels after add_channel");
     assert_eq!(
-        channels.len() as u8, status.channel_count,
+        channels.len() as u8,
+        status.channel_count,
         "list-channels count must match status channels:N",
     );
-    assert_eq!(channels.len(), 1, "the added channel must be listed (not empty)");
+    assert_eq!(
+        channels.len(),
+        1,
+        "the added channel must be listed (not empty)"
+    );
 
     // commit must return a normal response — no 0-byte timeout.  Before the fix
     // the runtime server dropped this frame silently.
@@ -647,9 +664,13 @@ fn test_reset_pin() {
     let mut session = make_session_v2([0x33_u8; 32]);
 
     // Initial set.
-    session.set_pin(b"initial").expect("set_pin (initial) should succeed");
+    session
+        .set_pin(b"initial")
+        .expect("set_pin (initial) should succeed");
     // Reset to a new PIN (physical possession = auth; same wire frame).
-    session.set_pin(b"newpin99").expect("set_pin (reset) should succeed");
+    session
+        .set_pin(b"newpin99")
+        .expect("set_pin (reset) should succeed");
 }
 
 /// Acceptance: full provisioning session — contact + channel + identity + PIN
@@ -697,7 +718,10 @@ fn test_full_provisioning_session() {
 
     // 8. Verify status after commit (provisioned flag set, counts correct).
     let final_status = session.query_status().expect("status after commit");
-    assert!(final_status.provisioned, "device must be provisioned after commit");
+    assert!(
+        final_status.provisioned,
+        "device must be provisioned after commit"
+    );
     assert_eq!(final_status.contact_count, 2);
     assert_eq!(final_status.channel_count, 1);
     assert_eq!(final_status.pubkey, device_pubkey);
@@ -724,7 +748,9 @@ fn test_del_contact() {
     let mut session = make_session_v2([0x44_u8; 32]);
 
     let key = [0xCC_u8; 32];
-    session.add_contact(&key, false, b"Temp").expect("add contact");
+    session
+        .add_contact(&key, false, b"Temp")
+        .expect("add contact");
     session.del_contact(&key).expect("del contact");
 
     let status = session.query_status().expect("status after del");
@@ -737,7 +763,9 @@ fn test_del_channel() {
     let mut session = make_session_v2([0x44_u8; 32]);
 
     let secret = [0xBB_u8; 32];
-    session.add_channel(&secret, 32, false, b"temp").expect("add channel");
+    session
+        .add_channel(&secret, 32, false, b"temp")
+        .expect("add channel");
     session.del_channel(&secret).expect("del channel");
 
     let status = session.query_status().expect("status after del");
@@ -754,8 +782,12 @@ fn test_list_contacts() {
 
     let alice = [0xA1_u8; 32];
     let bob = [0xB0_u8; 32];
-    session.add_contact(&alice, true, b"Alice").expect("add Alice");
-    session.add_contact(&bob, false, b"").expect("add Bob (no name)");
+    session
+        .add_contact(&alice, true, b"Alice")
+        .expect("add Alice");
+    session
+        .add_contact(&bob, false, b"")
+        .expect("add Bob (no name)");
 
     let contacts = session.list_contacts().expect("list_contacts");
     assert_eq!(contacts.len(), 2);
@@ -763,7 +795,10 @@ fn test_list_contacts() {
     assert_eq!(contacts[0].index, 0);
     assert_eq!(contacts[0].pubkey, alice);
     assert!(contacts[0].telemetry_enable);
-    assert_eq!(&contacts[0].display_name[..contacts[0].display_name_len as usize], b"Alice");
+    assert_eq!(
+        &contacts[0].display_name[..contacts[0].display_name_len as usize],
+        b"Alice"
+    );
 
     assert_eq!(contacts[1].index, 1);
     assert_eq!(contacts[1].pubkey, bob);
@@ -786,14 +821,19 @@ fn test_list_channels() {
     let mut session = make_session_v2([0x22_u8; 32]);
 
     let secret = [0x6D_u8; 32]; // b'm'
-    session.add_channel(&secret, 32, true, b"family").expect("add channel");
+    session
+        .add_channel(&secret, 32, true, b"family")
+        .expect("add channel");
 
     let channels = session.list_channels().expect("list_channels");
     assert_eq!(channels.len(), 1);
     assert_eq!(channels[0].index, 0);
     assert_eq!(channels[0].key_len, 32);
     assert!(channels[0].primary);
-    assert_eq!(&channels[0].name[..channels[0].name_len as usize], b"family");
+    assert_eq!(
+        &channels[0].name[..channels[0].name_len as usize],
+        b"family"
+    );
     assert_eq!(
         channels[0].channel_hash,
         channel_hash_var(&secret),
@@ -809,7 +849,9 @@ fn test_del_contact_then_list_shows_gone_and_count_drops() {
 
     let alice = [0xA1_u8; 32];
     let bob = [0xB0_u8; 32];
-    session.add_contact(&alice, true, b"Alice").expect("add Alice");
+    session
+        .add_contact(&alice, true, b"Alice")
+        .expect("add Alice");
     session.add_contact(&bob, false, b"Bob").expect("add Bob");
     assert_eq!(session.query_status().unwrap().contact_count, 2);
 
@@ -818,7 +860,11 @@ fn test_del_contact_then_list_shows_gone_and_count_drops() {
 
     // Re-list: only Bob remains, and the index is re-packed.
     let contacts = session.list_contacts().expect("list after del");
-    assert_eq!(contacts.len(), 1, "deleted contact must be gone from the list");
+    assert_eq!(
+        contacts.len(),
+        1,
+        "deleted contact must be gone from the list"
+    );
     assert_eq!(contacts[0].pubkey, bob);
     assert_eq!(contacts[0].index, 0);
 
@@ -834,8 +880,12 @@ fn test_del_channel_then_list_shows_gone_and_count_drops() {
 
     let fam = [0x6D_u8; 32];
     let work = [0x77_u8; 32];
-    session.add_channel(&fam, 32, true, b"family").expect("add family");
-    session.add_channel(&work, 32, false, b"work").expect("add work");
+    session
+        .add_channel(&fam, 32, true, b"family")
+        .expect("add family");
+    session
+        .add_channel(&work, 32, false, b"work")
+        .expect("add work");
     assert_eq!(session.query_status().unwrap().channel_count, 2);
 
     session.del_channel(&fam).expect("del family");
@@ -894,16 +944,24 @@ fn make_grp_entry(sender_hash: u8, timestamp: u32, text: &[u8]) -> HistoryEntry 
 #[test]
 fn test_export_history_empty() {
     let mut session = make_session_with_history(vec![]);
-    let entries = session.export_history().expect("export_history (empty) must succeed");
-    assert!(entries.is_empty(), "expected no entries, got {}", entries.len());
+    let entries = session
+        .export_history()
+        .expect("export_history (empty) must succeed");
+    assert!(
+        entries.is_empty(),
+        "expected no entries, got {}",
+        entries.len()
+    );
 }
 
 /// Acceptance: single DM entry round-trips through export.
 #[test]
 fn test_export_history_single_entry() {
     let entry = make_dm_entry(0xAB, 1_000_000, b"hello world");
-    let mut session = make_session_with_history(vec![(entry.clone(), false)]);
-    let got = session.export_history().expect("export_history must succeed");
+    let mut session = make_session_with_history(vec![(entry, false)]);
+    let got = session
+        .export_history()
+        .expect("export_history must succeed");
     assert_eq!(got.len(), 1, "expected 1 entry");
     assert_eq!(got[0].0.sender_hash, 0xAB);
     assert_eq!(got[0].0.timestamp, 1_000_000);
@@ -920,7 +978,9 @@ fn test_export_history_multiple_entries_oldest_first() {
         (make_dm_entry(0x03, 300, b"newest"), false),
     ];
     let mut session = make_session_with_history(entries.clone());
-    let got = session.export_history().expect("export_history must succeed");
+    let got = session
+        .export_history()
+        .expect("export_history must succeed");
     assert_eq!(got.len(), 3, "expected 3 entries");
     assert_eq!(got[0].0.timestamp, 100, "first must be oldest");
     assert_eq!(got[1].0.timestamp, 200);
@@ -932,7 +992,9 @@ fn test_export_history_multiple_entries_oldest_first() {
 fn test_export_history_grp_txt_entries() {
     let entry = make_grp_entry(0xCC, 9999, b"group message");
     let mut session = make_session_with_history(vec![(entry, false)]);
-    let got = session.export_history().expect("export_history must succeed");
+    let got = session
+        .export_history()
+        .expect("export_history must succeed");
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].0.msg_type, HistoryMsgType::GrpTxt);
     let text = &got[0].0.text[..got[0].0.text_len as usize];
@@ -948,7 +1010,9 @@ fn test_export_history_mixed_message_types() {
         (make_dm_entry(0x30, 3, b"dm msg 2"), false),
     ];
     let mut session = make_session_with_history(entries);
-    let got = session.export_history().expect("export_history must succeed");
+    let got = session
+        .export_history()
+        .expect("export_history must succeed");
     assert_eq!(got.len(), 3);
     assert_eq!(got[0].0.msg_type, HistoryMsgType::Dm);
     assert_eq!(got[1].0.msg_type, HistoryMsgType::GrpTxt);
@@ -961,7 +1025,9 @@ fn test_export_history_text_preserved() {
     let text = b"exact bytes 0x42";
     let entry = make_dm_entry(0xFF, 42, text);
     let mut session = make_session_with_history(vec![(entry, false)]);
-    let got = session.export_history().expect("export_history must succeed");
+    let got = session
+        .export_history()
+        .expect("export_history must succeed");
     assert_eq!(got.len(), 1);
     let got_text = &got[0].0.text[..got[0].0.text_len as usize];
     assert_eq!(got_text, text, "text bytes must be preserved exactly");
@@ -975,22 +1041,41 @@ fn test_export_history_text_preserved() {
 fn test_export_history_cli_output_has_header_and_local_timestamp() {
     let entry = make_dm_entry(0xAB, 1_700_000_000, b"hello world");
     let mut session = make_session_with_history(vec![(entry, false)]);
-    let got = session.export_history().expect("export_history must succeed");
+    let got = session
+        .export_history()
+        .expect("export_history must succeed");
     assert_eq!(got.len(), 1);
 
     let iw = host::history_format::idx_width(got.len());
     let header = host::history_format::history_header(iw);
-    assert!(header.starts_with("idx"), "header must start with idx column: {header:?}");
-    assert!(header.contains("timestamp"), "header missing timestamp column: {header:?}");
-    assert!(header.contains("type"), "header missing type column: {header:?}");
-    assert!(header.contains("from"), "header missing from column: {header:?}");
-    assert!(header.ends_with("text"), "header must end with text column: {header:?}");
+    assert!(
+        header.starts_with("idx"),
+        "header must start with idx column: {header:?}"
+    );
+    assert!(
+        header.contains("timestamp"),
+        "header missing timestamp column: {header:?}"
+    );
+    assert!(
+        header.contains("type"),
+        "header missing type column: {header:?}"
+    );
+    assert!(
+        header.contains("from"),
+        "header missing from column: {header:?}"
+    );
+    assert!(
+        header.ends_with("text"),
+        "header must end with text column: {header:?}"
+    );
 
     let (e, is_ours) = &got[0];
     let line = host::history_format::format_history_line(0, e, *is_ours, iw);
     // Header and data row must align: each column starts at the same byte
     // offset in both strings, regardless of terminal tab stops.
-    let ts_start = header.find("timestamp").expect("header has timestamp column");
+    let ts_start = header
+        .find("timestamp")
+        .expect("header has timestamp column");
     let ty_start = header.find("type").expect("header has type column");
     let dr_start = header.find("dir").expect("header has dir column");
     let fr_start = header.find("from").expect("header has from column");
@@ -1002,10 +1087,16 @@ fn test_export_history_cli_output_has_header_and_local_timestamp() {
     let fr_field = &line[fr_start..tx_start];
     let tx_field = &line[tx_start..];
 
-    assert!(line.starts_with('0'), "expected idx column to start with '0': {line:?}");
+    assert!(
+        line.starts_with('0'),
+        "expected idx column to start with '0': {line:?}"
+    );
     // The bare u32 must not appear verbatim — it's rendered as a local
     // timestamp string, not the raw decimal.
-    assert!(!ts_field.contains("1700000000"), "raw epoch leaked into timestamp column: {ts_field:?}");
+    assert!(
+        !ts_field.contains("1700000000"),
+        "raw epoch leaked into timestamp column: {ts_field:?}"
+    );
     assert!(
         ts_field.starts_with(&host::history_format::format_local_timestamp(1_700_000_000)),
         "unexpected timestamp column: {ts_field:?}"
@@ -1026,9 +1117,10 @@ fn test_export_history_cli_output_has_header_and_local_timestamp() {
 fn test_export_history_outbound_entry_renders_as_sent() {
     let sent = make_dm_entry(0x46, 100, b"outbound dm");
     let received = make_dm_entry(0x46, 200, b"inbound dm");
-    let mut session =
-        make_session_with_history(vec![(sent, true), (received, false)]);
-    let got = session.export_history().expect("export_history must succeed");
+    let mut session = make_session_with_history(vec![(sent, true), (received, false)]);
+    let got = session
+        .export_history()
+        .expect("export_history must succeed");
     assert_eq!(got.len(), 2);
     assert!(got[0].1, "first entry must round-trip is_ours=true");
     assert!(!got[1].1, "second entry must round-trip is_ours=false");
@@ -1036,10 +1128,15 @@ fn test_export_history_outbound_entry_renders_as_sent() {
     let iw = host::history_format::idx_width(got.len());
     let sent_line = host::history_format::format_history_line(0, &got[0].0, got[0].1, iw);
     let recv_line = host::history_format::format_history_line(1, &got[1].0, got[1].1, iw);
-    assert!(sent_line.contains("SENT"), "outbound row must show SENT: {sent_line:?}");
-    assert!(recv_line.contains("RECV"), "inbound row must show RECV: {recv_line:?}");
+    assert!(
+        sent_line.contains("SENT"),
+        "outbound row must show SENT: {sent_line:?}"
+    );
+    assert!(
+        recv_line.contains("RECV"),
+        "inbound row must show RECV: {recv_line:?}"
+    );
 }
-
 
 // ── Clear-history tests ────────────────────────────────────────────────────────
 
@@ -1059,7 +1156,11 @@ fn test_clear_history_then_export_is_empty() {
 
     // Sanity: history is present before the clear.
     let before = session.export_history().expect("export before clear");
-    assert_eq!(before.len(), 3, "fixture must seed 3 entries before clearing");
+    assert_eq!(
+        before.len(),
+        3,
+        "fixture must seed 3 entries before clearing"
+    );
 
     session.clear_history().expect("clear_history must succeed");
 
@@ -1076,7 +1177,9 @@ fn test_clear_history_then_export_is_empty() {
 #[test]
 fn test_clear_history_on_empty_device_succeeds() {
     let mut session = make_session_with_history(vec![]);
-    session.clear_history().expect("clear_history on empty history must still succeed");
+    session
+        .clear_history()
+        .expect("clear_history on empty history must still succeed");
     let after = session.export_history().expect("export after clear");
     assert!(after.is_empty());
 }
@@ -1090,7 +1193,9 @@ fn test_clear_history_on_empty_device_succeeds() {
 fn test_clear_history_then_status_no_desync() {
     let mut session = make_session_with_history(vec![(make_dm_entry(0x09, 1, b"hi"), false)]);
     session.clear_history().expect("clear_history must succeed");
-    let status = session.query_status().expect("status after clear_history must not hang/desync");
+    let status = session
+        .query_status()
+        .expect("status after clear_history must not hang/desync");
     assert_eq!(status.contact_count, 0);
 }
 
@@ -1105,7 +1210,9 @@ struct PreloadTransport {
 
 impl PreloadTransport {
     fn with_data(data: Vec<u8>) -> Self {
-        Self { recv_buf: data.into() }
+        Self {
+            recv_buf: data.into(),
+        }
     }
 }
 
@@ -1228,7 +1335,10 @@ fn test_export_history_at_hil_scale_with_interleaved_log_noise() {
         } else {
             format!("dm message {i}").into_bytes()
         };
-        entries.push((make_dm_entry((i % 256) as u8, 1_000_000 + i, &text), i % 2 == 0));
+        entries.push((
+            make_dm_entry((i % 256) as u8, 1_000_000 + i, &text),
+            i % 2 == 0,
+        ));
     }
     for i in 0..20u32 {
         let text: Vec<u8> = if i % 4 == 0 {
@@ -1236,7 +1346,10 @@ fn test_export_history_at_hil_scale_with_interleaved_log_noise() {
         } else {
             format!("grp message {i}").into_bytes()
         };
-        entries.push((make_grp_entry((i % 256) as u8, 2_000_000 + i, &text), i % 2 == 1));
+        entries.push((
+            make_grp_entry((i % 256) as u8, 2_000_000 + i, &text),
+            i % 2 == 1,
+        ));
     }
     assert_eq!(entries.len(), 38, "HIL repro scale: 18 DM + 20 GRP");
 
@@ -1250,7 +1363,10 @@ fn test_export_history_at_hil_scale_with_interleaved_log_noise() {
         stream.extend_from_slice(&noise_block(idx));
         let mut pbuf = [0u8; MAX_RSP_HISTORY_ENTRY_PAYLOAD + 1];
         let plen = encode_rsp_history_entry(idx as u8, entry, *is_ours, &mut pbuf);
-        assert!(plen > 0, "entry {idx} must encode (buffer must be large enough)");
+        assert!(
+            plen > 0,
+            "entry {idx} must encode (buffer must be large enough)"
+        );
         let mut fbuf = [0u8; MAX_RSP_HISTORY_ENTRY_PAYLOAD + 16];
         let n = encode_frame(FRAME_RSP_HISTORY_ENTRY, &pbuf[..plen], &mut fbuf);
         stream.extend_from_slice(&fbuf[..n]);
@@ -1267,13 +1383,26 @@ fn test_export_history_at_hil_scale_with_interleaved_log_noise() {
         .export_history()
         .expect("export_history must stream to completion at HIL scale with interleaved log noise");
 
-    assert_eq!(got.len(), 38, "all 38 entries must be received, none dropped by a false resync");
+    assert_eq!(
+        got.len(),
+        38,
+        "all 38 entries must be received, none dropped by a false resync"
+    );
     for (i, ((want_entry, want_ours), (got_entry, got_ours))) in
         entries.iter().zip(got.iter()).enumerate()
     {
-        assert_eq!(got_entry.sender_hash, want_entry.sender_hash, "entry {i} sender_hash");
-        assert_eq!(got_entry.msg_type, want_entry.msg_type, "entry {i} msg_type");
-        assert_eq!(got_entry.timestamp, want_entry.timestamp, "entry {i} timestamp");
+        assert_eq!(
+            got_entry.sender_hash, want_entry.sender_hash,
+            "entry {i} sender_hash"
+        );
+        assert_eq!(
+            got_entry.msg_type, want_entry.msg_type,
+            "entry {i} msg_type"
+        );
+        assert_eq!(
+            got_entry.timestamp, want_entry.timestamp,
+            "entry {i} timestamp"
+        );
         assert_eq!(
             &got_entry.text[..got_entry.text_len as usize],
             &want_entry.text[..want_entry.text_len as usize],
@@ -1324,7 +1453,7 @@ fn test_export_history_tolerates_stray_leading_status_and_identity_frames() {
     stray.extend_from_slice(&ifbuf[..n]);
 
     // The real history stream: two entries, then DONE.
-    let entries = vec![
+    let entries = [
         (make_dm_entry(0x10, 100, b"first"), false),
         (make_grp_entry(0x20, 200, b"second"), true),
     ];
@@ -1347,10 +1476,17 @@ fn test_export_history_tolerates_stray_leading_status_and_identity_frames() {
         .export_history()
         .expect("export_history must skip stray leading RSP_STATUS/RSP_IDENTITY frames, not bail");
 
-    assert_eq!(got.len(), 2, "both real history entries must still be returned");
+    assert_eq!(
+        got.len(),
+        2,
+        "both real history entries must still be returned"
+    );
     assert_eq!(got[0].0.sender_hash, 0x10);
     assert_eq!(got[1].0.sender_hash, 0x20);
-    assert!(got[1].1, "second entry's is_ours must round-trip through the stray-frame prefix");
+    assert!(
+        got[1].1,
+        "second entry's is_ours must round-trip through the stray-frame prefix"
+    );
 }
 
 // ── NoisyMockTransport — full round-trip with interleaved log noise ───────────
@@ -1482,7 +1618,10 @@ fn test_full_provisioning_round_trip_with_log_noise() {
     let status = session
         .query_status()
         .expect("query_status must succeed with log noise in stream");
-    assert_eq!(status.pubkey, pubkey, "pubkey must round-trip through noisy stream");
+    assert_eq!(
+        status.pubkey, pubkey,
+        "pubkey must round-trip through noisy stream"
+    );
     assert!(!status.provisioned, "device must start unprovisioned");
     assert_eq!(status.contact_count, 0);
     assert_eq!(status.channel_count, 0);
@@ -1508,10 +1647,16 @@ fn test_full_provisioning_round_trip_with_log_noise() {
     let final_status = session
         .query_status()
         .expect("final query_status must succeed with log noise");
-    assert!(final_status.provisioned, "device must be provisioned after commit");
+    assert!(
+        final_status.provisioned,
+        "device must be provisioned after commit"
+    );
     assert_eq!(final_status.contact_count, 1, "one contact must be staged");
     assert_eq!(final_status.channel_count, 1, "one channel must be staged");
-    assert_eq!(final_status.pubkey, pubkey, "pubkey must survive full noisy session");
+    assert_eq!(
+        final_status.pubkey, pubkey,
+        "pubkey must survive full noisy session"
+    );
 }
 
 // ── DroppedSendTransport — retry regression ───────────────────────────────────
@@ -1611,8 +1756,14 @@ fn test_query_status_retries_on_dropped_frame() {
         .query_status()
         .expect("query_status must succeed after 2 dropped frames via retry");
 
-    assert_eq!(status.pubkey, pubkey, "pubkey must round-trip through retry");
-    assert!(!status.provisioned, "fresh mock device must not be provisioned");
+    assert_eq!(
+        status.pubkey, pubkey,
+        "pubkey must round-trip through retry"
+    );
+    assert!(
+        !status.provisioned,
+        "fresh mock device must not be provisioned"
+    );
 }
 
 /// Acceptance: `add_channel` must accept a 16-byte (128-bit) secret (`key_len=16`),
@@ -1632,7 +1783,10 @@ fn test_add_channel_128bit_secret() {
     let status = session
         .query_status()
         .expect("query_status after 128-bit channel add");
-    assert_eq!(status.channel_count, 1, "channel count must increment after 128-bit add");
+    assert_eq!(
+        status.channel_count, 1,
+        "channel count must increment after 128-bit add"
+    );
 }
 
 /// Regression: `send_and_expect_ok` (used by add_contact, add_channel, set_pin,
@@ -1680,5 +1834,8 @@ fn test_cli_clear_history_subcommand_help() {
         .args(["--port", "/dev/null", "clear-history", "--help"])
         .output()
         .expect("meshcadet clear-history --help must run");
-    assert!(output.status.success(), "clear-history --help must exit successfully");
+    assert!(
+        output.status.success(),
+        "clear-history --help must exit successfully"
+    );
 }

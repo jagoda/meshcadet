@@ -11,8 +11,8 @@
 //!   Verified at dee3e26a:src/Utils.cpp. We implement ECB as the source dictates.
 
 use aes::{
-    Aes128,
     cipher::{BlockDecrypt, BlockEncrypt, KeyInit},
+    Aes128,
 };
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -113,7 +113,12 @@ pub fn sha256_2(a: &[u8], b: &[u8]) -> [u8; 32] {
 ///
 /// `aes_key`  = first 16 bytes of the shared secret
 /// `hmac_key` = full 32-byte shared secret
-pub fn encrypt_then_mac(aes_key: &[u8; 16], hmac_key: &[u8; 32], plaintext: &[u8], out: &mut [u8]) -> usize {
+pub fn encrypt_then_mac(
+    aes_key: &[u8; 16],
+    hmac_key: &[u8; 32],
+    plaintext: &[u8],
+    out: &mut [u8],
+) -> usize {
     encrypt_then_mac_var(aes_key, hmac_key, plaintext, out)
 }
 
@@ -123,7 +128,12 @@ pub fn encrypt_then_mac(aes_key: &[u8; 16], hmac_key: &[u8; 32], plaintext: &[u8
 /// required for 128-bit group channels, whose secret is 16 bytes: AES key =
 /// secret[0:16], HMAC key = the same 16-byte secret (MeshCore keys the channel
 /// HMAC on `secret_len` bytes). See recon doc §9 / `BaseChatMesh.cpp:896`.
-pub fn encrypt_then_mac_var(aes_key: &[u8; 16], hmac_key: &[u8], plaintext: &[u8], out: &mut [u8]) -> usize {
+pub fn encrypt_then_mac_var(
+    aes_key: &[u8; 16],
+    hmac_key: &[u8],
+    plaintext: &[u8],
+    out: &mut [u8],
+) -> usize {
     let ct_len = ceil_16(plaintext.len());
     debug_assert!(out.len() >= 2 + ct_len, "output buffer too small");
     // Encrypt into out[2..]
@@ -217,8 +227,8 @@ mod tests {
         // PT:  3243f6a8885a308d313198a2e0370734
         // CT:  3925841d02dc09fbdc118597196a0b32
         let key = hex!("2b7e151628aed2a6abf7158809cf4f3c");
-        let pt  = hex!("3243f6a8885a308d313198a2e0370734");
-        let ct  = hex!("3925841d02dc09fbdc118597196a0b32");
+        let pt = hex!("3243f6a8885a308d313198a2e0370734");
+        let ct = hex!("3925841d02dc09fbdc118597196a0b32");
 
         let mut out = [0u8; 16];
         let n = aes128_ecb_encrypt(&key, &pt, &mut out);
@@ -302,6 +312,10 @@ mod tests {
 
         let mut dec_buf = [0u8; 16];
         let result = mac_then_decrypt(&aes_key, &shared_secret, &enc_buf[..n], &mut dec_buf);
-        assert_eq!(result, Err(MacError), "tampered ciphertext must be rejected");
+        assert_eq!(
+            result,
+            Err(MacError),
+            "tampered ciphertext must be rejected"
+        );
     }
 }

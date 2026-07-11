@@ -20,17 +20,17 @@
 //! Each `FRAME_RSP_HISTORY_ENTRY` payload:
 //!   - byte 0:      entry index (0-based, oldest = 0)
 //!   - byte 1:      sender_hash (first byte of Ed25519 pubkey; for both
-//!                  directions this is the *conversation* hash — contact hash
-//!                  for a DM, channel hash for a GrpTxt — matching the
-//!                  per-conversation region key, NOT the device's own hash
-//!                  for outbound entries)
+//!     directions this is the *conversation* hash — contact hash
+//!     for a DM, channel hash for a GrpTxt — matching the
+//!     per-conversation region key, NOT the device's own hash
+//!     for outbound entries)
 //!   - byte 2:      msg_type (0 = DM, 1 = GrpTxt)
 //!   - bytes 3..6:  timestamp (u32 LE)
 //!   - byte 7:      text_len
 //!   - byte 8:      is_ours (0 = received, 1 = sent by this device — mirrors
-//!                  `history_region::FLAG_IS_OURS`; added so `export-history`
-//!                  can distinguish direction, since `sender_hash` alone
-//!                  cannot)
+//!     `history_region::FLAG_IS_OURS`; added so `export-history`
+//!     can distinguish direction, since `sender_hash` alone
+//!     cannot)
 //!   - bytes 9..:   text (text_len bytes, no NUL)
 //!
 //! Maximum payload = 9 + 64 = 73 bytes.
@@ -134,7 +134,13 @@ pub fn decode_entry_blob(blob: &[u8; HISTORY_ENTRY_BLOB_LEN]) -> Option<HistoryE
     let text_len = blob[6];
     let mut text = [0u8; MAX_HISTORY_TEXT_LEN];
     text.copy_from_slice(&blob[7..7 + MAX_HISTORY_TEXT_LEN]);
-    Some(HistoryEntry { sender_hash, msg_type, timestamp, text, text_len })
+    Some(HistoryEntry {
+        sender_hash,
+        msg_type,
+        timestamp,
+        text,
+        text_len,
+    })
 }
 
 // ── Wire export codec ─────────────────────────────────────────────────────────
@@ -203,13 +209,17 @@ pub fn decode_rsp_history_entry(payload: &[u8]) -> Option<(u8, HistoryEntry, boo
     }
     let mut text = [0u8; MAX_HISTORY_TEXT_LEN];
     text[..text_len].copy_from_slice(&payload[9..9 + text_len]);
-    Some((index, HistoryEntry {
-        sender_hash,
-        msg_type,
-        timestamp,
-        text,
-        text_len: text_len as u8,
-    }, is_ours))
+    Some((
+        index,
+        HistoryEntry {
+            sender_hash,
+            msg_type,
+            timestamp,
+            text,
+            text_len: text_len as u8,
+        },
+        is_ours,
+    ))
 }
 
 // ── In-memory ring buffer (for host tests / firmware integration tests) ───────
@@ -406,7 +416,7 @@ mod tests {
     fn rsp_entry_bad_msg_type_returns_none() {
         let mut payload = [0u8; 10];
         payload[2] = 0xFF; // bad msg_type
-        payload[7] = 0;    // text_len = 0
+        payload[7] = 0; // text_len = 0
         assert!(decode_rsp_history_entry(&payload).is_none());
     }
 
@@ -474,7 +484,11 @@ mod tests {
 
         // One more: oldest (ts=0) is overwritten.
         rb.append(&dm(0xFF, MAX_HISTORY_ENTRIES as u32, b"new"));
-        assert_eq!(rb.len(), MAX_HISTORY_ENTRIES, "count must not exceed MAX_HISTORY_ENTRIES");
+        assert_eq!(
+            rb.len(),
+            MAX_HISTORY_ENTRIES,
+            "count must not exceed MAX_HISTORY_ENTRIES"
+        );
 
         // New oldest has timestamp = 1 (the entry with ts=0 was overwritten).
         let oldest = rb.get(0).unwrap();
@@ -507,7 +521,10 @@ mod tests {
         // Oldest timestamp = total - MAX_HISTORY_ENTRIES
         let expected_oldest_ts = (total - MAX_HISTORY_ENTRIES) as u32;
         assert_eq!(rb.get(0).unwrap().timestamp, expected_oldest_ts);
-        assert_eq!(rb.get(MAX_HISTORY_ENTRIES - 1).unwrap().timestamp, (total - 1) as u32);
+        assert_eq!(
+            rb.get(MAX_HISTORY_ENTRIES - 1).unwrap().timestamp,
+            (total - 1) as u32
+        );
     }
 
     /// Acceptance: export intact — encode/decode each entry round-trips.
@@ -537,6 +554,9 @@ mod tests {
         assert_eq!(exported[1].0, 1);
         assert_eq!(exported[1].1.msg_type, HistoryMsgType::GrpTxt);
         assert_eq!(exported[2].0, 2);
-        assert_eq!(&exported[2].1.text[..exported[2].1.text_len as usize], b"third");
+        assert_eq!(
+            &exported[2].1.text[..exported[2].1.text_len as usize],
+            b"third"
+        );
     }
 }

@@ -91,67 +91,67 @@ pub enum PayloadType {
 
 // ── Sub-modules ───────────────────────────────────────────────────────────────
 
+pub mod codec;
+pub mod crypto;
+pub mod dedup;
 pub mod emoji;
-pub mod mention;
-pub mod staging;
+pub mod header;
 pub mod history;
 pub mod history_region;
-pub mod policy;
-pub mod telemetry;
-pub mod codec;
-pub mod dedup;
-pub mod provisioning;
-pub mod crypto;
-pub mod header;
 pub mod identity;
+pub mod mention;
+pub mod policy;
+pub mod provisioning;
+pub mod staging;
+pub mod telemetry;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
-pub use dedup::{packet_dedup_key, packet_payload_view};
 pub use codec::{
-    CHANNEL_NAME_DELIM, CodecError, GrpTxtFields, PathExtra, ReturnPath,
-    channel_hash, channel_hash_var, compute_ack_hash,
-    decode_dm_payload, decode_grp_txt, decode_grp_txt_var, decode_path_return,
-    decode_txt_msg_plaintext,
-    encode_dm_payload, encode_grp_txt, encode_grp_txt_var, encode_txt_msg_plaintext,
-    format_channel_text, parse_channel_text,
+    channel_hash, channel_hash_var, compute_ack_hash, decode_dm_payload, decode_grp_txt,
+    decode_grp_txt_var, decode_path_return, decode_txt_msg_plaintext, encode_dm_payload,
+    encode_grp_txt, encode_grp_txt_var, encode_txt_msg_plaintext, format_channel_text,
+    parse_channel_text, CodecError, GrpTxtFields, PathExtra, ReturnPath, CHANNEL_NAME_DELIM,
 };
 pub use crypto::{
-    MacError, aes128_ecb_decrypt, aes128_ecb_encrypt, ceil_16,
-    encrypt_then_mac, encrypt_then_mac_var, hmac_sha256_2,
-    mac_then_decrypt, mac_then_decrypt_var, sha256, sha256_2,
+    aes128_ecb_decrypt, aes128_ecb_encrypt, ceil_16, encrypt_then_mac, encrypt_then_mac_var,
+    hmac_sha256_2, mac_then_decrypt, mac_then_decrypt_var, sha256, sha256_2, MacError,
 };
-pub use mention::{MentionRun, MentionRuns, MentionTier, split_mentions, wrap_mentions};
+pub use dedup::{packet_dedup_key, packet_payload_view};
 pub use header::{Header, PathLen};
-pub use identity::Identity;
-pub use policy::PolicyFilter;
 pub use history::{
-    HistoryEntry, HistoryMsgType, RingBuffer,
-    HISTORY_BLOB_LEN, HISTORY_ENTRY_BLOB_LEN, MAX_HISTORY_ENTRIES, MAX_HISTORY_TEXT_LEN,
-    MAX_RSP_HISTORY_ENTRY_PAYLOAD,
-    encode_entry_blob, decode_entry_blob,
-    encode_rsp_history_entry, decode_rsp_history_entry,
+    decode_entry_blob, decode_rsp_history_entry, encode_entry_blob, encode_rsp_history_entry,
+    HistoryEntry, HistoryMsgType, RingBuffer, HISTORY_BLOB_LEN, HISTORY_ENTRY_BLOB_LEN,
+    MAX_HISTORY_ENTRIES, MAX_HISTORY_TEXT_LEN, MAX_RSP_HISTORY_ENTRY_PAYLOAD,
 };
 pub use history_region::{
-    HistoryRegion, RegionHeader, RegionError,
-    SECTOR_SIZE, SECTORS_PER_REGION, REGION_SIZE, REGION_HEADER_LEN, SLOTS_PER_SECTOR,
-    MAX_CONVERSATION_REGIONS, FLAG_IS_OURS,
-    encode_slot, decode_slot, find_newest_ours_unacked,
-    encode_region_header, decode_region_header,
-    find_write_head, find_or_claim_region, slot_offset,
-    generation_is_newer,
+    decode_region_header, decode_slot, encode_region_header, encode_slot, find_newest_ours_unacked,
+    find_or_claim_region, find_write_head, generation_is_newer, slot_offset, HistoryRegion,
+    RegionError, RegionHeader, FLAG_IS_OURS, MAX_CONVERSATION_REGIONS, REGION_HEADER_LEN,
+    REGION_SIZE, SECTORS_PER_REGION, SECTOR_SIZE, SLOTS_PER_SECTOR,
 };
+pub use identity::Identity;
+pub use mention::{split_mentions, wrap_mentions, MentionRun, MentionRuns, MentionTier};
+pub use policy::PolicyFilter;
 pub use telemetry::{
-    TelemetryResponse,
-    is_telemetry_request, is_no_fix_response,
-    encode_telemetry_response, encode_no_fix_response,
     decode_telemetry_response,
-    TELEMETRY_REQUEST_MAGIC, MAX_RESPONSE_LEN,
+    decode_telemetry_response_lpp,
+    encode_no_fix_response,
+    encode_telemetry_response,
+    encode_telemetry_response_lpp,
+    is_no_fix_response,
+    is_telemetry_req,
+    is_telemetry_request,
+    parse_telemetry_req,
     // MeshCore-native companion-app telemetry REQ/RESPONSE codec.
-    TelemetryReq, TelemetryResponseLpp,
-    parse_telemetry_req, is_telemetry_req,
-    encode_telemetry_response_lpp, decode_telemetry_response_lpp,
-    REQ_TYPE_GET_TELEMETRY_DATA, TELEM_CHANNEL_SELF, MAX_TELEMETRY_RESPONSE_LEN,
+    TelemetryReq,
+    TelemetryResponse,
+    TelemetryResponseLpp,
+    MAX_RESPONSE_LEN,
+    MAX_TELEMETRY_RESPONSE_LEN,
+    REQ_TYPE_GET_TELEMETRY_DATA,
+    TELEMETRY_REQUEST_MAGIC,
+    TELEM_CHANNEL_SELF,
 };
 
 // ── Top-level tests (smoke + regression) ─────────────────────────────────────
@@ -167,24 +167,32 @@ mod tests {
         assert_eq!(constants::PUB_KEY_SIZE, 32);
         assert_eq!(constants::CIPHER_MAC_SIZE, 2);
         // Wire frame ceiling: 1 + 4 + 1 + 64 + 184 = 254 < 255
-        assert!(1 + 4 + 1 + constants::MAX_PATH_SIZE + constants::MAX_PACKET_PAYLOAD < constants::MAX_TRANS_UNIT);
+        const {
+            assert!(
+                1 + 4 + 1 + constants::MAX_PATH_SIZE + constants::MAX_PACKET_PAYLOAD
+                    < constants::MAX_TRANS_UNIT
+            );
+        }
     }
 
     #[test]
     fn header_field_encoding_roundtrips() {
         // A flood TXT_MSG header byte = (TXT_MSG << 2) | FLOOD = 0x09 (recon §8).
-        let header: u8 = (PayloadType::TxtMsg as u8) << constants::PH_TYPE_SHIFT
-            | (RouteType::Flood as u8);
+        let header: u8 =
+            (PayloadType::TxtMsg as u8) << constants::PH_TYPE_SHIFT | (RouteType::Flood as u8);
         assert_eq!(header, 0x09);
         assert_eq!(header & constants::PH_ROUTE_MASK, RouteType::Flood as u8);
-        assert_eq!((header >> constants::PH_TYPE_SHIFT) & 0x0F, PayloadType::TxtMsg as u8);
+        assert_eq!(
+            (header >> constants::PH_TYPE_SHIFT) & 0x0F,
+            PayloadType::TxtMsg as u8
+        );
     }
 
     #[test]
     fn end_to_end_dm_with_ecdh() {
         // Full E2E: two identities → ECDH → encode DM → decode DM
         let alice = Identity::from_seed([0xAAu8; 32]);
-        let bob   = Identity::from_seed([0xBBu8; 32]);
+        let bob = Identity::from_seed([0xBBu8; 32]);
 
         let shared_a = alice.ecdh_shared_secret(&bob.pubkey);
         let shared_b = bob.ecdh_shared_secret(&alice.pubkey);
@@ -194,7 +202,13 @@ mod tests {
         let pt_len = encode_txt_msg_plaintext(0xDEAD_BEEF, 0, 0, b"hi bob", &mut pt_buf);
 
         let mut dm_buf = [0u8; 256];
-        let dm_len = encode_dm_payload(&shared_a, bob.pub_hash(), alice.pub_hash(), &pt_buf[..pt_len], &mut dm_buf);
+        let dm_len = encode_dm_payload(
+            &shared_a,
+            bob.pub_hash(),
+            alice.pub_hash(),
+            &pt_buf[..pt_len],
+            &mut dm_buf,
+        );
 
         let mut dec_buf = [0u8; 256];
         let (dest, src, _) = decode_dm_payload(&shared_b, &dm_buf[..dm_len], &mut dec_buf).unwrap();

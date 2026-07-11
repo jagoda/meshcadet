@@ -15,7 +15,10 @@ fn main() -> ExitCode {
         println!("xtask verify-glyphs: OK — every (codepoint, size) used in firmware/src/ui/screens/*.rs is covered.");
         ExitCode::SUCCESS
     } else {
-        eprintln!("xtask verify-glyphs: FAILED — {} violation(s):", violations.len());
+        eprintln!(
+            "xtask verify-glyphs: FAILED — {} violation(s):",
+            violations.len()
+        );
         for v in &violations {
             eprintln!("  - {v}");
         }

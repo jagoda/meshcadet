@@ -27,8 +27,7 @@ fn comet_sweep_flushes_a_narrow_band_not_the_full_window() {
     h.request_redraw();
     let settle = h.frame().expect("settle frame must paint");
     assert_eq!(
-        settle.lines_flushed,
-        HEIGHT as usize,
+        settle.lines_flushed, HEIGHT as usize,
         "the first (navigation) frame is a full-window paint by design"
     );
     println!(

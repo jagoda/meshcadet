@@ -10,25 +10,55 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 
+use protocol::history::{decode_rsp_history_entry, HistoryEntry, MAX_RSP_HISTORY_ENTRY_PAYLOAD};
 use protocol::provisioning::{
-    ProvError, RspChannelPayload, RspContactPayload, RspStatusPayload,
-    // frame synchronisation
-    PROV_MAGIC,
-    // frame-type constants
-    FRAME_ADD_CHANNEL, FRAME_ADD_CONTACT, FRAME_CLEAR_HISTORY, FRAME_COMMIT_PROVISIONING,
-    FRAME_DEL_CHANNEL, FRAME_DEL_CONTACT, FRAME_EXPORT_HISTORY, FRAME_QUERY_CHANNELS,
-    FRAME_QUERY_CONTACTS, FRAME_QUERY_STATUS, FRAME_RSP_CHANNEL, FRAME_RSP_CHANNELS_DONE,
-    FRAME_RSP_CONTACT, FRAME_RSP_CONTACTS_DONE, FRAME_RSP_ERROR, FRAME_RSP_HISTORY_DONE,
-    FRAME_RSP_HISTORY_ENTRY, FRAME_RSP_IDENTITY, FRAME_RSP_OK, FRAME_RSP_STATUS,
-    FRAME_SET_DEVICE_NAME, FRAME_SET_NOTIF_DEFAULTS, FRAME_SET_PIN,
     // decode helpers
-    decode_frame, decode_rsp_channel, decode_rsp_contact, decode_rsp_error, decode_rsp_identity,
+    decode_frame,
+    decode_rsp_channel,
+    decode_rsp_contact,
+    decode_rsp_error,
+    decode_rsp_identity,
     decode_rsp_status,
     // encode helpers
-    encode_add_channel, encode_add_contact, encode_del_channel, encode_del_contact,
-    encode_frame, encode_set_device_name, encode_set_notif_defaults, encode_set_pin,
+    encode_add_channel,
+    encode_add_contact,
+    encode_del_channel,
+    encode_del_contact,
+    encode_frame,
+    encode_set_device_name,
+    encode_set_notif_defaults,
+    encode_set_pin,
+    ProvError,
+    RspChannelPayload,
+    RspContactPayload,
+    RspStatusPayload,
+    // frame-type constants
+    FRAME_ADD_CHANNEL,
+    FRAME_ADD_CONTACT,
+    FRAME_CLEAR_HISTORY,
+    FRAME_COMMIT_PROVISIONING,
+    FRAME_DEL_CHANNEL,
+    FRAME_DEL_CONTACT,
+    FRAME_EXPORT_HISTORY,
+    FRAME_QUERY_CHANNELS,
+    FRAME_QUERY_CONTACTS,
+    FRAME_QUERY_STATUS,
+    FRAME_RSP_CHANNEL,
+    FRAME_RSP_CHANNELS_DONE,
+    FRAME_RSP_CONTACT,
+    FRAME_RSP_CONTACTS_DONE,
+    FRAME_RSP_ERROR,
+    FRAME_RSP_HISTORY_DONE,
+    FRAME_RSP_HISTORY_ENTRY,
+    FRAME_RSP_IDENTITY,
+    FRAME_RSP_OK,
+    FRAME_RSP_STATUS,
+    FRAME_SET_DEVICE_NAME,
+    FRAME_SET_NOTIF_DEFAULTS,
+    FRAME_SET_PIN,
+    // frame synchronisation
+    PROV_MAGIC,
 };
-use protocol::history::{HistoryEntry, MAX_RSP_HISTORY_ENTRY_PAYLOAD, decode_rsp_history_entry};
 
 use crate::transport::Transport;
 
@@ -272,8 +302,8 @@ impl<T: Transport> Session<T> {
             FRAME_RSP_ERROR => {
                 let e = decode_rsp_error(&rsp_payload)
                     .map_err(|de| anyhow::anyhow!("decode RSP_ERROR payload: {:?}", de))?;
-                let msg = std::str::from_utf8(&e.msg[..e.msg_len as usize])
-                    .unwrap_or("<invalid utf-8>");
+                let msg =
+                    std::str::from_utf8(&e.msg[..e.msg_len as usize]).unwrap_or("<invalid utf-8>");
                 anyhow::bail!("device returned error {}: {}", e.error_code, msg)
             }
             _ => anyhow::bail!(
@@ -301,8 +331,8 @@ impl<T: Transport> Session<T> {
             FRAME_RSP_ERROR => {
                 let e = decode_rsp_error(&payload)
                     .map_err(|de| anyhow::anyhow!("decode RSP_ERROR payload: {:?}", de))?;
-                let msg = std::str::from_utf8(&e.msg[..e.msg_len as usize])
-                    .unwrap_or("<invalid utf-8>");
+                let msg =
+                    std::str::from_utf8(&e.msg[..e.msg_len as usize]).unwrap_or("<invalid utf-8>");
                 anyhow::bail!("device error {}: {}", e.error_code, msg)
             }
             _ => anyhow::bail!("unexpected response 0x{:02X} to QUERY_STATUS", ft),
@@ -311,8 +341,9 @@ impl<T: Transport> Session<T> {
         // after RSP_STATUS.  Leaving it in the buffer would desync the next command.
         // Decode it (rather than discard) to capture the persisted device name —
         // `last_device_name()` exposes it after this call.
-        let (ft2, id_payload) = self.recv_frame()
-            .map_err(|e| anyhow::anyhow!("timeout waiting for RSP_IDENTITY after RSP_STATUS: {}", e))?;
+        let (ft2, id_payload) = self.recv_frame().map_err(|e| {
+            anyhow::anyhow!("timeout waiting for RSP_IDENTITY after RSP_STATUS: {}", e)
+        })?;
         if ft2 != FRAME_RSP_IDENTITY {
             anyhow::bail!(
                 "expected RSP_IDENTITY (0x{:02X}) after RSP_STATUS; got 0x{:02X}",
@@ -350,8 +381,7 @@ impl<T: Transport> Session<T> {
     /// (pre-commit) staging config — pair it with `add-contact` / `del-contact`
     /// / `status` to verify the configured set before `commit`.
     pub fn list_contacts(&mut self) -> anyhow::Result<Vec<RspContactPayload>> {
-        let (mut ft, mut payload) =
-            self.send_recv_with_retry(FRAME_QUERY_CONTACTS, &[])?;
+        let (mut ft, mut payload) = self.send_recv_with_retry(FRAME_QUERY_CONTACTS, &[])?;
         let mut entries: Vec<RspContactPayload> = Vec::new();
         loop {
             match ft {
@@ -369,7 +399,8 @@ impl<T: Transport> Session<T> {
                     anyhow::bail!("device error {}: {}", e.error_code, msg)
                 }
                 other => anyhow::bail!(
-                    "unexpected frame 0x{:02X} during contact enumeration", other
+                    "unexpected frame 0x{:02X} during contact enumeration",
+                    other
                 ),
             }
             (ft, payload) = self.recv_frame()?;
@@ -383,8 +414,7 @@ impl<T: Transport> Session<T> {
     /// `FRAME_RSP_CHANNEL` frames terminated by `FRAME_RSP_CHANNELS_DONE`.
     /// Returns the entries in device-index order.
     pub fn list_channels(&mut self) -> anyhow::Result<Vec<RspChannelPayload>> {
-        let (mut ft, mut payload) =
-            self.send_recv_with_retry(FRAME_QUERY_CHANNELS, &[])?;
+        let (mut ft, mut payload) = self.send_recv_with_retry(FRAME_QUERY_CHANNELS, &[])?;
         let mut entries: Vec<RspChannelPayload> = Vec::new();
         loop {
             match ft {
@@ -402,7 +432,8 @@ impl<T: Transport> Session<T> {
                     anyhow::bail!("device error {}: {}", e.error_code, msg)
                 }
                 other => anyhow::bail!(
-                    "unexpected frame 0x{:02X} during channel enumeration", other
+                    "unexpected frame 0x{:02X} during channel enumeration",
+                    other
                 ),
             }
             (ft, payload) = self.recv_frame()?;
@@ -536,8 +567,7 @@ impl<T: Transport> Session<T> {
         // healed before the streaming response begins.  The first frame from
         // the device is HISTORY_ENTRY, HISTORY_DONE, or RSP_ERROR — all
         // handled inside the loop below.
-        let (mut ft, mut payload) =
-            self.send_recv_with_retry(FRAME_EXPORT_HISTORY, &[])?;
+        let (mut ft, mut payload) = self.send_recv_with_retry(FRAME_EXPORT_HISTORY, &[])?;
 
         let mut entries: Vec<(HistoryEntry, bool)> = Vec::new();
         let mut stray_frames = 0u32;
@@ -566,8 +596,13 @@ impl<T: Transport> Session<T> {
                         .unwrap_or("<invalid utf-8>");
                     anyhow::bail!("device error {}: {}", e.error_code, msg)
                 }
-                FRAME_RSP_STATUS | FRAME_RSP_IDENTITY | FRAME_RSP_OK | FRAME_RSP_CONTACT
-                | FRAME_RSP_CONTACTS_DONE | FRAME_RSP_CHANNEL | FRAME_RSP_CHANNELS_DONE => {
+                FRAME_RSP_STATUS
+                | FRAME_RSP_IDENTITY
+                | FRAME_RSP_OK
+                | FRAME_RSP_CONTACT
+                | FRAME_RSP_CONTACTS_DONE
+                | FRAME_RSP_CHANNEL
+                | FRAME_RSP_CHANNELS_DONE => {
                     stray_frames += 1;
                     if stray_frames > MAX_STRAY_FRAMES {
                         anyhow::bail!(
@@ -584,9 +619,7 @@ impl<T: Transport> Session<T> {
                     );
                 }
                 other => {
-                    anyhow::bail!(
-                        "unexpected frame 0x{:02X} during history export", other
-                    );
+                    anyhow::bail!("unexpected frame 0x{:02X} during history export", other);
                 }
             }
             // Receive the next streaming frame (no retry — the device is already

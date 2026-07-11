@@ -21,7 +21,11 @@ fn quantize565(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
     let r5 = r >> 3;
     let g6 = g >> 2;
     let b5 = b >> 3;
-    (((r5 << 3) | (r5 >> 2)), ((g6 << 2) | (g6 >> 4)), ((b5 << 3) | (b5 >> 2)))
+    (
+        ((r5 << 3) | (r5 >> 2)),
+        ((g6 << 2) | (g6 >> 4)),
+        ((b5 << 3) | (b5 >> 2)),
+    )
 }
 
 fn at(fb: &[slint::platform::software_renderer::Rgb565Pixel], x: u32, y: u32) -> (u8, u8, u8) {
@@ -59,29 +63,64 @@ fn motif_library_renders_every_asset_and_motion_helper() {
     assert_eq!(fb0.len(), (WIDTH * HEIGHT) as usize);
 
     // Background is visible somewhere nothing else covers.
-    assert_eq!(at(&fb0, WIDTH - 4, 4), space_deep, "space-deep backdrop missing");
+    assert_eq!(
+        at(&fb0, WIDTH - 4, 4),
+        space_deep,
+        "space-deep backdrop missing"
+    );
 
     // Starfield header strip (0,0)-(320,40).
-    assert!(region_has_non_bg(&fb0, 0, 320, 0, 40, space_deep), "Starfield region is blank");
+    assert!(
+        region_has_non_bg(&fb0, 0, 320, 0, 40, space_deep),
+        "Starfield region is blank"
+    );
 
     // RingedPlanetCorner at (8,44), 40x40 — same offset technique M1's own
     // test uses (near-but-not-exact center, avoiding the terminator overlay).
-    assert_ne!(at(&fb0, 8 + 20, 44 + 20), space_deep, "RingedPlanetCorner did not paint");
+    assert_ne!(
+        at(&fb0, 8 + 20, 44 + 20),
+        space_deep,
+        "RingedPlanetCorner did not paint"
+    );
 
     // CrescentMoon at (60,50), 28x28 — a point inside the un-erased sliver.
-    assert_ne!(at(&fb0, 60 + 4, 50 + 14), space_deep, "CrescentMoon did not paint");
+    assert_ne!(
+        at(&fb0, 60 + 4, 50 + 14),
+        space_deep,
+        "CrescentMoon did not paint"
+    );
 
     // Static Comet at (104,58): opaque star-gold head, unmodified by the
     // small glint circle at this exact point.
-    assert_eq!(at(&fb0, 104 + 21, 58 + 7), star_gold, "static Comet head is not star-gold");
+    assert_eq!(
+        at(&fb0, 104 + 21, 58 + 7),
+        star_gold,
+        "static Comet head is not star-gold"
+    );
 
     // Static Rocket at (148,44): opaque star-white window, drawn last.
-    assert_eq!(at(&fb0, 148 + 10, 44 + 11), star_white, "static Rocket window is not star-white");
+    assert_eq!(
+        at(&fb0, 148 + 10, 44 + 11),
+        star_white,
+        "static Rocket window is not star-white"
+    );
 
     // Mascot poses: visor color at each pose's own helmet-center offset.
-    assert_eq!(at(&fb0, 4 + 32, 92 + 25), brand_signal, "CadetIdle visor is not brand-signal");
-    assert_eq!(at(&fb0, 72 + 32, 92 + 25), brand_signal, "CadetWave visor is not brand-signal");
-    assert_eq!(at(&fb0, 140 + 32, 92 + 25), brand_signal, "CadetThumbsUp visor is not brand-signal");
+    assert_eq!(
+        at(&fb0, 4 + 32, 92 + 25),
+        brand_signal,
+        "CadetIdle visor is not brand-signal"
+    );
+    assert_eq!(
+        at(&fb0, 72 + 32, 92 + 25),
+        brand_signal,
+        "CadetWave visor is not brand-signal"
+    );
+    assert_eq!(
+        at(&fb0, 140 + 32, 92 + 25),
+        brand_signal,
+        "CadetThumbsUp visor is not brand-signal"
+    );
     // CadetSleeping: visor is DIMMED (nebula-violet-deep, not brand-signal) —
     // the pose-specific differentiator.
     assert_eq!(
@@ -89,7 +128,11 @@ fn motif_library_renders_every_asset_and_motion_helper() {
         nebula_violet_deep,
         "CadetSleeping visor should be dimmed nebula-violet-deep, not lit brand-signal"
     );
-    assert_eq!(at(&fb0, 4 + 32, 160 + 41), brand_signal, "CadetPeeking visor is not brand-signal");
+    assert_eq!(
+        at(&fb0, 4 + 32, 160 + 41),
+        brand_signal,
+        "CadetPeeking visor is not brand-signal"
+    );
 
     // RocketOnSend REST state: rocket visible at its home position (288,160).
     assert_eq!(
@@ -101,17 +144,28 @@ fn motif_library_renders_every_asset_and_motion_helper() {
     // CometOnNotify REST state: parked fully off-canvas — no comet-teal or
     // star-gold pixel anywhere in its header band.
     let comet_band_clear_at_rest = !region_has_non_bg(&fb0, 0, 320, 226, 240, space_deep);
-    assert!(comet_band_clear_at_rest, "CometOnNotify should be off-canvas (play: false)");
+    assert!(
+        comet_band_clear_at_rest,
+        "CometOnNotify should be off-canvas (play: false)"
+    );
 
     // ── t≈1000ms: mount-time one-shots (MascotBob 450ms, Twinkle 900ms) settle ──
     std::thread::sleep(Duration::from_millis(1000));
     let fb1 = frame.render();
 
     // MascotBob at (100,160), default cadet_idle pose, settled (bob_y: 0px).
-    assert_eq!(at(&fb1, 100 + 32, 160 + 25), brand_signal, "MascotBob (settled) visor is not brand-signal");
+    assert_eq!(
+        at(&fb1, 100 + 32, 160 + 25),
+        brand_signal,
+        "MascotBob (settled) visor is not brand-signal"
+    );
 
     // Twinkle at (280,170), 3x3, settled to full star-gold opacity.
-    assert_ne!(at(&fb1, 280 + 1, 170 + 1), space_deep, "Twinkle (settled) did not paint");
+    assert_ne!(
+        at(&fb1, 280 + 1, 170 + 1),
+        space_deep,
+        "Twinkle (settled) did not paint"
+    );
 
     // ── Trigger the two retriggerable one-shots ────────────────────────────
     frame.set_send_trigger(true);
@@ -122,7 +176,10 @@ fn motif_library_renders_every_asset_and_motion_helper() {
     std::thread::sleep(Duration::from_millis(300));
     let fb2 = frame.render();
     let comet_visible_mid_flight = region_has_non_bg(&fb2, 0, 320, 226, 240, space_deep);
-    assert!(comet_visible_mid_flight, "CometOnNotify did not become visible after play: true");
+    assert!(
+        comet_visible_mid_flight,
+        "CometOnNotify did not become visible after play: true"
+    );
 
     // t≈700ms after trigger: both RocketOnSend (400ms) and CometOnNotify
     // (600ms) have fully settled to their "fired" end states.
