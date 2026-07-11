@@ -54,10 +54,48 @@ fn is_up_to_date(output: &Path, inputs: &[&Path]) -> bool {
 /// re-runs it whenever any package file changes, so this value tracks the
 /// actual flashed app on every incremental build — including uncommitted edits,
 /// which surface as the `-dirty` suffix.
+///
+/// `MESHCADET_RELEASE_VERSION`, if set to a non-empty value, is emitted
+/// verbatim instead of the git-derived string. This is the seam the release
+/// pipeline (release.yml) uses to stamp a real release version into the
+/// binary — CI sets the env var before invoking `cargo build`, local dev
+/// builds never set it, so this path is inert for `cargo run`.
+///
+/// The dev-build (non-override) path uses `git rev-parse --short HEAD`
+/// rather than `git describe --tags`: the latter switches from a bare short
+/// SHA to `vX.Y.Z-N-gSHA` the moment the repo grows its first tag, which
+/// would silently change the boot string that `cargo run` developers rely
+/// on. `rev-parse --short HEAD` stays a bare short SHA regardless of tags,
+/// preserving today's boot string byte-for-byte.
 fn emit_build_version() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+
+    if let Ok(release_version) = env::var("MESHCADET_RELEASE_VERSION") {
+        if !release_version.is_empty() {
+            // `cargo:rustc-env=...` is a single-line directive Cargo parses off
+            // this script's stdout — an embedded newline in the override would
+            // corrupt the directive stream and silently break the build. Fail
+            // loudly instead: a newline here means the release pipeline itself
+            // is passing a malformed value, which is a bug worth surfacing, not
+            // masking.
+            assert!(
+                !release_version.contains(['\n', '\r']),
+                "MESHCADET_RELEASE_VERSION must not contain newlines, got {release_version:?}"
+            );
+            println!("cargo:rustc-env=MESHCADET_BUILD_VERSION={release_version}");
+            return;
+        }
+    }
+
+    let dirty = Command::new("git")
+        .args(["diff", "--quiet", "HEAD"])
+        .current_dir(&manifest_dir)
+        .status()
+        .map(|s| !s.success())
+        .unwrap_or(false);
+
     let version = Command::new("git")
-        .args(["describe", "--always", "--dirty", "--tags"])
+        .args(["rev-parse", "--short", "HEAD"])
         .current_dir(&manifest_dir)
         .output()
         .ok()
@@ -65,6 +103,7 @@ fn emit_build_version() {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+        .map(|sha| if dirty { format!("{sha}-dirty") } else { sha })
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=MESHCADET_BUILD_VERSION={version}");
 }
