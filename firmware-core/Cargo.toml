@@ -1,0 +1,20 @@
+[package]
+name = "firmware-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MeshCadet firmware logic decoupled from esp-idf/Slint — host-testable via `cargo test --workspace`; also a `path` dep of the detached `firmware/` crate for the xtensa target."
+
+[features]
+default = []
+# Mirrors `firmware`'s own `diagnostics` feature (`firmware/Cargo.toml`) —
+# gates the tiny pure helpers a `--features diagnostics` firmware build calls
+# (e.g. `gps::hex_dump_tail`) so they compile out of a default build here too.
+# `firmware/Cargo.toml`'s `diagnostics` feature forwards to this one
+# (`firmware-core/diagnostics`) so a single `--features diagnostics` firmware
+# build enables both.
+diagnostics = []
+
+[dependencies]
+protocol.workspace = true

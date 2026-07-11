@@ -1676,6 +1676,7 @@ dependencies = [
  "embuild",
  "esp-idf-hal",
  "esp-idf-svc",
+ "firmware-core",
  "i-slint-core",
  "log",
  "mipidsi",
@@ -1683,6 +1684,13 @@ dependencies = [
  "rand 0.8.6",
  "slint",
  "slint-build",
+]
+
+[[package]]
+name = "firmware-core"
+version = "0.1.0"
+dependencies = [
+ "protocol",
 ]
 
 [[package]]

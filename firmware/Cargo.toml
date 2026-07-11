@@ -45,11 +45,20 @@ hil = []
 # independent of the `hil` build role above.
 # Use: cargo build --features diagnostics  (or cargo run --features diagnostics)
 # Future on-device probes (counters, hex dumps, timing aids) land here.
-diagnostics = []
+# Forwards to `firmware-core`'s same-named feature (below) so a single
+# `--features diagnostics` here also compiles in that crate's diagnostics-only
+# helpers (e.g. `gps::hex_dump_tail`).
+diagnostics = ["firmware-core/diagnostics"]
 
 [dependencies]
 # Shared wire protocol (no_std-compatible; also builds on the esp target)
 protocol = { path = "../protocol" }
+
+# Decoupled, host-testable half of firmware logic (pure Rust, `std`, no
+# `esp-idf-*`/Slint) — a root-workspace member ALSO consumed here as a `path`
+# dependency across the detached-workspace boundary, same pattern as
+# `protocol` above. See `docs/adr/0005-firmware-core-extraction.md`.
+firmware-core = { path = "../firmware-core" }
 
 # esp-idf std stack — enabled for M1 radio+identity bring-up.
 # Build prerequisites: run `espup install` and `. ~/export-esp.sh`, then
