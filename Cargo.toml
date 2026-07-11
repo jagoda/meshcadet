@@ -47,6 +47,15 @@ edition = "2021"
 # royalty/registration agreement required.
 license = "GPL-3.0-only"
 publish = false
+# ONE project-wide version for every crate in this workspace (see
+# docs/adr/0004-release-architecture.md). release-plz manages this field —
+# it opens a "release vX.Y.Z" PR that bumps it here and every member below
+# inherits it via `version.workspace = true`. The DETACHED `firmware`
+# workspace (see firmware/Cargo.toml's own `[workspace]` doc) cannot be
+# reached by workspace inheritance across the boundary, so its version is
+# a separate hardcoded literal kept in lockstep by CI's version-drift guard
+# (see .github/workflows/ci.yml's `version-drift-guard` job).
+version = "0.1.0"
 
 [workspace.dependencies]
 protocol = { path = "protocol" }

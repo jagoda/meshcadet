@@ -1,6 +1,13 @@
 [package]
 name = "firmware"
-version = "0.0.0"
+# DETACHED from the root workspace (see the `[workspace]` doc a few lines
+# down), so this crate CANNOT use `version.workspace = true` — there is no
+# workspace root to inherit from here. This version is a hardcoded literal
+# kept in lockstep with the root `[workspace.package].version` (Cargo.toml)
+# by CI's version-drift guard (.github/workflows/ci.yml,
+# `version-drift-guard` job) since release-plz cannot cross the workspace
+# boundary to bump it directly. See docs/adr/0004-release-architecture.md.
+version = "0.1.0"
 edition = "2021"
 # GPLv3 — this crate is the one that forces the project-wide license choice:
 # it reaches into `i-slint-core` internals (RendererSealed et al, see the

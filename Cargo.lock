@@ -1719,7 +1719,7 @@ dependencies = [
 
 [[package]]
 name = "host"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3497,7 +3497,7 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "aes",
  "curve25519-dalek",
@@ -4707,7 +4707,7 @@ dependencies = [
 
 [[package]]
 name = "ui_perf"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "protocol",
  "slint",
@@ -4716,7 +4716,7 @@ dependencies = [
 
 [[package]]
 name = "ui_sim"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "image",
  "slint",
@@ -5521,7 +5521,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "regex",
 ]
