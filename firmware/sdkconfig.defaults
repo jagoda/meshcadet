@@ -143,3 +143,24 @@ CONFIG_ESP_BROWNOUT_DET=y
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ── Reproducible builds (release pipeline, docs/release-reproducibility.md) ─────
+#
+# CONFIG_APP_REPRODUCIBLE_BUILD=y (components/esp_app_format/Kconfig, esp-idf
+# v5.2.2) strips the compile date/time stamp from the esp_app_desc structure
+# (APP_COMPILE_TIME_DATE flips off automatically, see that option's `depends on
+# !APP_REPRODUCIBLE_BUILD`) and auto-selects CONFIG_COMPILER_HIDE_PATHS_MACROS,
+# which passes `-fmacro-prefix-map`/`-fdebug-prefix-map` to the C components so
+# absolute build-machine paths do not leak into `__FILE__`/debug info there.
+#
+# This setting applies to ALL build configs (hil, diagnostics, default) — it is
+# a Kconfig-level (esp-idf C toolchain) lever, harmless to leave on for every
+# local dev build too (it only removes information, never changes behavior).
+# It is NOT sufficient on its own for a byte-reproducible release image: the
+# Rust side needs its own `--remap-path-prefix` (RUSTFLAGS, set by
+# .github/workflows/release.yml) since this Kconfig option only reaches
+# esp-idf's own C components, not `rustc`. See
+# docs/release-reproducibility.md for the full recipe and its remaining
+# non-obvious hazard (build.rs's system FreeType/DejaVu emoji-font
+# generation, addressed by the pinned release container, not by this option).
+CONFIG_APP_REPRODUCIBLE_BUILD=y

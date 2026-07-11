@@ -25,3 +25,8 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Reproducible builds (release pipeline). Strips the compile date/time stamp
+# and auto-selects COMPILER_HIDE_PATHS_MACROS; see firmware/sdkconfig.defaults
+# and docs/release-reproducibility.md for the full rationale + recipe.
+CONFIG_APP_REPRODUCIBLE_BUILD=y
