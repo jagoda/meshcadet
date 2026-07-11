@@ -1,0 +1,14 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MeshCadet host-side glyph-coverage verification harness."
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]
+regex = "1"

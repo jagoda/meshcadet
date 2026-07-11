@@ -1,0 +1,33 @@
+[package]
+name = "protocol"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MeshCore v1.15 wire protocol (framing, path encoding, crypto, codec) shared by MeshCadet firmware and the host CLI."
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+# AES-128 block cipher (no_std, pure computation)
+aes = { version = "0.8", default-features = false }
+# SHA-256 / SHA-512 (no_std, pure computation)
+sha2 = { version = "0.10", default-features = false }
+# HMAC-SHA256 (no_std, pure computation)
+hmac = { version = "0.12", default-features = false }
+# Ed25519 key generation, signing — hazmat for ExpandedSecretKey
+ed25519-dalek = { version = "2", default-features = false, features = ["hazmat", "rand_core", "zeroize"] }
+# X25519 Diffie-Hellman
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
+# Edwards25519 point→Montgomery conversion (Ed25519 pub key → X25519 pub key)
+# alloc+precomputed-tables for correctness + reasonable speed; firmware has an allocator
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
+# RNG trait for key generation (caller-supplied RNG; no concrete RNG here)
+rand_core = { version = "0.6", default-features = false }
+
+[dev-dependencies]
+# Concrete RNG for tests
+rand = "0.8"
+# hex literal convenience in test vectors
+hex-literal = "0.4"

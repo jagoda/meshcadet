@@ -1,0 +1,92 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// theme.slint — MeshCadet "Mission Control" theme token surface.
+//
+// SINGLE SOURCE OF TRUTH for the color palette and type scale shared by
+// every screen (`firmware/src/ui/screens/*.rs`). Each screen's
+// `slint::slint!{}` macro imports this global directly:
+//
+//     import { Theme } from "../theme.slint";
+//     ... color: Theme.text-primary; font-size: Theme.size-body; ...
+//
+// This works because the `slint::slint!{}` proc macro resolves relative
+// `import` paths against the invoking `.rs` file's own directory (or the
+// crate's `CARGO_MANIFEST_DIR` as a compatibility fallback) — see
+// `slint-macros`' own doc comment on the `slint!` macro. No slint-build /
+// `.slint`-file compilation step is needed for this to work; each screen's
+// inline macro just gains one `import` line.
+//
+// # Two invariants this file MUST respect
+//
+// 1. **Color palette** — collapse the app's ad-hoc hex literals into one
+//    named, non-redundant set.
+//    `ok`/`warn`/`alert` are the Slint-side twins of the RGB565 constants in
+//    `ui/theme.rs` — see that file's doc for why the "twin" relationship is
+//    presently dormant (no consumer since the border-flash notification
+//    channel was removed) but still the single semantic vocabulary any
+//    future non-Slint drawing path (or a reintroduced visual notification)
+//    should reuse rather than inventing new colors.
+//
+// 2. **Type scale** — every `size-*`/`icon-*` value below MUST be a member of
+//    `PIXEL_SIZES` in `firmware/gen_emoji_font.c` (that file's own
+//    SYNC INVARIANT comment). The Slint software renderer snaps an
+//    unregistered size to the nearest registered one and rescales the glyph
+//    metrics — the "garbled text" defect (see gen_emoji_font.c and the
+//    now-fixed `gps_status.rs` 12px bug). This file's twelve `size-*`/
+//    `icon-*` properties are a 1:1 naming of the twelve current
+//    `PIXEL_SIZES` entries `{8,9,10,11,13,14,15,16,18,20,22,28}` so every
+//    screen can reference a *name* instead of a bare literal without ever
+//    needing to extend the pixel-size table. If a screen ever needs a size
+//    outside this named set, that is a contract amendment: extend both this
+//    file AND `PIXEL_SIZES` (and `EMOJI_SIZES` if the new size can carry an
+//    emoji) in the SAME change — never silently reuse an unregistered
+//    literal.
+export global Theme {
+    // ── Colors — "Mission Control" dark-space + cyan radio signal ──────────
+    out property <color> bg-space: #0d1117;             // window background (universal)
+    out property <color> surface: #161e28;               // raised panels / list rows / header bars
+    out property <color> surface-raised: #1e2a38;         // selected rows, separators, headers
+    out property <color> surface-alt: #2a3442;            // dividers, input wells, toggle tracks
+    out property <color> brand-signal: #00b4ff;           // primary cyan accent, wordmark, active icon
+    out property <color> brand-signal-bright: #33c4ff;    // hover/active variant of brand-signal
+    out property <color> text-primary: #e8ecf0;           // body text
+    out property <color> text-secondary: #a0a8b0;         // subtitles (folds #8090a0/#7a8896/#607080)
+    out property <color> text-muted: #606870;             // timestamps, hints (folds #404850)
+    out property <color> select: #1e3050;                 // selection / hover highlight
+    // Semantic colors — Slint-side twins of the RGB565 constants in
+    // `ui/theme.rs` (see that file's doc for the historical border-flash
+    // link and why it's currently dormant).
+    out property <color> ok: #00ff00;     // success / positive state
+    out property <color> warn: #ffff00;   // caution / needs-attention state
+    out property <color> alert: #ff0000;  // error / failure state
+
+    // ── Widened space palette ──────────────────────────────────────────────
+    // ADDITIVE ONLY — every property above this block is UNCHANGED. These 9
+    // tokens exist purely so screens can opt into the literal-outer-space
+    // TIER B look (baked celestial scenery + the "Cadet" mascot) one at a
+    // time; a screen that never references them renders byte-for-byte as
+    // before. See the design plan's "Widened palette — new tokens" table
+    // for the full rationale per token.
+    out property <color> space-deep: #070a12;             // deeper-than-bg backdrop for baked starfield scenery
+    out property <color> nebula-violet: #7c5cff;           // secondary brand accent, nebula glow, own-message bubble tint
+    out property <color> nebula-violet-deep: #3a2a6b;      // nebula wash fill / deep-space gradient stop
+    out property <color> planet-warm: #e08a4c;             // warm planet body (Mars/Jupiter tone)
+    out property <color> planet-warm-deep: #a85a2c;        // planet terminator / shadow
+    out property <color> moon-silver: #c8d0e0;             // moon body, muted celestial elements
+    out property <color> star-gold: #ffd66b;               // stars, comet head, highlight/affordance accent
+    out property <color> star-white: #f4f7ff;              // bright stars, sparkle points
+    out property <color> comet-teal: #5cf0d0;              // comet tail / send-motion accent (distinct from brand-signal cyan)
+
+    // ── Type scale — every value is a member of PIXEL_SIZES, see above ─────
+    out property <length> size-badge: 8px;      // unread-count badges, tiny numerics
+    out property <length> size-caption: 9px;    // timestamps, hint text
+    out property <length> size-meta: 10px;      // secondary numerics/labels
+    out property <length> size-preview: 11px;   // list-preview text, splash version string
+    out property <length> size-body: 13px;      // message/body text, tab labels
+    out property <length> size-body-lg: 14px;   // headers, contact/channel names, row labels
+    out property <length> size-subtitle: 15px;  // status values, subtitles
+    out property <length> size-title: 16px;     // section titles, contact-initial column
+    out property <length> icon-sm: 18px;        // small icon glyphs (emoji-picker toggle)
+    out property <length> icon-lg: 20px;        // large icon glyphs (PIN lock, emoji grid)
+    out property <length> size-display: 22px;   // wordmark, header chevrons
+    out property <length> size-hero: 28px;      // unprovisioned hero icon
+}

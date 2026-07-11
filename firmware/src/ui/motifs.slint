@@ -1,0 +1,290 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// motifs.slint — shared celestial-asset + one-shot motion-helper library.
+//
+// This is the SHARED-ASSET CONTRACT
+// the 7 fan-out screens (`splash`, `contact_list`, `message_view`,
+// `compose`, `pin_entry`, `admin_menu`, `gps_status`) `--base` and import
+// from — same mechanism `ui/theme.slint`'s `Theme` global already
+// establishes: a screen's `slint::slint!{}` macro adds one `import` line
+// (the proc macro resolves relative `import` paths against the invoking
+// `.rs` file's own directory), e.g.:
+//
+//     import { Theme } from "../theme.slint";
+//     import { Starfield, CadetPeeking, MascotBob } from "../motifs.slint";
+//
+// `unprovisioned.rs` (M1's pilot screen) does NOT import this file — it
+// ships its own inline celestial-scenery + mascot-bob markup, authored
+// before this shared module existed (see that file's module doc). It is
+// intentionally left as-is: the design plan excludes `unprovisioned` from
+// the 7-screen fan-out ("already themed"), so retrofitting it here would be
+// an unscoped, non-additive touch to a file already
+// verified against a specific landed commit. Nothing in this file is
+// consumed in production yet — `ui_sim` (see `ui_sim/src/motif_library.rs`)
+// is the host-sim proof that every component below actually
+// compiles and paints correct pixels, standing in for the per-screen
+// consumers that land in Phases 4-10.
+//
+// # Two categories of exports
+//
+// 1. **Static celestial/mascot wrappers** — thin `Image`-inheriting
+//    components, one `@image-url(...)` binding each, PNG sourced from
+//    `firmware/assets/space/` (generated reproducibly by
+//    `generate_assets.py`; see that file's module doc for the M1/M2 asset
+//    split). A caller can override `source`/`width`/`height` per instance
+//    like any other Slint component default (e.g.
+//    `RingedPlanetCorner { width: 24px; height: 24px; }`).
+// 2. **One-shot motion helpers** — the four named in the design plan's
+//    "Motion language" section: `MascotBob`, `Twinkle` (fire once on
+//    mount — the "never an infinite loop" rule `unprovisioned.rs`'s module
+//    doc already established, point 1, applies here too), and
+//    `RocketOnSend` / `CometOnNotify` (retriggerable one-shots, driven by an
+//    `in property <bool> play` a consuming screen binds to its own
+//    Rust-settable trigger property — see each component's own doc below
+//    for the exact contract).
+import { Theme } from "theme.slint";
+
+// ── Static celestial scenery ────────────────────────────────────────────
+
+/// Sparse gold/white starfield header strip (320x40, transparent bg).
+/// Same asset `unprovisioned.rs` embeds inline; exported here so the 7
+/// fan-out screens don't each need their own `@image-url` line for it.
+export component Starfield inherits Image {
+    source: @image-url("../../assets/space/starfield.png");
+    width: 320px;
+    height: 40px;
+}
+
+/// Ringed planet corner accent (40x40, transparent bg).
+export component RingedPlanetCorner inherits Image {
+    source: @image-url("../../assets/space/planet_corner.png");
+    width: 40px;
+    height: 40px;
+}
+
+/// Crescent moon (28x28, transparent bg) — lock/quiet-state motif per the
+/// design plan's motif inventory (`pin_entry`'s spec row: "crescent moon +
+/// lock").
+export component CrescentMoon inherits Image {
+    source: @image-url("../../assets/space/crescent_moon.png");
+    width: 28px;
+    height: 28px;
+}
+
+/// Static comet accent (28x14, transparent bg) — for screens that want the
+/// comet motif WITHOUT the notify-triggered sweep motion (see
+/// `CometOnNotify` below for the animated version sharing this same PNG).
+export component Comet inherits Image {
+    source: @image-url("../../assets/space/comet.png");
+    width: 28px;
+    height: 14px;
+}
+
+/// Static rocket accent (20x24, transparent bg) — for screens that want the
+/// rocket motif at rest (see `RocketOnSend` below for the animated,
+/// send-tap-triggered version sharing this same PNG).
+export component Rocket inherits Image {
+    source: @image-url("../../assets/space/rocket.png");
+    width: 20px;
+    height: 24px;
+}
+
+// ── Cadet mascot poses ──────────────────────────────────────────────────
+// One base component (`CadetMascot`, default idle pose) + five named,
+// self-documenting aliases — one per pose the design plan enumerates
+// ("Poses (idle / wave / thumbs-up / sleeping / peeking) reuse one
+// silhouette"). `cadet_idle.png` is M1's proven asset (byte-identical,
+// unmodified here); the other four PNGs are new in this
+// `generate_assets.py` amendment.
+
+/// Base mascot component — defaults to the idle pose; override `source` to
+/// swap poses without going through one of the named aliases below.
+export component CadetMascot inherits Image {
+    source: @image-url("../../assets/space/cadet_idle.png");
+    width: 64px;
+    height: 64px;
+}
+
+export component CadetIdle inherits CadetMascot {
+    source: @image-url("../../assets/space/cadet_idle.png");
+}
+
+export component CadetWave inherits CadetMascot {
+    source: @image-url("../../assets/space/cadet_wave.png");
+}
+
+export component CadetThumbsUp inherits CadetMascot {
+    source: @image-url("../../assets/space/cadet_thumbsup.png");
+}
+
+export component CadetSleeping inherits CadetMascot {
+    source: @image-url("../../assets/space/cadet_sleeping.png");
+}
+
+export component CadetPeeking inherits CadetMascot {
+    source: @image-url("../../assets/space/cadet_peeking.png");
+}
+
+// ── Full-window backdrop + lower-half line art ───────────────────────────
+// The shared contract Phase 2 (`apply-dense-screens`) and Phase 3
+// (`splash-lineart`) both consume — see the
+// design plan's "Legibility approach" section for the full rationale.
+// Both components are thin `Image` wrappers exactly like the static
+// celestial scenery above; the only new thing either does is bake a fixed,
+// non-overridable low `opacity` so no per-screen consumer can accidentally
+// dial the backdrop up past the legibility ceiling set for this contract.
+
+/// Full-window (320x240) dim starfield backdrop. Intended as the FIRST
+/// child of a screen's `Window` (z-bottom, behind every other node) —
+/// `generate_assets.py::gen_starfield_full`'s own doc comment covers the
+/// density/bias/central-band spec baked into the PNG; this component's job
+/// is purely the ≤0.35 alpha ceiling, applied here (not per-consumer) so
+/// every screen that adds `SpaceBackdrop {}` gets the same legibility
+/// guarantee for free and cannot diverge from it.
+export component SpaceBackdrop inherits Image {
+    source: @image-url("../../assets/space/starfield_full.png");
+    width: 320px;
+    height: 240px;
+    opacity: 0.3;
+}
+
+/// Dim outline planet-limb + orbit-line motif (320x72, transparent bg) for
+/// a screen's durable lower band (per the design plan's layout analysis,
+/// only `splash` qualifies — see Phase 3). Line-art, not filled: the low
+/// alpha is baked directly into `generate_assets.py::gen_planet_horizon`'s
+/// PNG (each stroke drawn well under full alpha), so this wrapper doesn't
+/// need its own additional `opacity` on top — unlike `SpaceBackdrop`, whose
+/// source PNG is drawn at full per-star alpha with the dimming applied
+/// here instead (see that component's doc for why the two assets split the
+/// dimming step differently).
+export component PlanetHorizon inherits Image {
+    source: @image-url("../../assets/space/planet_horizon.png");
+    width: 320px;
+    height: 72px;
+}
+
+// ── One-shot motion helpers ──────────────────────────────────────────────
+// All four follow this UI's established animation-language rule
+// (`unprovisioned.rs` module doc, point 1): `animate` only fires on a VALUE
+// CHANGE, and nothing here declares `iteration-count: -1` — a screen swap
+// can never cut one of these off mid-loop because there is no loop.
+
+/// Subtle one-shot bob-in for a hero mascot image on screen entry. Wraps a
+/// single `Image` (its `source`/`mascot-width`/`mascot-height` in
+/// properties select which bitmap and size) and settles it in from a small
+/// upward offset — the exact mechanism `unprovisioned.rs` established
+/// inline (`mascot_bob_y`), extracted here so every other hero screen gets
+/// the same physics without re-deriving it. Self-contained: fires once on
+/// `init`, no external trigger needed (matches the motion language's
+/// "subtle one-shot bob on entry" — entry is screen mount, not a user
+/// event).
+///
+/// Usage: `MascotBob { source: @image-url("../../assets/space/cadet_peeking.png"); }`
+export component MascotBob inherits Rectangle {
+    background: transparent;
+    in property <image> source: @image-url("../../assets/space/cadet_idle.png");
+    in property <length> mascot-width: 64px;
+    in property <length> mascot-height: 64px;
+    width: mascot-width;
+    height: mascot-height;
+
+    in-out property <length> bob_y: -10px;
+    animate bob_y { duration: 450ms; easing: ease-out; }
+    init => { self.bob_y = 0px; }
+
+    Image {
+        source: root.source;
+        width: root.mascot-width;
+        height: root.mascot-height;
+        y: root.bob_y;
+    }
+}
+
+/// A single star's one-shot "twinkle": fades in from a dim rest opacity to
+/// full brightness once on mount. Per the design plan ("star opacity
+/// pulse, used sparingly") this is deliberately ONE pulse, not a repeating
+/// loop — a screen wanting a recurring twinkle should re-trigger this from
+/// a low-frequency Rust-driven timer rather than an infinite `animate`
+/// (see this file's own header note + `unprovisioned.rs`'s dead-glow
+/// cautionary tale for why).
+export component Twinkle inherits Rectangle {
+    background: transparent;
+    in property <length> twinkle-width: 3px;
+    in property <length> twinkle-height: 3px;
+    in property <color> twinkle-color: Theme.star-gold;
+    width: twinkle-width;
+    height: twinkle-height;
+
+    in-out property <float> twinkle_opacity: 0.35;
+    animate twinkle_opacity { duration: 900ms; easing: ease-in-out; }
+    init => { self.twinkle_opacity = 1.0; }
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: self.width / 2;
+        background: root.twinkle-color;
+        opacity: root.twinkle_opacity;
+    }
+}
+
+/// Small rocket bitmap that arcs up and fades on send-tap (compose /
+/// message-view, per the design plan's motion language). RETRIGGERABLE
+/// one-shot: a consuming screen exposes its OWN `in-out property <bool>`
+/// trigger at its Window root (Rust sets it via the generated setter,
+/// exactly like `SplashScreen::start_animation()` sets its own top-level
+/// properties — see that file), and binds `RocketOnSend { play: <that
+/// property>; }`. `play: false` is the rest state (rocket visible at its
+/// declared box); `play: true` is the "sent" end state (rocket displaced
+/// up and out, faded) — the VALUE CHANGE between the two is what fires the
+/// `animate` transitions below, same one-shot-via-value-change contract as
+/// every other animated property in this codebase. Resetting `play` back
+/// to `false` to arm the next send is the consuming screen's
+/// responsibility (out of scope here — this module is the shared
+/// primitive, not the per-screen send-handler wiring, which lands in the
+/// `compose`/`message-view` fan-out children).
+export component RocketOnSend inherits Rectangle {
+    background: transparent;
+    width: 20px;
+    height: 24px;
+    in property <bool> play: false;
+
+    property <length> rocket_y: root.play ? -40px : 0px;
+    property <float> rocket_opacity: root.play ? 0.0 : 1.0;
+    animate rocket_y { duration: 400ms; easing: ease-out; }
+    animate rocket_opacity { duration: 400ms; easing: ease-in; }
+
+    Image {
+        source: @image-url("../../assets/space/rocket.png");
+        width: 20px;
+        height: 24px;
+        y: root.rocket_y;
+        opacity: root.rocket_opacity;
+    }
+}
+
+/// Comet that sweeps left-to-right across a header strip and fades on new
+/// message (contact-list / message-view header, per the design plan's
+/// motion language). Same retriggerable-one-shot contract as
+/// `RocketOnSend`: `play: false` parks the comet fully off-canvas to the
+/// left (nothing painted); `play: true` sweeps it across to fully off the
+/// right edge while fading out. Sized to a 320px-wide header; a consuming
+/// screen instantiates it at `x: 0px` spanning the header's own width.
+export component CometOnNotify inherits Rectangle {
+    background: transparent;
+    width: 28px;
+    height: 14px;
+    in property <bool> play: false;
+
+    property <length> comet_x: root.play ? 292px : -28px;
+    property <float> comet_opacity: root.play ? 0.0 : 1.0;
+    animate comet_x { duration: 600ms; easing: ease-in; }
+    animate comet_opacity { duration: 600ms; easing: ease-in; }
+
+    Image {
+        source: @image-url("../../assets/space/comet.png");
+        width: 28px;
+        height: 14px;
+        x: root.comet_x;
+        opacity: root.comet_opacity;
+    }
+}

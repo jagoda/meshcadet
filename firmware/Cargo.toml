@@ -1,0 +1,119 @@
+[package]
+name = "firmware"
+version = "0.0.0"
+edition = "2021"
+# GPLv3 — this crate is the one that forces the project-wide license choice:
+# it reaches into `i-slint-core` internals (RendererSealed et al, see the
+# `i-slint-core` dependency comment below), taken under Slint's GPL-3.0-only
+# license option. See docs/licensing/DEPENDENCY-AUDIT.md.
+license = "GPL-3.0-only"
+publish = false
+description = "MeshCadet T-Deck Plus firmware (esp-idf / std, ESP32-S3 / Xtensa)."
+resolver = "2"
+
+# Detached from the root workspace: this crate cross-compiles for
+# xtensa-esp32s3-espidf under the `esp` toolchain and must not be pulled into a
+# host-native `cargo test` at the repo root. Path deps still resolve across the
+# boundary.
+[workspace]
+
+[[bin]]
+name = "meshcadet-firmware"
+path = "src/main.rs"
+harness = false
+
+[features]
+default = []
+# ── HIL real-mesh interop (single board, talks to STOCK MeshCore nodes) ──────
+# Pins a FIXED compiled identity seed (stable across reflash + NVS-erase) and
+# sources the real peer pubkey, channel secret, and channel-hash mode from a
+# GITIGNORED local file `src/hil_keys.rs` (copy `src/hil_keys.example.rs`).
+# Real secrets are NEVER committed and NEVER logged. No advert is emitted
+# (charter purity): the operator registers MeshCadet's printed pubkey as a
+# contact in the companion app.
+hil = []
+# ── On-device diagnostic instrumentation ─────────────────────────────────────
+# Gate temporary diagnostic probes behind this feature so they compile out of
+# production. Composes with any build role (including production or `hil`) —
+# independent of the `hil` build role above.
+# Use: cargo build --features diagnostics  (or cargo run --features diagnostics)
+# Future on-device probes (counters, hex dumps, timing aids) land here.
+diagnostics = []
+
+[dependencies]
+# Shared wire protocol (no_std-compatible; also builds on the esp target)
+protocol = { path = "../protocol" }
+
+# esp-idf std stack — enabled for M1 radio+identity bring-up.
+# Build prerequisites: run `espup install` and `. ~/export-esp.sh`, then
+# `cd firmware && cargo build --target xtensa-esp32s3-espidf`.
+esp-idf-svc  = { version = "0.52", features = ["binstart"] }
+esp-idf-hal  = "0.46"
+
+# Error handling (esp-idf-svc re-exports anyhow; explicit dep for clarity)
+anyhow = "1"
+
+# Logging facade (esp-idf-svc provides the backend at runtime)
+log = "0.4"
+
+# CSPRNG: OsRng works on esp-idf/std (backed by esp_fill_random / /dev/urandom)
+rand = { version = "0.8", features = ["std"] }
+
+# ── Touch UI dependencies ────────────────────────────────────────────────────
+
+# Slint UI toolkit — Rust-native declarative UI (ADR-0003).
+# `unsafe-single-threaded`: required for cooperative embedded use without sync.
+# `renderer-software`: enables MinimalSoftwareRenderer for line-buffer rendering.
+slint = { version = "1", default-features = false, features = [
+    "unsafe-single-threaded",
+    "renderer-software",
+    "libm",
+    "compat-1-2",
+] }
+
+# Direct access to i-slint-core internals: RendererSealed (for register_bitmap_font)
+# and BitmapFont / BitmapGlyph / CharacterMapEntry (for the build-time generated font data).
+# Pinned to match the locked slint version.  `unsafe-single-threaded` matches slint's
+# feature selection so Cargo merges the deps without feature conflicts.
+# PIN-TRACKING: this exact version pin MUST be bumped when slint is updated.
+# Run `cargo update -p slint && cargo update -p i-slint-core` together.
+i-slint-core = { version = "=1.16.1", default-features = false, features = [
+    "unsafe-single-threaded",
+    "libm",
+] }
+
+# mipidsi: Display driver for ST7789/ILI9488/ILI9341 over SPI.
+# Provides the DrawTarget + SPI write path that Slint's SoftwareRenderer feeds.
+mipidsi = "0.8"
+
+# embedded-graphics: Drawing target trait + primitives (Rgb565 pixel type used
+# by both mipidsi and Slint's software renderer).
+embedded-graphics = "0.8"
+
+# display-interface-spi: SPI-to-display-interface bridge used by mipidsi.
+display-interface-spi = "0.5"
+
+[build-dependencies]
+# esp-idf build system integration (propagates IDF_PATH etc. to the linker)
+embuild = "0.33"
+# Slint build helper — added as a build-dependency for its effect on the HOST
+# compilation graph, NOT because build.rs calls it directly.
+#
+# Why: the slint::slint!{} proc macro needs i-slint-compiler compiled with the
+# `software-renderer` feature (HOST target) so that SLINT_EMBED_TEXTURES=1
+# (set in .cargo/config.toml [env]) triggers EmbedTextures mode instead of a
+# compile-time panic.  slint-build depends on i-slint-compiler/software-renderer;
+# cargo's resolver v2 unifies HOST-target features across proc macros and build
+# deps, so adding slint-build here propagates software-renderer to slint-macros'
+# i-slint-compiler instance.  This causes the slint!{} macro to pre-render all
+# glyph bitmaps and emit register_bitmap_font() calls in component init code,
+# populating BITMAP_FONTS before any render attempt — eliminating the
+# fonts.rs:193 panic.
+slint-build = { version = "=1.16.1" }
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+# esp-idf needs opt-level >= 1 to avoid stack overflows in debug.
+opt-level = 1

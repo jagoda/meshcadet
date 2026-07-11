@@ -1,0 +1,21 @@
+# Root cargo config — host-native builds only. No default `build.target` is set,
+# so `protocol` and `host` build for the host triple. The firmware crate carries
+# its own firmware/.cargo/config.toml that pins the Xtensa target, the esp-idf
+# runner, and the ESP-IDF environment.
+[alias]
+# Convenience: build/flash the firmware from the repo root.
+fw = "build --manifest-path firmware/Cargo.toml"
+
+[env]
+# ── Slint macro-embed env, needed ONLY by the `ui_sim` workspace member ─────
+# (needed once the space-theme asset/palette pipeline started embedding real
+# texture data via the Slint macros). Cargo config is
+# resolved by walking UP from the invoking CWD, so a root `cargo test` (which
+# builds protocol + host + xtask + ui_sim together) only ever sees THIS file
+# — `ui_sim`'s own nested config (if it had one) would never be read for that
+# invocation. `protocol`/`host`/`xtask` don't use Slint at all, so these two
+# env vars are inert no-ops for them; see `firmware/.cargo/config.toml`'s
+# identical pair (there, scoped to the esp-idf target build instead) for the
+# full explanation of what each one does.
+SLINT_EMBED_TEXTURES = "1"
+SLINT_EMBED_RESOURCES = "embed-for-software-renderer"

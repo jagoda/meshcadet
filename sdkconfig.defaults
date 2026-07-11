@@ -1,0 +1,27 @@
+# ESP-IDF sdkconfig defaults — REFERENCE COPY (NOT consumed by the build).
+#
+# The file actually consumed by embuild / esp-idf-sys is firmware/sdkconfig.defaults.
+# embuild resolves sdkconfig paths relative to the cargo workspace_dir, which for the
+# detached firmware/ workspace equals firmware/ (6 × OUT_DIR pops on a cross-compile).
+# See firmware/sdkconfig.defaults for the authoritative, build-active copy.
+
+# Main task stack — radio + protocol + UI need headroom. Kept in sync with
+# firmware/sdkconfig.defaults's authoritative value and rationale.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=49152
+
+# T-Deck Plus has 8 MB octal PSRAM; enable it for UI framebuffers + history.
+CONFIG_ESP32S3_SPIRAM_SUPPORT=y
+CONFIG_SPIRAM_MODE_OCT=y
+
+# CPU at full tilt for LoRa timing + UI responsiveness.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# No flash encryption / secure boot — charter: at-rest security is intentionally
+# NONE (a lost device is low value; rotate channels/keys if compromised).
+
+# Custom partition table (16 MB flash). Layout lives in firmware/partitions.csv
+# (nvs/phy_init/factory + a 256 KB `mc_hist` data partition for per-conversation
+# history).
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"

@@ -1,0 +1,5 @@
+# Firmware toolchain: the Espressif Rust fork (Xtensa support), installed via
+# `espup install`. rustup selects this file when the working directory is
+# firmware/. The root rust-toolchain.toml pins stable for the host crates.
+[toolchain]
+channel = "esp"

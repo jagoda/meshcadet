@@ -1,0 +1,8 @@
+/target
+/firmware/target
+/host/target
+/protocol/target
+**/*.rs.bk
+.embuild
+# HIL real-key config — SECRET, never committed (copy from hil_keys.example.rs)
+/firmware/src/hil_keys.rs

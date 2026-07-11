@@ -1,0 +1,62 @@
+# MeshCadet Cargo workspace.
+#
+# Three host-native crates live in this workspace; the firmware crate is a
+# DETACHED workspace (it declares its own `[workspace]` table in
+# firmware/Cargo.toml) because it cross-compiles for ESP32-S3 / Xtensa under
+# the `esp` toolchain and the esp-idf (std) sysroot. Keeping it out of the
+# root member set means `cargo build` / `cargo test` from the repo root only
+# touches `protocol` + `host` + `xtask` and stays buildable on stable rustc
+# with no espup / ESP-IDF installed.
+#
+#   cargo test                 # protocol + host + xtask (stable, native)
+#   cd firmware && cargo build # firmware (esp toolchain, xtensa-esp32s3-espidf)
+#
+# `xtask` is the host-side glyph-coverage verification harness: it statically
+# scans `firmware/src/ui/screens/*.rs` for every (codepoint, font-size) pair
+# used in a Slint literal and cross-checks it against the frozen icon
+# inventory in `firmware/gen_emoji_font.c`, turning the historically silent
+# "blank glyph on real hardware" defect class into a `cargo test` failure.
+# See `xtask/src/lib.rs` for the full design doc.
+#
+# `ui_sim` is the host-native render rig for the firmware's image-asset
+# pipeline: firmware can't be exercised on host (see above), so this crate
+# links plain `slint` (software-renderer only) and proves, on the host, that
+# both the primary (`@image-url` + `SLINT_EMBED_RESOURCES=embed-for-software-
+# renderer`) and fallback (build.rs RGB565 byte array + `SharedPixelBuffer`)
+# asset-embed paths actually render pixels. See `ui_sim/src/lib.rs` for the
+# full design doc and `ui_sim/README.md` for the reproduction/evidence
+# summary.
+#
+# `ui_perf` is the host-native measurement harness for the UI performance
+# work: firmware's render/state-build hot paths can't be EXECUTED on host
+# either (the firmware crate's `[[bin]]` sets `harness = false`, so its own
+# `#[cfg(test)]` blocks type-check but never run on host — see
+# `firmware/src/ui/mod.rs`'s "Tests" section doc), so this crate ports the
+# pure logic (no Slint/esp-idf types involved) and pins it against the SAME
+# fixture values firmware's own tests use. See `docs/perf/ui-perf-
+# baseline.md` for the full methodology + ledger.
+[workspace]
+resolver = "2"
+members = ["protocol", "host", "xtask", "ui_sim", "ui_perf"]
+
+[workspace.package]
+edition = "2021"
+# GPLv3 (see LICENSE at repo root + docs/licensing/DEPENDENCY-AUDIT.md): the
+# firmware crate reaches into `i-slint-core` internals (RendererSealed et al),
+# and GPL-3.0-only is the license Slint offers for that with no separate
+# royalty/registration agreement required.
+license = "GPL-3.0-only"
+publish = false
+
+[workspace.dependencies]
+protocol = { path = "protocol" }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+debug = 2
+
+[profile.dev]
+opt-level = 1
+debug = 2

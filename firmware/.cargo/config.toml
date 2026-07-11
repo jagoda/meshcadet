@@ -1,0 +1,114 @@
+# Firmware-local cargo config (applies when cargo is invoked from firmware/).
+[build]
+target = "xtensa-esp32s3-espidf"
+
+[target.xtensa-esp32s3-espidf]
+linker = "ldproxy"
+# ── Flash runner ─────────────────────────────────────────────────────────────
+# cargo appends the freshly-linked ELF path, so the effective command is:
+#   scripts/flash-with-partition-table.sh <target/.../debug/meshcadet-firmware>
+# That script's own header comment explains the full sequence; in short, it wraps
+# `espflash flash --no-skip --after no-reset <ELF>` followed by `espflash write-bin
+# 0x8000 <partition-table.bin>` and `espflash monitor`, replicating what a plain
+# `espflash flash --no-skip --monitor <ELF>` used to do, plus landing our custom
+# partition table on the device (see "Custom partition table" comment below).
+#
+# `--no-skip` is the fix for a stale-flash defect: by default espflash computes the
+# MD5 of each flash part and SKIPS any whose checksum matches — an optimisation
+# that can leave the app partition unwritten across an incremental `cargo run`,
+# so the device keeps booting the previous image and only `cargo clean && cargo
+# run` reliably lands the latest.  Diagnosis established that the incremental
+# BUILD is already correct (an app-source edit relinks a fresh ELF in a fraction
+# of full-clean time), and that espflash flashes THIS ELF (it ignores the
+# esp-idf-sys-generated bootloader/partition-table bins — no espflash.toml /
+# [package.metadata.espflash] is present, so espflash uses its bundled defaults
+# plus the ELF).  The only removable flash-side staleness variable is the
+# checksum-skip; `--no-skip` forces the just-built app to be written every
+# invocation, restoring the invariant "cargo run flashes the latest build"
+# WITHOUT forcing a clean (builds stay incremental).
+#
+# Custom partition table: the runner is
+# now a wrapper script, NOT a plain `espflash flash --partition-table ...` invocation.
+# espflash's `--partition-table` flag would be the obvious fix (and is what a first pass
+# tried), but espflash 4.4.0's partition-table decoder (esp-idf-part v0.6.0) panics on any
+# custom-SubType `data` partition — including our real `mc_hist` (SubType 0x40) — whether
+# given as CSV or as the correctly pre-built binary (upstream bug, not a config mistake;
+# see the script's own header comment for the exact panic site and the verified
+# two-step-flash workaround). scripts/flash-with-partition-table.sh implements that
+# workaround and is confirmed, on real T-Deck Plus hardware, to flash + land `mc_hist` +
+# boot cleanly.
+runner = "scripts/flash-with-partition-table.sh"
+rustflags = ["--cfg", "espidf_time64"]
+
+[unstable]
+build-std = ["std", "panic_abort"]
+
+[env]
+MCU = "esp32s3"
+# ESP-IDF release pinned at bring-up (e.g. "v5.2.2").
+ESP_IDF_VERSION = "v5.2.2"
+# ── Slint software-renderer font embedding ───────────────────────────────────
+# Required for MinimalSoftwareRenderer on bare-metal (no systemfonts feature).
+#
+# i-slint-compiler reads SLINT_EMBED_TEXTURES at proc-macro expansion time.
+# When set, the compiler scans all string literals + font sizes declared in
+# slint!{} blocks, pre-renders glyph bitmaps from the host system font, and
+# emits `register_bitmap_font()` calls in the generated component init code.
+# Without this, BITMAP_FONTS stays empty → fonts.rs:193 panic at first render.
+#
+# IMPORTANT: This only works when i-slint-compiler/software-renderer is enabled
+# on the HOST.  We achieve that by adding slint-build to [build-dependencies]
+# in Cargo.toml — cargo unifies HOST-target i-slint-compiler features from both
+# slint-macros (proc macro) and slint-build (build dep), giving slint-macros'
+# i-slint-compiler the software-renderer feature it needs.
+SLINT_EMBED_TEXTURES = "1"
+
+# ── Slint image-asset embedding (space-theme asset pipeline) ────────────────
+#
+# i-slint-compiler also reads SLINT_EMBED_RESOURCES at proc-macro expansion
+# time, same mechanism/timing as SLINT_EMBED_TEXTURES above. "embed-for-
+# software-renderer" decodes every `@image-url(...)` referenced in a
+# slint!{} block (via the `image` crate, HOST-side, at compile time — already
+# pulled in transitively through i-slint-compiler's "image"/"software-
+# renderer" features, themselves already enabled by the slint-build
+# build-dependency's default features, so no new Cargo dependency was needed
+# for this) into raw pixel data baked directly into the generated
+# component's init code — no runtime PNG/image decoder is needed on-target.
+# This is the PRIMARY asset-embed path from the space-theme UI's
+# asset-architecture options table (see ADR-0003), proven end-to-end for the
+# `unprovisioned.rs` pilot screen's three baked-scenery bitmaps
+# (`firmware/assets/space/*.png`) ahead of the motif-library + 7-screen
+# fan-out. The build.rs-generated RGB565 byte-array + runtime
+# `SharedPixelBuffer` fallback (same shape as gen_emoji_font.c's font
+# pipeline) is proven separately in the host-native `ui_sim` crate at the
+# repo root (its own README documents the host-sim render + fallback
+# evidence).
+SLINT_EMBED_RESOURCES = "embed-for-software-renderer"
+
+# ── Custom partition table (16 MB, adds the `mc_hist` history region) ───────
+#
+# esp-idf-sys's native cmake project lives in a per-build-hash OUT_DIR
+# (target/xtensa.../release/build/esp-idf-sys-<hash>/out), and ESP-IDF's
+# partition_table/project_include.cmake resolves CONFIG_PARTITION_TABLE_CUSTOM_FILENAME
+# relative to that OUT_DIR (PROJECT_DIR defaults to CMAKE_SOURCE_DIR, which IS that
+# OUT_DIR for the synthetic cmake project esp-idf-sys generates) — NOT relative to
+# this crate root. Without this glob, cmake configure fails with "Partition table CSV
+# file .../out/partitions.csv not found."
+#
+# ESP_IDF_GLOB[_XXX]_BASE / ESP_IDF_GLOB[_XXX]_YYY (embuild::build::tracked_env_globs_iter)
+# copy files matching a glob, rooted at BASE, into that same OUT_DIR before cmake
+# configure runs — so pointing BASE at the crate root and globbing partitions.csv
+# lands it exactly where CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv" expects it.
+#
+# BASE must be an ABSOLUTE path (or a `relative = true` table, resolved by cargo at
+# config-parse time against the directory containing this .cargo/), NOT a bare "."
+# — a build script's own CWD is ITS OWN package's manifest dir (for esp-idf-sys, a
+# crates.io registry cache path, e.g. ~/.cargo/registry/src/.../esp-idf-sys-0.37.2),
+# not the CWD of the consuming crate (this firmware/ crate). A bare "." silently
+# resolved to esp-idf-sys's own bundled example `partitions.csv` (its 3 MB single-app
+# scaffold) instead of ours, with no error — cmake configure succeeded and produced a
+# build, but with the WRONG on-device partition table (no `mc_hist`, no 6 MB factory).
+# Caught by comparing target/.../out/partitions.csv content against the source after
+# a green build, not by the build failing.
+ESP_IDF_GLOB_PARTITIONS_BASE = { value = ".", relative = true }
+ESP_IDF_GLOB_PARTITIONS_CSV = "partitions.csv"

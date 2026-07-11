@@ -1,0 +1,145 @@
+# ESP-IDF sdkconfig defaults for MeshCadet firmware (ESP32-S3 / LilyGo T-Deck Plus).
+#
+# Location rationale: this file MUST live at firmware/sdkconfig.defaults (the crate
+# root).  embuild resolves sdkconfig.defaults relative to the cargo workspace_dir,
+# which for a detached firmware workspace equals firmware/ (6 × OUT_DIR pops on a
+# cross-compile).  A copy at the repo root is NOT consumed by the build.
+#
+# ── Main task stack ──────────────────────────────────────────────────────────────
+#
+# Stack budget rationale (49 152 B, raised from 32 768 B):
+#
+#   Original 16 384 B budget:
+#     Sized for radio + crypto only.  HWM measured at 8–12 KB on the provisioned
+#     path; 16 384 B left ~4 KB headroom.
+#
+#   Why 16 384 B overflows on the integrated candidate (c4af25e):
+#     The 6/15 Slint UI port wired `UiRuntime::step()` (display render + touch)
+#     directly into the main-task dispatcher loop.  The provisioned path keeps
+#     all of these locals live on run()'s stack frame simultaneously:
+#       - PolicyFilter (16 contacts × 33 B + padding ≈ 600 B)
+#       - AirtimeBudget (32 TxRecord slots × 12 B ≈ 390 B)
+#       - TxQueue (frame buffer 255 B + usize ≈ 260 B)
+#       - frame_buf [u8; 255] (256 B)
+#       - DuplicateFilter (ring 16 × 4 B + state ≈ 72 B)
+#     These dispatcher locals are NOT live during Radio::init() (explaining why
+#     that path's delay_ms() yields don't overflow), but ARE live by the first
+#     loop-iteration yield in radio::try_receive().  The SPI call chain and
+#     FreeRTOS vTaskDelay() overhead add another 1.5–3 KB of frame depth,
+#     pushing the peak past 16 KB.
+#
+#     The Slint software-renderer path (process_line) adds a further ~1 KB per
+#     line render (line_buf 640 B + was-on-stack eg_buf 640 B before the
+#     heap-migration fix in platform.rs); even with eg_buf moved to the heap,
+#     the Slint render pipeline itself adds 3–6 KB of call depth.
+#
+#   32 768 B (chosen then as a conservative 2× of the prior overflowing budget)
+#   held until a release-only crash-and-restart, reproduced
+#   on-hardware pressing the Settings gear. CONFIRMED root cause, from the
+#   operator-provided serial backtrace:
+#
+#     I (45337) ...ui: settings gear pressed -> PinEntry
+#     I (46017) ...ui: navigate_to_pin_entry
+#     ***ERROR*** A stack overflow in task main has been detected.
+#     Rebooting...
+#
+#   with a periodic HWM sample moments earlier reading "26776 B peak (18%
+#   headroom)" of the 32 768 B budget — i.e. steady state was ALREADY within
+#   ~6 KB of the ceiling before this navigation, and `navigate_to_pin_entry`'s
+#   own construction call pushed it over:
+#     - `screens::PinEntryScreen::new()` constructs `PinEntryScreenUi` — the
+#       single largest compiled component in this binary (confirmed via
+#       `nm --size-sort` against both build profiles: its generated `new()`
+#       has the biggest stack frame of every screen sampled), a 12-key numpad
+#       + dot row + 2 mascots screen that recently ALSO gained a full-window
+#       `SpaceBackdrop` image-compositing layer — the marginal addition that
+#       tipped an already-tight budget over the edge.
+#     - Release-only: measured (`nm --size-sort` on both `cargo build` and
+#       `cargo build --release` output) that the release profile's
+#       `opt-level = "s"` produces consistently LARGER per-function stack
+#       frames than the dev profile's `opt-level = 1` across every UI screen
+#       sampled (+5% to +37%) — the same class of opt-level-sensitive stack
+#       pressure this crate's dev-profile note (`firmware/Cargo.toml`)
+#       already documents ("esp-idf needs opt-level >= 1 to avoid stack
+#       overflows in debug"), explaining why identical source only overflows
+#       under `cargo run --release`.
+#   49 152 B chosen: +50% over the 32 768 B budget — comfortably above the
+#   ~6–8 KB shortfall the HWM sample measured, WITH margin held in reserve for
+#   a follow-on change that adds the same `SpaceBackdrop` layer to 3 more
+#   screens (contact list, message view, compose). `ui::mod::navigate_to_pin_entry`
+#   (the confirmed overflow site) and `navigate_to_admin_menu` (the next-
+#   densest transition on the same "open Settings" path) now both log
+#   uxTaskGetStackHighWaterMark(NULL) unconditionally at their exact
+#   transition — not just the dispatcher loop's periodic 30 s sample, which a
+#   stack-overflow reboot would never reach — so the next HIL run confirms
+#   actual headroom and drives a follow-on trim pass. Any screen touched by
+#   that follow-on change should copy that same one-line pattern at its own
+#   navigate_to_* call site.
+#
+#   This setting applies to ALL build configs (hil, diagnostics, default) —
+#   they all share the same identity+crypto init path in main.rs::run().
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=49152
+
+# ── T-Deck Plus hardware ─────────────────────────────────────────────────────────
+# 8 MB octal PSRAM — needed for UI framebuffers and rotating conversation history.
+CONFIG_ESP32S3_SPIRAM_SUPPORT=y
+CONFIG_SPIRAM_MODE_OCT=y
+
+# 240 MHz for LoRa timing accuracy and UI responsiveness.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# No flash encryption / secure boot — charter: at-rest security is intentionally
+# absent (a lost device is low-value; rotate channels/keys if compromised).
+
+# ── Console: USB-Serial-JTAG (required for GPS UART on GPIO43/44) ───────────────
+#
+# The T-Deck Plus GPS module (Quectel L76K) is wired to GPIO43 (ESP TX) and
+# GPIO44 (ESP RX) — the same pins that are UART0's default hardware assignment.
+# Without this redirect, ESP-IDF's console init claims GPIO43/44 as UART0,
+# conflicting with the GPS UART1 interface.
+#
+# CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y redirects all console I/O (log::info!,
+# espflash --monitor, provisioning server stdin/stdout) to the ESP32-S3's
+# built-in USB-Serial-JTAG controller — the same USB connection used for
+# flashing and monitoring.  GPIO43/44 are then free for UART1 (GPS, 9600 baud).
+#
+# This is the standard approach for T-Deck Plus: the LilyGo Arduino examples
+# do the same ("Arduino IDE → Tools → USB CDC On Boot → Enabled").
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# ── Watchdog and brownout protection (safety hardening) ──────────────────────────
+#
+# Defect fix (criterion 3 — Task WDT coverage of the dispatcher loop):
+#
+# CONFIG_ESP_TASK_WDT_EN=y enables the ESP-IDF Task Watchdog Timer.  The IDF
+# startup code initialises it automatically when this option is set; no explicit
+# esp_task_wdt_init() call is needed in application code.  main.rs subscribes
+# the dispatcher task with esp_task_wdt_add(NULL) and resets it each iteration.
+#
+# CONFIG_ESP_TASK_WDT_PANIC=y makes a TWDT timeout trigger an abort + core-dump
+# rather than just a log warning, so a wedged SPI/BUSY or NVS stall produces a
+# deterministic safe reboot.
+#
+# CONFIG_ESP_TASK_WDT_TIMEOUT_S=30: 30 s is generous vs. the ~50 ms dispatcher
+# loop iteration, while still catching any indefinite hardware stall.
+#
+# CONFIG_ESP_BROWNOUT_DET=y enables the ESP32-S3 brownout detector.  Without
+# it, a voltage sag during an NVS write can produce a partial-page write,
+# corrupting the NVS page table and manifesting as the NVS fault handled in
+# main.rs.  The brownout detector triggers a controlled reset before the supply
+# drops below the minimum operating voltage, preventing mid-write corruption.
+CONFIG_ESP_TASK_WDT_EN=y
+CONFIG_ESP_TASK_WDT_PANIC=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+CONFIG_ESP_BROWNOUT_DET=y
+
+# ── Custom partition table (16 MB flash) ──────────────────────────────────────────
+#
+# T-Deck Plus ships 16 MB of flash; the ESP-IDF DEFAULT partition table assumes
+# 4 MB and leaves no room for a dedicated history region. CONFIG_PARTITION_TABLE_
+# CUSTOM_FILENAME points embuild/esp-idf-sys at firmware/partitions.csv (see that
+# file for the full layout, including the 256 KB `mc_hist` data partition for
+# persistent per-conversation history).
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"

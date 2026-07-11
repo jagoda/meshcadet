@@ -1,0 +1,37 @@
+# ESP-IDF custom partition table — MeshCadet firmware (ESP32-S3 / T-Deck Plus, 16 MB flash).
+#
+# Replaces the ESP-IDF DEFAULT partition table (which assumes 4 MB flash and has no
+# room for a dedicated history region). Paired with sdkconfig.defaults:
+#   CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+#   CONFIG_PARTITION_TABLE_CUSTOM=y
+#   CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+#
+# nvs/phy_init offsets and sizes are unchanged from the ESP-IDF default table (mc_id/
+# mc_cfg/runtime config continue to live in nvs, untouched here).
+#
+# `factory` is sized at 6 MB. Verified against the actual built (release, `hil` off)
+# Slint app image: espflash reports 2,359,440 bytes (~2.25 MB) for the flashed app —
+# comfortably under 6 MB, leaving ~3.75 MB of headroom for UI asset growth.
+#
+# `mc_hist` (SubType 0x40, in the ESP-IDF user-defined data range 0x40–0xFE) is a raw
+# 256 KB region for per-conversation history. This file only DECLARES the partition;
+# the flash read/write/format logic against it lives in the history-store module.
+#
+# No `coredump` partition: CONFIG_ESP_TASK_WDT_PANIC=y aborts/reboots on a watchdog
+# timeout, and no CONFIG_COREDUMP_* option is set, so a TWDT panic does not flash-dump.
+# Revisit if COREDUMP_* is ever enabled.
+#
+# NOTE: gen_esp32part.py only treats a line as a comment when '#' is the FIRST
+# non-whitespace character — it does NOT strip trailing inline comments after data,
+# so per-row notes below are on their own comment line(s) rather than after commas.
+#
+# nvs: 24 KB (unchanged — mc_id/mc_cfg/runtime)
+# phy_init: 4 KB (unchanged)
+# factory: 6 MB — actual app image ~2.25 MB, ~3.75 MB headroom (measured, see above)
+# mc_hist: 256 KB — raw per-conversation history
+#
+# Name,   Type, SubType, Offset,  Size,     Flags
+nvs,      data, nvs,     0x9000,  0x6000,
+phy_init, data, phy,     0xf000,  0x1000,
+factory,  app,  factory, 0x10000, 0x600000,
+mc_hist,  data, 0x40,    ,        0x40000,

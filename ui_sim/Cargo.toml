@@ -1,0 +1,41 @@
+[package]
+name = "ui_sim"
+version = "0.0.0"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+description = """
+Host-native proof rig for the space-theme UI's RGB565 image-asset pipeline.
+See README.md for the full design doc.
+"""
+
+[[bin]]
+name = "ui_sim"
+path = "src/main.rs"
+
+[dependencies]
+# Same feature set as firmware/Cargo.toml's slint dependency (minus esp-only
+# concerns): no default-features (no winit/systemfonts backend), software
+# renderer only, so this crate exercises the IDENTICAL inline-slint!{}-macro
+# + MinimalSoftwareWindow mechanism the firmware crate uses, without needing
+# the esp-idf toolchain.
+slint = { version = "=1.16.1", default-features = false, features = [
+    "unsafe-single-threaded",
+    "renderer-software",
+    "libm",
+    "compat-1-2",
+] }
+
+# PNG-encodes the rendered host-sim framebuffer to disk (the visual evidence
+# deliverable). Only needed on the host side — no firmware/esp-target
+# dependency of any kind.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[build-dependencies]
+# Added for its EFFECT on the host compilation graph, not because build.rs
+# calls it directly — see firmware/Cargo.toml's own identical comment for
+# the full explanation. Without this, slint-macros' i-slint-compiler
+# instance may not have the "software-renderer"/"image" features needed for
+# `@image-url(...)` + SLINT_EMBED_RESOURCES=embed-for-software-renderer to
+# work in this crate's inline slint!{} block.
+slint-build = { version = "=1.16.1" }

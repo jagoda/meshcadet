@@ -1,0 +1,6 @@
+# Root toolchain: stable rustc for the host-native crates (protocol, host).
+# The firmware crate pins its own `esp` channel in firmware/rust-toolchain.toml
+# (rustup resolves the nearest toolchain file to the working directory).
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,157 @@
+MeshCadet — Attribution / NOTICE
+================================
+
+MeshCadet is licensed under the GNU General Public License, version 3 (see
+`LICENSE` at the repository root). This NOTICE credits upstream open-source
+projects that MeshCadet interoperates with or whose published source informed
+this codebase, per their own license terms and as good-practice attribution.
+Neither project's source is vendored or copied into this repository — both
+are independent Rust implementations informed by reading the public upstream
+source and documentation.
+
+--------------------------------------------------------------------------
+Disclaimer — no warranty, no guarantee of safety, use at your own risk
+--------------------------------------------------------------------------
+MeshCadet is provided "AS IS" and "AS AVAILABLE", with all faults and WITHOUT
+WARRANTY OF ANY KIND, express or implied, including but not limited to the
+implied warranties of merchantability, fitness for a particular purpose,
+title, and non-infringement, and specifically WITHOUT any warranty of safety,
+security, reliability, or suitability for any particular use. NO guarantee is
+made that any policy or security feature works, is effective, or protects any
+person or any data; the
+software may contain defects and may fail. The user ASSUMES ALL RISK of using,
+conveying, or modifying MeshCadet. There is NO obligation of support,
+maintenance, updates, or fixes, and no service-level commitment. To the
+maximum extent permitted by applicable law, the author and contributors are
+NOT LIABLE for any damages, injury, harm, or loss of any kind arising from the
+software or its use. By using, conveying, or modifying MeshCadet, the user
+agrees to INDEMNIFY, defend, and hold harmless the author and contributors
+from and against any and all claims, damages, losses, liabilities, and
+expenses arising from that use, conveyance, or modification. GPLv3 sections 15
+and 16 already disclaim warranty and limit liability; the assumption-of-risk
+and indemnification terms above are ADDITIONAL TERMS under GPLv3 section 7 and
+are to be read consistently with, not in contradiction of, the license. See
+`README.md` and `SECURITY.md` for the full disclaimer.
+
+--------------------------------------------------------------------------
+MeshCore
+--------------------------------------------------------------------------
+Project:    MeshCore — open-source LoRa mesh firmware/protocol
+Source:     https://github.com/meshcore-dev/MeshCore
+Copyright:  Copyright (c) 2025 Scott Powell / rippleradios.com
+License:    MIT License (see below)
+
+`protocol/` is a byte-exact Rust port of the MeshCore v1.15.0 wire protocol
+(packet framing, header/route/payload-type fields, path-hash encoding, the
+Ed25519/X25519/AES-128-ECB/HMAC-SHA256 crypto and identity primitives, the
+DM/ACK codec, and symmetric channel encryption) — see `protocol/src/lib.rs`
+for the module map and interop rationale. MeshCadet exists to be a fully
+compliant MeshCore citizen on the air; this interop is a hard project
+requirement (see `docs/adr/0001-charter.md`).
+
+--------------------------------------------------------------------------
+RadioLib
+--------------------------------------------------------------------------
+Project:    RadioLib — universal wireless communication library for Arduino/PlatformIO
+Source:     https://github.com/jgromes/RadioLib
+Copyright:  Copyright (c) 2018 Jan Gromeš
+License:    MIT License (see below)
+
+`firmware/src/radio.rs` bring-up sequencing for the SX1262 radio (TCXO
+voltage/delay, regulator mode, PA clamping fix-up, calibration image bytes,
+sync-word register values) mirrors RadioLib's `SX126x`/`SX1262` C++ driver
+behavior, specifically `src/helpers/SX126XLT.cpp` (referenced at commit
+`dee3e26a` of the MeshCore tree that vendors it), so that MeshCadet's radio
+bring-up matches what deployed stock MeshCore nodes (which build against
+RadioLib) do on the air. See `firmware/src/radio.rs`'s module doc for the
+full source-reference list.
+
+--------------------------------------------------------------------------
+MIT License text (applies to both works above, per each project's own terms)
+--------------------------------------------------------------------------
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to
+deal in the Software without restriction, including without limitation the
+rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+sell copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+IN THE SOFTWARE.
+
+--------------------------------------------------------------------------
+Third-party Rust crate dependencies
+--------------------------------------------------------------------------
+MeshCadet's Cargo dependency graph (protocol/host/xtask/ui_sim/ui_perf at
+the workspace root, and the detached firmware/ workspace) pulls in several
+hundred third-party crates, each under its own license (overwhelmingly
+MIT/Apache-2.0/BSD/Zlib-family permissive terms). None of them require
+reproducing their license text in this NOTICE file (none impose a
+NOTICE-file obligation the way Apache-2.0's own recommended practice
+does for its dependents, and no crate in the graph carries an Apache-2.0
+NOTICE file of its own to propagate). The full audit — every crate, its
+resolved version, and its SPDX license expression, plus the GPLv3
+compatibility reasoning — is recorded in `docs/licensing/DEPENDENCY-AUDIT.md`
+and `docs/licensing/THIRD-PARTY-LICENSES.md`.
+
+--------------------------------------------------------------------------
+serialport
+--------------------------------------------------------------------------
+Project:    serialport-rs — cross-platform serial port library
+Source:     https://github.com/serialport/serialport-rs
+License:    Mozilla Public License 2.0 (MPL-2.0)
+
+`serialport 4.9.0` is a direct dependency of `host/Cargo.toml`, used for
+USB-serial communication with the device (provisioning, PIN reset, history
+export). It is used as an unmodified upstream library dependency, not
+vendored or modified in this repository. See
+`docs/licensing/DEPENDENCY-AUDIT.md` for the GPLv3-compatibility reasoning
+(MPL-2.0 is file-level copyleft and GPL-combination-safe by default). The
+full MPL-2.0 license text is available at
+<https://www.mozilla.org/en-US/MPL/2.0/>.
+
+--------------------------------------------------------------------------
+Slint
+--------------------------------------------------------------------------
+Project:    Slint — Rust-native declarative UI toolkit
+Source:     https://github.com/slint-ui/slint
+License:    Triple-licensed by the Slint project; MeshCadet uses it under
+            the GPL-3.0-only option (see docs/licensing/DEPENDENCY-AUDIT.md
+            for why, and note this is the reason MeshCadet itself ships
+            under GPLv3).
+
+--------------------------------------------------------------------------
+Bundled/embedded font assets
+--------------------------------------------------------------------------
+`firmware/gen_emoji_font.c` (invoked from `firmware/build.rs`) rasterizes a
+combined bitmap font, baked into the firmware binary, from two source fonts:
+
+Noto Emoji
+  File:       firmware/assets/NotoEmoji-Regular.ttf (bundled in this repo)
+  Copyright:  Copyright 2013 Google Inc. All Rights Reserved.
+  License:    SIL Open Font License, Version 1.1 (OFL 1.1) — full text
+              accompanies the font at
+              firmware/assets/NotoEmoji-LICENSE.txt, per the OFL's own
+              redistribution condition (license + copyright notice must
+              travel with the font).
+
+DejaVu Sans
+  File:       NOT bundled in this repo (confirmed via `git ls-tree -r
+              HEAD`) — read from a system-installed path
+              (`/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf`, package
+              `fonts-dejavu-core` on Debian/Ubuntu) at firmware build time
+              only. A curated subset of its ASCII glyphs is rasterized into
+              the same combined bitmap font described above.
+  Copyright:  Copyright (c) 2003 by Bitstream, Inc. All Rights Reserved.
+              DejaVu's own changes are public domain.
+  License:    Bitstream Vera Fonts Copyright license. Text + full context
+              (why it's noted here despite not being an in-tree asset) at
+              docs/licensing/DejaVuSans-LICENSE.txt.

@@ -1,0 +1,43 @@
+[package]
+name = "ui_perf"
+version = "0.0.0"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+description = """
+Host-native measurement harness for the UI performance work. Combines two
+proof rigs: (1) a REPAINT-SCOPE rig that renders the REAL
+firmware/src/ui/motifs.slint animations through the identical Slint
+SoftwareRenderer in ReusedBuffer (dirty-region) mode firmware/src/ui/
+platform.rs drives on-target, reporting per-frame dirty-region size +
+lines-flushed via the software renderer's returned PhysicalRegion; and (2) a
+BASELINE rig of timed host benchmarks over the pure render-logic hot paths
+ported from firmware/src/ui/mod.rs, plus a reusable counting-allocator every
+downstream optimization measures against. See README.md and
+docs/perf/ui-perf-baseline.md for the full design docs.
+"""
+
+[[bin]]
+name = "ui_perf_bench"
+path = "src/bin/bench.rs"
+
+[dependencies]
+# IDENTICAL feature set to firmware/Cargo.toml + ui_sim/Cargo.toml: no default
+# features (no winit/systemfonts backend), software renderer only, so this
+# crate exercises the SAME MinimalSoftwareWindow + ReusedBuffer dirty-region
+# path the firmware's ui/platform.rs drives — without the esp-idf toolchain.
+slint = { version = "=1.16.1", default-features = false, features = [
+    "unsafe-single-threaded",
+    "renderer-software",
+    "libm",
+    "compat-1-2",
+] }
+protocol = { workspace = true }
+
+[build-dependencies]
+# Added for its EFFECT on the host compilation graph (software-renderer/image
+# features on slint-macros' i-slint-compiler instance), so `@image-url(...)` +
+# SLINT_EMBED_RESOURCES=embed-for-software-renderer works in this crate's
+# inline slint!{} block — see firmware/Cargo.toml + ui_sim/Cargo.toml's
+# identical comment.
+slint-build = { version = "=1.16.1" }
