@@ -1,0 +1,35 @@
+name: Pages Check
+
+# PR-facing regression guard for the site's one hard rule (relative paths
+# only — see check-relative-paths below and site/README.md "Conventions").
+# Deliberately pull_request-only and deliberately does NOT build or deploy
+# anything: pages-deploy.yml owns build/upload-pages-artifact/deploy-pages
+# and only fires on push to main, so a site PR's checks list shows this
+# validation and nothing about deploy (no more "build"/"deploy" showing as
+# skipped on every PR).
+on:
+  pull_request:
+    paths:
+      - "site/**"
+      - ".github/workflows/pages-check.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reject root-absolute asset/href paths
+        # This is a PROJECT Pages site (served at /meshcadet/, not a root
+        # site), so any href/src starting with "/" 404s in production even
+        # though it works from a local file:// or `python3 -m http.server`
+        # preview. Guard the mission's core acceptance criterion so a future
+        # page/section can't silently regress it.
+        run: |
+          if grep -rnE '(href|src)="/' site --include='*.html'; then
+            echo "::error::found a root-absolute href/src in site/ — this is a project Pages site (/meshcadet/…), paths must be relative (e.g. \"assets/foo.png\", not \"/assets/foo.png\")"
+            exit 1
+          fi

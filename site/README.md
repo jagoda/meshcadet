@@ -2,8 +2,10 @@
 
 Source for the MeshCadet GitHub Pages project site
 (`https://jagoda.github.io/meshcadet/`), deployed by
-`.github/workflows/pages.yml` on every push to `main` that touches this
-directory.
+`.github/workflows/pages-deploy.yml` on every push to `main` that touches
+this directory. `.github/workflows/pages-check.yml` runs the relative-path
+regression guard (below) on every PR that touches this directory, without
+building or publishing anything.
 
 ## Structure
 

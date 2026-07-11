@@ -46,12 +46,13 @@ name: CI
 # ── Path filter: skip entirely on site-only changes ──────────────────────
 #
 # All five jobs below build/test/lint the Rust workspace or the firmware
-# cross-compile — none of them touch `site/` or `pages.yml`, so a PR whose
-# diff is scoped to the GitHub Pages landing site gets nothing useful from
-# running them. `paths-ignore` skips the WHOLE workflow (all five jobs) when
-# every changed file matches the ignore list; any change outside it (any
-# Rust/firmware file, or ci.yml itself) still triggers the full suite
-# unchanged. `pages.yml`'s own `check` job already covers site-only PRs.
+# cross-compile — none of them touch `site/` or the pages-*.yml workflows, so
+# a PR whose diff is scoped to the GitHub Pages landing site gets nothing
+# useful from running them. `paths-ignore` skips the WHOLE workflow (all five
+# jobs) when every changed file matches the ignore list; any change outside
+# it (any Rust/firmware file, or ci.yml itself) still triggers the full suite
+# unchanged. `pages-check.yml`'s own `check` job already covers site-only
+# PRs.
 #
 # This is a plain skip, not a "companion job reports success" shim, because
 # it doesn't need to be: ruleset `main` (id 18807600, see
@@ -68,12 +69,14 @@ on:
   pull_request:
     paths-ignore:
       - "site/**"
-      - ".github/workflows/pages.yml"
+      - ".github/workflows/pages-check.yml"
+      - ".github/workflows/pages-deploy.yml"
   push:
     branches: [main]
     paths-ignore:
       - "site/**"
-      - ".github/workflows/pages.yml"
+      - ".github/workflows/pages-check.yml"
+      - ".github/workflows/pages-deploy.yml"
   # Lets a maintainer (or CI verification tooling) kick a run on-demand from
   # any branch without needing an open PR — `gh workflow run ci.yml --ref
   # <branch>`. Purely additive to the required pull_request/push triggers.

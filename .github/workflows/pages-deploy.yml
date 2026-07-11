@@ -2,20 +2,19 @@ name: Deploy Pages
 
 # Publishes site/ (the GitHub Pages project-site landing page, see
 # site/README.md) via GitHub Actions' native Pages deployment — no gh-pages
-# branch, no Jekyll. `check` runs on PRs too, as a regression guard for the
-# site's one hard rule (relative paths only — see check-relative-paths.sh);
-# `build`/`deploy` only run on push to main, which is where they have the
-# `pages: write` permission to actually publish.
+# branch, no Jekyll. Deliberately push-to-main-only: pages-check.yml owns the
+# PR-facing relative-path regression guard, so this workflow never appears on
+# a site PR's checks list — only on the push that actually publishes.
+# `workflow_dispatch` is kept as a trigger (parity with the pre-split
+# workflow) but build/deploy still guard on `github.event_name == 'push'`, so
+# a manual dispatch reaches the runner without actually publishing — it's not
+# a bypass around the push-to-main-only publish path.
 on:
   push:
     branches: [main]
     paths:
       - "site/**"
-      - ".github/workflows/pages.yml"
-  pull_request:
-    paths:
-      - "site/**"
-      - ".github/workflows/pages.yml"
+      - ".github/workflows/pages-deploy.yml"
   workflow_dispatch:
 
 permissions:
@@ -28,25 +27,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Reject root-absolute asset/href paths
-        # This is a PROJECT Pages site (served at /meshcadet/, not a root
-        # site), so any href/src starting with "/" 404s in production even
-        # though it works from a local file:// or `python3 -m http.server`
-        # preview. Guard the mission's core acceptance criterion so a future
-        # page/section can't silently regress it.
-        run: |
-          if grep -rnE '(href|src)="/' site --include='*.html'; then
-            echo "::error::found a root-absolute href/src in site/ — this is a project Pages site (/meshcadet/…), paths must be relative (e.g. \"assets/foo.png\", not \"/assets/foo.png\")"
-            exit 1
-          fi
-
   build:
-    needs: check
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
