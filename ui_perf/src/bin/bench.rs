@@ -72,7 +72,7 @@ fn main() {
     println!();
 
     // ── render_mentions — per-call timing ───────────────────────────────
-    println!("-- render_mentions (firmware/src/ui/mod.rs:2514) --");
+    println!("-- render_mentions (firmware_core::ui::message_view::render_mentions) --");
     let plain = "just a plain message with no mentions in it at all";
     let one_mention = "hi @[Alice] how's the weather over there today";
     let self_mention = "hey @[Bob] can you check the north relay";
@@ -92,7 +92,7 @@ fn main() {
     println!();
 
     // ── build_message_items — per-conversation-size timing + allocations ─
-    println!("-- build_message_items (firmware/src/ui/mod.rs:2477) --");
+    println!("-- build_message_items (firmware_core::ui::message_view::build_message_items) --");
     for n in [10usize, 50, 200] {
         let records = bench_fixtures::conversation(n);
         let iters = (20_000 / n.max(1)).max(50) as u32;

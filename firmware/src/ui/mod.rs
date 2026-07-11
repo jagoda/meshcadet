@@ -71,7 +71,7 @@ pub mod platform;
 pub mod screens;
 pub mod theme;
 
-use notification::{NotifDispatcher, NotifEvent, NotifPrefs, ToneBurst};
+use notification::{NotifDispatcher, NotifEvent, ToneBurst};
 
 use display::TDeckDisplay;
 use touch::TouchDriver;
@@ -94,6 +94,25 @@ use crate::gps;
 // `battery::BatteryStatus` is likewise a plain Copy struct — used here purely
 // as a display-state type for the admin-menu battery row.
 use crate::battery;
+
+// The pure, host-testable half of this module's own `UiRuntime`-level logic
+// (previously `#[cfg(test)]`-covered here but never executed — see the NOTE
+// above `mod tests` at the bottom of this file) now lives in
+// `firmware_core::ui` and its screen-named submodules, so those tests
+// execute under `cargo test --workspace`. Each import below is grouped by
+// its firmware-core home; see that module's doc for why it landed there.
+// See `docs/adr/0005-firmware-core-extraction.md`.
+use firmware_core::ui::{mark_last_unacked_outbound, messages_insert_non_empty, roll_selection};
+pub use firmware_core::ui::MessageRecord;
+use firmware_core::ui::admin_menu::{battery_display_fields_changed, notif_prefs_from_toggles};
+use firmware_core::ui::buzzer::square_wave_sample;
+use firmware_core::ui::compose::{compose_return_should_send, send_nav_deferral_elapsed};
+use firmware_core::ui::keyboard::{keyboard_drain_should_stop, message_view_compose_seed};
+use firmware_core::ui::message_view::incoming_message_is_unread;
+use firmware_core::ui::splash::splash_should_dismiss;
+use firmware_core::ui::touch::touch_wake_transition;
+use screens::contact_list::{build_channel_items, build_contact_items};
+use screens::message_view::{build_message_items, wrap_outgoing_mentions};
 
 // ── UI events (radio → UI) ────────────────────────────────────────────────────
 
@@ -264,7 +283,14 @@ impl<'d> BuzzerDriver<'d> {
         while emitted < total_samples {
             let n = (Self::CHUNK_SAMPLES as u32).min(total_samples - emitted) as usize;
             for i in 0..n {
-                let sample = Self::square_wave_sample(sample_counter, freq_hz, Self::SAMPLE_RATE_HZ, Self::AMPLITUDE);
+                // `square_wave_sample` is pure duty-cycle arithmetic (no
+                // I2S/hardware dependency) — it now lives in
+                // `firmware_core::ui::buzzer` so its tests execute under
+                // `cargo test --workspace` (this crate's `#[cfg(test)]`
+                // blocks are type-checked but never executed on host — see
+                // the NOTE above `mod tests` at the bottom of this file).
+                // See `docs/adr/0005-firmware-core-extraction.md`.
+                let sample = square_wave_sample(sample_counter, freq_hz, Self::SAMPLE_RATE_HZ, Self::AMPLITUDE);
                 let b = sample.to_le_bytes();
                 buf[i * 2] = b[0];
                 buf[i * 2 + 1] = b[1];
@@ -278,36 +304,6 @@ impl<'d> BuzzerDriver<'d> {
                 log::warn!("buzzer i2s write: {:?}", e);
                 return;
             }
-        }
-    }
-
-    /// Pure square-wave sample generator for `sample_index` of a `freq_hz`
-    /// tone at `sample_rate_hz`, returning `+amplitude`/`-amplitude` (or `0`
-    /// for `freq_hz == 0`, used for the silence gap between bursts).
-    ///
-    /// Extracted as a standalone function (no I2S/hardware dependency) so the
-    /// part of this driver most likely to carry a subtle bug — the duty-cycle
-    /// arithmetic — has a host-checkable unit test independent of the
-    /// esp-idf-hal I2S stack (this crate's `#[cfg(test)]` blocks are
-    /// type-checked but never executed on host — see the NOTE above `mod
-    /// tests` at the bottom of this file — so a wrong sample here would
-    /// otherwise only surface as "the buzzer sounds off" on real hardware).
-    ///
-    /// `.max(1)` guards the `sample_rate_hz / freq_hz` division against a
-    /// `freq_hz == 0` (silence) caller; `.max(2)` guards the `% samples_per_cycle`
-    /// below against a division/modulo by zero if `freq_hz` ever exceeded the
-    /// Nyquist limit (`sample_rate_hz`) — not reachable from the current
-    /// `notification::tone_sequence()` table (max 1320 Hz vs. an 8 kHz sample
-    /// rate), but cheap to make unconditionally safe.
-    fn square_wave_sample(sample_index: u32, freq_hz: u32, sample_rate_hz: u32, amplitude: i16) -> i16 {
-        if freq_hz == 0 {
-            return 0;
-        }
-        let samples_per_cycle = (sample_rate_hz / freq_hz.max(1)).max(2);
-        if (sample_index % samples_per_cycle) < samples_per_cycle / 2 {
-            amplitude
-        } else {
-            -amplitude
         }
     }
 }
@@ -654,72 +650,17 @@ pub struct UiRuntime<'d> {
     render_settling: bool,
 }
 
-/// One stored message in a conversation.
-#[derive(Clone, Debug)]
-pub struct MessageRecord {
-    pub text:     String,
-    pub is_ours:  bool,
-    pub acked:    bool,
-    // Captured at every construction site (cheap: `now_ms` is already in
-    // scope there) but not read anywhere yet — no message view renders a
-    // timestamp today. Kept rather than dropped: unlike the other fields,
-    // arrival time can't be reconstructed after the fact once a message has
-    // been appended, so deleting this now would foreclose a "time sent"
-    // label later at zero cost saved.
-    #[allow(dead_code)]
-    pub ts_ms:    u64,
-}
-
-/// Insert `records` under `hash`, unless `records` is empty (a no-op skip,
-/// not a clearing insert — see `UiRuntime::seed_conversation`'s doc for why
-/// an empty conversation is left absent from the map rather than inserted as
-/// `vec![]`).
-///
-/// Pulled out as a free function over a plain map — rather than an
-/// `impl UiRuntime` method — purely so it's testable in isolation, same
-/// "static function over plain data" pattern `build_contact_items`/
-/// `build_channel_items` already use (those can't touch real display/touch
-/// hardware in a test either).
-fn messages_insert_non_empty(
-    messages: &mut std::collections::HashMap<u8, Vec<MessageRecord>>,
-    hash: u8,
-    records: Vec<MessageRecord>,
-) {
-    if records.is_empty() {
-        return;
-    }
-    messages.insert(hash, records);
-}
-
-/// Mark the most-recently-sent, still-unacked outbound `MessageRecord` to
-/// `to_hash` as acked (✓ → ✓✓). Returns `true` if a record was found and
-/// flipped, `false` if there was no matching pending outbound message.
-///
-/// Searches newest-first (`.rev()`) and stops at the first unacked outbound
-/// hit — this is the "right message marked" invariant a confirmed-delivered
-/// DM depends on: `main.rs`'s `pending_ack` tracks only ONE outstanding ack at
-/// a time, for the most recently sent DM, so the newest unacked outbound
-/// record in this contact's thread is always the one a live match refers to.
-///
-/// Pulled out as a free function over a plain map for the same reason as
-/// `messages_insert_non_empty` above — `UiEvent::DmAcked`'s handler in
-/// `handle_event` is an `impl UiRuntime` method that can't be unit-tested
-/// directly (hardware-backed fields), so the matching logic itself lives here
-/// where a test can drive it against a plain `HashMap`.
-fn mark_last_unacked_outbound(
-    messages: &mut std::collections::HashMap<u8, Vec<MessageRecord>>,
-    to_hash: u8,
-) -> bool {
-    if let Some(msgs) = messages.get_mut(&to_hash) {
-        for m in msgs.iter_mut().rev() {
-            if m.is_ours && !m.acked {
-                m.acked = true;
-                return true;
-            }
-        }
-    }
-    false
-}
+// `MessageRecord` (one stored message in a conversation), and the two free
+// functions over it (`messages_insert_non_empty`/`mark_last_unacked_outbound`)
+// that used to live here, are pure Rust with no Slint/hardware dependency —
+// they now live in `firmware_core::ui` so their tests execute under `cargo
+// test --workspace` (this crate is a detached, cross-compiled workspace —
+// see `Cargo.toml`'s doc comment — so a `#[cfg(test)]` block written here
+// would type-check but never run); see that module's doc for why they moved
+// there rather than into a single screen submodule. Imported above via
+// `pub use firmware_core::ui::MessageRecord;` / `use firmware_core::ui::
+// {mark_last_unacked_outbound, messages_insert_non_empty, ...};`. See
+// `docs/adr/0005-firmware-core-extraction.md`.
 
 impl<'d> UiRuntime<'d> {
     /// Minimum wall-clock time the boot splash's one-shot animation is held
@@ -966,7 +907,7 @@ impl<'d> UiRuntime<'d> {
         self.contact_names.insert(hash, name);
         // Refresh the contact list Slint model if it is the active screen.
         if let ActiveScreen::ContactList(ref screen) = self.active_screen {
-            let contacts = Self::build_contact_items(
+            let contacts = build_contact_items(
                 &self.contact_names, &self.messages, &self.unread,
             );
             screen.set_contacts(&contacts);
@@ -1852,7 +1793,7 @@ impl<'d> UiRuntime<'d> {
                 );
                 // Refresh contact list preview/unread badge.
                 if let ActiveScreen::ContactList(ref screen) = self.active_screen {
-                    let contacts = Self::build_contact_items(
+                    let contacts = build_contact_items(
                         &self.contact_names, &self.messages, &self.unread,
                     );
                     screen.set_contacts(&contacts);
@@ -1896,7 +1837,7 @@ impl<'d> UiRuntime<'d> {
                 // incremented but nothing ever pushed the updated count into the
                 // Slint model.
                 if let ActiveScreen::ContactList(ref screen) = self.active_screen {
-                    let channels = Self::build_channel_items(
+                    let channels = build_channel_items(
                         &self.channel_items, &self.messages, &self.unread,
                     );
                     screen.set_channels(&channels);
@@ -1987,9 +1928,9 @@ impl<'d> UiRuntime<'d> {
         let ActiveScreen::ContactList(ref screen) = self.active_screen else { return };
         let show_contacts = screen.show_contacts();
         let len = if show_contacts {
-            Self::build_contact_items(&self.contact_names, &self.messages, &self.unread).len()
+            build_contact_items(&self.contact_names, &self.messages, &self.unread).len()
         } else {
-            Self::build_channel_items(&self.channel_items, &self.messages, &self.unread).len()
+            build_channel_items(&self.channel_items, &self.messages, &self.unread).len()
         };
         match ev {
             Up | Down => {
@@ -2006,10 +1947,10 @@ impl<'d> UiRuntime<'d> {
                 }
                 let idx = self.contact_list_selected as usize;
                 if show_contacts {
-                    let items = Self::build_contact_items(&self.contact_names, &self.messages, &self.unread);
+                    let items = build_contact_items(&self.contact_names, &self.messages, &self.unread);
                     screen.invoke_contact_selected(items[idx].hash);
                 } else {
-                    let items = Self::build_channel_items(&self.channel_items, &self.messages, &self.unread);
+                    let items = build_channel_items(&self.channel_items, &self.messages, &self.unread);
                     screen.invoke_channel_selected(items[idx].hash);
                 }
             }
@@ -2064,7 +2005,7 @@ impl<'d> UiRuntime<'d> {
     /// Route a composed message to the right transport and store it locally.
     ///
     /// Expands `:shortcode:` emoji, wraps `@name` mentions into their wire
-    /// form (`@[name]` — see [`Self::wrap_outgoing_mentions`]), appends an
+    /// form (`@[name]` — see [`wrap_outgoing_mentions`]), appends an
     /// outbound record to the thread so the conversation immediately shows
     /// the sent message, and queues the transport command (DM for contacts,
     /// group text for channels).
@@ -2082,7 +2023,7 @@ impl<'d> UiRuntime<'d> {
         // the single place that strips brackets back out for display, so
         // sent and received messages render through one code path.
         let known: Vec<&str> = self.known_names();
-        let text = Self::wrap_outgoing_mentions(&after_emoji, &known);
+        let text = wrap_outgoing_mentions(&after_emoji, &known);
 
         if text.trim().is_empty() {
             log::info!("ui: compose send ignored — empty draft after expansion");
@@ -2129,82 +2070,15 @@ impl<'d> UiRuntime<'d> {
             .collect()
     }
 
-    /// Wrap `@name` occurrences in `text` into wire form `@[name]` against
-    /// `known` (see `protocol::mention::wrap_mentions`). Pure/static so it's
-    /// unit-testable without a live `UiRuntime` (which needs hardware
-    /// handles to construct — see `build_message_items`'s doc for the same
-    /// pattern). Falls back to `text` verbatim on overflow of the internal
-    /// scratch buffer (matches `expand_shortcodes`'s call site's fallback
-    /// style just above) — a composed message longer than the scratch
-    /// buffer is already bounded well under it by the compose screen's own
-    /// input limit.
-    fn wrap_outgoing_mentions(text: &str, known: &[&str]) -> String {
-        let mut out = [0u8; 512];
-        match protocol::mention::wrap_mentions(text.as_bytes(), known, &mut out) {
-            Some(n) => String::from_utf8_lossy(&out[..n]).into_owned(),
-            None => text.to_string(),
-        }
-    }
-
-    /// Build a sorted contact item list from the current data maps.
-    ///
-    /// Static function so it can be called while `self.active_screen` is
-    /// borrowed — Rust's field-splitting rules allow simultaneous borrows of
-    /// separate struct fields.
-    fn build_contact_items(
-        contact_names: &std::collections::HashMap<u8, String>,
-        messages: &std::collections::HashMap<u8, Vec<MessageRecord>>,
-        unread: &std::collections::HashMap<u8, u32>,
-    ) -> Vec<screens::contact_list::ContactItem> {
-        use screens::contact_list::ContactItem;
-        let mut items: Vec<ContactItem> = contact_names.iter().map(|(&hash, name)| {
-            ContactItem {
-                name: name.clone(),
-                preview: messages.get(&hash)
-                    .and_then(|msgs| msgs.last())
-                    .map(|m| m.text.clone())
-                    .unwrap_or_default(),
-                time_str: String::new(),
-                unread: *unread.get(&hash).unwrap_or(&0) as i32,
-                hash,
-            }
-        }).collect();
-        // Sort by unread count (desc) then name (asc) for consistent ordering.
-        items.sort_by(|a, b| b.unread.cmp(&a.unread).then(a.name.cmp(&b.name)));
-        items
-    }
-
-    /// Build a fresh channel item list with up-to-date preview/unread from the
-    /// current data maps, using `channel_items` (the provisioned catalog: name +
-    /// hash) as the source of truth for identity.
-    ///
-    /// Mirrors `build_contact_items`.  Without this, `self.channel_items` — the
-    /// raw catalog pushed once at provisioning with `unread: 0` — was pushed to
-    /// the screen verbatim on every return to ContactList, permanently
-    /// overwriting any unread count that had accumulated in `self.unread`.
-    fn build_channel_items(
-        channel_items: &[screens::contact_list::ChannelItem],
-        messages: &std::collections::HashMap<u8, Vec<MessageRecord>>,
-        unread: &std::collections::HashMap<u8, u32>,
-    ) -> Vec<screens::contact_list::ChannelItem> {
-        use screens::contact_list::ChannelItem;
-        let mut items: Vec<ChannelItem> = channel_items.iter().map(|c| {
-            ChannelItem {
-                name: c.name.clone(),
-                preview: messages.get(&c.hash)
-                    .and_then(|msgs| msgs.last())
-                    .map(|m| m.text.clone())
-                    .unwrap_or_default(),
-                time_str: String::new(),
-                unread: *unread.get(&c.hash).unwrap_or(&0) as i32,
-                hash: c.hash,
-            }
-        }).collect();
-        // Sort by unread count (desc) then name (asc) — same ordering rule as
-        // `build_contact_items`, for cross-tab consistency.
-        items.sort_by(|a, b| b.unread.cmp(&a.unread).then(a.name.cmp(&b.name)));
-        items
-    }
+    // `wrap_outgoing_mentions`/`build_contact_items`/`build_channel_items`
+    // are pure functions over plain data (no display/touch/window hardware
+    // required) — they now live in `screens::contact_list`/
+    // `screens::message_view` (thin `pub use firmware_core::ui::...` shims)
+    // so their tests execute under `cargo test --workspace`. Imported above
+    // via `use screens::contact_list::{build_channel_items,
+    // build_contact_items};` / `use screens::message_view::{...,
+    // wrap_outgoing_mentions};`. See
+    // `docs/adr/0005-firmware-core-extraction.md`.
 
     // ── PIN-gated navigation ──────────────────────────────────────────────────
 
@@ -2559,10 +2433,10 @@ impl<'d> UiRuntime<'d> {
     /// belt-and-suspenders sync point, not a hot loop.
     fn refresh_contact_list_lists(&self) {
         if let ActiveScreen::ContactList(ref screen) = self.active_screen {
-            let contacts = Self::build_contact_items(
+            let contacts = build_contact_items(
                 &self.contact_names, &self.messages, &self.unread,
             );
-            let channels = Self::build_channel_items(
+            let channels = build_channel_items(
                 &self.channel_items, &self.messages, &self.unread,
             );
             log::debug!(
@@ -2649,7 +2523,7 @@ impl<'d> UiRuntime<'d> {
                 let known = self.known_names();
                 let items = self.messages
                     .get(&hash)
-                    .map(|records| Self::build_message_items(records, is_channel, &self.self_name, &known))
+                    .map(|records| build_message_items(records, is_channel, &self.self_name, &known))
                     .unwrap_or_default();
                 screen.set_messages(&items);
                 self.window.request_redraw();
@@ -2661,88 +2535,13 @@ impl<'d> UiRuntime<'d> {
         }
     }
 
-    /// Build the MessageView model rows from stored message records.
-    ///
-    /// For received channel messages (`is_channel && !m.is_ours`), the stored
-    /// text carries MeshCore's inline `"<name>: <msg>"` sender prefix (see
-    /// `protocol::parse_channel_text`, and `main.rs::handle_grp_txt` which
-    /// stores the raw prefixed text unmodified). This splits it into
-    /// `from_name` (the sender, sans delimiter) and a body so the Slint
-    /// `MessageBubble` can render the name+colon in bold and the body at
-    /// normal weight. DMs and sent messages never carry this prefix and pass
-    /// the whole text through as the body with `from_name` empty — which is
-    /// also the signal `MessageBubble` uses to fall back to plain, single-run
-    /// rendering, so the prefix split is scoped to received channel messages
-    /// only.
-    ///
-    /// The body (post prefix-split) is then run through
-    /// `protocol::mention::split_mentions` (`self_name`/`known` — same
-    /// known-names set `wrap_outgoing_mentions` matches against on send) to
-    /// flatten `@[name]` wire markup into a brackets-hidden `@name` display
-    /// string, and to compute `mention_tier`: the highest
-    /// `protocol::mention::MentionTier` found in the body, as an `i32` (0 =
-    /// none, 1 = other-node mention, 2 = self-mention) — `MessageBubble`
-    /// reads this to tint the bubble, self-mention more strongly than an
-    /// other-node mention (this is a bubble-level
-    /// tint rather than per-run inline color — Slint 1.16 has no rich-text
-    /// runs, and this sandbox has no HIL to validate a Rust-side word-wrap-
-    /// of-runs render, so bubble-level tint is the pre-authorized fallback).
-    /// Applied uniformly to sent and received messages (a self-composed
-    /// mention highlights too) — mentions are not channel-scoped.
-    fn build_message_items(
-        records: &[MessageRecord],
-        is_channel: bool,
-        self_name: &str,
-        known: &[&str],
-    ) -> Vec<screens::message_view::MessageItem> {
-        use screens::message_view::MessageItem;
-        records.iter().map(|m| {
-            let (from_name, body) = if is_channel && !m.is_ours {
-                match protocol::parse_channel_text(m.text.as_bytes()) {
-                    (Some(name), body) => (
-                        String::from_utf8_lossy(name).into_owned(),
-                        String::from_utf8_lossy(body).into_owned(),
-                    ),
-                    (None, _) => (String::new(), m.text.clone()),
-                }
-            } else {
-                (String::new(), m.text.clone())
-            };
-            let (text, mention_tier) = Self::render_mentions(&body, self_name, known);
-            MessageItem {
-                text,
-                from_name,
-                time_str: String::new(),
-                is_ours: m.is_ours,
-                acked: m.acked,
-                mention_tier,
-            }
-        }).collect()
-    }
-
-    /// Flatten `body`'s `@[name]` wire markup into a brackets-hidden
-    /// `@name` display string, and compute the highest
-    /// `protocol::mention::MentionTier` present, returned as `i32` (see
-    /// `build_message_items`'s doc for the tier code meaning). Pure/static
-    /// and unit-testable in isolation from the prefix-split/record plumbing
-    /// above it.
-    fn render_mentions(body: &str, self_name: &str, known: &[&str]) -> (String, i32) {
-        use protocol::mention::MentionTier;
-        let mut display = String::with_capacity(body.len());
-        let mut tier = MentionTier::Plain;
-        for run in protocol::mention::split_mentions(body, self_name, known) {
-            if run.tier == MentionTier::Plain {
-                display.push_str(run.text);
-            } else {
-                display.push('@');
-                display.push_str(run.text);
-            }
-            if run.tier > tier {
-                tier = run.tier;
-            }
-        }
-        (display, tier as i32)
-    }
+    // `build_message_items`/`render_mentions` are pure functions over plain
+    // data (no display/touch/window hardware required) — they now live in
+    // `screens::message_view` (a thin `pub use firmware_core::ui::...`
+    // shim) so their tests execute under `cargo test --workspace`. Imported
+    // above via `use screens::message_view::{build_message_items,
+    // render_mentions, ...};`. See
+    // `docs/adr/0005-firmware-core-extraction.md`.
 
     /// Navigate to the MessageView conversation for `hash`.
     ///
@@ -2770,7 +2569,7 @@ impl<'d> UiRuntime<'d> {
 
         let known = self.known_names();
         let items = self.messages.get(&hash)
-            .map(|records| Self::build_message_items(records, is_channel, &self.self_name, &known))
+            .map(|records| build_message_items(records, is_channel, &self.self_name, &known))
             .unwrap_or_default();
         screen.set_messages(&items);
 
@@ -2993,249 +2792,20 @@ impl<'d> UiRuntime<'d> {
     }
 }
 
-/// Pure decision function for the boot-splash dismissal gate (see
-/// `screens::splash` module doc and `UiRuntime::SPLASH_MIN_MS`/`SPLASH_MAX_MS`).
-/// Extracted as a pure function — same rationale as `touch_wake_transition`
-/// below — so the core acceptance logic (animation always
-/// completes, splash never lingers once settled, defensive cap) has
-/// host-checkable unit tests independent of the Slint/display stack.
-///
-/// `elapsed_ms` is measured from the splash's first `step()` tick (used ONLY
-/// by the `max_ms` defensive cap below). `animation_elapsed_ms` is `None`
-/// until `UiRuntime::step()` actually fires `SplashScreen::start_animation()`
-/// (gated on `mark_app_ready()` — see that method's doc), and `Some(ms)`
-/// thereafter, measured from ITS OWN clock (`splash_animation_started_ms`) —
-/// a different, later zero point than `elapsed_ms` whenever `mark_app_ready()`
-/// arrives after the splash's first tick.
-///
-/// Dismiss once EITHER:
-/// - `animation_elapsed_ms` is `Some(ms)` with `ms >= min_ms` (normal path:
-///   the one-shot splash animation has started AND had time to finish), OR
-/// - `elapsed_ms >= max_ms`, unconditionally (defensive cap — see
-///   `SPLASH_MAX_MS`'s doc; covers both "animation never started" and
-///   "started too late to have settled yet").
-fn splash_should_dismiss(elapsed_ms: u64, animation_elapsed_ms: Option<u64>, min_ms: u64, max_ms: u64) -> bool {
-    matches!(animation_elapsed_ms, Some(ms) if ms >= min_ms) || elapsed_ms >= max_ms
-}
-
-/// Result of [`touch_wake_transition`]: what `step()` should do with one
-/// polled touch event.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TouchWakeOutcome {
-    /// `true` if this event is the one that woke the screen (backlight
-    /// should turn on) — `step()` calls `wake_screen` when this is set.
-    woke: bool,
-    /// `true` if this event should be forwarded to `window.dispatch_touch`.
-    /// Mutually exclusive with `woke` and with mid-gesture swallow.
-    dispatch: bool,
-    /// New value for `UiRuntime::touch_wake_swallow_active`.
-    swallow_active: bool,
-}
-
-/// Pure decision function for the touch wake/swallow state machine.
-///
-/// This is the technically sharp part of the screen-sleep feature: the
-/// wake-triggering touch must be consumed to
-/// wake ONLY, never routed to the focused widget, and a still-held finger
-/// must not leak the rest of its Pressed→Moved→Released gesture into the app
-/// after the initiating Pressed was swallowed. Extracted as a pure function
-/// (no hardware/Slint dependency) so this invariant has host-checkable unit
-/// tests instead of relying solely on the manual HIL procedure (§H).
-///
-/// - `screen_asleep`: state BEFORE this event (i.e. before any wake this call causes).
-/// - `swallow_active`: whether a previous call is still draining a wake gesture's tail.
-/// - `kind`: the polled event's `TouchKind`.
-fn touch_wake_transition(
-    screen_asleep: bool,
-    swallow_active: bool,
-    kind: touch::TouchKind,
-) -> TouchWakeOutcome {
-    if screen_asleep {
-        // This event wakes the screen. Swallow it; if it's not already the
-        // gesture's Released, keep swallowing until one arrives.
-        TouchWakeOutcome {
-            woke: true,
-            dispatch: false,
-            swallow_active: kind != touch::TouchKind::Released,
-        }
-    } else if swallow_active {
-        // Draining the wake gesture's Moved/Released tail — still swallowed.
-        TouchWakeOutcome {
-            woke: false,
-            dispatch: false,
-            swallow_active: kind != touch::TouchKind::Released,
-        }
-    } else {
-        // Normal operation: screen already awake, no gesture to drain.
-        TouchWakeOutcome { woke: false, dispatch: true, swallow_active: false }
-    }
-}
-
-/// Decide whether a keyboard byte, polled while `MessageView` is the active
-/// screen and the device is already awake, should seed the Compose draft and
-/// flip the UI into write mode.
-///
-/// Returns `Some(text)` — the character to load as the draft's first
-/// character — for printable ASCII, using exactly the same byte range
-/// `keyboard::key_text` documents as "the printable char"
-/// (`0x20..=0x7E`, space through `~`, matching that "printable
-/// character key" wording). Returns `None` for anything else: Backspace,
-/// Return, Tab, Escape (which `key_text` maps to non-text Slint keys) and any
-/// byte with no mapping at all — those must retain MessageView's current
-/// behavior (today, a no-op, since MessageView has no focusable input) rather
-/// than jumping to Compose.
-///
-/// Pure (no hardware/Slint dependency) so the printable/non-printable
-/// boundary — the crux of the "non-text keys must be excluded" acceptance
-/// criterion — is host-testable independent of the keyboard co-processor,
-/// same rationale as `touch_wake_transition` above. Callers are additionally
-/// responsible for the sleep-wake exclusion (only calling this once a
-/// wake-triggering keypress has already been swallowed elsewhere) — that is
-/// `step()`'s job, not this function's.
-fn message_view_compose_seed(byte: u8) -> Option<String> {
-    match byte {
-        0x20..=0x7E => Some((byte as char).to_string()),
-        _ => None,
-    }
-}
-
-/// Decide whether a Return keypress in the Compose draft should trigger Send.
-///
-/// Returns `true` whenever `draft` has non-whitespace content — the same
-/// intent as the Send button, which sends whatever text is present. Returns
-/// `false` for empty or whitespace-only drafts, an explicit guard
-/// against empty sends: `step()` treats a `false` result as a total no-op
-/// (no send, no navigation, and — because Return is intercepted before
-/// `keyboard::key_text` dispatch — no newline inserted either), rather than
-/// falling back to the button's behavior of silently discarding the draft and
-/// still navigating back to MessageView.
-///
-/// Pure (no Slint/hardware dependency), same rationale as
-/// `message_view_compose_seed` and `touch_wake_transition` above: this is the
-/// acceptance-critical decision (empty/whitespace must not send) and is
-/// host-testable in isolation.
-fn compose_return_should_send(draft: &str) -> bool {
-    !draft.trim().is_empty()
-}
-
-/// Decide whether `step()`'s keyboard byte-drain loop should stop after
-/// processing the byte that was just handled.
-///
-/// `pending_nav` is `self.pending_nav.get()` — nonzero means the byte just
-/// handled set a screen-navigation flag (MessageView-seed or Compose
-/// Return-to-send). The loop must stop in that case even if the drain bound
-/// hasn't been reached: `active_screen` is about to change on the *next*
-/// `step()`, so evaluating a same-burst byte against the still-current (soon
-/// stale) screen would misattribute it — e.g. a second buffered character
-/// overwriting the just-set Compose seed instead of landing in the Compose
-/// draft it seeded. `drained >= max` is the independent defensive bound so a
-/// stuck/flooding bus cannot starve RX/render.
-///
-/// Pure (no hardware/Slint dependency) so this burst/nav interaction — the
-/// one behavioral edge case the multi-byte drain fix had to get right to
-/// avoid a regression — is host-testable independent of the keyboard
-/// co-processor, same rationale as `touch_wake_transition` above.
-fn keyboard_drain_should_stop(pending_nav: u8, drained: u8, max: u8) -> bool {
-    pending_nav != 0 || drained >= max
-}
-
-/// Pure predicate: has `step()`'s deferred post-send Compose → MessageView
-/// navigation deadline (`UiRuntime::deferred_message_view_nav_at_ms`)
-/// elapsed? Extracted from `step()`'s hardware-bound body so this timing edge —
-/// unarmed, armed-but-not-yet-due, and armed-and-due (including the exact
-/// boundary) — is covered by a host-native unit test independent of the
-/// display/touch stack, same "pull the pure decision out of the dispatcher"
-/// rationale as `splash_should_dismiss`/`keyboard_drain_should_stop` above.
-fn send_nav_deferral_elapsed(deferred_at_ms: Option<u64>, now_ms: u64) -> bool {
-    matches!(deferred_at_ms, Some(at_ms) if now_ms >= at_ms)
-}
-
-/// Pure predicate: should an incoming message for `(hash, is_channel)` be
-/// flagged unread, given the conversation the user is CURRENTLY viewing
-/// (`active_convo`)? `false` only while that exact conversation is the one
-/// open in a live `MessageView` — see `handle_event`'s IncomingDm/
-/// IncomingGroupMsg branches, both of which share this one gate.
-///
-/// # The invariant this depends on
-///
-/// `active_convo` must be `None` whenever no conversation is on screen —
-/// `navigate_to_message_view` sets it, and `navigate_to_contact_list` (the
-/// single choke point both PinEntry-cancel and MessageView's Back button
-/// route through) clears it back to `None`. Before that clear existed,
-/// `active_convo` stayed latched to whichever conversation was most
-/// recently opened, so this predicate stayed permanently `false` for that
-/// one (hash, is_channel) — suppressing its unread badge even long after
-/// the user had navigated away, reproducing as "no badge at all" for
-/// whichever DM or channel thread had been inspected last (e.g. while
-/// checking an unrelated theme change on the MessageView screen). Extracted
-/// as a pure function (mirrors `send_nav_deferral_elapsed` above) so the
-/// gate itself — independent of whether `navigate_to_contact_list` actually
-/// clears the latch — is host-testable without the display/touch stack.
-fn incoming_message_is_unread(active_convo: Option<(u8, bool)>, hash: u8, is_channel: bool) -> bool {
-    active_convo != Some((hash, is_channel))
-}
-
-/// Pure index-math for a trackball Up/Down roll,
-/// shared by `handle_trackball_contact_list` and
-/// `handle_trackball_admin_menu`: move `current` toward the top (`up: true`,
-/// decrement) or bottom (`up: false`, increment) of a `0..=max_idx` list.
-///
-/// - `current < 0` means "no highlight yet" (the `-1` sentinel documented on
-///   `contact_list_selected`/`admin_menu_selected`): the FIRST roll in
-///   either direction always lands on row `0`, matching "roll highlights a
-///   contact/channel" — the first roll picks the top row rather than needing
-///   an extra roll to establish a starting point.
-/// - `max_idx < 0` means an empty list (nothing to highlight): always returns
-///   `-1` regardless of direction or `current`, so a caller can treat a
-///   negative result as "no-op, no valid row" uniformly.
-/// - Otherwise clamps to `0..=max_idx` — rolling off either end holds at that
-///   end rather than wrapping (a wrap would let a roll silently jump from the
-///   last row back to the first, easy to trigger by accident on a physical
-///   trackball and surprising for the target audience).
-///
-/// Pure (no `UiRuntime`/Slint dependency) so this index arithmetic — the part
-/// of the whole feature most likely to carry an off-by-one — is
-/// host-checkable in isolation, same rationale as `touch_wake_transition`.
-fn roll_selection(current: i32, max_idx: i32, up: bool) -> i32 {
-    if max_idx < 0 {
-        return -1;
-    }
-    if current < 0 {
-        0
-    } else if up {
-        (current - 1).max(0)
-    } else {
-        (current + 1).min(max_idx)
-    }
-}
-
-/// Whether `prev` -> `new` changes anything the AdminMenu battery row
-/// renders. [`screens::admin_menu::format_battery_display`] reads exactly
-/// `percent` and `charging` (see that function's doc) — `raw_mv`/
-/// `held_raw_mv` are live diagnostic-only fields the on-device row never
-/// shows, so they are deliberately excluded here. Used by
-/// `UiRuntime::set_battery_status` to skip the row's `format!` allocation +
-/// Slint push on ADC-jitter ticks that don't move the displayed percentage or
-/// charging state.
-///
-/// Extracted as a pure function (no `UiRuntime`/hardware dependency) for a
-/// host-checkable unit test, same pattern as `notif_prefs_from_toggles`
-/// just below.
-fn battery_display_fields_changed(prev: battery::BatteryStatus, new: battery::BatteryStatus) -> bool {
-    prev.percent != new.percent || prev.charging != new.charging
-}
-
-/// Map the admin-menu's two master toggles (`RuntimeSettings.notif_visual` /
-/// `notif_audible`) to the [`NotifPrefs`] table `UiRuntime::sync_notif_prefs`
-/// installs into `self.notif` every `step()`.
-///
-/// Extracted as a pure function (no `UiRuntime`/hardware dependency) so the
-/// actual value of this fix — "the toggle wired to what `fire()`
-/// gates on" — has a host-checkable unit test, same pattern as
-/// `touch_wake_transition` above.
-fn notif_prefs_from_toggles(visual: bool, audible: bool) -> NotifPrefs {
-    NotifPrefs::from_provisioning_defaults(visual, audible)
-}
+// `splash_should_dismiss`, `touch_wake_transition`/`TouchWakeOutcome`,
+// `message_view_compose_seed`, `compose_return_should_send`,
+// `keyboard_drain_should_stop`, `send_nav_deferral_elapsed`,
+// `incoming_message_is_unread`, `roll_selection`,
+// `battery_display_fields_changed`, and `notif_prefs_from_toggles` are all
+// pure functions with no hardware/Slint dependency — they now live in
+// `firmware_core::ui` and its screen-named submodules (see the grouped
+// imports near the top of this file) so their tests execute under `cargo
+// test --workspace` (this crate's `#[cfg(test)]` blocks are type-checked
+// but never executed on host — see the NOTE above `mod tests` below).
+// `persist_runtime_settings`/`log_stack_hwm` below stay: the former touches
+// real NVS hardware, the latter is an unsafe FreeRTOS stack-introspection
+// call — both genuinely device-only. See
+// `docs/adr/0005-firmware-core-extraction.md`.
 
 /// Persist `settings` to NVS via `runtime_settings_store::save`, if a
 /// partition handle has been wired (`UiRuntime::set_nvs_partition`).
@@ -3297,777 +2867,38 @@ fn log_stack_hwm(context: &str) {
     log::info!("ui: {} stack HWM: {} B free", context, hwm);
 }
 
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 //
-// `build_contact_items`/`build_channel_items` are pure functions over plain
-// data maps — no display/touch/window hardware required — so they're testable
-// in isolation, same pattern as `keyboard.rs`/`notification.rs`/`compose.rs`.
-// These pin down the two regressions this module fixed: channel unread counts
-// reaching the screen (previously only contacts refreshed), and both trees
-// reading a common `unread` map that gets cleared on read.
+// The pure `UiRuntime`-level helpers this module used to pin here directly
+// (`build_contact_items`/`build_channel_items`/`build_message_items`,
+// `touch_wake_transition`, `splash_should_dismiss`, `roll_selection`,
+// `notif_prefs_from_toggles`, …) moved to `firmware_core::ui` and its
+// screen-named submodules — see the doc comments at each removed function's
+// former call site above, and `docs/adr/0005-firmware-core-extraction.md`
+// for the full inventory. Only `buzzer_channel_config_enables_auto_clear`
+// remains here: it pins an `esp_idf_hal::i2s::config::Config` value directly
+// and cannot be exercised without the esp-idf-hal I2S type, which is
+// genuinely device-only.
 //
 // NOTE: this crate's single `[[bin]]` target sets `harness = false` (see
 // Cargo.toml) so `main()` is the esp-idf entry point, not a synthesized libtest
 // runner — `cargo test` never actually *executes* any `#[cfg(test)]` block in
 // this crate, this one included; it only type-checks it (`cargo test --no-run`
 // is as far as this gets on host, and the runner in `.cargo/config.toml` needs
-// real hardware). Same pre-existing limitation as the three files above; not
-// introduced or fixed here.
+// real hardware). Same pre-existing limitation as the other files in this
+// crate; not introduced or fixed here.
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ── BuzzerDriver::square_wave_sample ────────────────────────────────────
-    // Pure duty-cycle arithmetic, no I2S/hardware dependency — see the
-    // function's doc for why this is pulled out and pinned here.
-
-    #[test]
-    fn square_wave_sample_silence_is_always_zero() {
-        for i in [0u32, 1, 2, 100] {
-            assert_eq!(BuzzerDriver::square_wave_sample(i, 0, 8_000, 16_384), 0);
-        }
-    }
-
-    #[test]
-    fn square_wave_sample_alternates_high_then_low_per_cycle() {
-        // freq_hz=1000 @ sample_rate=8000 => samples_per_cycle = 8: first
-        // half of each 8-sample cycle is +amplitude, second half -amplitude.
-        let amplitude = 16_384i16;
-        let expected = [
-            amplitude, amplitude, amplitude, amplitude,
-            -amplitude, -amplitude, -amplitude, -amplitude,
-        ];
-        for (i, &want) in expected.iter().enumerate() {
-            assert_eq!(
-                BuzzerDriver::square_wave_sample(i as u32, 1_000, 8_000, amplitude),
-                want,
-                "sample {i} of an 8-sample cycle",
-            );
-        }
-        // Cycle repeats: sample 8 matches sample 0.
-        assert_eq!(
-            BuzzerDriver::square_wave_sample(8, 1_000, 8_000, amplitude),
-            amplitude,
-        );
-    }
-
-    #[test]
-    fn square_wave_sample_never_panics_above_nyquist() {
-        // freq_hz > sample_rate_hz would drive samples_per_cycle to 0 without
-        // the `.max(2)` guard (mod-by-zero panic). Not reachable from the
-        // current tone_sequence() table, but must stay safe regardless.
-        let _ = BuzzerDriver::square_wave_sample(0, 50_000, 8_000, 16_384);
-    }
-
-    #[allow(dead_code)] // only called from #[test] fns, which the crate's real
-                         // main() never reaches — see NOTE above.
-    fn catalog(entries: &[(&str, u8)]) -> Vec<screens::contact_list::ChannelItem> {
-        entries.iter().map(|&(name, hash)| screens::contact_list::ChannelItem {
-            name: name.to_string(),
-            preview: String::new(),
-            time_str: String::new(),
-            unread: 0, // catalog entries are always seeded at 0 — see set_channels
-            hash,
-        }).collect()
-    }
-
-    #[test]
-    fn build_channel_items_reflects_unread_map() {
-        let channels = catalog(&[("General", 0x10), ("Ops", 0x20)]);
-        let messages: HashMap<u8, Vec<MessageRecord>> = HashMap::new();
-        let mut unread = HashMap::new();
-        unread.insert(0x20u8, 3u32);
-
-        let items = UiRuntime::build_channel_items(&channels, &messages, &unread);
-
-        // Regression guard for the missing-badge defect: a channel with a
-        // nonzero `unread` map entry must carry that count through, not the
-        // catalog's frozen `unread: 0`.
-        let ops = items.iter().find(|c| c.hash == 0x20).unwrap();
-        assert_eq!(ops.unread, 3);
-        let general = items.iter().find(|c| c.hash == 0x10).unwrap();
-        assert_eq!(general.unread, 0);
-    }
-
-    #[test]
-    fn build_channel_items_sorts_unread_first() {
-        let channels = catalog(&[("Alpha", 1), ("Bravo", 2), ("Charlie", 3)]);
-        let messages: HashMap<u8, Vec<MessageRecord>> = HashMap::new();
-        let mut unread = HashMap::new();
-        unread.insert(3u8, 1u32);
-
-        let items = UiRuntime::build_channel_items(&channels, &messages, &unread);
-        assert_eq!(items[0].hash, 3); // sole unread channel sorts first
-    }
-
-    #[test]
-    fn build_channel_items_carries_last_message_as_preview() {
-        let channels = catalog(&[("General", 0x10)]);
-        let mut messages: HashMap<u8, Vec<MessageRecord>> = HashMap::new();
-        messages.insert(0x10, vec![
-            MessageRecord { text: "first".into(), is_ours: false, acked: false, ts_ms: 0 },
-            MessageRecord { text: "latest".into(), is_ours: false, acked: false, ts_ms: 1 },
-        ]);
-        let unread = HashMap::new();
-
-        let items = UiRuntime::build_channel_items(&channels, &messages, &unread);
-        assert_eq!(items[0].preview, "latest");
-    }
-
-    // ── messages_insert_non_empty — boot-hydrate seeding core ───────────────
-    //
-    // Regression guard:
-    // `seed_conversation` must land restored history in `messages` so
-    // `build_contact_items`/`build_channel_items` (tested above) pick it up
-    // as a preview on the very first contact-list build, and must NOT insert
-    // an empty `Vec` for a conversation with no stored history.
-
-    #[test]
-    fn messages_insert_non_empty_seeds_restored_history() {
-        let mut messages: HashMap<u8, Vec<MessageRecord>> = HashMap::new();
-        let records = vec![
-            MessageRecord { text: "inbound restored".into(), is_ours: false, acked: true, ts_ms: 0 },
-            MessageRecord { text: "outbound restored".into(), is_ours: true, acked: true, ts_ms: 0 },
-        ];
-        messages_insert_non_empty(&mut messages, 0x55, records);
-
-        let seeded = messages.get(&0x55).expect("conversation must be seeded");
-        assert_eq!(seeded.len(), 2);
-        assert_eq!(seeded[0].text, "inbound restored");
-        assert!(!seeded[0].is_ours);
-        assert!(seeded[0].acked, "restored records must never show perpetual pending");
-        assert!(seeded[1].is_ours);
-    }
-
-    #[test]
-    fn messages_insert_non_empty_skips_empty_conversation() {
-        // An empty conversation (no history stored) must hydrate to empty —
-        // i.e. leave the key absent — not insert `vec![]`, so a caller can
-        // still tell "never messaged" apart from "seeded but list happened
-        // to be empty" if that distinction ever matters, and so previews
-        // read via `messages.get(&hash).and_then(|m| m.last())` behave
-        // identically either way (both `None`).
-        let mut messages: HashMap<u8, Vec<MessageRecord>> = HashMap::new();
-        messages_insert_non_empty(&mut messages, 0x77, Vec::new());
-        assert!(messages.get(&0x77).is_none());
-    }
-
-    #[test]
-    fn messages_insert_non_empty_seeded_history_feeds_contact_preview() {
-        // End-to-end (within the pure-function slice): seeding restored
-        // history and then building contact items must surface the restored
-        // text as the preview — the actual acceptance behavior ("contact
-        // list previews show restored history").
-        let mut contact_names = HashMap::new();
-        contact_names.insert(0x64u8, "Dana".to_string());
-        let mut messages: HashMap<u8, Vec<MessageRecord>> = HashMap::new();
-        messages_insert_non_empty(&mut messages, 0x64, vec![
-            MessageRecord { text: "welcome back".into(), is_ours: false, acked: true, ts_ms: 0 },
-        ]);
-        let unread = HashMap::new();
-
-        let items = UiRuntime::build_contact_items(&contact_names, &messages, &unread);
-        let dana = items.iter().find(|c| c.hash == 0x64).unwrap();
-        assert_eq!(dana.preview, "welcome back");
-    }
-
-    // ── mark_last_unacked_outbound — live ACK → ✓✓ indicator ────────────────
-    //
-    // Regression guard: this
-    // is the exact "right message marked" question the original diagnosis
-    // step raised — a confirmed-delivered DM must flip the correct
-    // `MessageRecord`, not an arbitrary one, and must not disturb unrelated
-    // conversations or already-acked history.
-
-    #[test]
-    fn marks_the_newest_unacked_outbound_message() {
-        let mut messages: HashMap<u8, Vec<MessageRecord>> = HashMap::new();
-        messages.insert(0x42, vec![
-            MessageRecord { text: "first".into(), is_ours: true, acked: false, ts_ms: 0 },
-            MessageRecord { text: "second".into(), is_ours: true, acked: false, ts_ms: 1 },
-        ]);
-
-        let marked = mark_last_unacked_outbound(&mut messages, 0x42);
-
-        assert!(marked, "an unacked outbound message must be found and marked");
-        let msgs = &messages[&0x42];
-        assert!(!msgs[0].acked, "the older unacked message must be left alone");
-        assert!(msgs[1].acked, "the most recently sent unacked message is the one the ack refers to");
-    }
-
-    #[test]
-    fn does_not_re_ack_an_already_acked_message_or_touch_inbound_records() {
-        let mut messages: HashMap<u8, Vec<MessageRecord>> = HashMap::new();
-        messages.insert(0x42, vec![
-            MessageRecord { text: "outbound already delivered".into(), is_ours: true, acked: true, ts_ms: 0 },
-            MessageRecord { text: "their reply".into(), is_ours: false, acked: false, ts_ms: 1 },
-        ]);
-
-        let marked = mark_last_unacked_outbound(&mut messages, 0x42);
-
-        assert!(!marked, "no unacked OUTBOUND message exists — an inbound record must never be flipped");
-        assert!(messages[&0x42][0].acked);
-        assert!(!messages[&0x42][1].acked, "inbound records are never acked by this path");
-    }
-
-    #[test]
-    fn does_not_touch_a_different_contacts_conversation() {
-        let mut messages: HashMap<u8, Vec<MessageRecord>> = HashMap::new();
-        messages.insert(0x10, vec![
-            MessageRecord { text: "to alice".into(), is_ours: true, acked: false, ts_ms: 0 },
-        ]);
-        messages.insert(0x20, vec![
-            MessageRecord { text: "to bob".into(), is_ours: true, acked: false, ts_ms: 0 },
-        ]);
-
-        let marked = mark_last_unacked_outbound(&mut messages, 0x10);
-
-        assert!(marked);
-        assert!(messages[&0x10][0].acked, "the addressed contact's message is marked");
-        assert!(!messages[&0x20][0].acked, "an unrelated contact's pending message must be untouched");
-    }
-
-    #[test]
-    fn unknown_contact_hash_is_a_no_op() {
-        let mut messages: HashMap<u8, Vec<MessageRecord>> = HashMap::new();
-        let marked = mark_last_unacked_outbound(&mut messages, 0x99);
-        assert!(!marked);
-    }
-
-    #[test]
-    fn build_contact_items_reflects_unread_map() {
-        let mut contact_names = HashMap::new();
-        contact_names.insert(0x30u8, "Alice".to_string());
-        contact_names.insert(0x40u8, "Bob".to_string());
-        let messages: HashMap<u8, Vec<MessageRecord>> = HashMap::new();
-        let mut unread = HashMap::new();
-        unread.insert(0x30u8, 2u32);
-
-        let items = UiRuntime::build_contact_items(&contact_names, &messages, &unread);
-        let alice = items.iter().find(|c| c.hash == 0x30).unwrap();
-        assert_eq!(alice.unread, 2);
-        let bob = items.iter().find(|c| c.hash == 0x40).unwrap();
-        assert_eq!(bob.unread, 0);
-    }
-
-    #[test]
-    fn contact_and_channel_unread_share_one_map_and_clear_together() {
-        // Documents the pre-existing key-space assumption both builders share:
-        // `unread` is keyed only by `u8` hash, not by (hash, is_channel). A
-        // contact hash and a channel hash that happen to collide will share
-        // one counter and one clear-on-read. Not a regression introduced by
-        // this fix (contact_names/messages already share the same u8 key
-        // space) — recorded here so a future change to disambiguate the key
-        // space has a test to update.
-        let mut unread: HashMap<u8, u32> = HashMap::new();
-        unread.insert(0x55, 1);
-        // Simulate navigate_to_message_view's clear-on-read for hash 0x55,
-        // regardless of whether it was opened as a contact or a channel.
-        unread.remove(&0x55);
-        assert_eq!(unread.get(&0x55), None);
-    }
-
-    // ── build_message_items — channel sender-prefix split ────────────────
-    //
-    // Regression guard: pins which
-    // records get their MeshCore "<name>: <msg>" wire text split into
-    // (from_name, text) — the signal `MessageBubble` uses to bold the
-    // sender prefix — and which pass `text` through verbatim with an empty
-    // `from_name` (the fallback to plain rendering).
-
-    #[test]
-    fn build_message_items_splits_prefix_on_received_channel_message() {
-        let records = vec![
-            MessageRecord { text: "Alice: hello there".into(), is_ours: false, acked: false, ts_ms: 0 },
-        ];
-        let items = UiRuntime::build_message_items(&records, /* is_channel */ true, "Self", &[]);
-        assert_eq!(items[0].from_name, "Alice");
-        assert_eq!(items[0].text, "hello there");
-    }
-
-    #[test]
-    fn build_message_items_leaves_sent_channel_message_unprefixed() {
-        // Sent messages store the raw compose text (no MeshCore name prefix
-        // — see `on_send_message`), and must render exactly as before this
-        // fix regardless of channel-ness: no split, empty from_name.
-        let records = vec![
-            MessageRecord { text: "Alice: hello there".into(), is_ours: true, acked: false, ts_ms: 0 },
-        ];
-        let items = UiRuntime::build_message_items(&records, /* is_channel */ true, "Self", &[]);
-        assert_eq!(items[0].from_name, "");
-        assert_eq!(items[0].text, "Alice: hello there");
-    }
-
-    #[test]
-    fn build_message_items_leaves_dm_message_unprefixed() {
-        // DMs never carry the channel wire-text delimiter, even if their
-        // literal text happens to contain "name: " — is_channel=false is the
-        // guard, not a text-shape heuristic.
-        let records = vec![
-            MessageRecord { text: "Alice: hello there".into(), is_ours: false, acked: false, ts_ms: 0 },
-        ];
-        let items = UiRuntime::build_message_items(&records, /* is_channel */ false, "Self", &[]);
-        assert_eq!(items[0].from_name, "");
-        assert_eq!(items[0].text, "Alice: hello there");
-    }
-
-    #[test]
-    fn build_message_items_falls_back_when_channel_text_has_no_prefix() {
-        // Malformed/prefix-less channel text (no "<name>: " delimiter) passes
-        // through verbatim rather than mis-splitting on the wrong bytes.
-        let records = vec![
-            MessageRecord { text: "no delimiter here".into(), is_ours: false, acked: false, ts_ms: 0 },
-        ];
-        let items = UiRuntime::build_message_items(&records, /* is_channel */ true, "Self", &[]);
-        assert_eq!(items[0].from_name, "");
-        assert_eq!(items[0].text, "no delimiter here");
-    }
-
-    #[test]
-    fn build_message_items_empty_sender_name_falls_back_to_plain_body() {
-        // Pathological wire text (never emitted by real MeshCore senders,
-        // whose sender_name is never empty) with an EMPTY name before the
-        // delimiter: `parse_channel_text` still reports `Some("")`, which
-        // collapses to `from_name == ""` here — the same signal `MessageBubble`
-        // treats as "no attribution", so it falls back to plain rendering.
-        // Documented rather than special-cased: the delimiter itself is
-        // dropped from the displayed body in this corner case (accepted
-        // known limitation).
-        let records = vec![
-            MessageRecord { text: ": hello".into(), is_ours: false, acked: false, ts_ms: 0 },
-        ];
-        let items = UiRuntime::build_message_items(&records, /* is_channel */ true, "Self", &[]);
-        assert_eq!(items[0].from_name, "");
-        assert_eq!(items[0].text, "hello");
-    }
-
-    // ── @mentions — wrap (send) / render (receive) ────────────────────────
-    //
-    // Pins the two
-    // Rust-side seams around `protocol::mention` (itself unit-tested in
-    // `protocol/src/mention.rs`): `wrap_outgoing_mentions` (send-side glue)
-    // and `render_mentions`/`build_message_items` (receive-side glue —
-    // flattened display text + `mention_tier`).
-
-    #[test]
-    fn wrap_outgoing_mentions_wraps_known_name() {
-        let out = UiRuntime::wrap_outgoing_mentions("hi @Alice!", &["Alice", "Bob"]);
-        assert_eq!(out, "hi @[Alice]!");
-    }
-
-    #[test]
-    fn wrap_outgoing_mentions_leaves_unknown_name_verbatim() {
-        let out = UiRuntime::wrap_outgoing_mentions("hi @nobody!", &["Alice", "Bob"]);
-        assert_eq!(out, "hi @nobody!");
-    }
-
-    #[test]
-    fn render_mentions_flattens_brackets_and_reports_no_tier_for_plain_text() {
-        let (text, tier) = UiRuntime::render_mentions("just a plain message", "Bob", &[]);
-        assert_eq!(text, "just a plain message");
-        assert_eq!(tier, 0);
-    }
-
-    #[test]
-    fn render_mentions_other_node_mention_is_tier_1() {
-        let (text, tier) = UiRuntime::render_mentions("hi @[Alice] there", "Bob", &[]);
-        assert_eq!(text, "hi @Alice there");
-        assert!(!text.contains('['));
-        assert!(!text.contains(']'));
-        assert_eq!(tier, 1);
-    }
-
-    #[test]
-    fn render_mentions_self_mention_is_tier_2_more_prominent_than_other() {
-        let (text, tier) = UiRuntime::render_mentions("hi @[Bob] there", "Bob", &[]);
-        assert_eq!(text, "hi @Bob there");
-        assert_eq!(tier, 2);
-        assert!(tier > 1); // self-mention outranks an other-node mention
-    }
-
-    #[test]
-    fn render_mentions_multiword_name_not_tokenized_on_space() {
-        // A real-world example: "Chicken Little" contains a space —
-        // the delimiter must not be mistaken for a word boundary.
-        let (text, tier) = UiRuntime::render_mentions(
-            "watch out @[Chicken Little] the sky is falling", "Rex", &[],
-        );
-        assert_eq!(text, "watch out @Chicken Little the sky is falling");
-        assert_eq!(tier, 1);
-    }
-
-    #[test]
-    fn build_message_items_renders_self_mention_in_received_dm() {
-        let records = vec![
-            MessageRecord { text: "hey @[Bob] check this out".into(), is_ours: false, acked: false, ts_ms: 0 },
-        ];
-        let items = UiRuntime::build_message_items(&records, /* is_channel */ false, "Bob", &["Bob"]);
-        assert_eq!(items[0].text, "hey @Bob check this out");
-        assert_eq!(items[0].mention_tier, 2);
-    }
-
-    #[test]
-    fn build_message_items_renders_other_mention_in_received_channel_message_after_prefix_split() {
-        // Sender-prefix split (from_name) and mention flattening both apply
-        // to the same received channel message, in sequence: prefix comes
-        // off first, then the body is scanned for mentions — the two
-        // features this render rework couples on purpose. This
-        // node's own name is "Carol" — the mention is of "Bob", a different
-        // node, so it must tier as `Other` (1), not `SelfMention`.
-        let records = vec![
-            MessageRecord {
-                text: "Alice: hi @[Bob] check this out".into(),
-                is_ours: false, acked: false, ts_ms: 0,
-            },
-        ];
-        let items = UiRuntime::build_message_items(
-            &records, /* is_channel */ true, "Carol", &["Carol", "Bob", "Alice"],
-        );
-        assert_eq!(items[0].from_name, "Alice");
-        assert_eq!(items[0].text, "hi @Bob check this out");
-        assert_eq!(items[0].mention_tier, 1);
-    }
-
-    #[test]
-    fn build_message_items_mention_free_text_is_tier_zero_unchanged() {
-        let records = vec![
-            MessageRecord { text: "no mentions here".into(), is_ours: false, acked: false, ts_ms: 0 },
-        ];
-        let items = UiRuntime::build_message_items(&records, /* is_channel */ false, "Bob", &["Bob"]);
-        assert_eq!(items[0].text, "no mentions here");
-        assert_eq!(items[0].mention_tier, 0);
-    }
-
-    #[test]
-    fn build_message_items_sent_message_mentions_also_render() {
-        // Mentions are not receive-only: a self-composed mention (already
-        // wire-wrapped by `on_send_message` before the record is stored)
-        // must render identically through the same one code path.
-        let records = vec![
-            MessageRecord { text: "hi @[Alice] it's Bob".into(), is_ours: true, acked: false, ts_ms: 0 },
-        ];
-        let items = UiRuntime::build_message_items(&records, /* is_channel */ false, "Bob", &["Bob", "Alice"]);
-        assert_eq!(items[0].text, "hi @Alice it's Bob");
-        assert_eq!(items[0].mention_tier, 1);
-    }
-
-    // ── splash_should_dismiss ────────────────────────────────────────────
-    //
-    // Acceptance-critical: pins the requirements below — the
-    // animation always completes (not started yet, or started but not
-    // settled → never dismiss on that basis alone), the splash never lingers
-    // once the animation has settled (`Some(ms) >= min` → dismiss), and a
-    // boot that never reaches `mark_app_ready()` (animation never starts)
-    // can't wedge the UI (max cap dismisses regardless).
-
-    // Mirrors `UiRuntime::SPLASH_MIN_MS`/`SPLASH_MAX_MS` (inlined rather than
-    // referenced: those are private associated consts on a lifetime-generic
-    // type, and `splash_should_dismiss` takes the thresholds as plain
-    // parameters precisely so callers — including these tests — don't need
-    // a concrete `UiRuntime<'d>` to exercise it).
-    //
-    // BUG FIX: mirrors moved from 1200/2000 to
-    // 1600/2400 alongside the real constants — see their docs.
-    const MIN_MS: u64 = 1600;
-    const MAX_MS: u64 = 2400;
-
-    #[test]
-    fn animation_not_started_never_dismisses_below_max() {
-        assert!(!splash_should_dismiss(0, None, MIN_MS, MAX_MS));
-        assert!(!splash_should_dismiss(MAX_MS - 1, None, MIN_MS, MAX_MS));
-    }
-
-    #[test]
-    fn animation_started_but_not_settled_waits() {
-        // The animation has started (app_ready fired and `start_animation()`
-        // ran) but hasn't had time to play through — must NOT dismiss yet,
-        // regardless of how much boot-clock time (`elapsed_ms`) has passed.
-        assert!(!splash_should_dismiss(0, Some(0), MIN_MS, MAX_MS));
-        assert!(!splash_should_dismiss(MIN_MS - 1, Some(MIN_MS - 1), MIN_MS, MAX_MS));
-    }
-
-    #[test]
-    fn animation_settled_dismisses() {
-        assert!(splash_should_dismiss(MIN_MS, Some(MIN_MS), MIN_MS, MAX_MS));
-        assert!(splash_should_dismiss(MIN_MS + 500, Some(MIN_MS + 500), MIN_MS, MAX_MS));
-    }
-
-    #[test]
-    fn animation_started_late_settles_on_its_own_clock_not_the_boot_clock() {
-        // The whole point of decoupling the two clocks: `mark_app_ready()` can
-        // fire well after the splash's first `step()` tick. Here the boot
-        // clock (`elapsed_ms`) is already past `MIN_MS`, but the animation
-        // only just started (`animation_elapsed_ms = Some(0)`) — must still
-        // wait for the ANIMATION's own clock to reach `MIN_MS`, not dismiss
-        // just because the boot clock did.
-        assert!(!splash_should_dismiss(MIN_MS + 200, Some(0), MIN_MS, MAX_MS));
-        assert!(splash_should_dismiss(MIN_MS + 200, Some(MIN_MS), MIN_MS, MAX_MS));
-    }
-
-    #[test]
-    fn max_cap_dismisses_even_when_animation_never_started() {
-        assert!(splash_should_dismiss(MAX_MS, None, MIN_MS, MAX_MS));
-        assert!(splash_should_dismiss(MAX_MS + 1000, None, MIN_MS, MAX_MS));
-    }
-
-    // BUG FIX: pins the coordination
-    // constraint between the two thresholds themselves, not just
-    // `splash_should_dismiss`'s branch logic — the actual defect
-    // was a MIN/MAX pair that had drifted out of the "lingers a bit longer,
-    // total time still ~2-2.5 s max, animation still completes" envelope.
-    // A future edit to either constant (or to the splash animation's total
-    // duration in `screens::splash`) that breaks this envelope should fail
-    // here rather than only be caught by eyeballing the on-device timing.
-    #[test]
-    fn min_and_max_stay_within_the_acceptance_envelope() {
-        // Animation timeline total, from `screens::splash`'s module doc.
-        const SPLASH_ANIMATION_TOTAL_MS: u64 = 1150;
-        assert!(
-            MIN_MS >= SPLASH_ANIMATION_TOTAL_MS,
-            "SPLASH_MIN_MS must stay >= the one-shot animation's total \
-             duration or the splash can dismiss mid-animation",
-        );
-        assert!(MIN_MS < MAX_MS, "the defensive cap must sit above the floor");
-        assert!(
-            MAX_MS <= 2500,
-            "SPLASH_MAX_MS must stay within the ~2-2.5 s acceptance budget",
-        );
-    }
-
-    // ── touch_wake_transition ─────────────────────────────────────────────
-    //
-    // Acceptance-critical: the central invariant is that the
-    // wake-triggering input is swallowed globally and never reaches the
-    // focused widget. These pin the state machine driving that invariant.
-
-    #[test]
-    fn asleep_pressed_wakes_and_swallows_without_dispatch() {
-        let o = touch_wake_transition(true, false, touch::TouchKind::Pressed);
-        assert!(o.woke, "a Pressed while asleep must wake the screen");
-        assert!(!o.dispatch, "the wake-triggering Pressed must NOT reach the focused widget");
-        assert!(o.swallow_active, "must keep swallowing until the matching Released");
-    }
-
-    #[test]
-    fn asleep_released_wakes_and_does_not_leave_swallow_active() {
-        // Defensive case: shouldn't happen in practice (sleep can't engage
-        // mid-gesture — see step()'s inactivity check — but a Released alone
-        // must still wake+swallow, not dispatch, and not get stuck swallowing
-        // forever waiting for a Released that already happened).
-        let o = touch_wake_transition(true, false, touch::TouchKind::Released);
-        assert!(o.woke);
-        assert!(!o.dispatch);
-        assert!(!o.swallow_active);
-    }
-
-    #[test]
-    fn wake_gesture_moved_tail_still_swallowed() {
-        // After the initiating Pressed woke the screen, a held finger's
-        // Moved samples must keep being swallowed, not dispatched.
-        let o = touch_wake_transition(false, true, touch::TouchKind::Moved);
-        assert!(!o.woke, "already awake — this is not a second wake");
-        assert!(!o.dispatch, "still draining the wake gesture's tail");
-        assert!(o.swallow_active, "Moved does not end the gesture");
-    }
-
-    #[test]
-    fn wake_gesture_released_ends_swallow() {
-        let o = touch_wake_transition(false, true, touch::TouchKind::Released);
-        assert!(!o.woke);
-        assert!(!o.dispatch, "the wake gesture's own Released must not dispatch either");
-        assert!(!o.swallow_active, "Released ends the swallowed gesture");
-    }
-
-    #[test]
-    fn normal_operation_dispatches_every_kind() {
-        // Screen already awake, no wake gesture in flight: every event kind
-        // dispatches normally — this is the ordinary, un-swallowed path that
-        // must not regress for existing touch interactions.
-        for kind in [touch::TouchKind::Pressed, touch::TouchKind::Moved, touch::TouchKind::Released] {
-            let o = touch_wake_transition(false, false, kind);
-            assert!(!o.woke);
-            assert!(o.dispatch, "{:?} must dispatch during normal operation", kind);
-            assert!(!o.swallow_active);
-        }
-    }
-
-    #[test]
-    fn a_full_wake_gesture_never_dispatches_any_event() {
-        // End-to-end simulation of one physical tap that wakes the screen:
-        // Pressed (wakes) -> Moved -> Released, driven through the state
-        // machine exactly as step() would sequence it. NOT ONE event in this
-        // gesture may reach `dispatch` — that is the whole point of the
-        // swallow invariant.
-        let mut asleep = true;
-        let mut swallow = false;
-        let mut any_dispatched = false;
-        let mut woke_count = 0;
-        for kind in [touch::TouchKind::Pressed, touch::TouchKind::Moved, touch::TouchKind::Released] {
-            let o = touch_wake_transition(asleep, swallow, kind);
-            if o.woke { woke_count += 1; }
-            if o.dispatch { any_dispatched = true; }
-            swallow = o.swallow_active;
-            asleep = false; // step() always clears asleep after processing any event
-        }
-        assert_eq!(woke_count, 1, "exactly one wake for the whole gesture");
-        assert!(!any_dispatched, "no event in the waking gesture may reach the focused widget");
-        assert!(!swallow, "swallow must have cleared by the gesture's Released");
-    }
-
-    // ── keyboard_drain_should_stop ────────────────────────────────────────
-    //
-    // Regression guard: the
-    // multi-byte keyboard drain must not evaluate a same-burst byte against a
-    // screen that a nav-triggering byte just scheduled to change out from
-    // under it.
-
-    #[test]
-    fn continues_below_bound_with_no_pending_nav() {
-        assert!(!keyboard_drain_should_stop(0, 0, 8));
-        assert!(!keyboard_drain_should_stop(0, 7, 8));
-    }
-
-    #[test]
-    fn stops_at_the_defensive_bound_even_with_no_nav() {
-        assert!(keyboard_drain_should_stop(0, 8, 8));
-        assert!(keyboard_drain_should_stop(0, 9, 8));
-    }
-
-    #[test]
-    fn stops_on_any_nonzero_pending_nav_regardless_of_count() {
-        // A nav-triggering byte (MessageView-seed = 5, Compose Return-to-send
-        // = 6) must stop the drain immediately, even on the very first byte
-        // of a burst — the whole point is to defer the REST of the burst to
-        // the next step() rather than misattribute it to the about-to-change
-        // screen.
-        assert!(keyboard_drain_should_stop(5, 0, 8));
-        assert!(keyboard_drain_should_stop(6, 1, 8));
-    }
-
-    // ── send_nav_deferral_elapsed ─────────────────────────────────────────
-    //
-    // Regression guard: RocketOnSend's one-shot must have its full 400ms window to
-    // render on the still-live Compose screen before step() swaps to
-    // MessageView.
-
-    #[test]
-    fn no_deferral_armed_never_elapses() {
-        assert!(!send_nav_deferral_elapsed(None, 0));
-        assert!(!send_nav_deferral_elapsed(None, u64::MAX));
-    }
-
-    #[test]
-    fn deferral_not_yet_elapsed_before_the_deadline() {
-        assert!(!send_nav_deferral_elapsed(Some(1_000), 999));
-    }
-
-    #[test]
-    fn deferral_elapsed_at_and_past_the_deadline() {
-        // Exactly-at-deadline counts as elapsed (`>=`), not just strictly past.
-        assert!(send_nav_deferral_elapsed(Some(1_000), 1_000));
-        assert!(send_nav_deferral_elapsed(Some(1_000), 1_500));
-    }
-
-    // ── incoming_message_is_unread ─────────────────────────────────────────
-    //
-    // Regression guard:
-    // the "don't flag unread while this exact thread is open" gate must
-    // suppress ONLY the currently-open conversation, and must NOT stay
-    // latched to a conversation that is no longer open (i.e. once
-    // `navigate_to_contact_list` has cleared `active_convo` back to `None`).
-
-    #[test]
-    fn no_active_convo_is_always_unread() {
-        // `None` — either never opened a conversation, or (the bug this
-        // fix addresses) properly cleared on return to ContactList — must
-        // never suppress the badge.
-        assert!(incoming_message_is_unread(None, 0x20, false));
-        assert!(incoming_message_is_unread(None, 0x20, true));
-    }
-
-    #[test]
-    fn matching_open_convo_suppresses_unread() {
-        // The exact (hash, is_channel) pair currently open in MessageView —
-        // the message lands directly in the live view, so it must not also
-        // flag the badge.
-        assert!(!incoming_message_is_unread(Some((0x20, false)), 0x20, false));
-        assert!(!incoming_message_is_unread(Some((0x20, true)), 0x20, true));
-    }
-
-    #[test]
-    fn different_hash_or_kind_stays_unread_even_with_an_active_convo() {
-        // A different contact/channel — or the same hash under the other
-        // kind (DM hash 0x20 vs. channel hash 0x20 are different threads) —
-        // must still flag unread while some OTHER convo is open.
-        assert!(incoming_message_is_unread(Some((0x20, false)), 0x30, false));
-        assert!(incoming_message_is_unread(Some((0x20, false)), 0x20, true));
-        assert!(incoming_message_is_unread(Some((0x20, true)), 0x20, false));
-    }
-
-    // ── message_view_compose_seed ────────────────────────────────────────
-    //
-    // Acceptance-critical: printable keys must seed the Compose draft;
-    // non-text/navigation keys must not.
-
-    #[test]
-    fn printable_letters_digits_and_symbols_seed_the_draft() {
-        assert_eq!(message_view_compose_seed(b'a').as_deref(), Some("a"));
-        assert_eq!(message_view_compose_seed(b'Z').as_deref(), Some("Z"));
-        assert_eq!(message_view_compose_seed(b'5').as_deref(), Some("5"));
-        assert_eq!(message_view_compose_seed(b'!').as_deref(), Some("!"));
-        // ':' seeds too, so the compose shortcode autocomplete can trigger
-        // immediately off a keypress that opened compose.
-        assert_eq!(message_view_compose_seed(b':').as_deref(), Some(":"));
-        assert_eq!(message_view_compose_seed(b' ').as_deref(), Some(" "));
-        assert_eq!(message_view_compose_seed(b'~').as_deref(), Some("~"));
-    }
-
-    #[test]
-    fn control_and_navigation_bytes_do_not_seed() {
-        // Backspace, Return/Enter, Tab, Escape — all have Slint key mappings
-        // in `keyboard::key_text` but must NOT flip MessageView to Compose.
-        for byte in [0x08u8, 0x7F, 0x0D, 0x0A, 0x09, 0x1B] {
-            assert_eq!(
-                message_view_compose_seed(byte), None,
-                "byte 0x{:02X} must not seed a Compose draft", byte,
-            );
-        }
-    }
-
-    #[test]
-    fn unmapped_control_bytes_do_not_seed() {
-        assert_eq!(message_view_compose_seed(0x00), None);
-        assert_eq!(message_view_compose_seed(0x01), None);
-        assert_eq!(message_view_compose_seed(0x1F), None);
-    }
-
-    // ── compose_return_should_send ────────────────────────────────────────
-    //
-    // Acceptance-critical: Return sends non-empty drafts; empty/whitespace-only
-    // drafts must NOT send (an explicit guard-against-empty-sends requirement).
-
-    #[test]
-    fn non_empty_draft_sends_on_return() {
-        assert!(compose_return_should_send("hi"));
-        assert!(compose_return_should_send("  hi  ")); // surrounding whitespace is fine
-        assert!(compose_return_should_send("a"));
-        assert!(compose_return_should_send(":smile:"));
-    }
-
-    #[test]
-    fn empty_or_whitespace_only_draft_does_not_send() {
-        assert!(!compose_return_should_send(""));
-        assert!(!compose_return_should_send(" "));
-        assert!(!compose_return_should_send("   \t  "));
-        assert!(!compose_return_should_send("\n"));
-    }
-
     // ── BuzzerDriver channel config (auto_clear) ────────────────────────────
-    // Regression guard for "notification audio plays indefinitely": the fix is a one-flag I2S channel
-    // config change in `BuzzerDriver::new` that can't be exercised without
-    // real hardware, so pin the contract at the config-value level instead —
-    // if a future edit drops or no-ops the `.auto_clear(true)` call, this
-    // fails loudly rather than the bug silently coming back.
+    // Regression guard for "notification audio plays indefinitely": the fix
+    // is a one-flag I2S channel config change in `BuzzerDriver::new` that
+    // can't be exercised without real hardware, so pin the contract at the
+    // config-value level instead — if a future edit drops or no-ops the
+    // `.auto_clear(true)` call, this fails loudly rather than the bug
+    // silently coming back.
 
     #[test]
     fn buzzer_channel_config_enables_auto_clear() {
@@ -4076,125 +2907,5 @@ mod tests {
         // (see `esp-idf-hal::i2s::config::Config::new`), so this fails if
         // `.auto_clear(true)` is ever accidentally dropped from `BuzzerDriver::new`.
         assert_ne!(cfg, I2sChannelConfig::default());
-    }
-
-    // ── battery_display_fields_changed (alloc-and-tick dedup guard) ─────────
-    // Regression guard: pins
-    // exactly which `BatteryStatus` fields gate the AdminMenu battery row's
-    // `format!` + Slint push, independent of the hardware-backed `UiRuntime`.
-
-    #[test]
-    fn battery_display_fields_changed_false_when_percent_and_charging_same() {
-        let a = crate::battery::BatteryStatus { percent: 50, charging: false, raw_mv: 3700, held_raw_mv: 3700 };
-        let b = crate::battery::BatteryStatus { percent: 50, charging: false, raw_mv: 3712, held_raw_mv: 3705 };
-        // raw_mv/held_raw_mv jitter (e.g. one ADC sample apart) must NOT count
-        // as a display change — the row never renders either field.
-        assert!(!battery_display_fields_changed(a, b));
-    }
-
-    #[test]
-    fn battery_display_fields_changed_true_on_percent_change() {
-        let a = crate::battery::BatteryStatus { percent: 50, charging: false, raw_mv: 0, held_raw_mv: 0 };
-        let b = crate::battery::BatteryStatus { percent: 49, charging: false, raw_mv: 0, held_raw_mv: 0 };
-        assert!(battery_display_fields_changed(a, b));
-    }
-
-    #[test]
-    fn battery_display_fields_changed_true_on_charging_flip() {
-        let a = crate::battery::BatteryStatus { percent: 50, charging: false, raw_mv: 0, held_raw_mv: 0 };
-        let b = crate::battery::BatteryStatus { percent: 50, charging: true, raw_mv: 0, held_raw_mv: 0 };
-        assert!(battery_display_fields_changed(a, b));
-    }
-
-    // ── notif_prefs_from_toggles (admin-menu master toggles) ───────────────
-    // Regression guard for "audio/visual notifications ignore the admin
-    // settings toggles": pins the
-    // pure mapping `sync_notif_prefs` installs into `self.notif` every
-    // `step()`, independent of the hardware-backed `UiRuntime`.
-
-    #[test]
-    fn notif_prefs_from_toggles_both_off_disables_every_event() {
-        let prefs = notif_prefs_from_toggles(false, false);
-        for event in [
-            NotifEvent::IncomingDm,
-            NotifEvent::IncomingGroupMsg,
-            NotifEvent::DmAcked,
-            NotifEvent::ChannelAcked,
-            NotifEvent::Provisioned,
-            NotifEvent::TelemetryResponse,
-            NotifEvent::PinError,
-            NotifEvent::PinSuccess,
-        ] {
-            let pref = prefs.pref_for(event);
-            assert!(!pref.visual, "{:?} visual should be off", event);
-            assert!(!pref.audible, "{:?} audible should be off", event);
-        }
-    }
-
-    #[test]
-    fn notif_prefs_from_toggles_both_on_enables_incoming_dm() {
-        let prefs = notif_prefs_from_toggles(true, true);
-        assert!(prefs.incoming_dm.visual);
-        assert!(prefs.incoming_dm.audible);
-    }
-
-    #[test]
-    fn notif_prefs_from_toggles_gates_dispatcher_fire() {
-        // End-to-end through the real gating path: build the prefs the
-        // "both off" master toggle produces, install them via `set_prefs`
-        // (same call `sync_notif_prefs` makes), then confirm `fire()`
-        // actually produces no tone (PinSuccess has no visual mechanism to
-        // gate at all now that the border flash is gone).
-        let mut d = NotifDispatcher::new(NotifPrefs::default());
-        d.set_prefs(notif_prefs_from_toggles(false, false));
-        d.fire(NotifEvent::PinSuccess, 0, false);
-        assert!(d.take_tones().is_none());
-    }
-
-    #[test]
-    fn notif_prefs_from_toggles_visual_off_audible_on_is_independent() {
-        // The two toggles are independent switches, not a single master
-        // mute — audible-only must still fire tones. (`pin_success.visual`
-        // is inert now that the border flash is gone, but the toggle
-        // mapping still threads the raw bool through uniformly; see
-        // `NotifPref`'s doc.)
-        let prefs = notif_prefs_from_toggles(false, true);
-        assert!(!prefs.pin_success.visual);
-        assert!(prefs.pin_success.audible);
-    }
-
-    // ── roll_selection ───────────────────────────────────────────────────
-    //
-    // Acceptance-critical: this is the index math behind "roll highlights a
-    // contact/channel" / "roll through rows" on ContactList and AdminMenu.
-
-    #[test]
-    fn first_roll_from_no_selection_lands_on_top_row_either_direction() {
-        assert_eq!(roll_selection(-1, 3, true), 0, "first Up roll starts at row 0");
-        assert_eq!(roll_selection(-1, 3, false), 0, "first Down roll also starts at row 0");
-    }
-
-    #[test]
-    fn empty_list_never_produces_a_valid_index() {
-        assert_eq!(roll_selection(-1, -1, true), -1);
-        assert_eq!(roll_selection(-1, -1, false), -1);
-    }
-
-    #[test]
-    fn roll_up_decrements_and_floors_at_zero() {
-        assert_eq!(roll_selection(2, 3, true), 1);
-        assert_eq!(roll_selection(0, 3, true), 0, "already at the top row — holds, no wrap");
-    }
-
-    #[test]
-    fn roll_down_increments_and_ceilings_at_max_idx() {
-        assert_eq!(roll_selection(1, 3, false), 2);
-        assert_eq!(roll_selection(3, 3, false), 3, "already at the bottom row — holds, no wrap");
-    }
-
-    #[test]
-    fn single_row_list_holds_at_zero_both_directions() {
-        assert_eq!(roll_selection(0, 0, true), 0);
-        assert_eq!(roll_selection(0, 0, false), 0);
     }
 }

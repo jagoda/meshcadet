@@ -33,6 +33,15 @@ slint = { version = "=1.16.1", default-features = false, features = [
     "compat-1-2",
 ] }
 protocol = { workspace = true }
+# `render_logic` used to hand-port `build_message_items`/`render_mentions`
+# from `firmware/src/ui/mod.rs` (a detached, cross-compiled workspace this
+# crate can't depend on directly — see that crate's Cargo.toml doc). Now that
+# the `firmware-core-extract-ui-runtime` increment moved those functions into
+# this root-workspace crate (host-testable, `protocol`-only, no Slint), this
+# crate depends on the real thing instead of maintaining a parallel port —
+# closing the drift risk `render_logic`'s own module doc used to carry. See
+# `docs/adr/0005-firmware-core-extraction.md`.
+firmware-core = { path = "../firmware-core" }
 
 [build-dependencies]
 # Added for its EFFECT on the host compilation graph (software-renderer/image

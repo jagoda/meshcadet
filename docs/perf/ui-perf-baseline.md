@@ -62,9 +62,21 @@ mirror by line number). Since firmware's own tests never execute (§1), this
 is the only place those fixtures are actually verified to hold at all,
 until on-hardware confirmation.
 
-DRIFT CONTRACT: if `build_message_items`/`render_mentions` change behavior
-in a later change, mirror the change in `ui_perf/src/render_logic.rs` too —
-the pinned tests here are the tripwire.
+DRIFT CONTRACT (historical — see UPDATE below): if `build_message_items`/
+`render_mentions` change behavior in a later change, mirror the change in
+`ui_perf/src/render_logic.rs` too — the pinned tests here are the tripwire.
+
+**UPDATE (`firmware-core-extract-ui-runtime` increment):** `build_message_items`/
+`render_mentions` (and the `MessageRecord`/`MessageItem` types they operate
+over) moved from `firmware/src/ui/mod.rs` into `firmware_core::ui::
+message_view` — a root-workspace crate, host-testable under `cargo test
+--workspace`, with no Slint dependency. `firmware`'s own tests (§1's "never
+execute" problem) now execute for real, in `firmware-core`, closing the gap
+this section describes. `ui_perf::render_logic` no longer ports these two
+functions; it `pub use`s the real ones from `firmware-core` and keeps only
+the synthetic `bench_fixtures` generator, so the DRIFT CONTRACT above no
+longer applies — there is exactly one implementation and one set of
+correctness tests, in `firmware-core`, not two.
 
 A second harness, `ui_sim/src/perf_profile.rs` + `ui_sim/src/alloc_count.rs`
 (added in this same pass), covers the OTHER half of the acceptance criteria

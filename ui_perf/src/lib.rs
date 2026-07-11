@@ -12,11 +12,14 @@
 //!    over SPI. See "Why this is a faithful proxy" / "Determinism" below.
 //! 2. **Phase-1 BASELINE rig** ([`counting_alloc`] + [`render_logic`]
 //!    modules) — timed host
-//!    benchmarks over the pure render-logic hot paths ported from
-//!    `firmware/src/ui/mod.rs`, plus a reusable counting-`GlobalAlloc`
-//!    wrapper every downstream optimization child measures against. See
-//!    those modules' own docs, `src/bin/bench.rs`, and
-//!    `docs/perf/ui-perf-baseline.md` for the full methodology + ledger.
+//!    benchmarks over the pure render-logic hot paths in
+//!    `firmware_core::ui::message_view` (moved there from
+//!    `firmware/src/ui/mod.rs` by the `firmware-core-extract-ui-runtime`
+//!    increment — [`render_logic`] re-exports the real functions rather
+//!    than porting them, see that module's doc), plus a reusable
+//!    counting-`GlobalAlloc` wrapper every downstream optimization child
+//!    measures against. See those modules' own docs, `src/bin/bench.rs`,
+//!    and `docs/perf/ui-perf-baseline.md` for the full methodology + ledger.
 //!
 //! # Why this is a faithful proxy for the on-target flush cost (repaint-scope)
 //!

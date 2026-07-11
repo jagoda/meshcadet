@@ -1,18 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Contact / channel list screen — pure display-string formatting + the
-//! plain-data channel-entry type.
+//! Contact / channel list screen — pure display-string formatting, the
+//! plain-data contact/channel-entry types, and the two list-builder
+//! functions that assemble them from `UiRuntime`'s data maps.
 //!
-//! The `slint::slint!{}` view and the `ContactListScreen` Rust wrapper
-//! (along with `ContactItem`, its DM-side twin) stay in
-//! `firmware/src/ui/screens/contact_list.rs` — they depend on Slint; only
-//! the plain-data pieces below move here so their tests execute under
+//! The `slint::slint!{}` view and the `ContactListScreen` Rust wrapper stay
+//! in `firmware/src/ui/screens/contact_list.rs` — they depend on Slint;
+//! only the plain-data pieces below move here so their tests execute under
 //! `cargo test --workspace` (this crate is a detached, cross-compiled
 //! workspace — see `Cargo.toml`'s doc comment — so a `#[cfg(test)]` block
-//! written there would type-check but never run). `ChannelItem` moves too
-//! even though it carries no test of its own: it is plain data with no
-//! Slint dependency, and the follow-on `firmware-core-extract-ui-runtime`
-//! increment needs it in this crate for `UiRuntime::build_channel_items`.
-//! See `docs/adr/0005-firmware-core-extraction.md`.
+//! written there would type-check but never run). `ContactItem` moves
+//! alongside `ChannelItem` (both plain data, no Slint dependency) so
+//! `build_contact_items`/`build_channel_items` below can return them. See
+//! `docs/adr/0005-firmware-core-extraction.md`.
 
 /// Format an unread count for badge display: exact digits at ≤9, capped to
 /// `"9+"` above — the single clamp rule shared by every unread badge
@@ -53,6 +52,78 @@ pub struct ChannelItem {
     pub hash: u8,
 }
 
+/// A contact entry passed into the Slint model.
+#[derive(Clone, Debug)]
+pub struct ContactItem {
+    pub name: String,
+    pub preview: String,
+    pub time_str: String,
+    pub unread: i32,
+    pub hash: u8,
+}
+
+/// Build a sorted contact item list from the current data maps.
+///
+/// Static function so `UiRuntime` can call it while `self.active_screen` is
+/// borrowed — Rust's field-splitting rules allow simultaneous borrows of
+/// separate struct fields.
+pub fn build_contact_items(
+    contact_names: &std::collections::HashMap<u8, String>,
+    messages: &std::collections::HashMap<u8, Vec<super::MessageRecord>>,
+    unread: &std::collections::HashMap<u8, u32>,
+) -> Vec<ContactItem> {
+    let mut items: Vec<ContactItem> = contact_names
+        .iter()
+        .map(|(&hash, name)| ContactItem {
+            name: name.clone(),
+            preview: messages
+                .get(&hash)
+                .and_then(|msgs| msgs.last())
+                .map(|m| m.text.clone())
+                .unwrap_or_default(),
+            time_str: String::new(),
+            unread: *unread.get(&hash).unwrap_or(&0) as i32,
+            hash,
+        })
+        .collect();
+    // Sort by unread count (desc) then name (asc) for consistent ordering.
+    items.sort_by(|a, b| b.unread.cmp(&a.unread).then(a.name.cmp(&b.name)));
+    items
+}
+
+/// Build a fresh channel item list with up-to-date preview/unread from the
+/// current data maps, using `channel_items` (the provisioned catalog: name +
+/// hash) as the source of truth for identity.
+///
+/// Mirrors `build_contact_items`.  Without this, `self.channel_items` — the
+/// raw catalog pushed once at provisioning with `unread: 0` — was pushed to
+/// the screen verbatim on every return to ContactList, permanently
+/// overwriting any unread count that had accumulated in `self.unread`.
+pub fn build_channel_items(
+    channel_items: &[ChannelItem],
+    messages: &std::collections::HashMap<u8, Vec<super::MessageRecord>>,
+    unread: &std::collections::HashMap<u8, u32>,
+) -> Vec<ChannelItem> {
+    let mut items: Vec<ChannelItem> = channel_items
+        .iter()
+        .map(|c| ChannelItem {
+            name: c.name.clone(),
+            preview: messages
+                .get(&c.hash)
+                .and_then(|msgs| msgs.last())
+                .map(|m| m.text.clone())
+                .unwrap_or_default(),
+            time_str: String::new(),
+            unread: *unread.get(&c.hash).unwrap_or(&0) as i32,
+            hash: c.hash,
+        })
+        .collect();
+    // Sort by unread count (desc) then name (asc) — same ordering rule as
+    // `build_contact_items`, for cross-tab consistency.
+    items.sort_by(|a, b| b.unread.cmp(&a.unread).then(a.name.cmp(&b.name)));
+    items
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 //
 // Regression guard: the per-tab aggregate badges (`contacts_unread_total`/
@@ -66,6 +137,8 @@ pub struct ChannelItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::MessageRecord;
+    use std::collections::HashMap;
 
     #[test]
     fn format_unread_badge_exact_for_zero_through_nine() {
@@ -103,5 +176,140 @@ mod tests {
         assert!(!unread_total_increased(Some(3), 3));
         assert!(!unread_total_increased(Some(3), 2));
         assert!(!unread_total_increased(Some(3), 0));
+    }
+
+    // ── build_contact_items / build_channel_items ───────────────────────────
+    //
+    // Regression guard: pins the two regressions the original firmware fix
+    // addressed — channel unread counts reaching the screen (previously only
+    // contacts refreshed), and both trees reading a common `unread` map that
+    // gets cleared on read.
+
+    fn catalog(entries: &[(&str, u8)]) -> Vec<ChannelItem> {
+        entries
+            .iter()
+            .map(|&(name, hash)| ChannelItem {
+                name: name.to_string(),
+                preview: String::new(),
+                time_str: String::new(),
+                unread: 0, // catalog entries are always seeded at 0 — see set_channels
+                hash,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn build_channel_items_reflects_unread_map() {
+        let channels = catalog(&[("General", 0x10), ("Ops", 0x20)]);
+        let messages: HashMap<u8, Vec<MessageRecord>> = HashMap::new();
+        let mut unread = HashMap::new();
+        unread.insert(0x20u8, 3u32);
+
+        let items = build_channel_items(&channels, &messages, &unread);
+
+        // Regression guard for the missing-badge defect: a channel with a
+        // nonzero `unread` map entry must carry that count through, not the
+        // catalog's frozen `unread: 0`.
+        let ops = items.iter().find(|c| c.hash == 0x20).unwrap();
+        assert_eq!(ops.unread, 3);
+        let general = items.iter().find(|c| c.hash == 0x10).unwrap();
+        assert_eq!(general.unread, 0);
+    }
+
+    #[test]
+    fn build_channel_items_sorts_unread_first() {
+        let channels = catalog(&[("Alpha", 1), ("Bravo", 2), ("Charlie", 3)]);
+        let messages: HashMap<u8, Vec<MessageRecord>> = HashMap::new();
+        let mut unread = HashMap::new();
+        unread.insert(3u8, 1u32);
+
+        let items = build_channel_items(&channels, &messages, &unread);
+        assert_eq!(items[0].hash, 3); // sole unread channel sorts first
+    }
+
+    #[test]
+    fn build_channel_items_carries_last_message_as_preview() {
+        let channels = catalog(&[("General", 0x10)]);
+        let mut messages: HashMap<u8, Vec<MessageRecord>> = HashMap::new();
+        messages.insert(
+            0x10,
+            vec![
+                MessageRecord {
+                    text: "first".into(),
+                    is_ours: false,
+                    acked: false,
+                    ts_ms: 0,
+                },
+                MessageRecord {
+                    text: "latest".into(),
+                    is_ours: false,
+                    acked: false,
+                    ts_ms: 1,
+                },
+            ],
+        );
+        let unread = HashMap::new();
+
+        let items = build_channel_items(&channels, &messages, &unread);
+        assert_eq!(items[0].preview, "latest");
+    }
+
+    #[test]
+    fn build_contact_items_reflects_unread_map() {
+        let mut contact_names = HashMap::new();
+        contact_names.insert(0x30u8, "Alice".to_string());
+        contact_names.insert(0x40u8, "Bob".to_string());
+        let messages: HashMap<u8, Vec<MessageRecord>> = HashMap::new();
+        let mut unread = HashMap::new();
+        unread.insert(0x30u8, 2u32);
+
+        let items = build_contact_items(&contact_names, &messages, &unread);
+        let alice = items.iter().find(|c| c.hash == 0x30).unwrap();
+        assert_eq!(alice.unread, 2);
+        let bob = items.iter().find(|c| c.hash == 0x40).unwrap();
+        assert_eq!(bob.unread, 0);
+    }
+
+    #[test]
+    fn contact_and_channel_unread_share_one_map_and_clear_together() {
+        // Documents the pre-existing key-space assumption both builders share:
+        // `unread` is keyed only by `u8` hash, not by (hash, is_channel). A
+        // contact hash and a channel hash that happen to collide will share
+        // one counter and one clear-on-read. Not a regression introduced by
+        // this fix (contact_names/messages already share the same u8 key
+        // space) — recorded here so a future change to disambiguate the key
+        // space has a test to update.
+        let mut unread: HashMap<u8, u32> = HashMap::new();
+        unread.insert(0x55, 1);
+        // Simulate navigate_to_message_view's clear-on-read for hash 0x55,
+        // regardless of whether it was opened as a contact or a channel.
+        unread.remove(&0x55);
+        assert_eq!(unread.get(&0x55), None);
+    }
+
+    #[test]
+    fn messages_insert_non_empty_seeded_history_feeds_contact_preview() {
+        // End-to-end (within the pure-function slice): seeding restored
+        // history and then building contact items must surface the restored
+        // text as the preview — the actual acceptance behavior ("contact
+        // list previews show restored history").
+        let mut contact_names = HashMap::new();
+        contact_names.insert(0x64u8, "Dana".to_string());
+        let mut messages: HashMap<u8, Vec<MessageRecord>> = HashMap::new();
+        crate::ui::messages_insert_non_empty(
+            &mut messages,
+            0x64,
+            vec![MessageRecord {
+                text: "welcome back".into(),
+                is_ours: false,
+                acked: true,
+                ts_ms: 0,
+            }],
+        );
+        let unread = HashMap::new();
+
+        let items = build_contact_items(&contact_names, &messages, &unread);
+        let dana = items.iter().find(|c| c.hash == 0x64).unwrap();
+        assert_eq!(dana.preview, "welcome back");
     }
 }

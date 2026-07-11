@@ -100,16 +100,15 @@ pub struct TouchEvent {
     pub kind: TouchKind,
 }
 
-/// Touch gesture kind.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TouchKind {
-    /// Finger pressed down.
-    Pressed,
-    /// Finger moved while pressed.
-    Moved,
-    /// Finger lifted.
-    Released,
-}
+// `TouchKind` is pure Rust with no I2C/hardware dependency — it now lives in
+// `firmware_core::ui::touch` alongside `touch_wake_transition` (which
+// matches against it), so its tests execute under `cargo test --workspace`
+// (this crate is a detached, cross-compiled workspace — see `Cargo.toml`'s
+// doc comment — so a `#[cfg(test)]` block written here would type-check but
+// never run). This re-export keeps every existing call site
+// (`TouchEvent { kind: TouchKind::Pressed, .. }`, etc.) resolving unchanged.
+// See `docs/adr/0005-firmware-core-extraction.md`.
+pub use firmware_core::ui::touch::TouchKind;
 
 /// GT911 driver.
 ///
