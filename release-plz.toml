@@ -32,6 +32,26 @@ release_always = false
 publish = false
 publish_allow_dirty = false
 
+# THE FIX (see docs/adr/0004-release-architecture.md's "first-release
+# bootstrap" note, and the root-cause writeup in this repo's release-plz
+# bootstrap investigation): `publish = false` alone does not just skip the
+# crates.io *publish* step — release-plz's `Publishable` check
+# (release_plz_core::next_ver::is_publishable) treats every `publish = false`
+# crate as entirely out of scope for version/changelog tracking unless it is
+# ALSO marked `git_only`. With every crate `publish = false` and `git_only`
+# unset (default `false`), release-plz's `packages_to_process()` returned
+# ZERO packages on every run — `next_versions` computed `version groups: {}`
+# unconditionally, before it ever looked at commits, tags, or the workspace
+# version — which is why `release-pr` always produced `{"prs":[]}` no matter
+# what landed on `main`. `git_only = true` tells release-plz to determine
+# each package's latest released version from the `vX.Y.Z` git tag history
+# instead of a crates.io registry lookup — the correct mode for an
+# unpublished, tag-only-released project (this is also what makes
+# `git_tag_enable`, already relied on above, meaningful: without `git_only`
+# the tag was created for a package release-plz never tracked in the first
+# place).
+git_only = true
+
 # All crates in this workspace are internal-only (never published to
 # crates.io — see `publish = false` above), so there is no crates.io
 # baseline to diff against for API-breakage detection. Leave semver-check
@@ -45,6 +65,14 @@ semver_check = false
 # CHANGELOG.md's hand-written header + the "Initial public release" section
 # that the FIRST release-plz PR retitles to `## [0.1.0] - <date>`), so this
 # only affects the version-section body.
+#
+# `changelog_path` MUST be set to the single root file: without it, each of
+# the six root-workspace crates gets its OWN `<crate>/CHANGELOG.md` (release-
+# plz's per-package default), which contradicts §1/§3's "one project-wide
+# version, one changelog" design and was never exercised while `publish =
+# false` + unset `git_only` filtered every crate out before changelog
+# generation ever ran (see `git_only` above).
+changelog_path = "CHANGELOG.md"
 changelog_config = "cliff.toml"
 changelog_update = true
 

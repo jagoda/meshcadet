@@ -3,11 +3,12 @@
 All notable changes to MeshCadet are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-This project does not yet follow a formal version-numbering scheme (all
-workspace crates are currently `0.0.0`); the entry below will be retitled with
-a version number and date at the first tagged release.
+Versioning is managed by [release-plz](https://release-plz.dev) — see
+`release-plz.toml` and `docs/adr/0004-release-architecture.md`. This project
+has not yet cut a tagged release; the entry below documents everything
+landed before release-plz's first `release vX.Y.Z` PR.
 
-## [Unreleased] — Initial public release
+## [Unreleased]
 
 The first public release of MeshCadet: a deliberately-limited, MeshCore-interop
 firmware for the LilyGo T-Deck Plus. Its limits are design choices for a
