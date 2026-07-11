@@ -4,7 +4,8 @@
 - **Deciders:** Maintainer design review
 - **Supersedes:** —
 - **Implements:** —
-- **Code:** `release-plz.toml`, `cliff.toml`, `.github/workflows/release-plz.yml`,
+- **Code:** `release-plz.toml`, `cliff.toml`, `CHANGELOG.md`,
+  `.github/workflows/release-plz.yml`,
   `.github/workflows/commitlint.yml`, `.github/workflows/ci.yml`
   (`version-drift-guard` job), `Cargo.toml` (`[workspace.package].version`),
   `firmware/Cargo.toml` (`version`), `firmware/build.rs`
@@ -83,6 +84,21 @@ change that wired this up, and `firmware/Cargo.toml` was bumped to match.
   confusing; there is exactly one.
 - Skip semver-checking (`semver_check = false`): with every crate
   unpublished, there is no crates.io baseline to diff against.
+- **Track releases via git tag, not the crates.io registry**
+  (`git_only = true`) — this is load-bearing, not cosmetic: release-plz's
+  `Publishable` check treats every `publish = false` crate as entirely out
+  of scope for version/changelog tracking *unless* it is also marked
+  `git_only`. Without it, `release-plz update`/`release-pr` silently
+  processed zero packages on every run (verified with `release-plz update
+  -vv`, which logged `version groups: {}` unconditionally) — this is what
+  caused the first-release bootstrap gap: `release-pr` always produced
+  `{"prs":[]}` on `main`, regardless of what commits landed, because no
+  package was ever considered for a bump in the first place.
+- **Write to the single root `CHANGELOG.md`, not a per-crate one**
+  (`changelog_path = "CHANGELOG.md"`) — without this, release-plz's default
+  (a changelog next to each crate's own `Cargo.toml`) would produce six
+  independent `<crate>/CHANGELOG.md` files, one per root-workspace member,
+  contradicting the single project-wide changelog this section describes.
 
 `.github/workflows/release-plz.yml` runs two jobs on every push to `main`:
 `release-plz-pr` (open/update the version+changelog PR) and
@@ -99,15 +115,26 @@ Internal bookkeeping commit types (`chore`, `ci`, `build`, `style`, `test`,
 and release-plz's own `chore(release)` commits) are filtered out of the
 user-facing changelog entirely.
 
-`CHANGELOG.md`'s existing hand-written header and its
-`## [Unreleased] — Initial public release` section (covering the whole
-pre-tag history, written before this project had Conventional Commits
-discipline) are preserved as-is: release-plz only ever rewrites the file
-below the first `## [...]` heading it finds, never the header above it.
-**On the first release-plz PR**, that `[Unreleased]` heading is retitled to
-`[0.1.0] - <date>` (standard Keep a Changelog / release-plz behavior for
-the first tagged release), and a fresh, empty `[Unreleased]` section is
-opened above it for whatever lands next.
+`CHANGELOG.md`'s existing hand-written header (everything up to and
+including the `## [Unreleased]` heading line) is preserved as-is: release-plz
+only ever rewrites the file below that heading, never the header above/
+including it. **Verified mechanism (not a rename):** on the first
+release-plz PR, release-plz does not edit the `[Unreleased]` heading text in
+place — it inserts a freshly git-cliff-generated `## [0.1.0] - <date>`
+section immediately *after* it, and everything that was already below
+`[Unreleased]` (this project's hand-written "Initial public release"
+prose/bullets) is carried forward unchanged, landing after the generated
+section. Net effect for this project: `[Unreleased]` ends up empty (correct,
+ready for whatever lands next) and the hand-written release notes end up
+nested under the new `[0.1.0]` heading (also correct, since nothing else
+separates them) — but that requires the pre-existing `[Unreleased]` heading
+to be *bare* (no trailing text) going in; this project's original heading was
+`## [Unreleased] — Initial public release`, which release-plz's header
+parser (`changelog_parser::parse_header`) happily matches and freezes
+verbatim, including the trailing text — so it would have persisted,
+unchanged and increasingly stale, on every future unreleased section. This
+PR retitles it to a bare `## [Unreleased]` by hand, once, ahead of
+release-plz's first run.
 
 ### 4. Conventional-commit CI gate (Implemented)
 
