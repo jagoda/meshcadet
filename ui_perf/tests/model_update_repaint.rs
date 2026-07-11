@@ -32,7 +32,10 @@ use ui_perf::{Harness, Row, HEIGHT};
 
 fn entries(n: usize) -> Vec<Row> {
     (0..n)
-        .map(|i| Row { text: format!("message row {i}").into(), ours: i % 2 == 0 })
+        .map(|i| Row {
+            text: format!("message row {i}").into(),
+            ours: i % 2 == 0,
+        })
         .collect()
 }
 
@@ -40,7 +43,10 @@ fn entries(n: usize) -> Vec<Row> {
 // row 2 edited to its acked form. Used to build the wholesale-replace control.
 fn final_state() -> Vec<Row> {
     let mut v = entries(6);
-    v[2] = Row { text: "message row 2 (acked)".into(), ours: true };
+    v[2] = Row {
+        text: "message row 2 (acked)".into(),
+        ours: true,
+    };
     v
 }
 
@@ -58,14 +64,20 @@ fn in_place_updates_beat_wholesale_replace_and_are_pixel_identical() {
     // Settle a 5-row list with a navigation-equivalent full paint.
     h.request_redraw();
     let settle = h.frame().expect("settle frame must paint");
-    assert_eq!(settle.lines_flushed, HEIGHT as usize, "settle is a full paint");
+    assert_eq!(
+        settle.lines_flushed, HEIGHT as usize,
+        "settle is a full paint"
+    );
     println!(
         "[model] settle (navigation full paint): {} lines, {} px",
         settle.lines_flushed, settle.dirty_pixels
     );
 
     // ── OPTIMIZED path 1: a new message arrives; push it in place, NO redraw ─
-    model.push(Row { text: "message row 5".into(), ours: false });
+    model.push(Row {
+        text: "message row 5".into(),
+        ours: false,
+    });
     let appended = h.frame().expect(
         "BEHAVIOR-SAFE: an in-place model append must self-dirty & paint with \
          no request_redraw() — else the live update would silently stall",
@@ -77,7 +89,13 @@ fn in_place_updates_beat_wholesale_replace_and_are_pixel_identical() {
 
     // ── OPTIMIZED path 2: an ack-state flip on an existing sent message is an
     // in-place single-row edit (what happens when an ACK lands).
-    model.set_row_data(2, Row { text: "message row 2 (acked)".into(), ours: true });
+    model.set_row_data(
+        2,
+        Row {
+            text: "message row 2 (acked)".into(),
+            ours: true,
+        },
+    );
     let edited = h.frame().expect("in-place edit must self-dirty & paint");
     println!(
         "[model] live ack-flip, IN-PLACE single-row edit: {} lines, bbox {}x{}",
@@ -105,8 +123,7 @@ fn in_place_updates_beat_wholesale_replace_and_are_pixel_identical() {
 
     // THE WIN: each in-place update flushed far fewer scanlines than the replace.
     assert_eq!(
-        replaced.lines_flushed,
-        HEIGHT as usize,
+        replaced.lines_flushed, HEIGHT as usize,
         "the old wholesale-replace path is a full-window flush"
     );
     for (label, s) in [("append", appended), ("edit", edited)] {

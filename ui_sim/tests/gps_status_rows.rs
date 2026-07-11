@@ -20,7 +20,11 @@ fn quantize565(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
     let r5 = r >> 3;
     let g6 = g >> 2;
     let b5 = b >> 3;
-    (((r5 << 3) | (r5 >> 2)), ((g6 << 2) | (g6 >> 4)), ((b5 << 3) | (b5 >> 2)))
+    (
+        ((r5 << 3) | (r5 >> 2)),
+        ((g6 << 2) | (g6 >> 4)),
+        ((b5 << 3) | (b5 >> 2)),
+    )
 }
 
 fn at(fb: &[slint::platform::software_renderer::Rgb565Pixel], x: u32, y: u32) -> (u8, u8, u8) {

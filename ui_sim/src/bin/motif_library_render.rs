@@ -34,9 +34,15 @@ fn main() {
         ui_sim::motif_library::HEIGHT,
     );
 
-    let out_path: PathBuf = [env!("CARGO_MANIFEST_DIR"), "..", "docs", "renders", "motif-library-host-sim.png"]
-        .iter()
-        .collect();
+    let out_path: PathBuf = [
+        env!("CARGO_MANIFEST_DIR"),
+        "..",
+        "docs",
+        "renders",
+        "motif-library-host-sim.png",
+    ]
+    .iter()
+    .collect();
     std::fs::create_dir_all(out_path.parent().unwrap()).expect("create docs/renders");
     img.save(&out_path).expect("write host-sim render PNG");
     println!("wrote host-sim render: {}", out_path.display());

@@ -61,7 +61,7 @@ fn longest_match<'k>(after: &str, known: &[&'k str]) -> Option<&'k str> {
             None => true,
             Some(c) => !c.is_alphanumeric(),
         };
-        if terminator_ok && best.map_or(true, |b: &str| name.len() > b.len()) {
+        if terminator_ok && best.is_none_or(|b: &str| name.len() > b.len()) {
             best = Some(name);
         }
     }
@@ -233,17 +233,23 @@ impl<'a> Iterator for MentionRuns<'a> {
         }
         let rest = &self.text[self.pos..];
         match find_next_mention(rest, self.self_name, self.known) {
-            Some((start, wire_end, tier, name)) if start == 0 => {
+            Some((0, wire_end, tier, name)) => {
                 self.pos += wire_end;
                 Some(MentionRun { text: name, tier })
             }
             Some((start, ..)) => {
                 self.pos += start;
-                Some(MentionRun { text: &rest[..start], tier: MentionTier::Plain })
+                Some(MentionRun {
+                    text: &rest[..start],
+                    tier: MentionTier::Plain,
+                })
             }
             None => {
                 self.pos = self.text.len();
-                Some(MentionRun { text: rest, tier: MentionTier::Plain })
+                Some(MentionRun {
+                    text: rest,
+                    tier: MentionTier::Plain,
+                })
             }
         }
     }
@@ -271,7 +277,12 @@ pub fn split_mentions<'a>(
     self_name: &'a str,
     known: &'a [&'a str],
 ) -> MentionRuns<'a> {
-    MentionRuns { text: wire, self_name, known, pos: 0 }
+    MentionRuns {
+        text: wire,
+        self_name,
+        known,
+        pos: 0,
+    }
 }
 
 #[cfg(test)]
@@ -310,7 +321,8 @@ mod tests {
             b"tell @Chicken Little the sky is falling",
             &["Chicken Little"],
             &mut out,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(&out[..n], b"tell @[Chicken Little] the sky is falling");
     }
 
@@ -352,15 +364,39 @@ mod tests {
     fn split_mentions_bracketed_other() {
         let runs: Vec<_> = split_mentions("hi @[Alice] there", "Bob", &[]).collect();
         assert_eq!(runs.len(), 3);
-        assert_eq!(runs[0], MentionRun { text: "hi ", tier: MentionTier::Plain });
-        assert_eq!(runs[1], MentionRun { text: "Alice", tier: MentionTier::Other });
-        assert_eq!(runs[2], MentionRun { text: " there", tier: MentionTier::Plain });
+        assert_eq!(
+            runs[0],
+            MentionRun {
+                text: "hi ",
+                tier: MentionTier::Plain
+            }
+        );
+        assert_eq!(
+            runs[1],
+            MentionRun {
+                text: "Alice",
+                tier: MentionTier::Other
+            }
+        );
+        assert_eq!(
+            runs[2],
+            MentionRun {
+                text: " there",
+                tier: MentionTier::Plain
+            }
+        );
     }
 
     #[test]
     fn split_mentions_bracketed_self_is_more_prominent_tier() {
         let runs: Vec<_> = split_mentions("hi @[Bob] there", "Bob", &[]).collect();
-        assert_eq!(runs[1], MentionRun { text: "Bob", tier: MentionTier::SelfMention });
+        assert_eq!(
+            runs[1],
+            MentionRun {
+                text: "Bob",
+                tier: MentionTier::SelfMention
+            }
+        );
         assert!(MentionTier::SelfMention > MentionTier::Other);
     }
 
@@ -368,7 +404,13 @@ mod tests {
     fn split_mentions_multiword_name_not_tokenized_on_space() {
         let runs: Vec<_> =
             split_mentions("@[Chicken Little] the sky is falling", "Rex", &[]).collect();
-        assert_eq!(runs[0], MentionRun { text: "Chicken Little", tier: MentionTier::Other });
+        assert_eq!(
+            runs[0],
+            MentionRun {
+                text: "Chicken Little",
+                tier: MentionTier::Other
+            }
+        );
         assert_eq!(runs[1].text, " the sky is falling");
     }
 
@@ -376,7 +418,13 @@ mod tests {
     fn split_mentions_no_mention_is_single_plain_run() {
         let runs: Vec<_> = split_mentions("just a plain message", "Bob", &[]).collect();
         assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0], MentionRun { text: "just a plain message", tier: MentionTier::Plain });
+        assert_eq!(
+            runs[0],
+            MentionRun {
+                text: "just a plain message",
+                tier: MentionTier::Plain
+            }
+        );
     }
 
     #[test]
@@ -384,7 +432,13 @@ mod tests {
         // Brackets are authoritative — an unbracketed "@Bob" tiers as
         // `Other`, never `SelfMention`, even when "Bob" is self_name.
         let runs: Vec<_> = split_mentions("hi @Bob there", "Bob", &["Bob"]).collect();
-        assert_eq!(runs[1], MentionRun { text: "Bob", tier: MentionTier::Other });
+        assert_eq!(
+            runs[1],
+            MentionRun {
+                text: "Bob",
+                tier: MentionTier::Other
+            }
+        );
     }
 
     #[test]
@@ -401,7 +455,8 @@ mod tests {
             b"a mention of @Chicken Little arrives",
             &["Chicken Little"],
             &mut wire_buf,
-        ).unwrap();
+        )
+        .unwrap();
         let wire = core::str::from_utf8(&wire_buf[..n]).unwrap();
         assert_eq!(wire, "a mention of @[Chicken Little] arrives");
 
@@ -443,7 +498,13 @@ mod tests {
     #[test]
     fn split_mentions_empty_bracket_is_a_mention_with_empty_name() {
         let runs: Vec<_> = split_mentions("hi @[] there", "Bob", &[]).collect();
-        assert_eq!(runs[1], MentionRun { text: "", tier: MentionTier::Other });
+        assert_eq!(
+            runs[1],
+            MentionRun {
+                text: "",
+                tier: MentionTier::Other
+            }
+        );
     }
 
     #[test]
@@ -465,8 +526,20 @@ mod tests {
     fn split_mentions_adjacent_mentions_with_no_gap() {
         let runs: Vec<_> = split_mentions("@[Alice]@[Bob]", "Bob", &[]).collect();
         assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0], MentionRun { text: "Alice", tier: MentionTier::Other });
-        assert_eq!(runs[1], MentionRun { text: "Bob", tier: MentionTier::SelfMention });
+        assert_eq!(
+            runs[0],
+            MentionRun {
+                text: "Alice",
+                tier: MentionTier::Other
+            }
+        );
+        assert_eq!(
+            runs[1],
+            MentionRun {
+                text: "Bob",
+                tier: MentionTier::SelfMention
+            }
+        );
     }
 
     #[test]
@@ -474,7 +547,13 @@ mod tests {
         // Non-ASCII display names (accented / multi-byte characters) must
         // slice at valid UTF-8 boundaries.
         let runs: Vec<_> = split_mentions("hi @[Zoë Müller] there", "Bob", &[]).collect();
-        assert_eq!(runs[1], MentionRun { text: "Zoë Müller", tier: MentionTier::Other });
+        assert_eq!(
+            runs[1],
+            MentionRun {
+                text: "Zoë Müller",
+                tier: MentionTier::Other
+            }
+        );
     }
 
     #[test]

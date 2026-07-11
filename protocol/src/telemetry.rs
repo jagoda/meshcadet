@@ -146,7 +146,11 @@ pub fn decode_telemetry_response(text: &[u8]) -> Option<TelemetryResponse> {
     let rest = rest.strip_prefix(b"age=")?;
     let age_str = rest.strip_suffix(b"s")?;
     let age_secs = parse_u32(age_str)?;
-    Some(TelemetryResponse { lat_e7, lon_e7, age_secs })
+    Some(TelemetryResponse {
+        lat_e7,
+        lon_e7,
+        age_secs,
+    })
 }
 
 /// Return `true` if `text` is a no-fix response.
@@ -196,12 +200,12 @@ impl<'a> Writer<'a> {
         // 7-digit fraction, zero-padded on the left.
         let frac_digits = [
             ((frac_part / 1_000_000) % 10) as u8 + b'0',
-            ((frac_part /   100_000) % 10) as u8 + b'0',
-            ((frac_part /    10_000) % 10) as u8 + b'0',
-            ((frac_part /     1_000) % 10) as u8 + b'0',
-            ((frac_part /       100) % 10) as u8 + b'0',
-            ((frac_part /        10) % 10) as u8 + b'0',
-            ((frac_part           ) % 10) as u8 + b'0',
+            ((frac_part / 100_000) % 10) as u8 + b'0',
+            ((frac_part / 10_000) % 10) as u8 + b'0',
+            ((frac_part / 1_000) % 10) as u8 + b'0',
+            ((frac_part / 100) % 10) as u8 + b'0',
+            ((frac_part / 10) % 10) as u8 + b'0',
+            ((frac_part) % 10) as u8 + b'0',
         ];
         for &d in &frac_digits {
             self.push_byte(d);
@@ -259,7 +263,7 @@ fn parse_u32(s: &[u8]) -> Option<u32> {
     }
     let mut acc = 0u32;
     for &b in s {
-        if b < b'0' || b > b'9' {
+        if !b.is_ascii_digit() {
             return None;
         }
         acc = acc.checked_mul(10)?.checked_add((b - b'0') as u32)?;
@@ -385,7 +389,10 @@ pub fn parse_telemetry_req(plaintext: &[u8]) -> Option<TelemetryReq> {
         return None;
     }
     let tag = u32::from_le_bytes([plaintext[0], plaintext[1], plaintext[2], plaintext[3]]);
-    Some(TelemetryReq { tag, req_type: plaintext[4] })
+    Some(TelemetryReq {
+        tag,
+        req_type: plaintext[4],
+    })
 }
 
 /// `true` if a parsed REQ is a telemetry-data pull.
@@ -521,7 +528,11 @@ pub fn decode_telemetry_response_lpp(plaintext: &[u8]) -> Option<TelemetryRespon
         (Some(p), Some(c)) => Some((p, c)),
         _ => None,
     };
-    Some(TelemetryResponseLpp { tag, gps_e4, battery })
+    Some(TelemetryResponseLpp {
+        tag,
+        gps_e4,
+        battery,
+    })
 }
 
 /// Read a 24-bit big-endian two's-complement integer from a 3-byte slice.
@@ -546,14 +557,19 @@ mod tests {
     #[test]
     fn request_magic_detected() {
         assert!(is_telemetry_request(b"?loc"), "exact magic must match");
-        assert!(is_telemetry_request(b"?loc verbose"), "prefix match must pass");
+        assert!(
+            is_telemetry_request(b"?loc verbose"),
+            "prefix match must pass"
+        );
     }
 
     #[test]
     fn non_request_not_detected() {
         assert!(!is_telemetry_request(b"hello"));
         assert!(!is_telemetry_request(b""));
-        assert!(!is_telemetry_request(b"loc:lat=1.0000000,lon=2.0000000,age=0s")); // response
+        assert!(!is_telemetry_request(
+            b"loc:lat=1.0000000,lon=2.0000000,age=0s"
+        )); // response
         assert!(!is_telemetry_request(b"?lox")); // wrong magic
         assert!(!is_telemetry_request(b"   ")); // whitespace only
         assert!(!is_telemetry_request(b"x?loc")); // magic not at (trimmed) start
@@ -584,14 +600,14 @@ mod tests {
         // Munich-ish: 48.1173°N, 11.5169°E, 42 s old
         let lat_e7 = 481_173_000i32;
         let lon_e7 = 115_169_000i32;
-        let age    = 42u32;
+        let age = 42u32;
 
         let mut buf = [0u8; MAX_RESPONSE_LEN];
         let n = encode_telemetry_response(lat_e7, lon_e7, age, &mut buf);
         let resp = decode_telemetry_response(&buf[..n]).expect("must parse positive coords");
-        assert_eq!(resp.lat_e7,    lat_e7, "lat roundtrip");
-        assert_eq!(resp.lon_e7,    lon_e7, "lon roundtrip");
-        assert_eq!(resp.age_secs,  age,    "age roundtrip");
+        assert_eq!(resp.lat_e7, lat_e7, "lat roundtrip");
+        assert_eq!(resp.lon_e7, lon_e7, "lon roundtrip");
+        assert_eq!(resp.age_secs, age, "age roundtrip");
     }
 
     #[test]
@@ -599,13 +615,13 @@ mod tests {
         // Southern / Western hemisphere
         let lat_e7 = -338_688_000i32;
         let lon_e7 = -1_512_093_000i32;
-        let age    = 120u32;
+        let age = 120u32;
 
         let mut buf = [0u8; MAX_RESPONSE_LEN];
         let n = encode_telemetry_response(lat_e7, lon_e7, age, &mut buf);
         let resp = decode_telemetry_response(&buf[..n]).expect("must parse negative coords");
-        assert_eq!(resp.lat_e7,   lat_e7);
-        assert_eq!(resp.lon_e7,   lon_e7);
+        assert_eq!(resp.lat_e7, lat_e7);
+        assert_eq!(resp.lon_e7, lon_e7);
         assert_eq!(resp.age_secs, age);
     }
 
@@ -625,8 +641,16 @@ mod tests {
         let mut buf = [0u8; MAX_RESPONSE_LEN];
         let n = encode_telemetry_response(0, 0, 99, &mut buf);
         let text = core::str::from_utf8(&buf[..n]).expect("must be UTF-8");
-        assert!(text.contains("age="), "response must have age= field: {}", text);
-        assert!(text.contains("99s"), "response must carry the age value: {}", text);
+        assert!(
+            text.contains("age="),
+            "response must have age= field: {}",
+            text
+        );
+        assert!(
+            text.contains("99s"),
+            "response must carry the age value: {}",
+            text
+        );
     }
 
     #[test]
@@ -643,7 +667,12 @@ mod tests {
         // Worst-case coordinate + max u32 age
         let mut buf = [0u8; MAX_RESPONSE_LEN];
         let n = encode_telemetry_response(-900_000_000, -1_800_000_000, u32::MAX, &mut buf);
-        assert!(n <= MAX_RESPONSE_LEN, "response must fit in MAX_RESPONSE_LEN: {} > {}", n, MAX_RESPONSE_LEN);
+        assert!(
+            n <= MAX_RESPONSE_LEN,
+            "response must fit in MAX_RESPONSE_LEN: {} > {}",
+            n,
+            MAX_RESPONSE_LEN
+        );
     }
 
     // ── no-fix encoding ──────────────────────────────────────────────────────
@@ -673,10 +702,11 @@ mod tests {
     #[test]
     fn decode_rejects_malformed() {
         assert!(decode_telemetry_response(b"").is_none());
-        assert!(decode_telemetry_response(b"?loc").is_none());          // request, not response
+        assert!(decode_telemetry_response(b"?loc").is_none()); // request, not response
         assert!(decode_telemetry_response(b"loc:lat=abc,lon=1.0000000,age=0s").is_none()); // non-numeric lat
         assert!(decode_telemetry_response(b"loc:lat=1.00000,lon=0.0000000,age=0s").is_none()); // 5 dp, not 7
-        assert!(decode_telemetry_response(b"loc:lat=1.0000000,lon=0.0000000,age=xs").is_none()); // non-numeric age
+        assert!(decode_telemetry_response(b"loc:lat=1.0000000,lon=0.0000000,age=xs").is_none());
+        // non-numeric age
     }
 
     // ── coord encoder precision ──────────────────────────────────────────────
@@ -689,7 +719,11 @@ mod tests {
         let n = encode_telemetry_response(lat_e7, 0, 0, &mut buf);
         let text = core::str::from_utf8(&buf[..n]).unwrap();
         // Should contain "lat=0.0010000"
-        assert!(text.contains("lat=0.0010000"), "zero padding wrong: {}", text);
+        assert!(
+            text.contains("lat=0.0010000"),
+            "zero padding wrong: {}",
+            text
+        );
     }
 
     #[test]
@@ -707,7 +741,9 @@ mod tests {
     #[test]
     fn parse_telemetry_req_extracts_tag_and_type() {
         // [tag(4 LE)=0xAABBCCDD] [req_type=0x03] [reserved/random...]
-        let pt = [0xDD, 0xCC, 0xBB, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44];
+        let pt = [
+            0xDD, 0xCC, 0xBB, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44,
+        ];
         let req = parse_telemetry_req(&pt).expect("valid REQ must parse");
         assert_eq!(req.tag, 0xAABB_CCDD);
         assert_eq!(req.req_type, REQ_TYPE_GET_TELEMETRY_DATA);
@@ -738,7 +774,10 @@ mod tests {
         let n = encode_telemetry_response_lpp(tag, Some((lat_e7, lon_e7)), None, &mut buf);
         assert!(n <= MAX_TELEMETRY_RESPONSE_LEN);
         let resp = decode_telemetry_response_lpp(&buf[..n]).expect("must parse");
-        assert_eq!(resp.tag, tag, "tag must reflect so the companion matches reply→request");
+        assert_eq!(
+            resp.tag, tag,
+            "tag must reflect so the companion matches reply→request"
+        );
         assert_eq!(resp.gps_e4, Some((lat_e7 / 1000, lon_e7 / 1000)));
         assert_eq!(resp.battery, None, "no battery reading was supplied");
     }
@@ -765,10 +804,19 @@ mod tests {
         let tag = 0xCAFEu32;
         let mut buf = [0u8; MAX_TELEMETRY_RESPONSE_LEN];
         let n = encode_telemetry_response_lpp(tag, None, None, &mut buf);
-        assert!(n > 4, "no-fix response must exceed the 4-byte tag (got {n}) or the companion ignores it");
+        assert!(
+            n > 4,
+            "no-fix response must exceed the 4-byte tag (got {n}) or the companion ignores it"
+        );
         let resp = decode_telemetry_response_lpp(&buf[..n]).unwrap();
-        assert_eq!(resp.tag, tag, "tag must still reflect for the companion to match");
-        assert_eq!(resp.gps_e4, None, "no-fix response carries no GPS coordinates");
+        assert_eq!(
+            resp.tag, tag,
+            "tag must still reflect for the companion to match"
+        );
+        assert_eq!(
+            resp.gps_e4, None,
+            "no-fix response carries no GPS coordinates"
+        );
     }
 
     #[test]
@@ -786,13 +834,12 @@ mod tests {
         let lat_e7 = 481_173_000i32;
         let lon_e7 = 115_169_000i32;
         let mut buf = [0u8; MAX_TELEMETRY_RESPONSE_LEN];
-        let n = encode_telemetry_response_lpp(
-            tag,
-            Some((lat_e7, lon_e7)),
-            Some((82, true)),
-            &mut buf,
+        let n =
+            encode_telemetry_response_lpp(tag, Some((lat_e7, lon_e7)), Some((82, true)), &mut buf);
+        assert!(
+            n <= MAX_TELEMETRY_RESPONSE_LEN,
+            "must fit the documented ceiling: {n}"
         );
-        assert!(n <= MAX_TELEMETRY_RESPONSE_LEN, "must fit the documented ceiling: {n}");
         let resp = decode_telemetry_response_lpp(&buf[..n]).expect("must parse");
         assert_eq!(resp.gps_e4, Some((lat_e7 / 1000, lon_e7 / 1000)));
         assert_eq!(resp.battery, Some((82, true)));
@@ -807,7 +854,11 @@ mod tests {
         let n = encode_telemetry_response_lpp(tag, None, Some((14, false)), &mut buf);
         let resp = decode_telemetry_response_lpp(&buf[..n]).unwrap();
         assert_eq!(resp.gps_e4, None);
-        assert_eq!(resp.battery, Some((14, false)), "not-charging low battery must decode intact");
+        assert_eq!(
+            resp.battery,
+            Some((14, false)),
+            "not-charging low battery must decode intact"
+        );
     }
 
     #[test]
@@ -862,7 +913,7 @@ mod tests {
     /// `?loc`-only fixes land green while the hardware never moved.
     #[test]
     fn native_companion_req_to_response_end_to_end() {
-        use crate::{Identity, encode_dm_payload, decode_dm_payload};
+        use crate::{decode_dm_payload, encode_dm_payload, Identity};
 
         let companion = Identity::from_seed([0xC0u8; 32]); // requester
         let meshcadet = Identity::from_seed([0x3Du8; 32]); // responder
@@ -893,7 +944,10 @@ mod tests {
             decode_dm_payload(&shared_m, &req_dm[..req_len], &mut dec).expect("REQ must decrypt");
         assert_eq!(dest, meshcadet.pub_hash());
         let req = parse_telemetry_req(&dec[..pt_len]).expect("REQ must parse");
-        assert!(is_telemetry_req(&req), "must be recognised as a telemetry pull");
+        assert!(
+            is_telemetry_req(&req),
+            "must be recognised as a telemetry pull"
+        );
         assert_eq!(req.tag, tag);
 
         // 4. MeshCadet builds the RESPONSE plaintext (reflect tag + GPS fix + battery).
@@ -923,9 +977,16 @@ mod tests {
             .expect("RESPONSE must decrypt");
         assert_eq!(rdest, companion.pub_hash());
         let resp = decode_telemetry_response_lpp(&rdec[..rpt_len]).expect("RESPONSE must parse");
-        assert_eq!(resp.tag, tag, "tag must round-trip for the companion to match");
+        assert_eq!(
+            resp.tag, tag,
+            "tag must round-trip for the companion to match"
+        );
         assert_eq!(resp.gps_e4, Some((lat_e7 / 1000, lon_e7 / 1000)));
-        assert_eq!(resp.battery, Some((77, false)), "battery status must round-trip end-to-end too");
+        assert_eq!(
+            resp.battery,
+            Some((77, false)),
+            "battery status must round-trip end-to-end too"
+        );
     }
 
     // ── policy gate (documented, tested indirectly) ───────────────────────────

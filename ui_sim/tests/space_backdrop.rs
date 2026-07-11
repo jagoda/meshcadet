@@ -26,7 +26,11 @@ fn quantize565(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
     let r5 = r >> 3;
     let g6 = g >> 2;
     let b5 = b >> 3;
-    (((r5 << 3) | (r5 >> 2)), ((g6 << 2) | (g6 >> 4)), ((b5 << 3) | (b5 >> 2)))
+    (
+        ((r5 << 3) | (r5 >> 2)),
+        ((g6 << 2) | (g6 >> 4)),
+        ((b5 << 3) | (b5 >> 2)),
+    )
 }
 
 #[test]
@@ -53,7 +57,10 @@ fn space_backdrop_and_planet_horizon_render() {
             }
         }
     }
-    assert!(backdrop_painted, "SpaceBackdrop did not paint any pixel over the space-deep fill");
+    assert!(
+        backdrop_painted,
+        "SpaceBackdrop did not paint any pixel over the space-deep fill"
+    );
 
     // The stand-in foreground "content" rectangle (bg-space fill) must
     // still read as its own flat color at its center — i.e. the backdrop
@@ -78,5 +85,8 @@ fn space_backdrop_and_planet_horizon_render() {
             break;
         }
     }
-    assert!(horizon_painted, "PlanetHorizon did not paint any pixel in the lower band");
+    assert!(
+        horizon_painted,
+        "PlanetHorizon did not paint any pixel in the lower band"
+    );
 }

@@ -33,13 +33,18 @@ fn quantize565(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
     let r5 = r >> 3;
     let g6 = g >> 2;
     let b5 = b >> 3;
-    (((r5 << 3) | (r5 >> 2)), ((g6 << 2) | (g6 >> 4)), ((b5 << 3) | (b5 >> 2)))
+    (
+        ((r5 << 3) | (r5 >> 2)),
+        ((g6 << 2) | (g6 >> 4)),
+        ((b5 << 3) | (b5 >> 2)),
+    )
 }
 
 /// Alpha-blend `fg` over `bg` at `alpha` (0.0..=1.0), matching Slint's own
 /// straight (non-premultiplied) compositing for a solid-color `Rectangle`.
 fn blend(fg: (u8, u8, u8), bg: (u8, u8, u8), alpha: f32) -> (u8, u8, u8) {
-    let mix = |f: u8, b: u8| -> u8 { ((f as f32) * alpha + (b as f32) * (1.0 - alpha)).round() as u8 };
+    let mix =
+        |f: u8, b: u8| -> u8 { ((f as f32) * alpha + (b as f32) * (1.0 - alpha)).round() as u8 };
     (mix(fg.0, bg.0), mix(fg.1, bg.1), mix(fg.2, bg.2))
 }
 

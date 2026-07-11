@@ -75,9 +75,14 @@
 //! what compaction itself preserves.
 
 use crate::history::{
-    HistoryEntry, HistoryMsgType, HISTORY_ENTRY_BLOB_LEN, MAX_HISTORY_ENTRIES,
-    encode_entry_blob, decode_entry_blob,
+    decode_entry_blob, encode_entry_blob, HistoryEntry, HistoryMsgType, HISTORY_ENTRY_BLOB_LEN,
+    MAX_HISTORY_ENTRIES,
 };
+
+/// A decoded region slot: `(entry, is_ours, acked)`. Named alias purely to
+/// keep signatures below under clippy's `type_complexity` threshold — see
+/// `decode_slot` for what each element means.
+type DecodedSlot = (HistoryEntry, bool, bool);
 
 // ── Slot codec: reuse the legacy 72-byte blob, repurposing blob[71] ───────────
 
@@ -113,7 +118,11 @@ pub const FLAG_ACKED: u8 = 0x02;
 
 /// Encode one region slot: the legacy 72-byte entry blob with the flags byte
 /// (`blob[71]`) set from `is_ours` and `acked`.
-pub fn encode_slot(entry: &HistoryEntry, is_ours: bool, acked: bool) -> [u8; HISTORY_ENTRY_BLOB_LEN] {
+pub fn encode_slot(
+    entry: &HistoryEntry,
+    is_ours: bool,
+    acked: bool,
+) -> [u8; HISTORY_ENTRY_BLOB_LEN] {
     let mut blob = [0u8; HISTORY_ENTRY_BLOB_LEN];
     encode_entry_blob(entry, &mut blob);
     let mut flags = 0u8;
@@ -131,7 +140,7 @@ pub fn encode_slot(entry: &HistoryEntry, is_ours: bool, acked: bool) -> [u8; HIS
 /// otherwise-unrecognised slot, exactly like [`crate::history::decode_entry_blob`].
 ///
 /// Returns `(entry, is_ours, acked)`.
-pub fn decode_slot(blob: &[u8; HISTORY_ENTRY_BLOB_LEN]) -> Option<(HistoryEntry, bool, bool)> {
+pub fn decode_slot(blob: &[u8; HISTORY_ENTRY_BLOB_LEN]) -> Option<DecodedSlot> {
     let entry = decode_entry_blob(blob)?;
     let flags = blob[HISTORY_ENTRY_BLOB_LEN - 1];
     let is_ours = (flags & FLAG_IS_OURS) != 0;
@@ -154,8 +163,10 @@ pub fn decode_slot(blob: &[u8; HISTORY_ENTRY_BLOB_LEN]) -> Option<(HistoryEntry,
 /// search, first unacked outbound hit wins, matching the "only one send is
 /// ever outstanding at a time" single-pending-slot model both the DM and
 /// channel ack trackers use.
-pub fn find_newest_ours_unacked(live: &[Option<(HistoryEntry, bool, bool)>]) -> Option<usize> {
-    (0..live.len()).rev().find(|&i| matches!(live[i], Some((_, is_ours, acked)) if is_ours && !acked))
+pub fn find_newest_ours_unacked(live: &[Option<DecodedSlot>]) -> Option<usize> {
+    (0..live.len())
+        .rev()
+        .find(|&i| matches!(live[i], Some((_, is_ours, acked)) if is_ours && !acked))
 }
 
 // ── Region geometry ────────────────────────────────────────────────────────────
@@ -229,7 +240,11 @@ pub fn decode_region_header(bytes: &[u8]) -> Option<RegionHeader> {
         return None;
     }
     let kind = HistoryMsgType::from_u8(bytes[3])?;
-    Some(RegionHeader { kind, conv_hash: bytes[4], generation: bytes[5] })
+    Some(RegionHeader {
+        kind,
+        conv_hash: bytes[4],
+        generation: bytes[5],
+    })
 }
 
 /// Wraparound-aware "is `candidate` newer than `current`" comparison for the
@@ -284,7 +299,9 @@ pub struct HistoryRegion {
 impl HistoryRegion {
     /// A fresh, unclaimed region (both sectors fully erased).
     pub fn new_erased() -> Self {
-        Self { sectors: [[0xFFu8; SECTOR_SIZE]; SECTORS_PER_REGION] }
+        Self {
+            sectors: [[0xFFu8; SECTOR_SIZE]; SECTORS_PER_REGION],
+        }
     }
 
     fn header_of(&self, sector_idx: usize) -> Option<RegionHeader> {
@@ -300,10 +317,12 @@ impl HistoryRegion {
         find_write_head(&self.sectors[sector_idx])
     }
 
-    fn decode_slot_at(&self, sector_idx: usize, slot: usize) -> Option<(HistoryEntry, bool, bool)> {
+    fn decode_slot_at(&self, sector_idx: usize, slot: usize) -> Option<DecodedSlot> {
         let off = slot_offset(slot);
-        let bytes: &[u8; HISTORY_ENTRY_BLOB_LEN] =
-            self.sectors[sector_idx][off..off + HISTORY_ENTRY_BLOB_LEN].try_into().ok()?;
+        let bytes: &[u8; HISTORY_ENTRY_BLOB_LEN] = self.sectors[sector_idx]
+            [off..off + HISTORY_ENTRY_BLOB_LEN]
+            .try_into()
+            .ok()?;
         decode_slot(bytes)
     }
 
@@ -314,7 +333,11 @@ impl HistoryRegion {
     pub fn active_sector_index(&self) -> Option<usize> {
         match (self.header_of(0), self.header_of(1)) {
             (Some(a), Some(b)) => {
-                if generation_is_newer(b.generation, a.generation) { Some(1) } else { Some(0) }
+                if generation_is_newer(b.generation, a.generation) {
+                    Some(1)
+                } else {
+                    Some(0)
+                }
             }
             (Some(_), None) => Some(0),
             (None, Some(_)) => Some(1),
@@ -337,8 +360,18 @@ impl HistoryRegion {
     /// callers (the directory helper) must only call this on a region for
     /// which [`Self::is_claimed`] is `false`; debug builds assert this.
     pub fn claim(&mut self, kind: HistoryMsgType, conv_hash: u8) {
-        debug_assert!(!self.is_claimed(), "claim() called on an already-claimed region — data loss");
-        self.write_header(0, &RegionHeader { kind, conv_hash, generation: 0 });
+        debug_assert!(
+            !self.is_claimed(),
+            "claim() called on an already-claimed region — data loss"
+        );
+        self.write_header(
+            0,
+            &RegionHeader {
+                kind,
+                conv_hash,
+                generation: 0,
+            },
+        );
         // Ensure sector 1 reads as unclaimed spare (fresh regions already are,
         // but re-claiming a previously-used region must not leave stale data
         // behind that could resolve as "active" via a higher generation).
@@ -351,10 +384,10 @@ impl HistoryRegion {
     fn gather_live(
         &self,
         sector_idx: usize,
-    ) -> ([Option<(HistoryEntry, bool, bool)>; MAX_HISTORY_ENTRIES], usize) {
+    ) -> ([Option<DecodedSlot>; MAX_HISTORY_ENTRIES], usize) {
         let head = self.write_head(sector_idx);
         let start = head.saturating_sub(MAX_HISTORY_ENTRIES);
-        let mut buf: [Option<(HistoryEntry, bool, bool)>; MAX_HISTORY_ENTRIES] = [None; MAX_HISTORY_ENTRIES];
+        let mut buf: [Option<DecodedSlot>; MAX_HISTORY_ENTRIES] = [None; MAX_HISTORY_ENTRIES];
         let mut n = 0;
         for slot in start..head {
             if let Some(triple) = self.decode_slot_at(sector_idx, slot) {
@@ -414,12 +447,19 @@ impl HistoryRegion {
     /// Append one entry, compacting first if the active sector's append
     /// area is full. Fails with [`RegionError::Unclaimed`] if the region has
     /// never been claimed.
-    pub fn append(&mut self, entry: &HistoryEntry, is_ours: bool, acked: bool) -> Result<(), RegionError> {
+    pub fn append(
+        &mut self,
+        entry: &HistoryEntry,
+        is_ours: bool,
+        acked: bool,
+    ) -> Result<(), RegionError> {
         let mut active = self.active_sector_index().ok_or(RegionError::Unclaimed)?;
         let mut head = self.write_head(active);
         if head >= SLOTS_PER_SECTOR {
             self.compact(active)?;
-            active = self.active_sector_index().expect("just committed a header above");
+            active = self
+                .active_sector_index()
+                .expect("just committed a header above");
             head = self.write_head(active);
         }
         let off = slot_offset(head);
@@ -439,7 +479,9 @@ impl HistoryRegion {
     /// Iterate the live (newest-≤32) entries oldest-first, calling
     /// `f(index, entry, is_ours, acked)` for each. `index` is 0-based (oldest = 0).
     pub fn iter_oldest_first<F: FnMut(u8, &HistoryEntry, bool, bool)>(&self, mut f: F) {
-        let Some(active) = self.active_sector_index() else { return };
+        let Some(active) = self.active_sector_index() else {
+            return;
+        };
         let (live, n) = self.gather_live(active);
         for (i, slot) in live.iter().take(n).enumerate() {
             if let Some((entry, is_ours, acked)) = slot {
@@ -526,7 +568,8 @@ mod tests {
         encode_entry_blob(&e, &mut legacy_blob);
         assert_eq!(legacy_blob[HISTORY_ENTRY_BLOB_LEN - 1], 0x00);
 
-        let (decoded, is_ours, acked) = decode_slot(&legacy_blob).expect("legacy blob still decodes");
+        let (decoded, is_ours, acked) =
+            decode_slot(&legacy_blob).expect("legacy blob still decodes");
         assert!(!is_ours, "legacy flags=0 must decode as is_ours=false");
         assert!(!acked, "legacy flags=0 must decode as acked=false");
         assert_eq!(decoded.timestamp, 7);
@@ -580,40 +623,48 @@ mod tests {
     #[test]
     fn find_newest_ours_unacked_picks_the_newest_pending_outbound() {
         let e = entry(1, b"hi");
-        let live: [Option<(HistoryEntry, bool, bool)>; 4] = [
-            Some((e, true, false)),  // index 0: outbound, pending (older)
-            Some((e, false, true)),  // index 1: inbound
-            Some((e, true, false)),  // index 2: outbound, pending (newest pending)
-            Some((e, true, true)),   // index 3: outbound, already acked
+        let live: [Option<DecodedSlot>; 4] = [
+            Some((e, true, false)), // index 0: outbound, pending (older)
+            Some((e, false, true)), // index 1: inbound
+            Some((e, true, false)), // index 2: outbound, pending (newest pending)
+            Some((e, true, true)),  // index 3: outbound, already acked
         ];
-        assert_eq!(find_newest_ours_unacked(&live), Some(2), "must pick the NEWEST unacked outbound entry, not the oldest");
+        assert_eq!(
+            find_newest_ours_unacked(&live),
+            Some(2),
+            "must pick the NEWEST unacked outbound entry, not the oldest"
+        );
     }
 
     #[test]
     fn find_newest_ours_unacked_ignores_inbound_and_already_acked() {
         let e = entry(2, b"hi");
-        let live: [Option<(HistoryEntry, bool, bool)>; 3] = [
+        let live: [Option<DecodedSlot>; 3] = [
             Some((e, false, false)), // inbound, "unacked" bit is inert for inbound
             Some((e, true, true)),   // outbound, already acked
             Some((e, false, true)),  // inbound
         ];
-        assert_eq!(find_newest_ours_unacked(&live), None, "no pending outbound entry present");
+        assert_eq!(
+            find_newest_ours_unacked(&live),
+            None,
+            "no pending outbound entry present"
+        );
     }
 
     #[test]
     fn find_newest_ours_unacked_skips_none_gaps() {
         let e = entry(3, b"hi");
-        let live: [Option<(HistoryEntry, bool, bool)>; 3] = [
-            Some((e, true, false)),
-            None,
-            None,
-        ];
-        assert_eq!(find_newest_ours_unacked(&live), Some(0), "must find the entry past trailing gaps");
+        let live: [Option<DecodedSlot>; 3] = [Some((e, true, false)), None, None];
+        assert_eq!(
+            find_newest_ours_unacked(&live),
+            Some(0),
+            "must find the entry past trailing gaps"
+        );
     }
 
     #[test]
     fn find_newest_ours_unacked_empty_slice_is_none() {
-        let live: [Option<(HistoryEntry, bool, bool)>; 0] = [];
+        let live: [Option<DecodedSlot>; 0] = [];
         assert_eq!(find_newest_ours_unacked(&live), None);
     }
 
@@ -621,7 +672,11 @@ mod tests {
 
     #[test]
     fn region_header_round_trips() {
-        let h = RegionHeader { kind: Kind::GrpTxt, conv_hash: 0xAB, generation: 3 };
+        let h = RegionHeader {
+            kind: Kind::GrpTxt,
+            conv_hash: 0xAB,
+            generation: 3,
+        };
         let bytes = encode_region_header(&h);
         let decoded = decode_region_header(&bytes).expect("decode");
         assert_eq!(decoded, h);
@@ -635,11 +690,19 @@ mod tests {
 
     #[test]
     fn region_header_rejects_bad_magic_and_version() {
-        let mut bytes = encode_region_header(&RegionHeader { kind: Kind::Dm, conv_hash: 1, generation: 0 });
+        let mut bytes = encode_region_header(&RegionHeader {
+            kind: Kind::Dm,
+            conv_hash: 1,
+            generation: 0,
+        });
         bytes[0] = 0x00;
         assert!(decode_region_header(&bytes).is_none());
 
-        let mut bytes2 = encode_region_header(&RegionHeader { kind: Kind::Dm, conv_hash: 1, generation: 0 });
+        let mut bytes2 = encode_region_header(&RegionHeader {
+            kind: Kind::Dm,
+            conv_hash: 1,
+            generation: 0,
+        });
         bytes2[2] = 0xFF; // bad version
         assert!(decode_region_header(&bytes2).is_none());
     }
@@ -648,7 +711,10 @@ mod tests {
     fn generation_comparison_handles_wraparound() {
         assert!(generation_is_newer(1, 0));
         assert!(!generation_is_newer(0, 1));
-        assert!(generation_is_newer(0, 255), "255 -> 0 must be treated as newer (wraparound)");
+        assert!(
+            generation_is_newer(0, 255),
+            "255 -> 0 must be treated as newer (wraparound)"
+        );
         assert!(!generation_is_newer(255, 0));
     }
 
@@ -674,7 +740,14 @@ mod tests {
     fn claim_then_append_and_iterate() {
         let mut r = HistoryRegion::new_erased();
         r.claim(Kind::Dm, 0x42);
-        assert_eq!(r.header(), Some(RegionHeader { kind: Kind::Dm, conv_hash: 0x42, generation: 0 }));
+        assert_eq!(
+            r.header(),
+            Some(RegionHeader {
+                kind: Kind::Dm,
+                conv_hash: 0x42,
+                generation: 0
+            })
+        );
 
         r.append(&entry(100, b"first"), false, false).unwrap();
         r.append(&entry(200, b"second"), true, true).unwrap();
@@ -731,7 +804,11 @@ mod tests {
 
         r.iter_oldest_first(|_, e, is_ours, acked| {
             let i = e.timestamp as usize;
-            assert_eq!(is_ours, i % 2 == 0, "is_ours must survive compaction for ts={i}");
+            assert_eq!(
+                is_ours,
+                i.is_multiple_of(2),
+                "is_ours must survive compaction for ts={i}"
+            );
             assert_eq!(acked, i % 4 < 2, "acked must survive compaction for ts={i}");
         });
     }
@@ -752,7 +829,10 @@ mod tests {
         r.iter_oldest_first(|_, e, _, _| ts_seq.push(e.timestamp));
         assert_eq!(ts_seq[0], (total - MAX_HISTORY_ENTRIES) as u32);
         assert_eq!(*ts_seq.last().unwrap(), (total - 1) as u32);
-        assert!(r.header().unwrap().generation >= 2, "expect at least 2 compactions over {total} appends");
+        assert!(
+            r.header().unwrap().generation >= 2,
+            "expect at least 2 compactions over {total} appends"
+        );
     }
 
     /// Acceptance: torn slot write — a half-written slot doesn't jam the
@@ -828,7 +908,10 @@ mod tests {
         // (it is not full — wait, it is full; this exercises real compaction
         // running again, cleanly, from the (still valid) old sector).
         r.append(&entry(999, b"resumed"), false, false).unwrap();
-        assert_eq!(r.header().unwrap().generation, old_header.generation.wrapping_add(1));
+        assert_eq!(
+            r.header().unwrap().generation,
+            old_header.generation.wrapping_add(1)
+        );
     }
 
     /// Acceptance: interrupted compaction where the header commit itself
@@ -863,17 +946,29 @@ mod tests {
         let active = r.active_sector_index().unwrap();
         assert_eq!(r.header().unwrap().generation, 1);
         let stale_spare = 1 - active;
-        r.write_header(stale_spare, &RegionHeader { kind: Kind::Dm, conv_hash: 0x0C, generation: 0 });
+        r.write_header(
+            stale_spare,
+            &RegionHeader {
+                kind: Kind::Dm,
+                conv_hash: 0x0C,
+                generation: 0,
+            },
+        );
         assert!(r.header_of(stale_spare).is_some(), "stale header planted");
 
         // Fill the active sector again to force a second compaction; it
         // must erase the stale spare before writing into it rather than
         // corrupting/merging with the leftover bytes.
         for i in 0..24 {
-            r.append(&entry(1000 + i as u32, b"y"), false, false).unwrap();
+            r.append(&entry(1000 + i as u32, b"y"), false, false)
+                .unwrap();
         }
 
-        assert_eq!(r.header().unwrap().generation, 2, "second compaction must have run");
+        assert_eq!(
+            r.header().unwrap().generation,
+            2,
+            "second compaction must have run"
+        );
         assert_eq!(r.live_count(), MAX_HISTORY_ENTRIES);
         let mut ts_seq = Vec::new();
         r.iter_oldest_first(|_, e, _, _| ts_seq.push(e.timestamp));
@@ -890,14 +985,19 @@ mod tests {
     fn directory_finds_existing_and_claims_free() {
         let mut regions: Vec<HistoryRegion> = (0..4).map(|_| HistoryRegion::new_erased()).collect();
 
-        let idx_a = find_or_claim_region(&mut regions, Kind::Dm, 0x11).expect("claims a free region");
-        let idx_b = find_or_claim_region(&mut regions, Kind::GrpTxt, 0x22).expect("claims a different region");
+        let idx_a =
+            find_or_claim_region(&mut regions, Kind::Dm, 0x11).expect("claims a free region");
+        let idx_b = find_or_claim_region(&mut regions, Kind::GrpTxt, 0x22)
+            .expect("claims a different region");
         assert_ne!(idx_a, idx_b);
 
         // Re-querying the same (kind, conv_hash) returns the same region,
         // without disturbing its contents.
-        regions[idx_a].append(&entry(5, b"hi"), false, false).unwrap();
-        let idx_a_again = find_or_claim_region(&mut regions, Kind::Dm, 0x11).expect("finds existing");
+        regions[idx_a]
+            .append(&entry(5, b"hi"), false, false)
+            .unwrap();
+        let idx_a_again =
+            find_or_claim_region(&mut regions, Kind::Dm, 0x11).expect("finds existing");
         assert_eq!(idx_a_again, idx_a);
         assert_eq!(regions[idx_a].live_count(), 1);
     }
@@ -926,13 +1026,23 @@ mod tests {
         // implementation would produce different output than this contract.
         let mut regions: Vec<HistoryRegion> = (0..4).map(|_| HistoryRegion::new_erased()).collect();
 
-        let idx_a = find_or_claim_region(&mut regions, Kind::Dm, 0xA1).expect("claims region for A");
-        regions[idx_a].append(&entry(500, b"a-oldest"), false, false).unwrap();
-        regions[idx_a].append(&entry(600, b"a-newest"), false, false).unwrap();
+        let idx_a =
+            find_or_claim_region(&mut regions, Kind::Dm, 0xA1).expect("claims region for A");
+        regions[idx_a]
+            .append(&entry(500, b"a-oldest"), false, false)
+            .unwrap();
+        regions[idx_a]
+            .append(&entry(600, b"a-newest"), false, false)
+            .unwrap();
 
-        let idx_b = find_or_claim_region(&mut regions, Kind::GrpTxt, 0xB2).expect("claims region for B");
-        regions[idx_b].append(&entry(100, b"b-oldest"), false, false).unwrap();
-        regions[idx_b].append(&entry(200, b"b-newest"), false, false).unwrap();
+        let idx_b =
+            find_or_claim_region(&mut regions, Kind::GrpTxt, 0xB2).expect("claims region for B");
+        regions[idx_b]
+            .append(&entry(100, b"b-oldest"), false, false)
+            .unwrap();
+        regions[idx_b]
+            .append(&entry(200, b"b-newest"), false, false)
+            .unwrap();
 
         // Simulate the firmware store's `export_entries` traversal: visit
         // regions in directory (claim) order, oldest-first within each,
@@ -968,7 +1078,9 @@ mod tests {
         // Simulate scanning in a different order by shuffling the slice.
         regions.swap(0, 2);
         let found = regions.iter().position(|r| {
-            r.header().map(|h| h.kind == Kind::Dm && h.conv_hash == 0x99).unwrap_or(false)
+            r.header()
+                .map(|h| h.kind == Kind::Dm && h.conv_hash == 0x99)
+                .unwrap_or(false)
         });
         assert!(found.is_some());
         assert_eq!(regions[found.unwrap()].live_count(), 1);

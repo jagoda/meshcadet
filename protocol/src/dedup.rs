@@ -123,7 +123,10 @@ mod tests {
     fn dedup_key_malformed_frame_falls_back() {
         // path_len 0x41 claims 1 two-byte hop (needs ≥ 4 bytes) but frame is 3 B.
         let runt = [0x15u8, 0x41, 0x00];
-        assert!(packet_payload_view(&runt).is_none(), "runt frame is malformed");
+        assert!(
+            packet_payload_view(&runt).is_none(),
+            "runt frame is malformed"
+        );
         // Fallback still yields a stable key for byte-identical repeats.
         assert_eq!(packet_dedup_key(&runt), packet_dedup_key(&runt));
     }

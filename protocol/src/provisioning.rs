@@ -383,7 +383,7 @@ pub fn encode_frame(frame_type: u8, payload: &[u8], out: &mut [u8]) -> usize {
         out[5..5 + plen].copy_from_slice(payload);
     }
     let crc = crc16(&out[..5 + plen]);
-    out[5 + plen]     = (crc & 0xFF) as u8;
+    out[5 + plen] = (crc & 0xFF) as u8;
     out[5 + plen + 1] = ((crc >> 8) & 0xFF) as u8;
     FRAME_OVERHEAD + plen
 }
@@ -411,7 +411,7 @@ pub fn decode_frame(buf: &[u8]) -> Result<(u8, &[u8]), ProvError> {
         return Err(ProvError::TruncatedFrame);
     }
     let crc_expected = buf[5 + plen] as u16 | ((buf[5 + plen + 1] as u16) << 8);
-    let crc_actual   = crc16(&buf[..5 + plen]);
+    let crc_actual = crc16(&buf[..5 + plen]);
     if crc_actual != crc_expected {
         return Err(ProvError::CrcMismatch);
     }
@@ -615,7 +615,12 @@ pub fn decode_add_contact(payload: &[u8]) -> Result<AddContactPayload, ProvError
     }
     let mut display_name = [0u8; MAX_NAME_LEN];
     display_name[..name_len].copy_from_slice(&payload[34..34 + name_len]);
-    Ok(AddContactPayload { pubkey, telemetry_enable, display_name, display_name_len: name_len as u8 })
+    Ok(AddContactPayload {
+        pubkey,
+        telemetry_enable,
+        display_name,
+        display_name_len: name_len as u8,
+    })
 }
 
 /// Decode a `DelContact` payload.
@@ -636,8 +641,8 @@ pub fn decode_add_channel(payload: &[u8]) -> Result<AddChannelPayload, ProvError
     }
     let mut secret = [0u8; 32];
     secret.copy_from_slice(&payload[0..32]);
-    let key_len  = payload[32];
-    let primary  = payload[33] != 0;
+    let key_len = payload[32];
+    let primary = payload[33] != 0;
     let name_len = payload[34] as usize;
     if name_len > MAX_NAME_LEN {
         return Err(ProvError::NameTooLong);
@@ -647,7 +652,13 @@ pub fn decode_add_channel(payload: &[u8]) -> Result<AddChannelPayload, ProvError
     }
     let mut name = [0u8; MAX_NAME_LEN];
     name[..name_len].copy_from_slice(&payload[35..35 + name_len]);
-    Ok(AddChannelPayload { secret, key_len, primary, name, name_len: name_len as u8 })
+    Ok(AddChannelPayload {
+        secret,
+        key_len,
+        primary,
+        name,
+        name_len: name_len as u8,
+    })
 }
 
 /// Decode a `DelChannel` payload.
@@ -665,7 +676,10 @@ pub fn decode_set_notif_defaults(payload: &[u8]) -> Result<NotifDefaultsPayload,
     if payload.len() < 2 {
         return Err(ProvError::TruncatedPayload);
     }
-    Ok(NotifDefaultsPayload { visual: payload[0] != 0, audible: payload[1] != 0 })
+    Ok(NotifDefaultsPayload {
+        visual: payload[0] != 0,
+        audible: payload[1] != 0,
+    })
 }
 
 /// Decode a `SetPin` payload.
@@ -682,7 +696,10 @@ pub fn decode_set_pin(payload: &[u8]) -> Result<SetPinPayload, ProvError> {
     }
     let mut pin = [0u8; MAX_PIN_LEN];
     pin[..pin_len].copy_from_slice(&payload[1..1 + pin_len]);
-    Ok(SetPinPayload { pin, pin_len: pin_len as u8 })
+    Ok(SetPinPayload {
+        pin,
+        pin_len: pin_len as u8,
+    })
 }
 
 /// Decode a `SetDeviceName` payload.
@@ -699,7 +716,10 @@ pub fn decode_set_device_name(payload: &[u8]) -> Result<SetDeviceNamePayload, Pr
     }
     let mut name = [0u8; MAX_NAME_LEN];
     name[..name_len].copy_from_slice(&payload[1..1 + name_len]);
-    Ok(SetDeviceNamePayload { name, name_len: name_len as u8 })
+    Ok(SetDeviceNamePayload {
+        name,
+        name_len: name_len as u8,
+    })
 }
 
 /// Decode an `RspStatus` payload.
@@ -768,7 +788,12 @@ pub fn decode_rsp_identity(payload: &[u8]) -> Result<RspIdentityPayload, ProvErr
     }
     let mut device_name = [0u8; MAX_NAME_LEN];
     device_name[..name_len].copy_from_slice(&payload[34..34 + name_len]);
-    Ok(RspIdentityPayload { pubkey, pub_hash, device_name, device_name_len: name_len as u8 })
+    Ok(RspIdentityPayload {
+        pubkey,
+        pub_hash,
+        device_name,
+        device_name_len: name_len as u8,
+    })
 }
 
 /// Decode an `RspContact` payload.
@@ -840,7 +865,11 @@ pub fn decode_rsp_error(payload: &[u8]) -> Result<RspErrorPayload, ProvError> {
     }
     let mut msg = [0u8; MAX_ERR_MSG_LEN];
     msg[..msg_len].copy_from_slice(&payload[2..2 + msg_len]);
-    Ok(RspErrorPayload { error_code, msg, msg_len: msg_len as u8 })
+    Ok(RspErrorPayload {
+        error_code,
+        msg,
+        msg_len: msg_len as u8,
+    })
 }
 
 // ── CRC-16/ARC helper ─────────────────────────────────────────────────────────
@@ -1099,7 +1128,10 @@ mod tests {
     #[test]
     fn rsp_status_truncated_payload_rejected() {
         let payload_buf = [0u8; 54]; // one byte short of the legacy 55-byte minimum
-        assert_eq!(decode_rsp_status(&payload_buf), Err(ProvError::TruncatedPayload));
+        assert_eq!(
+            decode_rsp_status(&payload_buf),
+            Err(ProvError::TruncatedPayload)
+        );
     }
 
     #[test]
@@ -1130,8 +1162,14 @@ mod tests {
         // Truncate to the legacy 55-byte length before decoding.
         let decoded = decode_rsp_status(&payload_buf[..55]).unwrap();
         assert_eq!(decoded.battery_percent, 50);
-        assert_eq!(decoded.battery_raw_mv, 0, "raw_mv absent on the wire must default to 0");
-        assert_eq!(decoded.battery_held_raw_mv, 0, "held_raw_mv absent on the wire must default to 0");
+        assert_eq!(
+            decoded.battery_raw_mv, 0,
+            "raw_mv absent on the wire must default to 0"
+        );
+        assert_eq!(
+            decoded.battery_held_raw_mv, 0,
+            "held_raw_mv absent on the wire must default to 0"
+        );
     }
 
     #[test]
@@ -1163,7 +1201,10 @@ mod tests {
         let decoded = decode_rsp_status(&payload_buf[..57]).unwrap();
         assert_eq!(decoded.battery_percent, 82);
         assert_eq!(decoded.battery_raw_mv, 4180);
-        assert_eq!(decoded.battery_held_raw_mv, 0, "held_raw_mv absent on the wire must default to 0");
+        assert_eq!(
+            decoded.battery_held_raw_mv, 0,
+            "held_raw_mv absent on the wire must default to 0"
+        );
     }
 
     // ── RspIdentity roundtrip ────────────────────────────────────────────────
@@ -1225,7 +1266,10 @@ mod tests {
     fn decode_set_device_name_too_long() {
         let mut payload = [0u8; 40];
         payload[0] = (MAX_NAME_LEN + 1) as u8;
-        assert_eq!(decode_set_device_name(&payload), Err(ProvError::NameTooLong));
+        assert_eq!(
+            decode_set_device_name(&payload),
+            Err(ProvError::NameTooLong)
+        );
     }
 
     // ── RspError roundtrip ───────────────────────────────────────────────────
@@ -1237,7 +1281,10 @@ mod tests {
         let decoded = decode_rsp_error(&payload_buf[..plen]).unwrap();
         assert_eq!(decoded.error_code, 0x42);
         assert_eq!(decoded.msg_len, b"contact list full".len() as u8);
-        assert_eq!(&decoded.msg[..decoded.msg_len as usize], b"contact list full");
+        assert_eq!(
+            &decoded.msg[..decoded.msg_len as usize],
+            b"contact list full"
+        );
     }
 
     // ── RspContact roundtrip ─────────────────────────────────────────────────
@@ -1289,7 +1336,10 @@ mod tests {
 
     #[test]
     fn decode_rsp_contact_truncated() {
-        assert_eq!(decode_rsp_contact(&[0u8; 34]), Err(ProvError::TruncatedPayload));
+        assert_eq!(
+            decode_rsp_contact(&[0u8; 34]),
+            Err(ProvError::TruncatedPayload)
+        );
     }
 
     // ── RspChannel roundtrip ─────────────────────────────────────────────────
@@ -1328,7 +1378,10 @@ mod tests {
 
     #[test]
     fn decode_rsp_channel_truncated() {
-        assert_eq!(decode_rsp_channel(&[0u8; 4]), Err(ProvError::TruncatedPayload));
+        assert_eq!(
+            decode_rsp_channel(&[0u8; 4]),
+            Err(ProvError::TruncatedPayload)
+        );
     }
 
     // ── CommitProvisioning frame (empty payload) ─────────────────────────────
@@ -1382,7 +1435,10 @@ mod tests {
     #[test]
     fn decode_add_contact_truncated() {
         // Need at least 34 bytes (32 + 1 + 1)
-        assert_eq!(decode_add_contact(&[0u8; 33]), Err(ProvError::TruncatedPayload));
+        assert_eq!(
+            decode_add_contact(&[0u8; 33]),
+            Err(ProvError::TruncatedPayload)
+        );
     }
 
     #[test]

@@ -201,7 +201,10 @@ impl ContactBadgesFrame {
         let rendered = self.window.draw_if_needed(|renderer| {
             renderer.render(&mut framebuffer, WIDTH as usize);
         });
-        assert!(rendered, "contact-badges frame was not dirty — nothing painted");
+        assert!(
+            rendered,
+            "contact-badges frame was not dirty — nothing painted"
+        );
         framebuffer
     }
 }
@@ -217,7 +220,11 @@ impl Default for ContactBadgesFrame {
 /// duplicates locally (see `motif_library.rs`'s identical function doc for
 /// why: no shared dependency on `lib.rs`'s `#[cfg(test)]`-adjacent
 /// internals).
-pub fn framebuffer_to_rgb_image(framebuffer: &[Rgb565Pixel], width: u32, height: u32) -> image::RgbImage {
+pub fn framebuffer_to_rgb_image(
+    framebuffer: &[Rgb565Pixel],
+    width: u32,
+    height: u32,
+) -> image::RgbImage {
     let mut img = image::RgbImage::new(width, height);
     for (i, px) in framebuffer.iter().enumerate() {
         let r5 = (px.0 >> 11) & 0x1F;
@@ -238,5 +245,9 @@ pub fn rgb8(px: Rgb565Pixel) -> (u8, u8, u8) {
     let r5 = (px.0 >> 11) & 0x1F;
     let g6 = (px.0 >> 5) & 0x3F;
     let b5 = px.0 & 0x1F;
-    (((r5 << 3) | (r5 >> 2)) as u8, ((g6 << 2) | (g6 >> 4)) as u8, ((b5 << 3) | (b5 >> 2)) as u8)
+    (
+        ((r5 << 3) | (r5 >> 2)) as u8,
+        ((g6 << 2) | (g6 >> 4)) as u8,
+        ((b5 << 3) | (b5 >> 2)) as u8,
+    )
 }

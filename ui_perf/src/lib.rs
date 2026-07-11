@@ -30,6 +30,7 @@
 //!     firmware pays that frame.
 //!   * **dirty pixels / frame** = total px the renderer recomposites + ships.
 //!   * **bbox** = the repaint-scope bounding box.
+//!
 //! Reducing these is exactly "reduce repaint scope": fewer SPI holds/frame →
 //! less bus contention with the SX1262 radio on the shared SPI2 bus, and less
 //! recomposite work → higher frame rate.
@@ -68,10 +69,8 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use slint::platform::software_renderer::{
-    MinimalSoftwareWindow, RepaintBufferType, Rgb565Pixel,
-};
 use slint::platform::software_renderer::PhysicalRegion;
+use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType, Rgb565Pixel};
 use slint::platform::{Platform, PlatformError, WindowAdapter};
 use slint::PhysicalSize;
 

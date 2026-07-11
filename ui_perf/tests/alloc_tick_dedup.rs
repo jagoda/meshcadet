@@ -168,7 +168,12 @@ fn build_gps_row_strings(status: &GpsStatus) -> [String; 4] {
     [
         format_fix_state(status.fix_state).to_string(),
         format_sat_count(status.sat_count),
-        format_coords(status.has_fix, status.lat_e7, status.lon_e7, status.fix_age_secs),
+        format_coords(
+            status.has_fix,
+            status.lat_e7,
+            status.lon_e7,
+            status.fix_age_secs,
+        ),
         format_time_sync(status.clock_synced, status.clock_sync_age_secs),
     ]
 }
@@ -226,9 +231,19 @@ fn ported_gps_formatters_match_firmware_fixtures() {
 
 #[test]
 fn ported_battery_formatter_matches_firmware_fixtures() {
-    let not_charging = BatteryStatus { percent: 63, charging: false, raw_mv: 0, held_raw_mv: 0 };
+    let not_charging = BatteryStatus {
+        percent: 63,
+        charging: false,
+        raw_mv: 0,
+        held_raw_mv: 0,
+    };
     assert_eq!(format_battery_display(not_charging), "63%");
-    let charging = BatteryStatus { percent: 9, charging: true, raw_mv: 0, held_raw_mv: 0 };
+    let charging = BatteryStatus {
+        percent: 9,
+        charging: true,
+        raw_mv: 0,
+        held_raw_mv: 0,
+    };
     assert_eq!(format_battery_display(charging), "9% (charging)");
 }
 
@@ -297,7 +312,10 @@ fn gps_status_push_allocates_only_on_genuine_change() {
     // value the sequence takes (0..=4 over 100 ticks/period 20 = 5 groups;
     // the first group's push is the `never()` -> first-real-status
     // transition).
-    assert_eq!(pushes, 5, "expected 5 distinct fix_age_secs groups over 100 ticks/period 20");
+    assert_eq!(
+        pushes, 5,
+        "expected 5 distinct fix_age_secs groups over 100 ticks/period 20"
+    );
     assert!(
         guarded_allocs < unconditional_allocs / 10,
         "guarded allocs ({guarded_allocs}) should be an order of magnitude below \
@@ -331,7 +349,12 @@ fn battery_display_push_allocates_only_on_percent_or_charging_change() {
     let unconditional_allocs = after.0 - before.0;
 
     // ── AFTER: gate on (percent, charging) only ─────────────────────────────
-    let mut prev = BatteryStatus { percent: 0, charging: false, raw_mv: 0, held_raw_mv: 0 };
+    let mut prev = BatteryStatus {
+        percent: 0,
+        charging: false,
+        raw_mv: 0,
+        held_raw_mv: 0,
+    };
     let before = alloc_snapshot();
     let mut pushes = 0usize;
     for status in &ticks {
@@ -351,7 +374,10 @@ fn battery_display_push_allocates_only_on_percent_or_charging_change() {
         ticks.len(), unconditional_allocs, guarded_allocs, pushes,
     );
 
-    assert_eq!(pushes, 4, "expected 1 initial change + percent drop at 20 + percent drop at 40 + charging flip at 45");
+    assert_eq!(
+        pushes, 4,
+        "expected 1 initial change + percent drop at 20 + percent drop at 40 + charging flip at 45"
+    );
     assert!(
         unconditional_allocs >= ticks.len(),
         "at least one String alloc per unconditional tick ({} ticks, {} allocs)",

@@ -88,14 +88,28 @@ const KNOWN_GAPS: &[(&str, u32, u32)] = &[("unprovisioned.rs", 0x1F4FB, 28)];
 pub enum Violation {
     /// A codepoint appears in a screen's Slint literal but is not present in
     /// ANY of `gen_emoji_font.c`'s registered tables (ASCII range excepted).
-    Unregistered { file: String, codepoint: u32, ch: char },
+    Unregistered {
+        file: String,
+        codepoint: u32,
+        ch: char,
+    },
     /// An EMOJI-class codepoint (registered, but only rasterised at the
     /// curated `EMOJI_SIZES` subset) is used at a font-size outside that
     /// subset.
-    WrongSize { file: String, codepoint: u32, ch: char, size_px: u32 },
+    WrongSize {
+        file: String,
+        codepoint: u32,
+        ch: char,
+        size_px: u32,
+    },
     /// An EMOJI-class codepoint's rendering font-size could not be
     /// statically determined (see module doc's "fails loud on ambiguity").
-    UnresolvedSize { file: String, codepoint: u32, ch: char, detail: String },
+    UnresolvedSize {
+        file: String,
+        codepoint: u32,
+        ch: char,
+        detail: String,
+    },
     /// A `font-size: Npx` literal (regardless of what text it applies to) is
     /// not a member of `PIXEL_SIZES` — the Slint software renderer snaps it
     /// to the nearest registered size and rescales glyph metrics, garbling
@@ -107,19 +121,33 @@ pub enum Violation {
 impl std::fmt::Display for Violation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Violation::Unregistered { file, codepoint, ch } => write!(
+            Violation::Unregistered {
+                file,
+                codepoint,
+                ch,
+            } => write!(
                 f,
                 "{file}: U+{codepoint:04X} ({ch:?}) is used in a Slint literal but is not \
                  registered in ANY of gen_emoji_font.c's BMP_SYMBOLS/EMOJI_CPS/UI_EXTRA_CPS \
                  tables — it renders BLANK on real hardware."
             ),
-            Violation::WrongSize { file, codepoint, ch, size_px } => write!(
+            Violation::WrongSize {
+                file,
+                codepoint,
+                ch,
+                size_px,
+            } => write!(
                 f,
                 "{file}: U+{codepoint:04X} ({ch:?}) is shown at {size_px}px, which is not in \
                  gen_emoji_font.c's EMOJI_SIZES — it rasterises as an empty (blank) glyph at \
                  that size."
             ),
-            Violation::UnresolvedSize { file, codepoint, ch, detail } => write!(
+            Violation::UnresolvedSize {
+                file,
+                codepoint,
+                ch,
+                detail,
+            } => write!(
                 f,
                 "{file}: could not statically determine the font-size U+{codepoint:04X} \
                  ({ch:?}) renders at ({detail}) — treating as a NO-GO per the harness's \
@@ -168,7 +196,10 @@ fn extract_array(src: &str, array_name: &str) -> String {
         Some(i) => i + needle.len(),
         None => return String::new(),
     };
-    let end = src[start..].find("};").map(|i| start + i).unwrap_or(src.len());
+    let end = src[start..]
+        .find("};")
+        .map(|i| start + i)
+        .unwrap_or(src.len());
     src[start..end].to_string()
 }
 
@@ -181,18 +212,30 @@ fn extract_hex_numbers(body: &str) -> Vec<u32> {
 
 fn extract_dec_numbers(body: &str) -> Vec<u32> {
     let re = Regex::new(r"\d+").unwrap();
-    re.find_iter(body).filter_map(|m| m.as_str().parse().ok()).collect()
+    re.find_iter(body)
+        .filter_map(|m| m.as_str().parse().ok())
+        .collect()
 }
 
 fn parse_font_tables(gen_emoji_font_c: &Path) -> FontTables {
     let src = fs::read_to_string(gen_emoji_font_c)
         .unwrap_or_else(|e| panic!("reading {}: {e}", gen_emoji_font_c.display()));
     FontTables {
-        bmp_symbols: extract_hex_numbers(&extract_array(&src, "BMP_SYMBOLS")).into_iter().collect(),
-        emoji_cps: extract_hex_numbers(&extract_array(&src, "EMOJI_CPS")).into_iter().collect(),
-        ui_extra_cps: extract_hex_numbers(&extract_array(&src, "UI_EXTRA_CPS")).into_iter().collect(),
-        pixel_sizes: extract_dec_numbers(&extract_array(&src, "PIXEL_SIZES")).into_iter().collect(),
-        emoji_sizes: extract_dec_numbers(&extract_array(&src, "EMOJI_SIZES")).into_iter().collect(),
+        bmp_symbols: extract_hex_numbers(&extract_array(&src, "BMP_SYMBOLS"))
+            .into_iter()
+            .collect(),
+        emoji_cps: extract_hex_numbers(&extract_array(&src, "EMOJI_CPS"))
+            .into_iter()
+            .collect(),
+        ui_extra_cps: extract_hex_numbers(&extract_array(&src, "UI_EXTRA_CPS"))
+            .into_iter()
+            .collect(),
+        pixel_sizes: extract_dec_numbers(&extract_array(&src, "PIXEL_SIZES"))
+            .into_iter()
+            .collect(),
+        emoji_sizes: extract_dec_numbers(&extract_array(&src, "EMOJI_SIZES"))
+            .into_iter()
+            .collect(),
     }
 }
 
@@ -306,12 +349,18 @@ fn tokenize(src: &str) -> Tokenized {
             if i < n {
                 i += 1; // consume closing quote
             }
-            literals.push(Literal { quote_start, decoded: decode_rust_escapes(&raw) });
+            literals.push(Literal {
+                quote_start,
+                decoded: decode_rust_escapes(&raw),
+            });
             continue;
         }
         i += 1;
     }
-    Tokenized { masked: masked.into_iter().collect(), literals }
+    Tokenized {
+        masked: masked.into_iter().collect(),
+        literals,
+    }
 }
 
 fn brace_spans(masked: &str) -> Vec<(usize, usize)> {
@@ -340,7 +389,10 @@ fn innermost_span(spans: &[(usize, usize)], pos: usize) -> Option<(usize, usize)
 }
 
 fn slice_chars(s: &str, start: usize, end: usize) -> String {
-    s.chars().skip(start).take(end.saturating_sub(start)).collect()
+    s.chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect()
 }
 
 /// How a reusable component's text property resolves to a font-size.
@@ -396,7 +448,10 @@ fn find_component_defs(masked: &str, spans: &[(usize, usize)]) -> HashMap<String
         };
         let body = slice_chars(masked, span.0, span.1 + 1);
 
-        let mut info = ComponentInfo { span, ..Default::default() };
+        let mut info = ComponentInfo {
+            span,
+            ..Default::default()
+        };
 
         // Property declarations (string text props + length defaults).
         for pc in prop_re.captures_iter(&body) {
@@ -404,7 +459,8 @@ fn find_component_defs(masked: &str, spans: &[(usize, usize)]) -> HashMap<String
             let pname = pc.get(2).unwrap().as_str().to_string();
             if kind == "length" {
                 if let Some(d) = pc.get(3) {
-                    info.length_defaults.insert(pname, d.as_str().parse().unwrap());
+                    info.length_defaults
+                        .insert(pname, d.as_str().parse().unwrap());
                 }
             }
         }
@@ -440,35 +496,49 @@ fn find_component_defs(masked: &str, spans: &[(usize, usize)]) -> HashMap<String
 /// regardless of what text (if any) it applies to — the raw material for
 /// the `PIXEL_SIZES`-membership check (independent of glyph coverage).
 fn scan_font_sizes(path: &Path) -> Vec<u32> {
-    let src = fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    let src =
+        fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
     let tok = tokenize(&src);
     let masked = &tok.masked;
-    let Some((mo, mc)) = macro_block_span(masked) else { return Vec::new() };
+    let Some((mo, mc)) = macro_block_span(masked) else {
+        return Vec::new();
+    };
     let body = slice_chars(masked, mo, mc + 1);
     let fs_px_re = Regex::new(r"font-size\s*:\s*(\d+)px").unwrap();
-    fs_px_re.captures_iter(&body).map(|c| c.get(1).unwrap().as_str().parse().unwrap()).collect()
+    fs_px_re
+        .captures_iter(&body)
+        .map(|c| c.get(1).unwrap().as_str().parse().unwrap())
+        .collect()
 }
 
 /// Locate the `slint::slint!{ ... }` macro block's outer brace span.
 fn macro_block_span(masked: &str) -> Option<(usize, usize)> {
-    let open = masked.find("slint::slint!").or_else(|| masked.find("slint !")).and_then(|idx| {
-        masked[idx..].find('{').map(|off| idx + off)
-    })?;
+    let open = masked
+        .find("slint::slint!")
+        .or_else(|| masked.find("slint !"))
+        .and_then(|idx| masked[idx..].find('{').map(|off| idx + off))?;
     brace_spans(masked).into_iter().find(|(o, _)| *o == open)
 }
 
 /// Scan one screen file's `slint::slint!{}` macro block for every literal's
 /// (codepoint, resolved-size) usage.
 fn scan_file(path: &Path) -> Vec<Usage> {
-    let src = fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    let src =
+        fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
     let tok = tokenize(&src);
     let masked = &tok.masked;
 
     let spans = brace_spans(masked);
-    let Some((mo, mc)) = macro_block_span(masked) else { return Vec::new() };
+    let Some((mo, mc)) = macro_block_span(masked) else {
+        return Vec::new();
+    };
 
-    let literals_by_pos: HashMap<usize, &Literal> =
-        tok.literals.iter().filter(|l| l.quote_start > mo && l.quote_start < mc).map(|l| (l.quote_start, l)).collect();
+    let literals_by_pos: HashMap<usize, &Literal> = tok
+        .literals
+        .iter()
+        .filter(|l| l.quote_start > mo && l.quote_start < mc)
+        .map(|l| (l.quote_start, l))
+        .collect();
 
     let components = find_component_defs(masked, &spans);
 
@@ -486,15 +556,23 @@ fn scan_file(path: &Path) -> Vec<Usage> {
     //    BMP-class in this codebase and don't need one).
     for m in text_lit_quote_re.find_iter(masked) {
         let quote_pos = m.end() - 1; // index of the opening `"`
-        let Some(lit) = literals_by_pos.get(&quote_pos) else { continue };
+        let Some(lit) = literals_by_pos.get(&quote_pos) else {
+            continue;
+        };
         resolved_positions.insert(quote_pos);
         let inner = innermost_span(&spans, quote_pos);
         let size_px = inner.and_then(|(io, ic)| {
             let inner_text = slice_chars(masked, io, ic + 1);
-            fs_px_re.captures(&inner_text).map(|c| c.get(1).unwrap().as_str().parse().unwrap())
+            fs_px_re
+                .captures(&inner_text)
+                .map(|c| c.get(1).unwrap().as_str().parse().unwrap())
         });
         for ch in lit.decoded.chars() {
-            usages.push(Usage { ch, size_px, unresolved_detail: None });
+            usages.push(Usage {
+                ch,
+                size_px,
+                unresolved_detail: None,
+            });
         }
     }
 
@@ -510,14 +588,20 @@ fn scan_file(path: &Path) -> Vec<Usage> {
             if open == cinfo.span.0 {
                 continue; // the component's own definition, not an instantiation
             }
-            let Some(ispan) = spans.iter().find(|(o, _)| *o == open).copied() else { continue };
+            let Some(ispan) = spans.iter().find(|(o, _)| *o == open).copied() else {
+                continue;
+            };
             let inst_text = slice_chars(masked, ispan.0, ispan.1 + 1);
             for pm in prop_lit_re.captures_iter(&inst_text) {
                 let pname = pm.get(1).unwrap().as_str();
-                let Some(size_source) = cinfo.text_props.get(pname) else { continue };
+                let Some(size_source) = cinfo.text_props.get(pname) else {
+                    continue;
+                };
                 let local_quote_pos = pm.get(0).unwrap().end() - 1;
                 let global_quote_pos = ispan.0 + inst_text[..local_quote_pos].chars().count();
-                let Some(lit) = literals_by_pos.get(&global_quote_pos) else { continue };
+                let Some(lit) = literals_by_pos.get(&global_quote_pos) else {
+                    continue;
+                };
                 resolved_positions.insert(global_quote_pos);
 
                 let (size_px, unresolved_detail) = match size_source {
@@ -525,7 +609,8 @@ fn scan_file(path: &Path) -> Vec<Usage> {
                     SizeSource::ViaProperty(varname) => {
                         // Override at THIS instantiation site?
                         let override_re =
-                            Regex::new(&format!(r"{}\s*:\s*(\d+)px", regex::escape(varname))).unwrap();
+                            Regex::new(&format!(r"{}\s*:\s*(\d+)px", regex::escape(varname)))
+                                .unwrap();
                         if let Some(om) = override_re.captures(&inst_text) {
                             (Some(om.get(1).unwrap().as_str().parse().unwrap()), None)
                         } else if let Some(default_px) = cinfo.length_defaults.get(varname) {
@@ -542,7 +627,11 @@ fn scan_file(path: &Path) -> Vec<Usage> {
                     }
                 };
                 for ch in lit.decoded.chars() {
-                    usages.push(Usage { ch, size_px, unresolved_detail: unresolved_detail.clone() });
+                    usages.push(Usage {
+                        ch,
+                        size_px,
+                        unresolved_detail: unresolved_detail.clone(),
+                    });
                 }
             }
         }
@@ -551,12 +640,20 @@ fn scan_file(path: &Path) -> Vec<Usage> {
     // 3) Any remaining literal inside the macro block that wasn't matched
     //    above (e.g. a bare property default not shaped like `text: "...";`)
     //    still needs Level-2 (registration) coverage, with no size claim.
-    for lit in tok.literals.iter().filter(|l| l.quote_start > mo && l.quote_start < mc) {
+    for lit in tok
+        .literals
+        .iter()
+        .filter(|l| l.quote_start > mo && l.quote_start < mc)
+    {
         if resolved_positions.contains(&lit.quote_start) {
             continue;
         }
         for ch in lit.decoded.chars() {
-            usages.push(Usage { ch, size_px: None, unresolved_detail: None });
+            usages.push(Usage {
+                ch,
+                size_px: None,
+                unresolved_detail: None,
+            });
         }
     }
 
@@ -584,7 +681,10 @@ pub fn check(repo_root: &Path) -> Vec<Violation> {
         let file_name = path.file_name().unwrap().to_string_lossy().to_string();
         for size_px in scan_font_sizes(path) {
             if !tables.pixel_sizes.contains(&size_px) {
-                violations.push(Violation::SizeNotInScale { file: file_name.clone(), size_px });
+                violations.push(Violation::SizeNotInScale {
+                    file: file_name.clone(),
+                    size_px,
+                });
             }
         }
     }
@@ -596,7 +696,11 @@ pub fn check(repo_root: &Path) -> Vec<Violation> {
                 continue; // plain ASCII: always covered
             }
             if !tables.is_registered(cp) {
-                violations.push(Violation::Unregistered { file: file_name.clone(), codepoint: cp, ch: usage.ch });
+                violations.push(Violation::Unregistered {
+                    file: file_name.clone(),
+                    codepoint: cp,
+                    ch: usage.ch,
+                });
                 continue;
             }
             if !tables.is_emoji_class(cp) {
@@ -609,7 +713,12 @@ pub fn check(repo_root: &Path) -> Vec<Violation> {
             }
             match (usage.size_px, &usage.unresolved_detail) {
                 (Some(px), _) if !tables.emoji_sizes.contains(&px) => {
-                    violations.push(Violation::WrongSize { file: file_name.clone(), codepoint: cp, ch: usage.ch, size_px: px });
+                    violations.push(Violation::WrongSize {
+                        file: file_name.clone(),
+                        codepoint: cp,
+                        ch: usage.ch,
+                        size_px: px,
+                    });
                 }
                 (None, Some(detail)) => {
                     violations.push(Violation::UnresolvedSize {
@@ -646,17 +755,31 @@ mod tests {
             violations.is_empty(),
             "\nglyph-coverage harness found {} violation(s):\n{}\n",
             violations.len(),
-            violations.iter().map(|v| format!("  - {v}")).collect::<Vec<_>>().join("\n")
+            violations
+                .iter()
+                .map(|v| format!("  - {v}"))
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     }
 
     #[test]
     fn font_tables_parse_known_entries() {
-        let tables = parse_font_tables(&repo_root_from_manifest_dir().join("firmware/gen_emoji_font.c"));
-        assert!(tables.is_registered(0x1F4FB), "📻 (radio) must be registered");
-        assert!(tables.is_registered(0x1F50B), "🔋 (battery) must be registered");
+        let tables =
+            parse_font_tables(&repo_root_from_manifest_dir().join("firmware/gen_emoji_font.c"));
+        assert!(
+            tables.is_registered(0x1F4FB),
+            "📻 (radio) must be registered"
+        );
+        assert!(
+            tables.is_registered(0x1F50B),
+            "🔋 (battery) must be registered"
+        );
         assert!(tables.is_emoji_class(0x1F50B));
-        assert!(!tables.is_emoji_class(0x2014), "em dash is a BMP symbol, not emoji-class");
+        assert!(
+            !tables.is_emoji_class(0x2014),
+            "em dash is a BMP symbol, not emoji-class"
+        );
         assert!(tables.emoji_sizes.contains(&14));
         assert!(!tables.emoji_sizes.contains(&28));
     }
@@ -741,7 +864,11 @@ static const int EMOJI_SIZES[] = {11, 13, 14, 16, 18, 20};
         cleanup_fixture(&root);
         assert_eq!(
             violations,
-            vec![Violation::Unregistered { file: "test_screen.rs".into(), codepoint: 0x1F50B, ch: '🔋' }]
+            vec![Violation::Unregistered {
+                file: "test_screen.rs".into(),
+                codepoint: 0x1F50B,
+                ch: '🔋'
+            }]
         );
     }
 
@@ -759,7 +886,12 @@ static const int EMOJI_SIZES[] = {11, 13, 14, 16, 18, 20};
         cleanup_fixture(&root);
         assert_eq!(
             violations,
-            vec![Violation::WrongSize { file: "test_screen.rs".into(), codepoint: 0x1F600, ch: '😀', size_px: 28 }]
+            vec![Violation::WrongSize {
+                file: "test_screen.rs".into(),
+                codepoint: 0x1F600,
+                ch: '😀',
+                size_px: 28
+            }]
         );
     }
 
@@ -775,7 +907,13 @@ static const int EMOJI_SIZES[] = {11, 13, 14, 16, 18, 20};
         );
         let violations = check(&root);
         cleanup_fixture(&root);
-        assert_eq!(violations, vec![Violation::SizeNotInScale { file: "test_screen.rs".into(), size_px: 12 }]);
+        assert_eq!(
+            violations,
+            vec![Violation::SizeNotInScale {
+                file: "test_screen.rs".into(),
+                size_px: 12
+            }]
+        );
     }
 
     #[test]
@@ -799,7 +937,11 @@ static const int EMOJI_SIZES[] = {11, 13, 14, 16, 18, 20};
         cleanup_fixture(&root);
         assert_eq!(
             violations,
-            vec![Violation::Unregistered { file: "test_screen.rs".into(), codepoint: 0x1F50B, ch: '🔋' }],
+            vec![Violation::Unregistered {
+                file: "test_screen.rs".into(),
+                codepoint: 0x1F50B,
+                ch: '🔋'
+            }],
             "🔋 is unregistered in this fixture's tables — the point is that the row-\
              component indirection itself must not swallow the finding"
         );
