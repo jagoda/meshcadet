@@ -1,6 +1,6 @@
 [package]
 name = "ui_sim"
-version = "0.0.0"
+version.workspace = true
 edition = "2021"
 license = "GPL-3.0-only"
 publish = false
