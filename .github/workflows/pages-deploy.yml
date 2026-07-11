@@ -2,19 +2,35 @@ name: Deploy Pages
 
 # Publishes site/ (the GitHub Pages project-site landing page, see
 # site/README.md) via GitHub Actions' native Pages deployment — no gh-pages
-# branch, no Jekyll. Deliberately push-to-main-only: pages-check.yml owns the
-# PR-facing relative-path regression guard, so this workflow never appears on
-# a site PR's checks list — only on the push that actually publishes.
+# branch, no Jekyll. Deliberately push-to-main-only + release-published-only:
+# pages-check.yml owns the PR-facing relative-path regression guard, so this
+# workflow never appears on a site PR's checks list — only on the push/
+# release that actually publishes.
+#
+# The `release: published` trigger exists so a newly tagged firmware release
+# (.github/workflows/release.yml) shows up on flash.html's version selector
+# promptly: the build job's "Mirror recent release firmware assets" step
+# below downloads each recent release's manifest.json + merged image into
+# site/firmware/<tag>/ (git-ignored, not committed — see site/README.md)
+# before site/ is uploaded as the Pages artifact, because GitHub Release
+# assets are NOT fetchable cross-origin from Pages (verified live: no
+# Access-Control-Allow-Origin on the release-asset redirect chain — see
+# docs/adr/0006-web-flasher.md). Every ordinary site/**-triggered deploy also
+# re-runs this mirror step, so it self-heals if a release-triggered deploy
+# ever fails partway.
+#
 # `workflow_dispatch` is kept as a trigger (parity with the pre-split
-# workflow) but build/deploy still guard on `github.event_name == 'push'`, so
-# a manual dispatch reaches the runner without actually publishing — it's not
-# a bypass around the push-to-main-only publish path.
+# workflow) but build/deploy still guard on `github.event_name` being `push`
+# or `release`, so a manual dispatch reaches the runner without actually
+# publishing — it's not a bypass around the publish-on-push-or-release path.
 on:
   push:
     branches: [main]
     paths:
       - "site/**"
       - ".github/workflows/pages-deploy.yml"
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -28,7 +44,7 @@ concurrency:
 
 jobs:
   build:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'release'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -36,6 +52,65 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Mirror recent release firmware assets
+        # Populates site/firmware/<tag>/{manifest.json,meshcadet-<tag>-merged.bin,SHA256SUMS}
+        # for flash.html/flash.js — see the workflow header comment above.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Keep this equal to site/flash.js's MAX_VERSIONS — the dropdown
+          # only shows what's mirrored here. No shared build step to enforce
+          # that automatically (site/README.md "no build step, on purpose"),
+          # so it's a manually-kept-in-sync constant in both places.
+          max_versions=8
+
+          # per_page=100 (single page, no --paginate) comfortably covers
+          # max_versions=8 plus any drafts/prereleases filtered out below —
+          # revisit if this project ever accumulates 100+ releases.
+          tags=$(gh api "repos/${{ github.repository }}/releases" -F per_page=100 \
+            --jq '[.[] | select(.draft == false and .prerelease == false and (.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")))]
+                  | sort_by(.published_at) | reverse | .[:'"$max_versions"'] | .[].tag_name')
+
+          if [ -z "$tags" ]; then
+            echo "No published v*.*.* releases yet — nothing to mirror."
+            exit 0
+          fi
+
+          # Each tag is mirrored independently and failures here are NOT
+          # fatal to the step (deliberately outside `set -e`'s reach, via the
+          # `if !` guards below): one flaky/incomplete release (see
+          # release.yml's own "KNOWN FAILURE MODE" doc comment — a Release
+          # can legitimately be missing an asset if its publish step got
+          # interrupted) must not take down the entire Pages deploy, which
+          # would otherwise re-break every OTHER already-working mirrored
+          # version too. A tag that fails to mirror cleanly is skipped (with
+          # a build-log warning) rather than left as a partial, broken
+          # site/firmware/<tag>/ that the dropdown could still list.
+          echo "$tags" | while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            echo "Mirroring release assets for ${tag}"
+            dest="site/firmware/${tag}"
+            mkdir -p "$dest"
+            if ! gh release download "$tag" \
+              --repo "${{ github.repository }}" \
+              --dir "$dest" \
+              --pattern 'manifest.json' \
+              --pattern 'meshcadet-*-merged.bin' \
+              --pattern 'SHA256SUMS' \
+              --clobber; then
+              echo "::warning::gh release download failed for ${tag} — skipping (not mirrored onto Pages this deploy)"
+              rm -rf "$dest"
+              continue
+            fi
+            if [ ! -f "${dest}/manifest.json" ] || ! ls "${dest}"/meshcadet-*-merged.bin >/dev/null 2>&1; then
+              echo "::warning::${tag} is missing manifest.json or its merged image after download — skipping (not mirrored onto Pages this deploy)"
+              rm -rf "$dest"
+              continue
+            fi
+          done
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
@@ -47,7 +122,7 @@ jobs:
 
   deploy:
     needs: build
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'release'
     runs-on: ubuntu-latest
     permissions:
       pages: write

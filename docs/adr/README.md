@@ -7,6 +7,7 @@
 | [0003](0003-ui-toolkit.md) | UI Toolkit: Slint with SoftwareRenderer | Accepted (2026-06-13) |
 | [0004](0004-release-architecture.md) | Release Architecture | Accepted (2026-07-11) |
 | [0005](0005-firmware-core-extraction.md) | `firmware-core` Extraction | Accepted (2026-07-11) |
+| [0006](0006-web-flasher.md) | Web Flasher: Version Selector Over a Same-Origin Mirror | Accepted (2026-07-11) |
 
 ADR-0001 is the project's founding charter: the design decisions made before
 any code was written. Subsequent ADRs (UI toolkit choice, provisioning wire

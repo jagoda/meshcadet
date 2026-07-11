@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Flash MeshCadet — web firmware installer</title>
+  <meta name="description" content="Flash MeshCadet firmware onto a LilyGo T-Deck Plus over USB, straight from your browser — no toolchain install required." />
+
+  <!-- All paths below are relative (no leading "/") — this is a GitHub Pages
+       PROJECT site served under /meshcadet/, not a root site. A root-rooted
+       path like "/styles.css" would 404 there. Keep it that way (see
+       site/README.md "Conventions" and .github/workflows/pages-check.yml). -->
+  <link rel="icon" type="image/png" href="assets/favicon.png" />
+  <link rel="stylesheet" href="styles.css" />
+
+  <!-- esp-web-tools: major-version-pinned CDN import, per upstream's own
+       recommended usage (https://github.com/esphome/esp-web-tools). No
+       bundler/build step — consistent with this site's "no build step, on
+       purpose" convention (site/README.md). -->
+  <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/install-button.js"></script>
+</head>
+<body>
+
+  <header class="topbar">
+    <div class="wrap topbar-inner">
+      <a class="wordmark" href="index.html">Mesh<span>Cadet</span></a>
+      <nav class="topnav">
+        <a href="index.html#about">What it does</a>
+        <a href="index.html#design">Design</a>
+        <a href="https://github.com/jagoda/meshcadet" target="_blank" rel="noopener">GitHub&nbsp;↗</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="top">
+
+    <section class="hero hero-flash">
+      <img class="hero-starfield" src="assets/starfield.png" alt="" aria-hidden="true" />
+      <div class="wrap hero-inner">
+        <div class="hero-copy">
+          <p class="eyebrow">Mission Control // Web Flasher</p>
+          <h1>Flash Mesh<span>Cadet</span></h1>
+          <p class="tagline">
+            Install MeshCadet firmware on a LilyGo T-Deck Plus straight from
+            your browser, over a USB cable — no toolchain, no command line.
+          </p>
+        </div>
+      </div>
+      <img class="hero-horizon" src="assets/planet-horizon.png" alt="" aria-hidden="true" />
+    </section>
+
+    <section class="section">
+      <div class="wrap wrap-narrow">
+
+        <div class="flash-panel">
+          <h2>1. Connect your T-Deck Plus</h2>
+          <p>
+            Plug the T-Deck Plus into this computer with a USB-C cable. Use
+            a desktop build of <strong>Google Chrome</strong> or
+            <strong>Microsoft Edge</strong> — this page needs
+            <a href="https://developer.mozilla.org/en-US/docs/Web/API/Web_Serial_API" target="_blank" rel="noopener">Web Serial</a>,
+            which Firefox, Safari, and mobile browsers don't support.
+          </p>
+
+          <h2>2. Choose a version</h2>
+          <label class="version-label" for="version-select">Firmware version</label>
+          <select id="version-select" class="version-select" disabled>
+            <option>Loading releases…</option>
+          </select>
+          <p id="version-status" class="muted version-status" role="status"></p>
+
+          <h2>3. Install</h2>
+          <p>
+            Flashing erases and reinstalls the whole firmware image
+            (bootloader, partition table, and app) — any settings or
+            contacts stored on the device are cleared, the same as a fresh
+            build.
+          </p>
+
+          <esp-web-install-button id="install-button" hidden>
+            <button slot="activate" class="btn btn-primary" type="button">Connect &amp; Install</button>
+            <span slot="unsupported" class="muted">
+              Your browser doesn't support installing firmware over USB. Use
+              a desktop build of Chrome or Edge.
+            </span>
+            <span slot="not-allowed" class="muted">
+              This page needs to be loaded over HTTPS to install firmware
+              (it is here — if you're seeing this, something's off; please
+              <a href="https://github.com/jagoda/meshcadet/issues" target="_blank" rel="noopener">open an issue</a>).
+            </span>
+          </esp-web-install-button>
+
+          <p class="muted footnote">
+            Prefer to flash manually, or want an older/newer version than
+            what's listed? Grab the merged image and
+            <code>manifest.json</code> straight from the
+            <a href="https://github.com/jagoda/meshcadet/releases" target="_blank" rel="noopener">GitHub Releases</a>
+            page instead.
+          </p>
+        </div>
+
+        <p class="muted">
+          MeshCadet is provided as-is, with no warranty and no guarantee of
+          safety — read the full disclaimer in the
+          <a href="https://github.com/jagoda/meshcadet#-disclaimer--no-warranty-no-guarantee-of-safety-use-at-your-own-risk" target="_blank" rel="noopener">project README</a>
+          before you flash.
+        </p>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="footer">
+    <div class="wrap footer-inner">
+      <p>
+        Licensed <a href="https://github.com/jagoda/meshcadet/blob/main/LICENSE" target="_blank" rel="noopener">GPLv3</a>.
+        MeshCore, MeshCadet, T-Deck, LILYGO, ESP32, Espressif, LoRa, and
+        Semtech are trademarks of their respective owners; use here is
+        nominative and implies no affiliation or endorsement.
+      </p>
+      <p class="footer-links">
+        <a href="https://github.com/jagoda/meshcadet/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">Contributing</a>
+        <a href="https://github.com/jagoda/meshcadet/blob/main/SECURITY.md" target="_blank" rel="noopener">Security</a>
+        <a href="https://github.com/jagoda/meshcadet/blob/main/CODE_OF_CONDUCT.md" target="_blank" rel="noopener">Code of Conduct</a>
+      </p>
+    </div>
+  </footer>
+
+  <script type="module" src="flash.js"></script>
+
+</body>
+</html>

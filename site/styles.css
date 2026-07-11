@@ -275,6 +275,73 @@ a {
   font-size: 13px;
 }
 
+/* ── Web flasher (flash.html) ──────────────────────────────────────── */
+
+.hero-flash {
+  padding-bottom: 48px;
+}
+
+.flash-panel {
+  background: var(--surface);
+  border: 1px solid var(--surface-alt);
+  border-radius: 10px;
+  padding: 32px;
+  margin-bottom: 24px;
+}
+
+.flash-panel h2 {
+  font-size: 16px;
+  margin: 28px 0 8px;
+}
+
+.flash-panel h2:first-child {
+  margin-top: 0;
+}
+
+.flash-panel p {
+  color: var(--text-secondary);
+  font-size: 14px;
+  margin: 0 0 8px;
+}
+
+.version-label {
+  display: block;
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+.version-select {
+  width: 100%;
+  max-width: 360px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--surface-alt);
+  background: var(--surface-raised);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 14px;
+}
+
+.version-select:disabled {
+  color: var(--text-muted);
+}
+
+.version-status {
+  margin-top: 8px !important;
+}
+
+esp-web-install-button {
+  display: inline-block;
+  margin-top: 4px;
+}
+
+.footnote {
+  margin-top: 24px !important;
+  padding-top: 16px;
+  border-top: 1px solid var(--surface-alt);
+}
+
 /* ── Footer ─────────────────────────────────────────────────────────── */
 
 .footer {

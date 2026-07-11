@@ -6,3 +6,7 @@
 .embuild
 # HIL real-key config — SECRET, never committed (copy from hil_keys.example.rs)
 /firmware/src/hil_keys.rs
+# Mirrored GitHub Release firmware assets for site/flash.html — populated at
+# Pages deploy time by .github/workflows/pages-deploy.yml, never committed
+# (see site/README.md).
+/site/firmware/
