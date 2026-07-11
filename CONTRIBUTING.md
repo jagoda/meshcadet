@@ -28,13 +28,17 @@ setup. Summary:
 ## Continuous integration
 
 `.github/workflows/ci.yml` runs on every pull request and every push to
-`main`: `cargo test --workspace`, `cargo fmt --all -- --check`, and
-`cargo clippy --workspace --all-targets -- -D warnings` — all against the
-host-native workspace only. It deliberately does **not** build `firmware/`
-(the `esp`/Xtensa cross-toolchain and ESP-IDF sysroot are too heavy for a
-per-PR job); see the workflow file's own header comment for the full
-rationale. `cd firmware && bash check-all-features.sh` (below) remains the
-required manual gate for firmware changes.
+`main`, as four separate jobs: `cargo test --workspace`,
+`cargo fmt --all -- --check`, and
+`cargo clippy --workspace --all-targets -- -D warnings` against the
+host-native workspace, plus a dedicated `firmware` job that installs the
+`esp`/Xtensa cross-toolchain + ESP-IDF sysroot and runs
+`cd firmware && bash check-all-features.sh` — the same command described
+below, now run by CI on every PR instead of only by a human before landing
+firmware changes. `firmware` is a separate job (not folded into `test`/
+`clippy`) precisely so a transient Espressif-toolchain hiccup can never block
+the fast host lane; see the workflow file's own header comment for the full
+rationale.
 
 ## Building and testing
 
