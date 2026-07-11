@@ -1,0 +1,55 @@
+name: Conventional commits
+
+# Gate: every PR must have a Conventional-Commits-formatted title AND every
+# commit it carries must itself be Conventional-Commits-formatted. This
+# repo merges exclusively via signed squash-merge (ruleset 18807600 on
+# `main`), and GitHub's squash-merge commit subject defaults to the PR
+# title — so the PR-title check is what release-plz/git-cliff actually
+# parses into CHANGELOG.md (release-plz.toml + cliff.toml). The per-commit
+# check catches non-conventional commits early, before they can influence a
+# PR title edit or (if the merge method is ever changed) land verbatim.
+#
+# See docs/adr/0004-release-architecture.md for how this fits the release
+# architecture, and https://www.conventionalcommits.org/ for the spec.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  lint-pr-title:
+    name: Lint PR title
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  lint-commit-messages:
+    name: Lint commit messages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check every commit in this PR follows Conventional Commits
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # type(scope)!: subject — scope optional, "!" (breaking) optional.
+          pattern='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-zA-Z0-9_./-]+\))?!?: .+'
+          fail=0
+          for sha in $(git rev-list "${BASE_SHA}..${HEAD_SHA}"); do
+            subject="$(git log -1 --format=%s "${sha}")"
+            if ! [[ "${subject}" =~ ${pattern} ]]; then
+              echo "::error::Commit ${sha} is not a Conventional Commit: \"${subject}\""
+              fail=1
+            fi
+          done
+          exit "${fail}"

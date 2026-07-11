@@ -1,0 +1,67 @@
+# release-plz configuration — see docs/adr/0004-release-architecture.md for
+# the full release architecture this config is one piece of.
+#
+# release-plz operates on the ROOT Cargo workspace only (protocol, host,
+# xtask, ui_sim, ui_perf). It cannot see `firmware/` — that crate declares
+# its own detached `[workspace]` table (firmware/Cargo.toml) so it can
+# cross-compile for xtensa-esp32s3-espidf without pulling the esp toolchain
+# into host-native `cargo test`/`cargo clippy` (see Cargo.toml's own doc
+# comment). Keeping firmware's version in lockstep with the root workspace
+# is instead enforced by CI's `version-drift-guard` job
+# (.github/workflows/ci.yml) — a human/reviewer bumps
+# `firmware/Cargo.toml`'s `version` by hand in the same PR as any release-plz
+# version-bump PR.
+#
+# Every crate in the root workspace uses `version.workspace = true`
+# (Cargo.toml's `[workspace.package].version`), so there is exactly ONE
+# project-wide version number here, not five independent per-crate versions.
+# release-plz bumps that single field and opens one PR for the whole
+# workspace.
+
+[workspace]
+# release-plz opens a PR on every conventional-commit-worthy change; it does
+# NOT cut an unattended release when there's nothing new to publish.
+release_always = false
+
+# No crates.io publish: every crate in this workspace is `publish = false`
+# (Cargo.toml's `[workspace.package]`) — MeshCadet is an end-user firmware
+# project, not a library ecosystem. This is belt-and-suspenders on top of
+# that per-crate setting; release-plz already skips `publish = false`
+# crates, but making it explicit here means the intent survives even if a
+# future crate forgets to inherit `publish.workspace = true`.
+publish = false
+publish_allow_dirty = false
+
+# All crates in this workspace are internal-only (never published to
+# crates.io — see `publish = false` above), so there is no crates.io
+# baseline to diff against for API-breakage detection. Leave semver-check
+# off rather than have it silently no-op or error on a nonexistent registry
+# baseline.
+semver_check = false
+
+# CHANGELOG.md is regenerated from Conventional Commits via git-cliff
+# (cliff.toml, keep-a-changelog-shaped output). release-plz preserves
+# everything above the first `## [...]` heading in the existing file (see
+# CHANGELOG.md's hand-written header + the "Initial public release" section
+# that the FIRST release-plz PR retitles to `## [0.1.0] - <date>`), so this
+# only affects the version-section body.
+changelog_config = "cliff.toml"
+changelog_update = true
+
+# Dependency bumps are handled by a separate, ordinary Dependabot/manual
+# workflow — release-plz's job here is versioning + changelog only.
+dependencies_update = false
+
+# release-plz DOES own the `vX.Y.Z` git tag (git_tag_enable, default true) —
+# that tag is the contract the release firmware workflow
+# (`.github/workflows/release.yml`) consumes to fire the production firmware
+# build + GitHub Release. It does
+# NOT create a GitHub Release object of its own: the firmware release
+# workflow publishes the actual user-facing GitHub Release (merged.bin +
+# esp-web-tools manifest.json + SHA256SUMS) for the `vX.Y.Z` tag, and a
+# second, empty "crate release" object here would just be confusing noise
+# next to it.
+git_release_enable = false
+
+pr_name = "release v{{ version }}"
+pr_branch_prefix = "release-plz-"
