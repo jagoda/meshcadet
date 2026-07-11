@@ -1,17 +1,29 @@
 name: Pages Check
 
 # PR-facing regression guard for the site's one hard rule (relative paths
-# only — see check-relative-paths below and site/README.md "Conventions").
-# Deliberately pull_request-only and deliberately does NOT build or deploy
-# anything: pages-deploy.yml owns build/upload-pages-artifact/deploy-pages
-# and only fires on push to main, so a site PR's checks list shows this
-# validation and nothing about deploy (no more "build"/"deploy" showing as
-# skipped on every PR).
+# only — see check-relative-paths below and site/README.md "Conventions"),
+# PLUS the provisioning-codec conformance guard (see the `codec-conformance`
+# job below). Deliberately pull_request-only and deliberately does NOT build
+# or deploy anything: pages-deploy.yml owns build/upload-pages-artifact/
+# deploy-pages and only fires on push to main, so a site PR's checks list
+# shows this validation and nothing about deploy (no more "build"/"deploy"
+# showing as skipped on every PR).
 on:
   pull_request:
     paths:
       - "site/**"
       - ".github/workflows/pages-check.yml"
+      # `codec-conformance` (below) guards site/provisioner/codec.js against
+      # drift from protocol::provisioning / the FRAME_RSP_HISTORY_ENTRY codec
+      # in protocol::history — the wire-format source of truth. Without these
+      # paths, a PR that changes ONLY the Rust side (no site/** touch) would
+      # never trigger this workflow, and byte-exact drift could land silently.
+      # See docs/adr/0007-provisioner-codec.md.
+      - "protocol/src/provisioning.rs"
+      - "protocol/src/history.rs"
+      - "xtask/src/golden.rs"
+      - "xtask/src/bin/gen_prov_golden_vectors.rs"
+      - "xtask/Cargo.toml"
 
 permissions:
   contents: read
@@ -33,3 +45,40 @@ jobs:
             echo "::error::found a root-absolute href/src in site/ — this is a project Pages site (/meshcadet/…), paths must be relative (e.g. \"assets/foo.png\", not \"/assets/foo.png\")"
             exit 1
           fi
+
+  codec-conformance:
+    name: site/provisioner/codec.js matches protocol::provisioning byte-for-byte
+    runs-on: ubuntu-latest
+    # `site/provisioner/codec.js` is a hand-ported, pure-JS reimplementation
+    # of protocol::provisioning (+ the FRAME_RSP_HISTORY_ENTRY payload codec
+    # in protocol::history) — see docs/adr/0007-provisioner-codec.md for why
+    # it's pure JS instead of a WASM build of `protocol` (keeps the site's
+    # "no build step, on purpose" convention, site/README.md). A hand port
+    # has no compiler to catch wire-format drift, so this job is the guard:
+    # it generates golden vectors straight from the real Rust codec, then
+    # asserts the JS codec reproduces every one byte-for-byte / field-for-
+    # field. Fails loud (nonzero exit) on any mismatch — see
+    # site/provisioner/codec.conformance.test.mjs's own header for how to
+    # reproduce this locally.
+    steps:
+      - uses: actions/checkout@v4
+
+      # Resolves rust-toolchain.toml (channel + rustfmt/clippy components) —
+      # the toolchain pin lives there, not in this workflow. Same pattern as
+      # ci.yml's host-native jobs.
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Generate golden vectors from the real Rust codec
+        run: cargo run -q -p xtask --bin gen-prov-golden-vectors --locked > /tmp/prov-golden-vectors.json
+
+      - name: Assert codec.js reproduces every golden vector byte-for-byte
+        run: node site/provisioner/codec.conformance.test.mjs /tmp/prov-golden-vectors.json
