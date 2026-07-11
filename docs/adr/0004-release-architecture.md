@@ -7,8 +7,12 @@
 - **Code:** `release-plz.toml`, `cliff.toml`, `.github/workflows/release-plz.yml`,
   `.github/workflows/commitlint.yml`, `.github/workflows/ci.yml`
   (`version-drift-guard` job), `Cargo.toml` (`[workspace.package].version`),
-  `firmware/Cargo.toml` (`version`). GitHub ruleset `18807600` (`main`
-  branch protection).
+  `firmware/Cargo.toml` (`version`), `firmware/build.rs`
+  (`emit_build_version` / `MESHCADET_RELEASE_VERSION`),
+  `.github/workflows/release.yml`, `firmware/release-container/` (Dockerfile
+  + `build.sh`), `firmware/sdkconfig.defaults`
+  (`CONFIG_APP_REPRODUCIBLE_BUILD`), `docs/release-reproducibility.md`.
+  GitHub ruleset `18807600` (`main` branch protection).
 
 ## Context
 
@@ -159,33 +163,61 @@ re-added `required_signatures` to ruleset `18807600` to close that gap —
 see the ruleset's `updated_at` timestamp and rule list for the corrected
 live state.
 
-### 6. Boot-version injection seam (Not yet implemented — next piece)
+### 6. Boot-version injection seam (Implemented)
 
-`firmware/build.rs::emit_build_version()` will read an environment variable
-(name to be frozen by that piece) so a release build can inject the exact
-released version verbatim into the on-device boot string, while an
-ordinary `cargo run` keeps emitting today's bare short-SHA-on-boot string
-unchanged. This is the seam the tag-fired release workflow (§7) writes to.
+`firmware/build.rs::emit_build_version()` reads `MESHCADET_RELEASE_VERSION`
+and, if set/non-empty, emits it verbatim as `MESHCADET_BUILD_VERSION` instead
+of deriving a value from git. An ordinary `cargo run` (the env var unset)
+keeps emitting a bare `git rev-parse --short HEAD` (+ `-dirty`) — deliberately
+NOT `git describe --tags`, which would switch to `vX.Y.Z-N-gSHA` the moment
+this repo's first tag exists. This is the seam the tag-fired release workflow
+(§7) writes to.
 
-### 7. Tag-fired production build + artifacts (Not yet implemented)
+### 7. Tag-fired production build + artifacts (Implemented)
 
-A `v*.*.*` tag push (created by release-plz per §2) will fire a dedicated
-release workflow that builds default-feature production firmware, merges
-bootloader + partition table + app into a single flashable image via
-`esptool merge_bin`, and publishes it to a GitHub Release alongside an
-esp-web-tools `manifest.json` and a `SHA256SUMS` file.
+`.github/workflows/release.yml` fires on `v*.*.*` tag pushes (created by
+release-plz per §2). It first re-verifies the tag's version against the
+checked-out `Cargo.toml`/`firmware/Cargo.toml` (belt-and-suspenders on top of
+§1's drift guard, in case a tag is ever pushed by hand rather than by
+release-plz), then builds default-feature (no `diagnostics`, no `hil`)
+production firmware inside the pinned release container (§8), merges
+bootloader (`0x0`) + the custom `partition-table.bin` carrying `mc_hist`
+(`0x8000`) + the app image (`0x10000`, `factory`) into one flashable image via
+`esptool merge_bin` (`firmware/release-container/build.sh` — offsets per
+`firmware/partitions.csv`; a bare app `.bin` will not boot against this
+project's custom partition table), and publishes a GitHub Release carrying
+`meshcadet-vX.Y.Z-merged.bin`, an esp-web-tools `manifest.json` (chip family
+`ESP32-S3`, single part at offset `0`), and a `SHA256SUMS`. UF2 and the raw
+ELF are deliberately not published (serial flashing only, out of scope for
+now). Release notes are extracted from the matching `CHANGELOG.md` section
+(§3) rather than hand-written per release.
 
-### 8. Reproducibility + provenance (Not yet implemented)
+### 8. Reproducibility + provenance (Implemented)
 
-The release build will set `CONFIG_APP_REPRODUCIBLE_BUILD=y`
-(`firmware/sdkconfig.defaults`), inject `SOURCE_DATE_EPOCH` from the tag
-commit's date, and run inside a pinned container (toolchain **and**
-`fonts-dejavu-core`/`libfreetype6` versions pinned — `firmware/build.rs`
-shells out to system FreeType to generate the emoji font at build time, and
-a different FreeType/DejaVu build would silently break byte-reproducibility
-even with every other lever controlled). `actions/attest-build-provenance`
-will attach a verifiable SLSA provenance attestation to the published
-assets (`gh attestation verify` as the third-party re-check).
+The release build sets `CONFIG_APP_REPRODUCIBLE_BUILD=y`
+(`firmware/sdkconfig.defaults`, applied to every build config, not just
+release), injects `SOURCE_DATE_EPOCH` from the tag commit's own date, and
+passes `RUSTFLAGS=--remap-path-prefix=...` remapping both the checkout path
+and `CARGO_HOME` to fixed, machine-independent targets. All of this runs
+inside a pinned container
+(`firmware/release-container/Dockerfile`) with `libfreetype6-dev` and
+`fonts-dejavu-core` pinned to exact package versions — the one
+byte-reproducibility hazard the other three levers cannot reach, since
+`firmware/build.rs`'s `build_emoji_font()` shells out to the *host's own*
+FreeType/DejaVu Sans to rasterize the bundled emoji font at compile time, and
+a different FreeType/DejaVu build silently changes those baked-in bytes.
+`docs/release-reproducibility.md` is the full third-party rebuild recipe
+(`docker build` + `docker run` + `sha256sum` compare against the published
+`SHA256SUMS`).
+
+`actions/attest-build-provenance@v1` (needing `id-token: write` +
+`attestations: write`, granted at the workflow level) attests SLSA build
+provenance over the three published assets. `docs/release-reproducibility.md`
+documents the `gh attestation verify <asset> --repo jagoda/meshcadet`
+third-party re-check, and is explicit that attestation (provenance: who
+built this, from what source) and the rebuild-and-compare recipe
+(reproducibility: does anyone else get the same bytes) are complementary,
+not substitutes for each other.
 
 ### 9. Web flasher (Not yet implemented)
 

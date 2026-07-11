@@ -1,0 +1,214 @@
+name: release
+
+# Tag-fired production firmware release. Fires on `vX.Y.Z` tags (created by
+# release-plz once a "release vX.Y.Z" PR merges — see
+# .github/workflows/release-plz.yml + docs/adr/0004-release-architecture.md
+# §7/§8) and:
+#   1. verifies the tag's version matches the checked-out Cargo.toml version
+#      (the same drift-guard spirit as ci.yml's version-drift-guard job, just
+#      against the tag instead of firmware/Cargo.toml);
+#   2. builds PRODUCTION firmware (default features — NO diagnostics, NO
+#      hil) inside the pinned release container (firmware/release-container/),
+#      injecting the release version via the phase-2 seam
+#      (MESHCADET_RELEASE_VERSION, firmware/build.rs::emit_build_version);
+#   3. merges bootloader + custom partition-table (mc_hist) + app into one
+#      flashable image via `esptool merge_bin`
+#      (firmware/release-container/build.sh has the exact offsets/rationale;
+#      see also firmware/scripts/flash-with-partition-table.sh, which flashes
+#      the same three components separately for local dev);
+#   4. publishes a GitHub Release: the merged image, an esp-web-tools
+#      `manifest.json`, and `SHA256SUMS`;
+#   5. attests SLSA build provenance over those three published assets.
+#
+# See docs/release-reproducibility.md for the full rebuild + third-party
+# verification recipe (this workflow and that doc must describe the exact
+# same steps — that doc IS the promise this workflow keeps).
+#
+# Deliberately reuses ci.yml's `firmware` job's toolchain-install *shape*
+# (esp-rs/xtensa-toolchain equivalent, ldproxy, ESP-IDF v5.2.2 cache) but NOT
+# its actual runner-side install: this workflow's toolchain lives inside the
+# pinned container instead, since reproducibility requires the exact
+# freetype/DejaVu versions build.rs's emoji-font generator sees to be pinned
+# (see firmware/release-container/Dockerfile) — a bare `esp-rs/xtensa-toolchain`
+# runner step, like ci.yml uses, installs whatever the OS image currently
+# ships, which drifts over time.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  # Never cancel a release build mid-flight — cancellation after the GitHub
+  # Release object is created but before all assets upload would publish a
+  # Release page missing its firmware image.
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build production firmware (merged image)
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fails fast (before the expensive container build below) if the tag
+      # doesn't match what's actually checked out — the release-plz.yml /
+      # version-drift-guard contract (docs/adr/0004-release-architecture.md
+      # §1) should make this impossible in practice, but a manually pushed
+      # tag bypasses both, so check it here too.
+      - name: Verify tag matches workspace version
+        id: version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          root_version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          firmware_version=$(grep -m1 '^version = ' firmware/Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          echo "tag ${tag} -> version ${version}"
+          echo "root [workspace.package].version = ${root_version}"
+          echo "firmware/Cargo.toml version = ${firmware_version}"
+          if [ "${version}" != "${root_version}" ] || [ "${version}" != "${firmware_version}" ]; then
+            echo "::error::Tag ${tag} does not match the checked-out workspace version (root=${root_version}, firmware=${firmware_version}). This should be impossible for a release-plz-created tag (docs/adr/0004-release-architecture.md §1's drift guard) — was this tag pushed manually?" >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      # SOURCE_DATE_EPOCH per the reproducibility recipe (docs/release-
+      # reproducibility.md): the tag commit's own date, not "now" — a
+      # rebuild of the SAME tag on a later date must embed the same value.
+      - name: Derive SOURCE_DATE_EPOCH from the tag commit
+        id: sde
+        run: echo "epoch=$(git log -1 --format=%ct HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Cache key includes the Dockerfile + build.sh (image contents) so a
+      # change to either invalidates the cache; ESP-IDF's own sysroot is
+      # bootstrapped INSIDE the container on first use and lives inside the
+      # container filesystem for that run, so caching it across runs would
+      # require pushing the built image to a registry — out of scope for
+      # this workflow (each release build is infrequent enough that a cold
+      # ESP-IDF bootstrap per release is an acceptable cost; ci.yml's
+      # per-PR/per-push firmware job is the one that needs that cache).
+      - name: Build the pinned release container
+        run: |
+          docker build \
+            -f firmware/release-container/Dockerfile \
+            -t meshcadet-release-builder:${{ github.sha }} \
+            firmware
+
+      - name: Build production firmware + merged image
+        run: |
+          mkdir -p dist
+          docker run --rm \
+            -v "${{ github.workspace }}:/build" \
+            meshcadet-release-builder:${{ github.sha }} \
+            "${{ steps.version.outputs.tag }}" "${{ steps.sde.outputs.epoch }}"
+
+      - name: Upload merged image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: merged-image
+          path: dist/meshcadet-${{ steps.version.outputs.tag }}-merged.bin
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub Release + attest provenance
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: merged-image
+          path: dist
+
+      - name: Generate esp-web-tools manifest.json
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cat > dist/manifest.json <<EOF
+          {
+            "name": "MeshCadet",
+            "version": "${TAG}",
+            "builds": [
+              {
+                "chipFamily": "ESP32-S3",
+                "parts": [
+                  { "path": "meshcadet-${TAG}-merged.bin", "offset": 0 }
+                ]
+              }
+            ]
+          }
+          EOF
+
+      - name: Generate SHA256SUMS
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum "meshcadet-${TAG}-merged.bin" manifest.json > SHA256SUMS
+          cd -
+
+      # Provenance for exactly the three published assets, over their final
+      # bytes (post-manifest/checksum generation, pre-upload) — see
+      # docs/release-reproducibility.md for the `gh attestation verify`
+      # third-party re-check this pairs with.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            dist/meshcadet-${{ github.ref_name }}-merged.bin
+            dist/manifest.json
+            dist/SHA256SUMS
+
+      - name: Extract release notes from CHANGELOG.md
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          awk -v heading="## [${VERSION}]" '
+            index($0, heading) == 1 { found=1; next }
+            found && index($0, "## [") == 1 { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "No CHANGELOG.md section found for [${VERSION}] — see CHANGELOG.md." > release-notes.md
+          fi
+
+      # KNOWN FAILURE MODE: `gh release create` uploads its file arguments
+      # sequentially after creating the Release object — a network blip
+      # partway through can leave a published Release missing one or more of
+      # the three assets, with no automatic retry/rollback here. Re-running
+      # this job (e.g. via workflow_dispatch or by re-running the failed
+      # run) does NOT recreate the tag, so recovery is manual:
+      # `gh release upload "${TAG}" <missing-file>` for whichever asset(s)
+      # are absent, or `gh release delete "${TAG}"` + re-run this job if
+      # starting over is simpler. Recovery is a documented manual step
+      # rather than scripted retry logic, since a real release is a rare,
+      # human-observed event — revisit if releases become frequent enough
+      # for this to bite in practice.
+      - name: Publish GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "${TAG}" \
+            "dist/meshcadet-${TAG}-merged.bin" \
+            "dist/manifest.json" \
+            "dist/SHA256SUMS" \
+            --title "MeshCadet ${TAG}" \
+            --notes-file release-notes.md
