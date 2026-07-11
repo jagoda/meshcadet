@@ -246,10 +246,18 @@ built this, from what source) and the rebuild-and-compare recipe
 (reproducibility: does anyone else get the same bytes) are complementary,
 not substitutes for each other.
 
-### 9. Web flasher (Not yet implemented)
+### 9. Web flasher (Implemented — see ADR-0006)
 
-A self-hosted GitHub Pages `esp-web-tools` flasher page, pointed at the
-latest Release's `manifest.json` from §7.
+A self-hosted GitHub Pages `esp-web-tools` flasher page
+(`site/flash.html`), with a version selector over recent Releases from §7
+rather than a single latest-only pin. **ADR-0006 is the record of how it's
+actually built** — in particular, a live check found GitHub Release assets
+carry no CORS headers, so the flasher can't fetch a Release's
+`manifest.json`/merged image directly; it points at a same-origin mirror
+that `.github/workflows/pages-deploy.yml` populates from live Release data
+at deploy time instead. This section is left brief on purpose so the two
+ADRs don't drift out of sync with each other — see ADR-0006 for the full
+design and its Alternatives Considered.
 
 ## Consequences
 
