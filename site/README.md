@@ -24,6 +24,19 @@ building or publishing anything.
   design and `.github/workflows/pages-deploy.yml`'s "Mirror recent release
   firmware assets" step for how `firmware/<tag>/` gets populated at deploy
   time (git-ignored, not checked in — see below).
+- `provisioner/codec.js` — pure-JS port of the USB-serial provisioning wire
+  protocol (`protocol/src/provisioning.rs`): frame encode/decode, CRC-16/ARC,
+  `find_magic_start` log-noise resync, and the payload codecs a browser
+  provisioner page needs. No build step — plain ES module. Guarded against
+  drift from the Rust codec by `provisioner/codec.conformance.test.mjs` +
+  `xtask --bin gen-prov-golden-vectors`, run by `pages-check.yml`'s
+  `codec-conformance` job on every PR touching either side. See
+  `docs/adr/0007-provisioner-codec.md` for the full design (why pure JS
+  instead of WASM, and the client-side security model the rest of the
+  provisioner page must uphold). The provisioner page itself
+  (`provisioner.html` + a Web Serial session module, mirroring
+  `flash.html`/`flash.js` below) is a separate, later piece of the same
+  campaign.
 - `styles.css` — one stylesheet, no build step. Color tokens at the top
   mirror `firmware/src/ui/theme.slint`'s `Theme` global 1:1, so the site and
   the on-device UI read as the same product. Keep them in sync if the

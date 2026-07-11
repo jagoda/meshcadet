@@ -37,7 +37,9 @@
 //! recorded alongside it, catching a bug in this generator itself before it
 //! ever reaches the JS side.
 
-use protocol::history::{decode_rsp_history_entry, encode_rsp_history_entry, HistoryEntry, HistoryMsgType};
+use protocol::history::{
+    decode_rsp_history_entry, encode_rsp_history_entry, HistoryEntry, HistoryMsgType,
+};
 use protocol::provisioning::*;
 
 // ── Minimal JSON writer ──────────────────────────────────────────────────────
@@ -226,7 +228,10 @@ fn rsp_status_vector(name: &'static str, payload_in: RspStatusPayload) -> Vector
         ("gps_lon_e7", n(d.gps_lon_e7 as i64)),
         ("gps_fix_age_secs", n(d.gps_fix_age_secs as i64)),
         ("gps_clock_synced", b(d.gps_clock_synced)),
-        ("gps_clock_sync_age_secs", n(d.gps_clock_sync_age_secs as i64)),
+        (
+            "gps_clock_sync_age_secs",
+            n(d.gps_clock_sync_age_secs as i64),
+        ),
         ("battery_percent", n(d.battery_percent as i64)),
         ("battery_charging", b(d.battery_charging)),
         ("battery_raw_mv", n(d.battery_raw_mv as i64)),
@@ -242,10 +247,19 @@ fn rsp_identity_vector(name: &'static str, pubkey: [u8; 32], device_name: &[u8])
     let expect = Json::Obj(vec![
         ("pubkey", hexj(&d.pubkey)),
         ("pub_hash", n(d.pub_hash as i64)),
-        ("device_name", s(std::str::from_utf8(&d.device_name[..d.device_name_len as usize]).unwrap())),
+        (
+            "device_name",
+            s(std::str::from_utf8(&d.device_name[..d.device_name_len as usize]).unwrap()),
+        ),
         ("device_name_len", n(d.device_name_len as i64)),
     ]);
-    decode_vector(name, "rsp_identity", FRAME_RSP_IDENTITY, &buf[..plen], expect)
+    decode_vector(
+        name,
+        "rsp_identity",
+        FRAME_RSP_IDENTITY,
+        &buf[..plen],
+        expect,
+    )
 }
 
 fn rsp_contact_vector(
@@ -287,7 +301,10 @@ fn rsp_channel_vector(
         ("channel_hash", n(d.channel_hash as i64)),
         ("key_len", n(d.key_len as i64)),
         ("primary", b(d.primary)),
-        ("name", s(std::str::from_utf8(&d.name[..d.name_len as usize]).unwrap())),
+        (
+            "name",
+            s(std::str::from_utf8(&d.name[..d.name_len as usize]).unwrap()),
+        ),
         ("name_len", n(d.name_len as i64)),
     ]);
     decode_vector(name, "rsp_channel", FRAME_RSP_CHANNEL, &buf[..plen], expect)
@@ -299,7 +316,10 @@ fn rsp_error_vector(name: &'static str, error_code: u8, msg: &[u8]) -> Vector {
     let d = decode_rsp_error(&buf[..plen]).expect("golden generator: rsp_error self-decode");
     let expect = Json::Obj(vec![
         ("error_code", n(d.error_code as i64)),
-        ("msg", s(std::str::from_utf8(&d.msg[..d.msg_len as usize]).unwrap())),
+        (
+            "msg",
+            s(std::str::from_utf8(&d.msg[..d.msg_len as usize]).unwrap()),
+        ),
         ("msg_len", n(d.msg_len as i64)),
     ]);
     decode_vector(name, "rsp_error", FRAME_RSP_ERROR, &buf[..plen], expect)
@@ -325,8 +345,8 @@ fn rsp_history_entry_vector(
     };
     let mut buf = [0u8; protocol::history::MAX_RSP_HISTORY_ENTRY_PAYLOAD];
     let plen = encode_rsp_history_entry(index, &entry, is_ours, &mut buf);
-    let (d_index, d_entry, d_is_ours) =
-        decode_rsp_history_entry(&buf[..plen]).expect("golden generator: rsp_history_entry self-decode");
+    let (d_index, d_entry, d_is_ours) = decode_rsp_history_entry(&buf[..plen])
+        .expect("golden generator: rsp_history_entry self-decode");
     let expect = Json::Obj(vec![
         ("index", n(d_index as i64)),
         ("sender_hash", n(d_entry.sender_hash as i64)),
@@ -339,7 +359,13 @@ fn rsp_history_entry_vector(
         ("text_len", n(d_entry.text_len as i64)),
         ("is_ours", b(d_is_ours)),
     ]);
-    decode_vector(name, "rsp_history_entry", FRAME_RSP_HISTORY_ENTRY, &buf[..plen], expect)
+    decode_vector(
+        name,
+        "rsp_history_entry",
+        FRAME_RSP_HISTORY_ENTRY,
+        &buf[..plen],
+        expect,
+    )
 }
 
 // ── The vector set ───────────────────────────────────────────────────────────
@@ -591,7 +617,11 @@ fn build_vectors() -> Vec<Vector> {
         },
     ));
 
-    v.push(rsp_identity_vector("rsp_identity_no_name", [0xCCu8; 32], b""));
+    v.push(rsp_identity_vector(
+        "rsp_identity_no_name",
+        [0xCCu8; 32],
+        b"",
+    ));
     v.push(rsp_identity_vector(
         "rsp_identity_with_name",
         [0xDDu8; 32],
@@ -605,7 +635,10 @@ fn build_vectors() -> Vec<Vector> {
         true,
         b"Bob",
     ));
-    v.push(frame_only_vector("rsp_contacts_done", FRAME_RSP_CONTACTS_DONE));
+    v.push(frame_only_vector(
+        "rsp_contacts_done",
+        FRAME_RSP_CONTACTS_DONE,
+    ));
 
     v.push(rsp_channel_vector(
         "rsp_channel",
@@ -615,7 +648,10 @@ fn build_vectors() -> Vec<Vector> {
         true,
         b"family",
     ));
-    v.push(frame_only_vector("rsp_channels_done", FRAME_RSP_CHANNELS_DONE));
+    v.push(frame_only_vector(
+        "rsp_channels_done",
+        FRAME_RSP_CHANNELS_DONE,
+    ));
 
     v.push(rsp_history_entry_vector(
         "rsp_history_entry_received_dm",
@@ -635,7 +671,10 @@ fn build_vectors() -> Vec<Vector> {
         b"",
         true,
     ));
-    v.push(frame_only_vector("rsp_history_done", FRAME_RSP_HISTORY_DONE));
+    v.push(frame_only_vector(
+        "rsp_history_done",
+        FRAME_RSP_HISTORY_DONE,
+    ));
 
     v
 }
@@ -672,7 +711,11 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{}: frame_hex is not valid hex: {e}", vec.name));
             let (frame_type, payload) = decode_frame(&frame_bytes)
                 .unwrap_or_else(|e| panic!("{}: frame_hex does not decode: {e:?}", vec.name));
-            assert_eq!(frame_type, vec.frame_type, "{}: frame_type mismatch", vec.name);
+            assert_eq!(
+                frame_type, vec.frame_type,
+                "{}: frame_type mismatch",
+                vec.name
+            );
             assert_eq!(
                 hex::encode(payload),
                 vec.payload_hex,
