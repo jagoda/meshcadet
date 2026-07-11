@@ -46,6 +46,22 @@ jobs:
             exit 1
           fi
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: session.js orchestration smoke test (mocked Web Serial)
+        # site/provisioner/session.js (the async Web Serial transport +
+        # QUERY_STATUS handshake driving provisioner.html) has no Rust
+        # counterpart to golden-vector against (unlike codec.js — see the
+        # codec-conformance job below) — host/src/session.rs is synchronous
+        # and is never itself modified by this code (see
+        # docs/adr/0007-provisioner-codec.md, Finding 2). This is its own
+        # regression coverage instead: retry/resync orchestration exercised
+        # against a fake `navigator.serial` port built from Node's built-in
+        # WHATWG Streams globals. See the test file's own header for details.
+        run: node site/provisioner/session.smoke.test.mjs
+
   codec-conformance:
     name: site/provisioner/codec.js matches protocol::provisioning byte-for-byte
     runs-on: ubuntu-latest

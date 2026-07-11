@@ -342,6 +342,42 @@ esp-web-install-button {
   border-top: 1px solid var(--surface-alt);
 }
 
+/* ── Web provisioner (provisioner.html) ────────────────────────────── */
+
+.mono {
+  font-family: var(--font-mono);
+}
+
+.status-grid {
+  display: grid;
+  grid-template-columns: minmax(120px, max-content) 1fr;
+  gap: 10px 20px;
+  margin: 0;
+}
+
+.status-grid dt {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.status-grid dd {
+  margin: 0;
+  font-size: 14px;
+  word-break: break-word;
+}
+
+.qr-wrap {
+  display: inline-block;
+  background: #ffffff;
+  padding: 12px;
+  border-radius: 8px;
+  line-height: 0;
+}
+
+.qr-uri {
+  word-break: break-all;
+}
+
 /* ── Footer ─────────────────────────────────────────────────────────── */
 
 .footer {
