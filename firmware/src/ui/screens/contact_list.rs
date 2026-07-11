@@ -472,21 +472,17 @@ slint::slint! {
 // tests execute under `cargo test --workspace` (this crate is a detached,
 // cross-compiled workspace — see `Cargo.toml`'s doc comment — so a
 // `#[cfg(test)]` block written here would type-check but never run).
-// `ChannelItem` moved alongside them (plain data, no Slint dependency); only
-// `ContactItem` (below) and this Slint-backed view wrapper stay. See
+// `ChannelItem`/`ContactItem` (plain data, no Slint dependency) moved
+// alongside them, together with `build_contact_items`/`build_channel_items`
+// (the `UiRuntime` list-builders that construct them — see
+// `firmware/src/ui/mod.rs`'s `register_contact`/`set_channels`/
+// `handle_event`/`handle_trackball_contact_list` call sites); only this
+// Slint-backed view wrapper stays. See
 // `docs/adr/0005-firmware-core-extraction.md`.
 use firmware_core::ui::contact_list::{format_unread_badge, unread_total_increased};
-pub use firmware_core::ui::contact_list::ChannelItem;
-
-/// A contact entry passed into the Slint model.
-#[derive(Clone, Debug)]
-pub struct ContactItem {
-    pub name:     String,
-    pub preview:  String,
-    pub time_str: String,
-    pub unread:   i32,
-    pub hash:     u8,
-}
+pub use firmware_core::ui::contact_list::{
+    build_channel_items, build_contact_items, ChannelItem, ContactItem,
+};
 
 /// Rust-side wrapper.
 pub struct ContactListScreen {

@@ -2609,6 +2609,24 @@ mod heapless_hex {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 //
+// FINAL TRIAGE (firmware-core-extract-ui-runtime increment): these 7 tests
+// stay here, device-only/compile-only — leave-as-is, per this campaign's
+// bucket (c). `match_pending_ack`/`match_pending_channel_ack` themselves are
+// in fact pure (`PendingAck`/`PendingChannelAck` are plain structs local to
+// this file, and `log::info!`/`log::warn!` are the only side effects), so
+// the block on this pair is narrower than a hardware dependency: their sole
+// non-primitive argument, `ui::UiEvent`, is the radio→UI event bridge type
+// still defined in `firmware/src/ui/mod.rs`, and moving IT into
+// `firmware-core` would require touching `main.rs`'s whole RX/dispatch
+// pipeline (every `UiEvent` construction site across the receive-handler
+// bring-up — genuinely hardware/boot-coupled code) to keep it a
+// behavior-preserving move rather than a rewrite. That is a larger,
+// separately-scoped change than this increment's "ui/mod.rs screen/UI-
+// runtime pure helpers" mandate, so per this campaign's own abort clause the
+// un-extractable remainder is filed here, explicitly, rather than forced.
+// See `docs/adr/0005-firmware-core-extraction.md` for the extraction pattern
+// this campaign follows.
+//
 // Regression guard for "live ACK never advances the ✓→✓✓ indicator":
 // `match_pending_ack` is the site where
 // a confirmed-delivered DM must both clear `pending_ack` AND raise

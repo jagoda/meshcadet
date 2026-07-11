@@ -584,39 +584,26 @@ slint::slint! {
     }
 }
 
-/// A single message in the conversation thread.
-#[derive(Clone, Debug)]
-pub struct MessageItem {
-    /// Message text (UTF-8, emoji already expanded from shortcodes, `@[name]`
-    /// mention wire markup already flattened to a brackets-hidden `@name`
-    /// display string — see `UiRuntime::render_mentions`). For a received
-    /// channel message with a parseable sender prefix, this is the body
-    /// ALONE — the "<name>: " prefix has been split off into `from_name`
-    /// (see below) so `MessageBubble` can render it bold.
-    pub text:      String,
-    /// Sender name for a received channel message, sans the trailing `": "`
-    /// delimiter — empty for DMs, sent messages, and channel messages with
-    /// no parseable prefix. `MessageBubble` renders `"<from_name>:"` in bold
-    /// beside the (normal-weight) body when this is non-empty, and falls
-    /// back to a single plain-weight Text otherwise. Populated by
-    /// `UiRuntime::build_message_items`.
-    pub from_name: String,
-    pub time_str:  String,
-    pub is_ours:   bool,
-    pub acked:     bool,
-    /// Highest `protocol::mention::MentionTier` found in `text`, as `i32` (0
-    /// = none, 1 = other-node mention, 2 = self-mention). Drives
-    /// `MessageBubble`'s tint — see that property's doc.
-    pub mention_tier: i32,
-}
-
 // `received_total_increased` is pure Rust with no Slint dependency — it now
 // lives in `firmware_core::ui::message_view` so its tests execute under
 // `cargo test --workspace` (this crate is a detached, cross-compiled
 // workspace — see `Cargo.toml`'s doc comment — so a `#[cfg(test)]` block
-// written here would type-check but never run). Only this Slint-backed view
-// wrapper stays. See `docs/adr/0005-firmware-core-extraction.md`.
+// written here would type-check but never run). `MessageItem` (plain data,
+// no Slint dependency) moved alongside it, together with
+// `build_message_items`/`render_mentions`/`wrap_outgoing_mentions` (the
+// `UiRuntime` model-builder and its @mention glue that construct/consume
+// it — see `firmware/src/ui/mod.rs`'s `refresh_message_view_for`/
+// `navigate_to_message_view`/`on_send_message` call sites). `render_mentions`
+// and `incoming_message_is_unread` are consumed only inside
+// `firmware_core::ui::message_view` (the former) or imported directly from
+// there by `ui/mod.rs` (the latter) — re-exported here as `build_message_items`/
+// `wrap_outgoing_mentions`/`MessageItem` only, since `firmware`'s single
+// `[[bin]]` target has no external re-export surface to keep an unused `pub
+// use` alive (`cargo check` warns on it as dead code, unlike a library
+// crate). Only this Slint-backed view wrapper stays. See
+// `docs/adr/0005-firmware-core-extraction.md`.
 use firmware_core::ui::message_view::received_total_increased;
+pub use firmware_core::ui::message_view::{build_message_items, wrap_outgoing_mentions, MessageItem};
 
 /// Rust-side wrapper.
 pub struct MessageViewScreen {
