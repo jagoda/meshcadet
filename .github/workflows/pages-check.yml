@@ -62,6 +62,11 @@ jobs:
         # WHATWG Streams globals. See the test file's own header for details.
         run: node site/provisioner/session.smoke.test.mjs
 
+      - name: contact-uri.js matches host/src/main.rs's url_encode + URI construction
+        # Checked against the SAME fixtures as host/src/main.rs's own
+        # #[cfg(test)] module — see the test file's own header.
+        run: node site/provisioner/contact-uri.test.mjs
+
   codec-conformance:
     name: site/provisioner/codec.js matches protocol::provisioning byte-for-byte
     runs-on: ubuntu-latest

@@ -48,13 +48,20 @@ building or publishing anything.
   Regression-guarded by `provisioner/session.smoke.test.mjs` (a mocked-
   Web-Serial orchestration test — no Rust counterpart to golden-vector
   against, unlike `codec.js`), run by `pages-check.yml`'s `check` job.
+- `provisioner/contact-uri.js` — the MeshCore companion contact-add URI
+  construction (`meshcore://contact/add?name=&public_key=&type=1`),
+  byte-for-byte hand-ported from `host/src/main.rs`'s `url_encode` +
+  URI-construction logic. Pulled out of `provisioner.js` into its own
+  DOM-free module specifically so it's testable under plain `node` —
+  `provisioner/contact-uri.test.mjs` checks it against the exact same
+  fixtures as `host/src/main.rs`'s own `#[cfg(test)]` module, run by
+  `pages-check.yml`'s `check` job.
 - `provisioner.html` + `provisioner.js` — the provisioner page itself:
   connect over Web Serial (mirrors `flash.html`'s Chrome/Edge + HTTPS
   guidance and unsupported-browser fallback), then render read-only
-  status/identity and a MeshCore contact QR (`meshcore://contact/add?...`,
-  hand-ported from `host/src/main.rs`'s `url_encode`/URI construction). The
-  QR itself is rendered by a major-version-pinned CDN import of the
-  `qrcode` npm package via esm.sh (pure JS, no WASM) — the same
+  status/identity (via `session.js`) and a MeshCore contact QR (via
+  `contact-uri.js`). The QR itself is rendered by a major-version-pinned CDN
+  import of the `qrcode` npm package via esm.sh (pure JS, no WASM) — the same
   single-pinned-CDN-import, no-bundler pattern `flash.html` uses for
   esp-web-tools.
 - `styles.css` — one stylesheet, no build step. Color tokens at the top

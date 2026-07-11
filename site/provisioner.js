@@ -16,6 +16,7 @@
 
 import { ProvisionerSession } from "./provisioner/session.js";
 import { bytesToHex } from "./provisioner/codec.js";
+import { buildContactUri } from "./provisioner/contact-uri.js";
 import QRCode from "https://esm.sh/qrcode@1.5.3";
 
 const unsupportedPanel = document.getElementById("unsupported-panel");
@@ -55,7 +56,12 @@ if (!ProvisionerSession.isSupported() || !ProvisionerSession.isSecureContext()) 
   connectPanel.hidden = true;
 } else {
   connectButton.addEventListener("click", handleConnect);
-  disconnectButton.addEventListener("click", handleDisconnect);
+  // Wrapped in a closure (not passed directly) — addEventListener would
+  // otherwise call `handleDisconnect(clickEvent)`, silently overriding its
+  // `message = "Disconnected."` default parameter with the click Event
+  // object (coerced to the string "[object PointerEvent]" by
+  // `setStatus`/`textContent`) instead of leaving the default in place.
+  disconnectButton.addEventListener("click", () => handleDisconnect());
   refreshButton.addEventListener("click", handleRefresh);
 
   // If the OS reports the connected device physically unplugged, tear down
@@ -162,50 +168,14 @@ function renderStatus(status, identity) {
 
 // ── MeshCore contact QR ──────────────────────────────────────────────────
 //
-// Mirrors host/src/main.rs's contact-URI construction and `url_encode`
-// byte-for-byte (see docs/adr/0002-provisioning-wire-format.md /
-// meshcore-dev/MeshCore docs/faq.md §7.5 for the URI grammar). `type=1` is
-// hardcoded (chat=1) — MeshCadet is always a chat node, matching main.rs.
-
-const NAME_ENCODER = new TextEncoder();
-
-/**
- * Percent-encode a string for use as a URI query-component value (RFC 3986).
- * A byte-for-byte hand port of `url_encode` in `host/src/main.rs`: same
- * unreserved set (`A-Z a-z 0-9 - _ . ~`), same uppercase-hex escaping,
- * operating on the UTF-8 byte sequence (not JS UTF-16 code units).
- */
-function urlEncode(str) {
-  let out = "";
-  for (const b of NAME_ENCODER.encode(str)) {
-    if (
-      (b >= 0x41 && b <= 0x5a) || // A-Z
-      (b >= 0x61 && b <= 0x7a) || // a-z
-      (b >= 0x30 && b <= 0x39) || // 0-9
-      b === 0x2d || // -
-      b === 0x5f || // _
-      b === 0x2e || // .
-      b === 0x7e // ~
-    ) {
-      out += String.fromCharCode(b);
-    } else {
-      out += "%" + b.toString(16).toUpperCase().padStart(2, "0");
-    }
-  }
-  return out;
-}
-
-/** Build the `meshcore://contact/add?...` URI for the connected device's identity. */
-function contactUri(identity) {
-  const name =
-    identity.device_name && identity.device_name.length > 0
-      ? identity.device_name
-      : `MeshCadet-${identity.pubkey[0].toString(16).toUpperCase().padStart(2, "0")}`;
-  return `meshcore://contact/add?name=${urlEncode(name)}&public_key=${bytesToHex(identity.pubkey)}&type=1`;
-}
+// URI construction itself (`buildContactUri`/`urlEncode`, a byte-for-byte
+// hand port of host/src/main.rs's contact-URI construction and `url_encode`)
+// lives in ./provisioner/contact-uri.js — a DOM-free module so it's testable
+// under plain `node` (contact-uri.test.mjs) without dragging in this file's
+// `document`/`navigator` top-level side effects.
 
 async function renderQr(identity) {
-  const uri = contactUri(identity);
+  const uri = buildContactUri(identity);
   qrPanel.hidden = false;
   qrUri.textContent = uri;
   try {

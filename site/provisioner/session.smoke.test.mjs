@@ -24,8 +24,10 @@ import {
   FRAME_QUERY_STATUS,
   FRAME_RSP_STATUS,
   FRAME_RSP_IDENTITY,
+  FRAME_RSP_ERROR,
+  FRAME_RSP_OK,
 } from "./codec.js";
-import { ProvisionerSession } from "./session.js";
+import { ProvisionerSession, DeviceError } from "./session.js";
 
 // ── Fake Web Serial port ─────────────────────────────────────────────────
 
@@ -232,12 +234,65 @@ async function disconnectWithoutConnect() {
   assert.equal(session.isConnected, false);
 }
 
+// ── Scenario 4: device answers QUERY_STATUS with RSP_ERROR ───────────────
+
+async function deviceErrorOnQueryStatus() {
+  const { port, push } = makeFakePort(() => {
+    // error_code(1) | msg_len(1) | msg(msg_len) — wire layout for RSP_ERROR.
+    const msg = new TextEncoder().encode("not ready");
+    const payload = new Uint8Array(2 + msg.length);
+    payload[0] = 7; // error_code
+    payload[1] = msg.length;
+    payload.set(msg, 2);
+    setTimeout(() => push(encodeFrame(FRAME_RSP_ERROR, payload)), 5);
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  await assert.rejects(
+    () => session.queryStatus(),
+    (err) => {
+      assert.ok(err instanceof DeviceError, `expected DeviceError, got ${err}`);
+      assert.equal(err.errorCode, 7);
+      assert.match(err.message, /not ready/);
+      return true;
+    }
+  );
+
+  await session.disconnect();
+}
+
+// ── Scenario 5: an unexpected frame follows RSP_STATUS instead of RSP_IDENTITY ─
+
+async function unexpectedFrameAfterStatus() {
+  const { port, push } = makeFakePort(() => {
+    setTimeout(() => {
+      push(statusFrame);
+      // RSP_OK instead of the expected RSP_IDENTITY — a genuine protocol
+      // desync the caller must surface, not silently misinterpret.
+      push(encodeFrame(FRAME_RSP_OK));
+    }, 5);
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  await assert.rejects(() => session.queryStatus(), /expected RSP_IDENTITY.*got 0x80/);
+
+  await session.disconnect();
+}
+
 // ── Run ────────────────────────────────────────────────────────────────────
 
 const scenarios = [
   ["happy path: two-frame handshake + magic-resync past log noise", happyPathWithLogNoiseResync],
   ["send_recv_with_retry retries a dropped first response", retryOnDroppedFirstResponse],
   ["disconnect() before connect() is a no-op", disconnectWithoutConnect],
+  ["device RSP_ERROR on QUERY_STATUS surfaces as DeviceError", deviceErrorOnQueryStatus],
+  ["unexpected frame after RSP_STATUS surfaces a desync error", unexpectedFrameAfterStatus],
 ];
 
 for (const [name, fn] of scenarios) {
