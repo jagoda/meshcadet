@@ -25,6 +25,17 @@ setup. Summary:
 - The `firmware` crate needs the `esp` toolchain (`espup`), `ldproxy`, and
   `espflash`, and a physical T-Deck Plus to flash and test on real hardware.
 
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every pull request and every push to
+`main`: `cargo test --workspace`, `cargo fmt --all -- --check`, and
+`cargo clippy --workspace --all-targets -- -D warnings` — all against the
+host-native workspace only. It deliberately does **not** build `firmware/`
+(the `esp`/Xtensa cross-toolchain and ESP-IDF sysroot are too heavy for a
+per-PR job); see the workflow file's own header comment for the full
+rationale. `cd firmware && bash check-all-features.sh` (below) remains the
+required manual gate for firmware changes.
+
 ## Building and testing
 
 ```sh

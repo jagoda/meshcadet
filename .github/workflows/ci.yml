@@ -1,0 +1,121 @@
+name: CI
+
+# Runs the full host-native test suite + static checks on every PR and on
+# every push to main. Toolchain version is NOT pinned in this file — it is
+# pinned exactly once, at the repo root in `rust-toolchain.toml` (channel
+# "stable" + the rustfmt/clippy components), and `rustup show` below just
+# forces that pin to resolve/install before the cache and build steps run.
+#
+# ── Scope: host-testable crates + fmt + clippy only (no firmware job) ───────
+#
+# `protocol`, `host`, `xtask`, `ui_sim`, and `ui_perf` are the root Cargo
+# workspace's members (see workspace/Cargo.toml's own doc comment) — they
+# build and test on stable Rust with no extra tooling, which is exactly what
+# this workflow exercises.
+#
+# `firmware/` is deliberately a DETACHED workspace (its own `[workspace]`
+# table in firmware/Cargo.toml) that cross-compiles for
+# `xtensa-esp32s3-espidf` under the Espressif `esp` rustc fork, and its
+# build.rs additionally shells out to a native C/FreeType toolchain to
+# generate the bundled emoji font and pulls down a full ESP-IDF sysroot via
+# `embuild`/`esp-idf-sys`. None of that is a "stock GitHub runner can't do
+# this" hard blocker in principle (espup + the esp-rs GH Actions exist), but
+# it was scoped OUT of this workflow rather than silently dropped:
+#   - `espup install` + the ESP-IDF v5.2.2 sysroot clone/build is a heavy,
+#     slow, network-dependent install (independent of this repo's own code)
+#     that would dominate every PR's CI time and turn transient
+#     Espressif-side network/version hiccups into spurious red X's on
+#     unrelated host-crate changes.
+#   - The workspace split above exists FOR THIS REASON already (see the
+#     Cargo.toml comment): keeping `cargo test`/`cargo fmt`/`cargo clippy` at
+#     the repo root fast and toolchain-independent was a deliberate design
+#     choice, and a firmware CI job would reintroduce the exact coupling
+#     that split was meant to avoid.
+#   - The project already has a dedicated, documented firmware build gate
+#     that covers every feature combination:
+#     `cd firmware && bash check-all-features.sh` (see CONTRIBUTING.md
+#     "Building and testing"). It requires the `esp` toolchain + ESP-IDF
+#     locally and is run by a human before landing firmware changes.
+# If firmware CI becomes worth the cost later (e.g. a self-hosted runner
+# with the esp toolchain pre-baked, or acceptance of the first-run install
+# tax via aggressive caching), the natural shape is a fourth job here that
+# runs `check-all-features.sh` — not a change to the jobs below.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # Lets a maintainer (or CI verification tooling) kick a run on-demand from
+  # any branch without needing an open PR — `gh workflow run ci.yml --ref
+  # <branch>`. Purely additive to the required pull_request/push triggers.
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: cargo test (protocol, host, xtask, ui_sim, ui_perf)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Native prerequisites for the host-native workspace's build.rs steps
+      # (ui_sim / ui_perf embed real Slint markup + assets at compile time via
+      # the same i-slint-compiler machinery firmware uses) — see README.md
+      # "Building from a fresh clone" for the authoritative package list.
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libfreetype6-dev fonts-dejavu-core
+
+      # Resolves rust-toolchain.toml (channel + rustfmt/clippy components) —
+      # the toolchain pin lives there, not in this workflow.
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: cargo test --workspace
+        run: cargo test --workspace --locked
+
+  fmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - name: cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: cargo clippy -D warnings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libfreetype6-dev fonts-dejavu-core
+
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
