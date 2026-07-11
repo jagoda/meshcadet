@@ -33,10 +33,37 @@ building or publishing anything.
   `codec-conformance` job on every PR touching either side. See
   `docs/adr/0007-provisioner-codec.md` for the full design (why pure JS
   instead of WASM, and the client-side security model the rest of the
-  provisioner page must uphold). The provisioner page itself
-  (`provisioner.html` + a Web Serial session module, mirroring
-  `flash.html`/`flash.js` below) is a separate, later piece of the same
-  campaign.
+  provisioner page must uphold).
+- `provisioner/session.js` — async Web Serial transport + session
+  orchestration (`send_recv_with_retry`, the `recv_frame` accumulation loop,
+  `find_magic_start` resync, the two-frame `QUERY_STATUS` ->
+  `RSP_STATUS`+`RSP_IDENTITY` handshake) driving `codec.js`. A fresh async
+  reimplementation of the relevant `host/src/session.rs` orchestration for
+  the browser's single-threaded event loop — `host/src/session.rs` itself is
+  read only as a reference and is never modified by this or any downstream
+  provisioner mission (see `docs/adr/0007-provisioner-codec.md`, Finding 2).
+  M1 (the walking-skeleton mission) exposes only the read-only
+  `queryStatus()`; command-frame methods (add/del contact, set pin, commit,
+  …) are later campaign milestones layered on the same retry/resync core.
+  Regression-guarded by `provisioner/session.smoke.test.mjs` (a mocked-
+  Web-Serial orchestration test — no Rust counterpart to golden-vector
+  against, unlike `codec.js`), run by `pages-check.yml`'s `check` job.
+- `provisioner/contact-uri.js` — the MeshCore companion contact-add URI
+  construction (`meshcore://contact/add?name=&public_key=&type=1`),
+  byte-for-byte hand-ported from `host/src/main.rs`'s `url_encode` +
+  URI-construction logic. Pulled out of `provisioner.js` into its own
+  DOM-free module specifically so it's testable under plain `node` —
+  `provisioner/contact-uri.test.mjs` checks it against the exact same
+  fixtures as `host/src/main.rs`'s own `#[cfg(test)]` module, run by
+  `pages-check.yml`'s `check` job.
+- `provisioner.html` + `provisioner.js` — the provisioner page itself:
+  connect over Web Serial (mirrors `flash.html`'s Chrome/Edge + HTTPS
+  guidance and unsupported-browser fallback), then render read-only
+  status/identity (via `session.js`) and a MeshCore contact QR (via
+  `contact-uri.js`). The QR itself is rendered by a major-version-pinned CDN
+  import of the `qrcode` npm package via esm.sh (pure JS, no WASM) — the same
+  single-pinned-CDN-import, no-bundler pattern `flash.html` uses for
+  esp-web-tools.
 - `styles.css` — one stylesheet, no build step. Color tokens at the top
   mirror `firmware/src/ui/theme.slint`'s `Theme` global 1:1, so the site and
   the on-device UI read as the same product. Keep them in sync if the
