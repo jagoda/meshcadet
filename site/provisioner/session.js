@@ -9,12 +9,17 @@
 // orchestration shape (see docs/adr/0007-provisioner-codec.md, Finding 2).
 //
 // M1 walking skeleton exposed only the read-only `queryStatus()` (the
-// two-frame QUERY_STATUS -> RSP_STATUS + RSP_IDENTITY handshake). M2
-// (this campaign's config child) layers the non-sensitive provisioning
-// **write** commands on top of the same `#sendRecvWithRetry`/`#recvFrame`
-// core: list-contacts/list-channels enumeration, add/del contact, add/del
-// channel, set-notif-defaults, set-device-name, and commit. PIN set/reset
-// and history export/clear remain a later (sensitive) campaign milestone.
+// two-frame QUERY_STATUS -> RSP_STATUS + RSP_IDENTITY handshake). M2's config
+// child layered the non-sensitive provisioning **write** commands on top of
+// the same `#sendRecvWithRetry`/`#recvFrame` core: list-contacts/list-channels
+// enumeration, add/del contact, add/del channel, set-notif-defaults,
+// set-device-name, and commit. M2's sensitive child (this change) adds the
+// last three — `setPin` (masked admin PIN), `exportHistory` (streamed
+// oldest-first conversation transcript), and `clearHistory` (destructive
+// erase) — upholding the ADR-0007 client-side security model: the PIN is
+// scrubbed from this module's own buffer after send and never logged, and
+// exported history (which surfaces private message text) is returned to the
+// caller only — this module never persists, transmits, or logs it.
 //
 // No build step: plain ES module, loaded directly by the browser.
 
@@ -27,12 +32,14 @@ import {
   decodeRspError,
   decodeRspContact,
   decodeRspChannel,
+  decodeRspHistoryEntry,
   encodeAddContact,
   encodeDelContact,
   encodeAddChannel,
   encodeDelChannel,
   encodeSetNotifDefaults,
   encodeSetDeviceName,
+  encodeSetPin,
   ProvError,
   FRAME_QUERY_STATUS,
   FRAME_QUERY_CONTACTS,
@@ -42,8 +49,11 @@ import {
   FRAME_ADD_CHANNEL,
   FRAME_DEL_CHANNEL,
   FRAME_SET_NOTIF_DEFAULTS,
+  FRAME_SET_PIN,
   FRAME_SET_DEVICE_NAME,
   FRAME_COMMIT_PROVISIONING,
+  FRAME_EXPORT_HISTORY,
+  FRAME_CLEAR_HISTORY,
   FRAME_RSP_STATUS,
   FRAME_RSP_IDENTITY,
   FRAME_RSP_ERROR,
@@ -52,6 +62,8 @@ import {
   FRAME_RSP_CONTACTS_DONE,
   FRAME_RSP_CHANNEL,
   FRAME_RSP_CHANNELS_DONE,
+  FRAME_RSP_HISTORY_ENTRY,
+  FRAME_RSP_HISTORY_DONE,
   MAX_RSP_HISTORY_ENTRY_PAYLOAD,
 } from "./codec.js";
 
@@ -320,6 +332,111 @@ export class ProvisionerSession {
    */
   async commit() {
     await this.#exclusive(() => this.#sendAndExpectOk(FRAME_COMMIT_PROVISIONING, new Uint8Array(0)));
+  }
+
+  /**
+   * Set (or reset) the device admin PIN. `pin` is a UTF-8 string, silently
+   * truncated to `MAX_PIN_LEN` (16) bytes by `encodeSetPin` — validate/trim
+   * upstream if you need to reject rather than truncate. Mirrors
+   * `Session::set_pin` (`host/src/session.rs`).
+   *
+   * ADR-0007 security model: the PIN is a secret. This method holds it only in
+   * the transient `payload` buffer for the duration of the send, then scrubs
+   * that buffer (`.fill(0)`) once the retry loop can no longer reference it —
+   * it is never stored on the instance, logged, placed in the URL, or written
+   * to `localStorage`/`sessionStorage`. (The caller owns the `pin` string
+   * itself; JS strings are immutable and cannot be scrubbed, so the caller
+   * should also drop its reference and clear any input field after this
+   * resolves — see `provisioner.js`'s `handleSetPin`.)
+   */
+  async setPin(pin) {
+    const payload = encodeSetPin(pin);
+    try {
+      await this.#sendAndExpectOk(FRAME_SET_PIN, payload);
+    } finally {
+      // Scrub the PIN bytes from our buffer now that no retry can re-send it.
+      payload.fill(0);
+    }
+  }
+
+  /**
+   * Clear ALL persisted conversation history on the device — every sent and
+   * received message across every DM contact and channel. Destructive and
+   * irreversible; gate behind an explicit user confirmation (see
+   * `provisioner.js`'s `handleClearHistory`). Mirrors `Session::clear_history`
+   * (`host/src/session.rs`). The erase hits flash immediately, but the
+   * device's on-screen conversation views only refresh after a reboot (they
+   * hold an in-memory copy hydrated at boot).
+   */
+  async clearHistory() {
+    await this.#sendAndExpectOk(FRAME_CLEAR_HISTORY, new Uint8Array(0));
+  }
+
+  /**
+   * Export conversation history from the device, oldest-first. Sends
+   * `FRAME_EXPORT_HISTORY`, then consumes the streamed
+   * `FRAME_RSP_HISTORY_ENTRY` frames terminated by `FRAME_RSP_HISTORY_DONE`.
+   * Mirrors `Session::export_history` (`host/src/session.rs`), including its
+   * bounded tolerance of stray well-formed replies to an *earlier* command
+   * that can still be in flight when the stream begins.
+   *
+   * Returns an array of decoded history-entry objects (see
+   * `codec.js`'s `decodeRspHistoryEntry` — each carries `is_ours`, which
+   * distinguishes a sent message from a received one since `sender_hash` is
+   * always the conversation hash regardless of direction).
+   *
+   * ADR-0007 security model: the returned entries contain **private message
+   * text**. This method returns them to the caller and does nothing else —
+   * it never logs, persists, or transmits them. The caller must keep them
+   * client-side (see `provisioner.js`'s explicit user-initiated download).
+   */
+  async exportHistory() {
+    // Retry only the initial command (a timing race is healed before the
+    // stream begins); the first frame is HISTORY_ENTRY, HISTORY_DONE, or
+    // RSP_ERROR — all handled in the loop below, mirroring the Rust version.
+    let { frameType, payload } = await this.#sendRecvWithRetry(FRAME_EXPORT_HISTORY, new Uint8Array(0));
+
+    const entries = [];
+    let strayFrames = 0;
+    const MAX_STRAY_FRAMES = 64;
+
+    while (true) {
+      if (frameType === FRAME_RSP_HISTORY_ENTRY) {
+        const entry = decodeRspHistoryEntry(payload);
+        if (entry === null) {
+          throw new Error("malformed RSP_HISTORY_ENTRY payload");
+        }
+        entries.push(entry);
+      } else if (frameType === FRAME_RSP_HISTORY_DONE) {
+        break;
+      } else if (frameType === FRAME_RSP_ERROR) {
+        throw deviceErrorFrom(payload);
+      } else if (
+        frameType === FRAME_RSP_STATUS ||
+        frameType === FRAME_RSP_IDENTITY ||
+        frameType === FRAME_RSP_OK ||
+        frameType === FRAME_RSP_CONTACT ||
+        frameType === FRAME_RSP_CONTACTS_DONE ||
+        frameType === FRAME_RSP_CHANNEL ||
+        frameType === FRAME_RSP_CHANNELS_DONE
+      ) {
+        // A leftover well-formed reply to an earlier command still draining
+        // over USB — tolerate a bounded number rather than mistaking it for a
+        // corrupted stream (mirrors export_history's stray-frame handling).
+        strayFrames += 1;
+        if (strayFrames > MAX_STRAY_FRAMES) {
+          throw new Error(
+            `too many stray non-history frames (last: 0x${hex2(frameType)}) during history export`
+          );
+        }
+      } else {
+        throw new Error(`unexpected frame 0x${hex2(frameType)} during history export`);
+      }
+      // Next streaming frame — no retry: the device is awake and streaming, so
+      // a timeout here is a genuine protocol error.
+      ({ frameType, payload } = await this.#recvFrame(FRAME_TIMEOUT_MS));
+    }
+    return entries;
   }
 
   // ── Low-level frame I/O ───────────────────────────────────────────────────
