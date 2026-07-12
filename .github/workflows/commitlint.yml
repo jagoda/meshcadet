@@ -1,19 +1,19 @@
 name: Conventional commits
 
 # Gate: every PR must have a Conventional-Commits-formatted title AND every
-# commit it carries must itself be Conventional-Commits-formatted. This
-# repo merges exclusively via signed squash-merge (ruleset 18807600 on
-# `main`), and GitHub's squash-merge commit subject defaults to the PR
-# title — so the PR-title check is what release-plz/git-cliff actually
-# parses into CHANGELOG.md (release-plz.toml + cliff.toml). The per-commit
-# check catches non-conventional commits early, before they can influence a
-# PR title edit or (if the merge method is ever changed) land verbatim.
+# commit it carries must itself be Conventional-Commits-formatted. This repo
+# merges every PR via a signed merge commit (ruleset 18807600 on `main` —
+# never squash), so every individual commit lands on `main` as-is, and
+# release-please parses Conventional Commits directly from the commit
+# history to compute versions/CHANGELOG.md entries
+# (release-please-config.json). The per-commit check catches non-
+# conventional commits early, before they can influence a PR title edit.
 #
 # `lint-commit-messages` delegates the actual rule to
 # `scripts/check-commit-format.sh` — the SAME script contributors run
 # locally before publishing a branch (see CONTRIBUTING.md "Submitting
 # changes") — so local and CI verdicts can never drift apart. That script
-# also documents/implements the release-plz own-branch exemption (see its
+# also documents/implements the release-please own-branch exemption (see its
 # header and docs/adr/0004-release-architecture.md §4); human commits remain
 # fully enforced everywhere, including on that branch.
 #
@@ -56,12 +56,11 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BRANCH_REF: ${{ github.head_ref }}
-          # release-plz's own release-PR commits are exempt on release-plz's
-          # own branch only — see scripts/check-commit-format.sh's header
-          # and docs/adr/0004-release-architecture.md §4 for the verified
-          # root cause (release-plz's commit subject can legitimately lag
-          # its PR title by one release-plz run). Local/manual runs of this
-          # same script leave this unset and check every commit
+          # release-please's own release-PR commits are exempt on
+          # release-please's own branch only — see
+          # scripts/check-commit-format.sh's header and
+          # docs/adr/0004-release-architecture.md §4. Local/manual runs of
+          # this same script leave this unset and check every commit
           # unconditionally.
-          EXEMPT_RELEASE_PLZ: "1"
+          EXEMPT_RELEASE_PLEASE: "1"
         run: scripts/check-commit-format.sh "${BASE_SHA}" "${HEAD_SHA}"

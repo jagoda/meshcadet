@@ -4,9 +4,15 @@ name = "firmware"
 # down), so this crate CANNOT use `version.workspace = true` — there is no
 # workspace root to inherit from here. This version is a hardcoded literal
 # kept in lockstep with the root `[workspace.package].version` (Cargo.toml)
-# by CI's version-drift guard (.github/workflows/ci.yml,
-# `version-drift-guard` job) since release-plz cannot cross the workspace
-# boundary to bump it directly. See docs/adr/0004-release-architecture.md.
+# by release-please's `extra-files` config (release-please-config.json),
+# which bumps both files in the same release PR — release-please cannot
+# cross the workspace boundary via `version.workspace = true` inheritance
+# (there is no workspace root here to inherit from), so it targets this
+# literal directly instead. CI's version-drift guard
+# (.github/workflows/ci.yml, `version-drift-guard` job) remains as a
+# belt-and-suspenders check in case anyone ever bumps one file by hand
+# without the other, or `extra-files` is ever misconfigured. See
+# docs/adr/0004-release-architecture.md.
 version = "0.1.0"
 edition = "2021"
 # GPLv3 — this crate is the one that forces the project-wide license choice:

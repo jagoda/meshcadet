@@ -3,12 +3,10 @@
 All notable changes to MeshCadet are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-Versioning is managed by [release-plz](https://release-plz.dev) — see
-`release-plz.toml` and `docs/adr/0004-release-architecture.md`. This project
-has not yet cut a tagged release; the entry below documents everything
-landed before release-plz's first `release vX.Y.Z` PR.
-
-## [Unreleased]
+Versioning is managed by [release-please](https://github.com/googleapis/release-please)
+— see `release-please-config.json` and `docs/adr/0004-release-architecture.md`.
+The entry below documents everything landed before release-please's first
+`chore(release): vX.Y.Z` PR.
 
 ## [0.1.0] - 2026-07-12
 

@@ -59,36 +59,33 @@ edition = "2021"
 license = "GPL-3.0-only"
 publish = false
 # ONE project-wide version for every crate in this workspace (see
-# docs/adr/0004-release-architecture.md). release-plz manages this field —
-# it opens a "release vX.Y.Z" PR that bumps it here and every member below
-# inherits it via `version.workspace = true`. The DETACHED `firmware`
+# docs/adr/0004-release-architecture.md). release-please manages this field —
+# it opens a "chore(release): vX.Y.Z" PR that bumps it here and every member
+# below inherits it via `version.workspace = true`. The DETACHED `firmware`
 # workspace (see firmware/Cargo.toml's own `[workspace]` doc) cannot be
 # reached by workspace inheritance across the boundary, so its version is
-# a separate hardcoded literal kept in lockstep by CI's version-drift guard
+# a separate hardcoded literal, bumped in the same PR via release-please's
+# `extra-files` config, kept honest by CI's version-drift guard
 # (see .github/workflows/ci.yml's `version-drift-guard` job).
 version = "0.1.0"
 
 [workspace.dependencies]
-# `version` here is required by `cargo package`'s manifest verification (any
-# workspace member packaging a `path` dependency must also give it a version
-# requirement — see the `cargo package` error this silences: "all
-# dependencies must have a version requirement specified when packaging").
-# `"*"` (not a pinned `"0.1.0"`) is deliberate: this workspace is
-# `publish = false` end to end (see `[workspace.package]` above, `git_only`
-# in `release-plz.toml`), so no real crates.io consumer ever resolves this
-# requirement against a published `protocol` — a pinned `"0.1.0"` would be
-# purely cosmetic right up until the next `[workspace.package].version` bump
-# release-plz opens, at which point it becomes a live, silent breakage:
-# verified locally that `cargo package` (and thus `cargo build`) starts
-# failing workspace-wide the moment the workspace version crosses out of the
-# pinned requirement's semver range (`^0.1.0` stops matching `0.2.0`), and
-# release-plz does NOT update this field when it bumps
-# `[workspace.package].version` (only that field and each member's own
-# `version.workspace = true`) — there is no equivalent of `firmware/
-# Cargo.toml`'s CI-enforced version-drift-guard for it. `"*"` sidesteps that
-# drift entirely: it always satisfies cargo's "a version requirement is
-# present" check regardless of what the workspace version is bumped to.
-protocol = { path = "protocol", version = "*" }
+# No `version` field: nothing in this repo's toolchain runs `cargo package`
+# or `cargo publish` against this workspace (release-please, which manages
+# `[workspace.package].version`, is pure git/GitHub-API/text-manifest
+# automation with no cargo invocation at all — see
+# docs/adr/0004-release-architecture.md §2). A prior release-plz-based setup
+# needed `version = "*"` here solely to satisfy `cargo package`'s manifest
+# verification ("all dependencies must have a version requirement specified
+# when packaging"), and that requirement turned out to be actively
+# dangerous, not just cosmetic: `cargo package`'s verify-build resolves a
+# `path` dependency's version requirement against the REAL crates.io index,
+# and `protocol` collides with an unrelated real crate of the same name
+# there (crates.io has a `protocol` package independent of this one) — `"*"`
+# silently satisfied that unrelated crate instead of failing, and any
+# workspace member's verify-build that actually depended on `protocol`
+# failed to compile against it.
+protocol = { path = "protocol" }
 
 [profile.release]
 opt-level = "z"

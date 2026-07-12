@@ -1,8 +1,8 @@
 name: release
 
 # Tag-fired production firmware release. Fires on `vX.Y.Z` tags (created by
-# release-plz once a "release vX.Y.Z" PR merges — see
-# .github/workflows/release-plz.yml + docs/adr/0004-release-architecture.md
+# release-please once a "chore(release): vX.Y.Z" PR merges — see
+# .github/workflows/release-please.yml + docs/adr/0004-release-architecture.md
 # §7/§8) and:
 #   1. verifies the tag's version matches the checked-out Cargo.toml version
 #      (the same drift-guard spirit as ci.yml's version-drift-guard job, just
@@ -63,7 +63,7 @@ jobs:
       - uses: actions/checkout@v4
 
       # Fails fast (before the expensive container build below) if the tag
-      # doesn't match what's actually checked out — the release-plz.yml /
+      # doesn't match what's actually checked out — the release-please.yml /
       # version-drift-guard contract (docs/adr/0004-release-architecture.md
       # §1) should make this impossible in practice, but a manually pushed
       # tag bypasses both, so check it here too.
@@ -79,7 +79,7 @@ jobs:
           echo "root [workspace.package].version = ${root_version}"
           echo "firmware/Cargo.toml version = ${firmware_version}"
           if [ "${version}" != "${root_version}" ] || [ "${version}" != "${firmware_version}" ]; then
-            echo "::error::Tag ${tag} does not match the checked-out workspace version (root=${root_version}, firmware=${firmware_version}). This should be impossible for a release-plz-created tag (docs/adr/0004-release-architecture.md §1's drift guard) — was this tag pushed manually?" >&2
+            echo "::error::Tag ${tag} does not match the checked-out workspace version (root=${root_version}, firmware=${firmware_version}). This should be impossible for a release-please-created tag (docs/adr/0004-release-architecture.md §1's drift guard) — was this tag pushed manually?" >&2
             exit 1
           fi
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
