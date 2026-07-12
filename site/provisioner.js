@@ -710,7 +710,10 @@ function handleDownloadTranscript() {
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
-  URL.revokeObjectURL(url);
+  // Revoke on the next macrotask, not synchronously: some browsers abort the
+  // download if the object URL is revoked before they've begun reading the
+  // blob after the click. A short deferral lets the download start first.
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
   historyStatus.textContent = "Transcript saved locally.";
 }
 
