@@ -85,7 +85,7 @@ done
 # ci.yml caches as `firmware/.embuild`); fall back to the global `~/.espressif`
 # location (embuild's other, non-project-scoped cache dir, also cached by
 # ci.yml) if the project-local one isn't where the venv landed.
-IDF_PYTHON="$(find firmware/.embuild "$HOME/.espressif" -maxdepth 4 -type d -name 'idf*_env' -print -quit 2>/dev/null)/bin/python"
+IDF_PYTHON="$(find .embuild "$HOME/.espressif" -maxdepth 4 -type d -name 'idf*_env' -print -quit 2>/dev/null)/bin/python"
 if [[ ! -x "$IDF_PYTHON" ]]; then
   echo "build.sh: could not locate the ESP-IDF python env (esptool) under firmware/.embuild or ~/.espressif" >&2
   echo "  — did the cargo build above actually invoke esp-idf-sys's ESP-IDF bootstrap?" >&2
@@ -96,12 +96,14 @@ echo "=== esptool: ${IDF_PYTHON} -m esptool ==="
 # ── Flash timing params: read from THIS build's own resolved sdkconfig, not
 # hardcoded — the ground truth for what the bootloader/app headers must
 # agree on (esp-idf-sys writes the fully-resolved config back out at
-# OUT_DIR/build/config/sdkconfig; OUT_DIR itself is a per-build content hash,
-# hence the find). Fail loudly rather than guess if a future sdkconfig change
-# picks an option this script doesn't recognize.
-SDKCONFIG_RESOLVED="$(find "${TARGET_DIR}/build" -path '*/out/build/config/sdkconfig' -print -quit 2>/dev/null)"
+# OUT_DIR/sdkconfig (plain KConfig .config format — OUT_DIR/build/config/
+# only holds the CMake-generated sdkconfig.cmake/.h/.json siblings, not this
+# file); OUT_DIR itself is a per-build content hash, hence the find). Fail
+# loudly rather than guess if a future sdkconfig change picks an option this
+# script doesn't recognize.
+SDKCONFIG_RESOLVED="$(find "${TARGET_DIR}/build" -path '*/out/sdkconfig' -print -quit 2>/dev/null)"
 if [[ -z "$SDKCONFIG_RESOLVED" ]]; then
-  echo "build.sh: could not locate the resolved sdkconfig under ${TARGET_DIR}/build/esp-idf-sys-*/out/build/config/" >&2
+  echo "build.sh: could not locate the resolved sdkconfig under ${TARGET_DIR}/build/esp-idf-sys-*/out/" >&2
   exit 1
 fi
 
