@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-only
 # scripts/check-commit-format.sh — Conventional Commits per-commit format
 # check.
 #

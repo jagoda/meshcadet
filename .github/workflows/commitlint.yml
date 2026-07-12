@@ -44,6 +44,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Self-test scripts/check-commit-format.sh
+        # Regression guard on the shared script itself (isolated throwaway
+        # repo, not this PR's commits) — a future edit that silently breaks
+        # the pass/fail/exemption logic fails loudly here instead of
+        # quietly changing what does or doesn't pass below.
+        run: scripts/check-commit-format.test.sh
+
       - name: Check every commit in this PR follows Conventional Commits
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
