@@ -49,8 +49,11 @@ building or publishing anything.
   `delContact`, `addChannel`/`delChannel`, `setNotifDefaults`,
   `setDeviceName`, and `commit` — each a thin `#sendAndExpectOk`/
   `#streamUntilDone` wrapper mirroring the correspondingly named
-  `host/src/session.rs` method. PIN set/reset and history export/clear
-  remain a later (sensitive) campaign milestone. Regression-guarded by
+  `host/src/session.rs` method. M2's sensitive-data mission adds the last
+  three: `setPin` (masked admin PIN — scrubs its own payload buffer after
+  send), `exportHistory` (streamed `RSP_HISTORY_ENTRY` -> `_DONE`, oldest-
+  first, with the same bounded stray-frame tolerance as
+  `Session::export_history`), and `clearHistory`. Regression-guarded by
   `provisioner/session.smoke.test.mjs` (a mocked-Web-Serial orchestration
   test — no Rust counterpart to golden-vector against, unlike `codec.js`),
   run by `pages-check.yml`'s `check` job.
@@ -65,11 +68,20 @@ building or publishing anything.
 - `provisioner/validation.js` — input validation for the M2 write forms:
   contact-pubkey and channel-secret hex-length checks (mirroring
   `host/src/main.rs`'s `parse_32bytes_hex`/`parse_channel_secret_hex`,
-  including the 128-bit secret's zero-pad-to-32-bytes behavior) and the
+  including the 128-bit secret's zero-pad-to-32-bytes behavior), the
   device-name byte-length check (mirroring the `Cmd::Identity` `--set-name`
-  check). DOM-free like `contact-uri.js`, so it's testable under plain
-  `node` via `provisioner/validation.test.mjs`, run by `pages-check.yml`'s
-  `check` job.
+  check), and `validatePin` (a ≤`MAX_PIN_LEN` byte check that deliberately
+  never returns the PIN itself). DOM-free like `contact-uri.js`, so it's
+  testable under plain `node` via `provisioner/validation.test.mjs`, run by
+  `pages-check.yml`'s `check` job.
+- `provisioner/history-format.js` — the DOM-free port of
+  `host/src/history_format.rs`: renders exported history entries into the
+  same fixed-width `idx  timestamp  type  dir  from  text` transcript the CLI
+  prints, so a browser-downloaded transcript reads identically. It only
+  *formats* entries (which carry private message text) — it never logs,
+  persists, or transmits them. Tested via `provisioner/history-format.test.mjs`
+  (column-alignment invariant, TZ pinned to UTC for deterministic
+  timestamps), run by `pages-check.yml`'s `check` job.
 - `provisioner.html` + `provisioner.js` — the provisioner page itself:
   connect over Web Serial (mirrors `flash.html`'s Chrome/Edge + HTTPS
   guidance and unsupported-browser fallback), then render status/identity
@@ -84,6 +96,14 @@ building or publishing anything.
   reboot-to-apply-to-the-live-mesh for contacts, first-boot-commit-reboots
   for commit). Channel deletion needs the exact secret (not just the list
   view's 1-byte hash), so it has its own form rather than a per-row button.
+  M2's sensitive-data mission adds three more sections, each upholding the
+  ADR-0007 client-side security model: a **masked admin-PIN** field (sent to
+  the device then cleared from the DOM, never in URL/storage/console); a
+  two-step **history export** (read into memory, then written to disk only on
+  an explicit "Download transcript" click — the transcript holds private
+  message text and is never auto-downloaded, transmitted, or logged); and a
+  triple-gated **clear-history** (reveal → acknowledgement checkbox → native
+  `confirm()` dialog) that surfaces the CLI's reboot-to-refresh note.
 - `styles.css` — one stylesheet, no build step. Color tokens at the top
   mirror `firmware/src/ui/theme.slint`'s `Theme` global 1:1, so the site and
   the on-device UI read as the same product. Keep them in sync if the

@@ -70,9 +70,16 @@ jobs:
       - name: validation.js's hex/byte-length checks match host/src/main.rs's CLI parsers
         # site/provisioner/validation.js is the M2 write-form counterpart to
         # host/src/main.rs's `parse_32bytes_hex`/`parse_channel_secret_hex`/
-        # the `Cmd::Identity` set-name length check — see the test file's own
-        # header.
+        # the `Cmd::Identity` set-name length check plus the sensitive-data
+        # `validatePin` (mirrors MAX_PIN_LEN) — see the test file's own header.
         run: node site/provisioner/validation.test.mjs
+
+      - name: history-format.js matches host/src/history_format.rs's transcript columns
+        # site/provisioner/history-format.js is the DOM-free port of
+        # host/src/history_format.rs (the export-history transcript renderer);
+        # this asserts the same header/data column-alignment invariant the
+        # Rust module's own tests do. See the test file's own header.
+        run: node site/provisioner/history-format.test.mjs
 
   codec-conformance:
     name: site/provisioner/codec.js matches protocol::provisioning byte-for-byte

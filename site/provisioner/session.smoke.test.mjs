@@ -22,8 +22,12 @@ import {
   encodeFrame,
   decodeFrame,
   encodeAddContact,
+  encodeSetPin,
   FRAME_QUERY_STATUS,
   FRAME_ADD_CONTACT,
+  FRAME_SET_PIN,
+  FRAME_EXPORT_HISTORY,
+  FRAME_CLEAR_HISTORY,
   FRAME_RSP_STATUS,
   FRAME_RSP_IDENTITY,
   FRAME_RSP_ERROR,
@@ -32,6 +36,10 @@ import {
   FRAME_RSP_CONTACTS_DONE,
   FRAME_RSP_CHANNEL,
   FRAME_RSP_CHANNELS_DONE,
+  FRAME_RSP_HISTORY_ENTRY,
+  FRAME_RSP_HISTORY_DONE,
+  HISTORY_MSG_TYPE_DM,
+  HISTORY_MSG_TYPE_GRP_TXT,
 } from "./codec.js";
 import { ProvisionerSession, DeviceError } from "./session.js";
 
@@ -498,6 +506,153 @@ async function concurrentCommandsAreSerialized() {
   await session.disconnect();
 }
 
+// ── Scenario 12: setPin sends FRAME_SET_PIN with the encoded PIN payload ──
+
+async function setPinSendsCorrectFrame() {
+  const written = [];
+  const { port, push } = makeFakePort((chunk) => {
+    written.push(chunk);
+    setTimeout(() => push(encodeFrame(FRAME_RSP_OK)), 5);
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  await session.setPin("1234");
+
+  assert.equal(written.length, 1);
+  const sent = decodeFrame(written[0]);
+  assert.equal(sent.frameType, FRAME_SET_PIN);
+  // Payload is pin_len(1) | pin bytes — matches encodeSetPin exactly. (The
+  // session scrubs its own copy after send; the bytes already handed to the
+  // fake writer here are the frame the device would have received.)
+  assert.deepEqual(Array.from(sent.payload), Array.from(encodeSetPin("1234")));
+
+  await session.disconnect();
+}
+
+// ── Scenario 13: exportHistory streams RSP_HISTORY_ENTRY*N -> RSP_HISTORY_DONE ─
+
+/** Wire layout: index(1) | sender_hash(1) | msg_type(1) | timestamp(4 LE) | text_len(1) | is_ours(1) | text(text_len). */
+function buildHistoryPayload(index, senderHash, msgType, timestamp, isOurs, text) {
+  const textBytes = new TextEncoder().encode(text);
+  const buf = new Uint8Array(9 + textBytes.length);
+  const view = new DataView(buf.buffer);
+  buf[0] = index;
+  buf[1] = senderHash;
+  buf[2] = msgType;
+  view.setUint32(3, timestamp, true);
+  buf[7] = textBytes.length;
+  buf[8] = isOurs ? 1 : 0;
+  buf.set(textBytes, 9);
+  return buf;
+}
+
+async function exportHistoryStreamsToDone() {
+  const { port, push } = makeFakePort(() => {
+    setTimeout(() => {
+      push(encodeFrame(FRAME_RSP_HISTORY_ENTRY, buildHistoryPayload(0, 0x11, HISTORY_MSG_TYPE_DM, 1_700_000_000, false, "hi there")));
+      push(encodeFrame(FRAME_RSP_HISTORY_ENTRY, buildHistoryPayload(1, 0x22, HISTORY_MSG_TYPE_GRP_TXT, 1_700_000_010, true, "sent one")));
+      push(encodeFrame(FRAME_RSP_HISTORY_DONE, new Uint8Array(0)));
+    }, 5);
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  const entries = await session.exportHistory();
+  assert.equal(entries.length, 2);
+  // Oldest-first, as the device streams them.
+  assert.equal(entries[0].sender_hash, 0x11);
+  assert.equal(entries[0].msg_type, HISTORY_MSG_TYPE_DM);
+  assert.equal(entries[0].is_ours, false);
+  assert.equal(entries[0].text, "hi there");
+  assert.equal(entries[1].sender_hash, 0x22);
+  assert.equal(entries[1].msg_type, HISTORY_MSG_TYPE_GRP_TXT);
+  assert.equal(entries[1].is_ours, true);
+  assert.equal(entries[1].text, "sent one");
+
+  await session.disconnect();
+}
+
+// ── Scenario 14: exportHistory tolerates a bounded stray reply, then completes ─
+
+async function exportHistoryToleratesStrayFrame() {
+  const { port, push } = makeFakePort(() => {
+    setTimeout(() => {
+      // A leftover RSP_OK (e.g. an earlier command's reply still draining)
+      // arrives before the history stream — must be tolerated, not fatal.
+      push(encodeFrame(FRAME_RSP_OK));
+      push(encodeFrame(FRAME_RSP_HISTORY_ENTRY, buildHistoryPayload(0, 0x33, HISTORY_MSG_TYPE_DM, 1_700_000_000, false, "after stray")));
+      push(encodeFrame(FRAME_RSP_HISTORY_DONE, new Uint8Array(0)));
+    }, 5);
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  const entries = await session.exportHistory();
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].text, "after stray");
+
+  await session.disconnect();
+}
+
+// ── Scenario 15: exportHistory surfaces a device RSP_ERROR ────────────────
+
+async function exportHistoryDeviceError() {
+  const { port, push } = makeFakePort(() => {
+    const msg = new TextEncoder().encode("history unavailable");
+    const payload = new Uint8Array(2 + msg.length);
+    payload[0] = 5;
+    payload[1] = msg.length;
+    payload.set(msg, 2);
+    setTimeout(() => push(encodeFrame(FRAME_RSP_ERROR, payload)), 5);
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  await assert.rejects(
+    () => session.exportHistory(),
+    (err) => {
+      assert.ok(err instanceof DeviceError);
+      assert.equal(err.errorCode, 5);
+      assert.match(err.message, /history unavailable/);
+      return true;
+    }
+  );
+
+  await session.disconnect();
+}
+
+// ── Scenario 16: clearHistory sends FRAME_CLEAR_HISTORY, expects RSP_OK ───
+
+async function clearHistorySendsCorrectFrame() {
+  const written = [];
+  const { port, push } = makeFakePort((chunk) => {
+    written.push(chunk);
+    setTimeout(() => push(encodeFrame(FRAME_RSP_OK)), 5);
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  await session.clearHistory();
+
+  assert.equal(written.length, 1);
+  const sent = decodeFrame(written[0]);
+  assert.equal(sent.frameType, FRAME_CLEAR_HISTORY);
+  assert.equal(sent.payload.length, 0);
+
+  await session.disconnect();
+}
+
 // ── Run ────────────────────────────────────────────────────────────────────
 
 const scenarios = [
@@ -512,6 +667,11 @@ const scenarios = [
   ["a write command's RSP_ERROR surfaces as DeviceError", writeCommandDeviceError],
   ["commit() resolves on RSP_OK ahead of a simulated first-boot port close", commitResolvesBeforeSimulatedReboot],
   ["concurrent command calls are serialized, not interleaved", concurrentCommandsAreSerialized],
+  ["setPin sends FRAME_SET_PIN with the encoded PIN payload", setPinSendsCorrectFrame],
+  ["exportHistory streams RSP_HISTORY_ENTRY*N -> RSP_HISTORY_DONE (oldest-first)", exportHistoryStreamsToDone],
+  ["exportHistory tolerates a bounded stray reply before the stream", exportHistoryToleratesStrayFrame],
+  ["exportHistory surfaces a device RSP_ERROR as DeviceError", exportHistoryDeviceError],
+  ["clearHistory sends FRAME_CLEAR_HISTORY and expects RSP_OK", clearHistorySendsCorrectFrame],
 ];
 
 for (const [name, fn] of scenarios) {
