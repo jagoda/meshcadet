@@ -1,11 +1,13 @@
 # ADR-0004 — Release Architecture
 
-- **Status:** Accepted (2026-07-11)
+- **Status:** Accepted (2026-07-11); §2/§3/§4 revised (2026-07-12) —
+  version/changelog/tag automation moved from release-plz to
+  release-please. See §2's "Why release-please, not release-plz" for why.
 - **Deciders:** Maintainer design review
 - **Supersedes:** —
 - **Implements:** —
-- **Code:** `release-plz.toml`, `cliff.toml`, `CHANGELOG.md`,
-  `.github/workflows/release-plz.yml`,
+- **Code:** `release-please-config.json`, `.release-please-manifest.json`,
+  `CHANGELOG.md`, `.github/workflows/release-please.yml`,
   `.github/workflows/commitlint.yml`, `scripts/check-commit-format.sh`,
   `CONTRIBUTING.md` ("Submitting changes"), `.github/workflows/ci.yml`
   (`version-drift-guard` job), `Cargo.toml` (`[workspace.package].version`),
@@ -33,9 +35,11 @@ Constraints:
   in `firmware/Cargo.toml`) — see `Cargo.toml`'s own doc comment for why
   (keeps `cargo test`/`fmt`/`clippy` at the repo root fast and
   toolchain-independent, with no `espup`/ESP-IDF install required). Any
-  tool that operates on "the Cargo workspace" (release-plz included) only
-  sees the root workspace's five crates (`protocol`, `host`, `xtask`,
-  `ui_sim`, `ui_perf`); `firmware/` is invisible to it.
+  tool that operates on "the Cargo workspace" (release-please included, when
+  it edits `Cargo.toml`) only sees the root workspace's crates; `firmware/`
+  is invisible to it — which is exactly why release-please's `extra-files`
+  config (§1) targets `firmware/Cargo.toml` explicitly, by path, rather than
+  relying on workspace discovery to find it.
 - All crates are `publish = false` (Cargo.toml `[workspace.package]`) —
   MeshCadet is an end-user firmware project, not a crates.io library
   ecosystem.
@@ -48,109 +52,112 @@ Constraints:
 
 One version number for the whole project, not one per crate. The root
 workspace declares it once — `Cargo.toml`'s `[workspace.package].version`
-— and `protocol`, `host`, `xtask`, `ui_sim`, and `ui_perf` all inherit it via
-`version.workspace = true`. release-plz manages this one field; bumping it
-bumps every root-workspace crate identically, and it opens exactly one PR
-for the whole project rather than five independent per-crate PRs.
+— and every root-workspace crate inherits it via `version.workspace = true`.
+release-please manages this one field (as of the 2026-07-12 revision — see
+below §4); bumping it bumps every root-workspace crate identically, and it
+opens exactly one PR for the whole project rather than one per crate.
 
 `firmware/Cargo.toml` cannot use `version.workspace = true` — it is its own
 detached workspace root (see Context) with nothing to inherit from. Its
-`version` field is a hardcoded literal, kept in lockstep by hand: any PR
-that bumps the root version must bump `firmware/Cargo.toml`'s version
-identically. **CI enforces this** — `.github/workflows/ci.yml`'s
-`version-drift-guard` job fails any PR where the two values disagree. This
-is the practical answer to "release-plz cannot cross the workspace
-boundary": rather than teach release-plz about a workspace it structurally
-cannot see, a small, fast, dependency-free CI check makes drift impossible
-to land unnoticed.
+`version` field is a hardcoded literal. release-please's `extra-files`
+config (`release-please-config.json`) targets it directly by TOML path
+(`$.package.version`) alongside the root workspace's own
+`$.workspace.package.version`, so both are bumped in the same release PR
+without release-please needing to cross the workspace boundary at all —
+neither file relies on the other's workspace-inheritance mechanism.
+**CI still enforces the invariant independently** —
+`.github/workflows/ci.yml`'s `version-drift-guard` job fails any PR where
+the two values disagree — as a belt-and-suspenders check against a human
+hand-editing one file without the other, or `extra-files` ever
+misconfigured, not as the primary bump mechanism.
 
-All five root-workspace crates were bumped `0.0.0` → `0.1.0` in the same
-change that wired this up, and `firmware/Cargo.toml` was bumped to match.
+All root-workspace crates were bumped `0.0.0` → `0.1.0` in the same change
+that wired this up, and `firmware/Cargo.toml` was bumped to match.
 
-### 2. release-plz: version bump + changelog PR (Implemented)
+### 2. release-please: version bump + changelog PR + tag (Implemented; revised 2026-07-12)
 
-`release-plz.toml` configures [release-plz](https://release-plz.dev) to:
-- Open (and keep up to date) a PR titled `chore(release): v{{ version }}`
-  whenever Conventional Commits land on `main` that warrant a release
-  (`release_always = false` — no PR opens for a no-op push). The title must
-  be a Conventional Commit — `.github/workflows/commitlint.yml`'s "Lint PR
-  title" job enforces this on every release-plz PR, same as any other PR —
-  because it's what actually reaches `main` (squash-merge). The title does
-  **not** reliably double as the release commit's message on every run: see
-  §4 for the verified mechanism and why "Lint commit messages" exempts
-  release-plz's own commits instead of relying on the title matching.
-- Regenerate `CHANGELOG.md` via `cliff.toml` (git-cliff, Keep a Changelog
-  shape — see §3).
-- **Never publish to crates.io** (`publish = false`, on top of every
-  crate's own `publish = false`) and **never open its own GitHub Release**
-  object (`git_release_enable = false`) — the tag it creates
-  (`git_tag_enable`, default on) is consumed by the production firmware
-  release workflow (§5, not yet implemented), which publishes the
-  user-facing Release itself. Two separate "release" objects on the same
-  tag — an empty crate release and the real firmware release — would be
-  confusing; there is exactly one.
-- Skip semver-checking (`semver_check = false`): with every crate
-  unpublished, there is no crates.io baseline to diff against.
-- **Track releases via git tag, not the crates.io registry**
-  (`git_only = true`) — this is load-bearing, not cosmetic: release-plz's
-  `Publishable` check treats every `publish = false` crate as entirely out
-  of scope for version/changelog tracking *unless* it is also marked
-  `git_only`. Without it, `release-plz update`/`release-pr` silently
-  processed zero packages on every run (verified with `release-plz update
-  -vv`, which logged `version groups: {}` unconditionally) — this is what
-  caused the first-release bootstrap gap: `release-pr` always produced
-  `{"prs":[]}` on `main`, regardless of what commits landed, because no
-  package was ever considered for a bump in the first place.
-- **Write to the single root `CHANGELOG.md`, not a per-crate one**
-  (`changelog_path = "CHANGELOG.md"`) — without this, release-plz's default
-  (a changelog next to each crate's own `Cargo.toml`) would produce six
-  independent `<crate>/CHANGELOG.md` files, one per root-workspace member,
-  contradicting the single project-wide changelog this section describes.
+`release-please-config.json` + `.release-please-manifest.json` configure
+[release-please](https://github.com/googleapis/release-please)
+(`.github/workflows/release-please.yml`, `googleapis/release-please-action`)
+to open (and keep up to date) a PR titled `chore(release): vX.Y.Z` whenever
+Conventional Commits land on `main` that warrant a release, and — in the
+same workflow run that detects such a PR was just merged — create the
+`vX.Y.Z` git tag consumed by the production firmware release workflow (§7).
+It never publishes to crates.io and never opens its own GitHub Release
+object (`skip-github-release: true`) — the production firmware release
+workflow owns the user-facing Release for a given tag (§7); two separate
+"release" objects on the same tag would be redundant and confusing.
 
-`.github/workflows/release-plz.yml` runs two jobs on every push to `main`:
-`release-plz-pr` (open/update the version+changelog PR) and
-`release-plz-release` (tag `main` `vX.Y.Z` once such a PR has been merged).
-Both are no-ops when there's nothing new to do, so running them
-unconditionally on every push to `main` is safe.
+**Why release-please, not release-plz (this section's original tool):**
+release-plz's `git_only` mode — needed because every crate here is
+`publish = false` end to end, so there is no crates.io baseline to version
+against — unconditionally runs `cargo package --workspace` to materialize
+each package's manifest, and that step requires every `path` dependency,
+even to a workspace-internal sibling that will never be published, to
+resolve against the *real* crates.io index. Verified two ways: reading
+`release_plz_core`'s `next_ver.rs` source, and reproducing the exact
+failure with plain `cargo package --workspace` outside release-plz
+entirely. Two independent failure modes followed from this: (a) a
+never-published crate name with no collision on crates.io fails outright
+("no matching package found"), and (b) a never-published crate name that
+*does* collide with an unrelated real crate of the same name (this
+project's `protocol`) silently resolves against that wrong crate and fails
+to compile — a live bug, not a hypothetical one, confirmed by reproducing
+it directly. Separately, release-plz's tag-creation command
+(`release_plz_core::project::Project::publishable_packages()`) filters
+candidate packages by each crate's own Cargo.toml `publish` field, which is
+`false` everywhere in this project (`cargo metadata` confirms
+`"publish": []` on every crate) — meaning release-plz could never create
+the release tag automatically, regardless of `git_only`, regardless of
+merge-vs-squash. (This is almost certainly the real cause behind v0.1.0's
+tag needing manual bootstrapping, a fact this ADR's §4 investigation had
+attributed to squash-merge instead.) release-please has neither failure
+mode: it is pure git/GitHub-API/text-manifest automation and never invokes
+`cargo` at all.
 
-### 3. Changelog: git-cliff from Conventional Commits (Implemented)
+`release-please-config.json` uses the `simple` release-type (not the
+built-in `rust`/cargo-workspace strategy — that strategy requires the root
+`Cargo.toml` to have its own `[package]` table and writes literal
+`[package].version` into every member, neither of which fits this repo's
+pure-`[workspace]` root + `version.workspace = true` inheritance shape) with
+an `extra-files` entry per §1 targeting `Cargo.toml`'s
+`$.workspace.package.version` and `firmware/Cargo.toml`'s `$.package.version`
+directly by TOML path.
 
-`cliff.toml` groups commits by Conventional Commit type into Keep a
-Changelog sections (`feat` → Added, `fix` → Fixed, `perf` → Performance,
-`refactor` → Changed, `revert` → Reverted, `docs` → Documentation).
-Internal bookkeeping commit types (`chore`, `ci`, `build`, `style`, `test`,
-and release-plz's own `chore(release)` commits) are filtered out of the
-user-facing changelog entirely.
+### 3. Changelog: release-please from Conventional Commits (Implemented; revised 2026-07-12)
 
-`CHANGELOG.md`'s existing hand-written header (everything up to and
-including the `## [Unreleased]` heading line) is preserved as-is: release-plz
-only ever rewrites the file below that heading, never the header above/
-including it. **Verified mechanism (not a rename):** on the first
-release-plz PR, release-plz does not edit the `[Unreleased]` heading text in
-place — it inserts a freshly git-cliff-generated `## [0.1.0] - <date>`
-section immediately *after* it, and everything that was already below
-`[Unreleased]` (this project's hand-written "Initial public release"
-prose/bullets) is carried forward unchanged, landing after the generated
-section. Net effect for this project: `[Unreleased]` ends up empty (correct,
-ready for whatever lands next) and the hand-written release notes end up
-nested under the new `[0.1.0]` heading (also correct, since nothing else
-separates them) — but that requires the pre-existing `[Unreleased]` heading
-to be *bare* (no trailing text) going in; this project's original heading was
-`## [Unreleased] — Initial public release`, which release-plz's header
-parser (`changelog_parser::parse_header`) happily matches and freezes
-verbatim, including the trailing text — so it would have persisted,
-unchanged and increasingly stale, on every future unreleased section. This
-PR retitles it to a bare `## [Unreleased]` by hand, once, ahead of
-release-plz's first run.
+`release-please-config.json`'s `changelog-sections` groups commits by
+Conventional Commit type into the same Keep a Changelog sections the
+original git-cliff-based setup used (`feat` → Added, `fix` → Fixed, `perf` →
+Performance, `refactor` → Changed, `revert` → Reverted, `docs` →
+Documentation). Internal bookkeeping commit types (`chore`, `ci`, `build`,
+`style`, `test`) are marked `hidden: true` and filtered out of the
+user-facing changelog entirely. `cliff.toml`/git-cliff is no longer part of
+this pipeline — release-please has its own built-in changelog generator and
+never reads it — so it was removed rather than left as dead config.
+
+`CHANGELOG.md`'s hand-written header (the `# Changelog` title + Keep a
+Changelog blurb) is preserved; release-please inserts each new release's
+entry immediately above the most recent existing `## [x.y.z]`-style heading
+it finds, never touching content above that. One format difference from
+the removed git-cliff setup: release-please has no concept of a
+perpetually-empty `## [Unreleased]` placeholder heading — it accumulates
+pending commits in its own PR/manifest state instead, so the standalone
+`## [Unreleased]` heading was removed from `CHANGELOG.md` as part of this
+revision (its presence would otherwise have been misdetected as a version
+heading by release-please's changelog updater, since its heading-match regex
+treats a bare `[` the same as a leading digit).
 
 ### 4. Conventional-commit CI gate (Implemented)
 
 `.github/workflows/commitlint.yml` runs on every PR:
 - **`lint-pr-title`** — the PR title must itself be a Conventional Commit
-  (`amannn/action-semantic-pull-request`). This is the check that matters
-  most in practice: this repo squash-merges exclusively, and GitHub's
-  squash-merge commit subject defaults to the PR title, so the PR title
-  *is* what git-cliff parses into `CHANGELOG.md`.
+  (`amannn/action-semantic-pull-request`). release-please parses the
+  individual commits reachable from `main` since the last release tag
+  directly (not the PR title) into `CHANGELOG.md` entries/version bumps, so
+  this check's job is to keep the PR title itself — the thing a human
+  actually reads on the Pull Requests list and in `git log --merges` —
+  honest and consistent with the commits it summarizes.
 - **`lint-commit-messages`** — every individual commit in the PR must also
   be a Conventional Commit: it invokes `scripts/check-commit-format.sh` (a
   small dependency-free bash regex check against `git rev-list base..head`),
@@ -164,57 +171,39 @@ release-plz's first run.
   non-conventional commits before a title edit can paper over them, and
   remains correct if the merge method is ever changed away from squash.
   Coverage boundary: this covers commits published through the interactive
-  PR-prep flow (mission/feature branches); release-plz's own auto-generated
-  release-branch commits are exempted here (see below) and handled
-  separately.
+  PR-prep flow (mission/feature branches); release-please's own
+  auto-generated release-branch commits are exempted here (see below) and
+  handled separately.
 
 `ci.yml`'s existing three jobs (`test`, `fmt`, `clippy`) are untouched and
 stay required; `commitlint.yml` and the new `version-drift-guard` job are
 additive gates, not replacements.
 
-**release-plz's own release-commit subject is exempt (verified root cause,
-2026-07-12):** `release-plz.toml`'s `pr_name` template was originally
-believed to drive both the release PR's title AND the commit release-plz
-pushes to its own branch (release_plz_core's `Pr::title` reused as the
-commit message). That's only half true. Reading `release_plz_core-0.36.15`
-(pinned by `.github/workflows/release-plz.yml`'s `release-plz/action@v0.5`,
-and the latest release-plz version as of this writing — there is no newer
-release to pin instead):
-- `command::release_pr::create_pr`/`github_create_release_branch` — the
-  path taken the FIRST time a release PR is opened — commit the freshly
-  rendered `pr.title` verbatim. `pr_name` controls this commit correctly.
-- `command::release_pr::update_pr`/`github_force_push` — the path taken on
-  every SUBSEQUENT push that updates an *already-open* release PR — commit
-  `opened_pr.title` instead: the PR's title as fetched from GitHub, i.e.
-  from BEFORE this run's `pr_name` template re-render. The freshly rendered
-  title (`new_pr.title`) is only used afterward, to `edit_pr` the PR
-  object's title metadata. So on every update after the first, the commit
-  subject lags one release-plz run behind the PR's actual (and visibly
-  correct) title.
-
-This was caught empirically on this repo's first release PR (#10): after
-`pr_name` was changed from `"release v{{ version }}"` to `"chore(release):
-v{{ version }}"`, the next release-plz run correctly updated PR #10's
-*title* to `chore(release): v0.1.0` (visible immediately, "Lint PR title"
-went green) but force-pushed a commit whose subject was still `release
-v0.1.0` — the PR's pre-change title — failing "Lint commit messages". No
-`release-plz.toml` knob and no available release-plz version fixes this; it
-is a fixed property of `update_pr`'s stale-title reuse.
-`scripts/check-commit-format.sh` therefore exempts commits that are BOTH on
-release-plz's own branch (`pr_branch_prefix`) AND authored by its bot
-identity (`github-actions[bot]`) from the Conventional Commits format check
-— but ONLY when invoked with `EXEMPT_RELEASE_PLZ=1` (`commitlint.yml`'s
-`lint-commit-messages` job sets this; local/manual runs of the script for
-the pre-PR-publish step in `CONTRIBUTING.md` leave it unset, which is
-correct — release-plz's own commits never pass through that interactive
-flow, see §4's coverage-boundary note above) — leaving human-commit
-enforcement, on that branch and everywhere else, unchanged.
+**release-please's own release-commit subject is exempt, defensively:**
+the prior release-plz-based setup had a verified, specific bug here —
+release-plz's `update_pr` code path committed the release PR's *previous*
+title on every push after the first, so its commit subject could legitimately
+lag its own (correct, visibly-updated) PR title by one automation run. That
+investigation is what motivated exempting the tool's own bot commits from
+this check in the first place, rather than relying on the PR title alone.
+release-please's own branch/commit state machine has not been read/verified
+to the same depth, so the exemption is kept rather than assumed unnecessary:
+`scripts/check-commit-format.sh` exempts commits that are BOTH on
+release-please's own branch (`release-please--branches--<target-branch>`)
+AND authored by its bot identity (`github-actions[bot]`) from the
+Conventional Commits format check — but ONLY when invoked with
+`EXEMPT_RELEASE_PLEASE=1` (`commitlint.yml`'s `lint-commit-messages` job
+sets this; local/manual runs of the script for the pre-PR-publish step in
+`CONTRIBUTING.md` leave it unset, which is correct — release-please's own
+commits never pass through that interactive flow, see §4's coverage-boundary
+note above) — leaving human-commit enforcement, on that branch and
+everywhere else, unchanged.
 
 ### 5. Squash-merge satisfies `required_signatures` (Implemented — ruleset re-verified/re-added)
 
 This repo requires every commit on `main` to carry `required_signatures`,
 but also merges exclusively via **squash**-merge through the GitHub UI, and
-release-plz's own bot commits on its PR branch are **not** signed. Those two
+release-please's own bot commits on its PR branch are **not** signed. Those two
 facts are compatible for a specific reason, worth spelling out because it
 is not obvious from either policy alone:
 
@@ -223,7 +212,7 @@ is not obvious from either policy alone:
 > branch. That commit is authored and signed by GitHub's own web-flow
 > identity (`GitHub <noreply@github.com>`, GitHub's own GPG/SSH signing
 > key) — it is not a fast-forward of any commit that existed on the PR
-> branch. The individual commits on the PR branch (including release-plz's
+> branch. The individual commits on the PR branch (including release-please's
 > unsigned bot commits) never themselves land on `main`; only the
 > synthesized, GitHub-signed squash commit does.
 
@@ -259,10 +248,10 @@ this repo's first tag exists. This is the seam the tag-fired release workflow
 ### 7. Tag-fired production build + artifacts (Implemented)
 
 `.github/workflows/release.yml` fires on `v*.*.*` tag pushes (created by
-release-plz per §2). It first re-verifies the tag's version against the
+release-please per §2). It first re-verifies the tag's version against the
 checked-out `Cargo.toml`/`firmware/Cargo.toml` (belt-and-suspenders on top of
 §1's drift guard, in case a tag is ever pushed by hand rather than by
-release-plz), then builds default-feature (no `diagnostics`, no `hil`)
+release-please), then builds default-feature (no `diagnostics`, no `hil`)
 production firmware inside the pinned release container (§8), merges
 bootloader (`0x0`) + the custom `partition-table.bin` carrying `mc_hist`
 (`0x8000`) + the app image (`0x10000`, `factory`) into one flashable image via
@@ -325,13 +314,13 @@ design and its Alternatives Considered.
   maintainer typed" — it is now a CI-enforced invariant tied to the root
   workspace version. Bumping one without the other is a build failure, not
   a silent drift.
-- release-plz's bot commits are deliberately left unsigned; the security
+- release-please's bot commits are deliberately left unsigned; the security
   property this project relies on lives entirely in the squash-merge +
   `required_signatures` mechanism (§5), not in the bot's own signing setup.
   If the merge method policy on ruleset `18807600` is ever loosened to
   allow non-squash merges of unreviewed branches, this property needs
   re-examination.
-- `firmware/` remains fully outside release-plz's reach by design (see
+- `firmware/` remains fully outside release-please's reach by design (see
   Context) — every future piece of this architecture that touches firmware
   versioning must go through the drift-guard pattern established in §1,
   not attempt to fold `firmware/` into the root workspace.
@@ -340,7 +329,7 @@ design and its Alternatives Considered.
 
 ### A. Merge `firmware/` into the root Cargo workspace
 
-Would let release-plz manage `firmware/Cargo.toml`'s version directly with
+Would let release-please manage `firmware/Cargo.toml`'s version directly with
 no drift guard needed. Rejected: this is the exact coupling
 `Cargo.toml`'s workspace-split doc comment and `ci.yml`'s "why no firmware
 job" doc already reject — pulling `firmware/` into the root workspace would
@@ -357,10 +346,10 @@ were already in place for this repo's other rules (`deletion`,
 `required_signatures` to the existing ruleset keeps all `main`-branch policy
 in one place instead of splitting it across two mechanisms.
 
-### C. Let release-plz open a GitHub Release itself
+### C. Let release-please open a GitHub Release itself
 
 Rejected per §2: the production firmware workflow (§7) needs to own the
 Release object for a given `vX.Y.Z` tag (it's where the flashable
-image/manifest/checksums live) — a second, empty release-plz-created
+image/manifest/checksums live) — a second, empty release-please-created
 Release on the same tag would be redundant and confusing to a downloading
 user.

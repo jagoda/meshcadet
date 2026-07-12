@@ -1,0 +1,48 @@
+name: release-please
+
+# Opens/updates a "chore(release): vX.Y.Z" PR (version bump + CHANGELOG.md)
+# from Conventional Commits landed on `main`, and — in the SAME run that
+# detects such a PR was just merged — creates the `vX.Y.Z` git tag that
+# fires the (separate, later) production firmware release workflow. See
+# docs/adr/0004-release-architecture.md for the full release architecture
+# and release-please-config.json/.release-please-manifest.json for the
+# versioning/changelog config this workflow runs.
+#
+# No crates.io publish happens from this workflow, and it never invokes
+# `cargo` at all: release-please is pure git/GitHub-API/text-manifest
+# automation (no `cargo package`/`cargo publish` step exists to gate on
+# `publish = false`, unlike the release-plz-based setup this replaced).
+# `skip-github-release: true` (release-please-config.json) means this
+# workflow only ever creates the tag, never a GitHub Release object — the
+# production firmware release workflow (.github/workflows/release.yml) owns
+# that, publishing the flashable image/manifest/checksums for the tag.
+#
+# Unlike the release-plz-based setup this replaced (two separate jobs, one
+# for "open/update the PR", one for "tag on merge"), release-please-action
+# does both in a single step: it detects on every run whether the current
+# state of `main` is an unreleased accumulation of commits (open/update the
+# PR) or a just-merged release PR (create the tag), so one job covers both.
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: release-please (PR + tag)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run release-please
+        uses: googleapis/release-please-action@v5
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

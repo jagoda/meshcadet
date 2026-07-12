@@ -5,7 +5,7 @@
 #
 # Exercises the three behaviors that gate matters most for (a passing
 # all-conventional range, a clearly-failing non-conventional commit, and the
-# release-plz exemption being opt-in rather than default-on) against an
+# release-please exemption being opt-in rather than default-on) against an
 # isolated throwaway git repo, so a future edit to the shared script can't
 # silently regress either CI or the local pre-PR-publish step it backs. Run
 # directly (`scripts/check-commit-format.test.sh`) or via
@@ -49,20 +49,20 @@ if ! grep -q "oops no type" "${tmpdir}/out.log"; then
   exit 1
 fi
 
-# Case 3: the release-plz exemption is opt-in, not default — the same
-# non-conventional-looking release-plz commit fails without
-# EXEMPT_RELEASE_PLZ/BRANCH_REF set (the local/manual mode this script
+# Case 3: the release-please exemption is opt-in, not default — the same
+# non-conventional-looking release-please commit fails without
+# EXEMPT_RELEASE_PLEASE/BRANCH_REF set (the local/manual mode this script
 # defaults to) and passes once CI's opt-in env vars are supplied.
-git checkout -q -b release-plz-test "${base}"
+git checkout -q -b release-please--branches--main "${base}"
 git -c user.name="github-actions[bot]" -c user.email="bot@example.com" \
   commit -q --allow-empty -m "release v9.9.9"
 if "${check}" "${base}" HEAD >"${tmpdir}/out.log" 2>&1; then
-  echo "FAIL: expected a release-plz commit to fail WITHOUT the exemption enabled" >&2
+  echo "FAIL: expected a release-please commit to fail WITHOUT the exemption enabled" >&2
   cat "${tmpdir}/out.log" >&2
   exit 1
 fi
-if ! EXEMPT_RELEASE_PLZ=1 BRANCH_REF=release-plz-test "${check}" "${base}" HEAD >"${tmpdir}/out.log" 2>&1; then
-  echo "FAIL: expected a release-plz commit to pass WITH the exemption enabled" >&2
+if ! EXEMPT_RELEASE_PLEASE=1 BRANCH_REF=release-please--branches--main "${check}" "${base}" HEAD >"${tmpdir}/out.log" 2>&1; then
+  echo "FAIL: expected a release-please commit to pass WITH the exemption enabled" >&2
   cat "${tmpdir}/out.log" >&2
   exit 1
 fi

@@ -40,13 +40,10 @@ protocol = { workspace = true }
 # this root-workspace crate (host-testable, `protocol`-only, no Slint), this
 # crate depends on the real thing instead of maintaining a parallel port —
 # closing the drift risk `render_logic`'s own module doc used to carry. See
-# `docs/adr/0005-firmware-core-extraction.md`.
-# `version = "*"` is required by `cargo package`'s manifest verification
-# (see `Cargo.toml`'s `[workspace.dependencies].protocol` doc comment for the
-# full rationale) — `firmware-core` is only path-depended-on here, so it gets
-# its own local `version` field rather than a `[workspace.dependencies]`
-# entry that would exist for a single consumer.
-firmware-core = { path = "../firmware-core", version = "*" }
+# `docs/adr/0005-firmware-core-extraction.md`. No `version` field: nothing in
+# this repo's toolchain runs `cargo package`/`cargo publish` (see
+# `Cargo.toml`'s `[workspace.dependencies].protocol` doc comment).
+firmware-core = { path = "../firmware-core" }
 
 [build-dependencies]
 # Added for its EFFECT on the host compilation graph (software-renderer/image

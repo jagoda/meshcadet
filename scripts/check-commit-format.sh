@@ -27,15 +27,17 @@
 # Run with no arguments from a mission/feature branch before `git push` /
 # `gh pr create` — that is the "pre-PR-publish" step this script exists for.
 #
-# release-plz exemption (CI-only; leave unset for local/manual use):
-# release-plz's own release-PR commit subject can legitimately lag its PR
-# title by one release-plz run and is exempted from this check on its own
-# branch — see docs/adr/0004-release-architecture.md §4 for the verified
-# root cause. Set EXEMPT_RELEASE_PLZ=1 and BRANCH_REF=<branch under test> to
-# enable it (commitlint.yml does this). The interactive PR-prep flow this
-# script's default/local mode covers never carries release-plz's own
-# commits, so local runs leave this exemption off and check every commit
-# unconditionally.
+# release-please exemption (CI-only; leave unset for local/manual use):
+# release-please's own release-PR commits are exempted from this check on
+# its own branch — its branch/PR-title state machine is opaque to this
+# script, and the same "commit subject can legitimately lag the PR's
+# current title by one automation run" caution that applied to the
+# release-plz-based setup this replaced is treated as still applying here
+# rather than assumed away. Set EXEMPT_RELEASE_PLEASE=1 and
+# BRANCH_REF=<branch under test> to enable it (commitlint.yml does this).
+# The interactive PR-prep flow this script's default/local mode covers
+# never carries release-please's own commits, so local runs leave this
+# exemption off and check every commit unconditionally.
 set -euo pipefail
 
 # type(scope)!: subject — scope optional, "!" (breaking) optional. Kept
@@ -44,8 +46,13 @@ set -euo pipefail
 # duplicating the pattern, so local and CI verdicts cannot drift apart.
 pattern='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-zA-Z0-9_./-]+\))?!?: .+'
 
-release_plz_branch_prefix='release-plz-'
-release_plz_bot_author='github-actions[bot]'
+# release-please's default branch name for the release PR, single-component
+# manifest mode, target branch `main`: `release-please--branches--main`
+# (src/util/branch-name.ts's `DefaultBranchName`/`ofTargetBranch`). Matched
+# as a prefix (not exact) so a future multi-target-branch config still
+# matches (`release-please--branches--<other-branch>`).
+release_please_branch_prefix='release-please--branches--'
+release_please_bot_author='github-actions[bot]'
 
 base="${1:-$(git merge-base HEAD origin/main)}"
 head="${2:-HEAD}"
@@ -56,10 +63,10 @@ for sha in $(git rev-list "${base}..${head}"); do
   subject="$(git log -1 --format=%s "${sha}")"
   author="$(git log -1 --format=%an "${sha}")"
 
-  if [[ "${EXEMPT_RELEASE_PLZ:-0}" == "1" \
-        && "${BRANCH_REF:-}" == "${release_plz_branch_prefix}"* \
-        && "${author}" == "${release_plz_bot_author}" ]]; then
-    echo "Skipping release-plz automated commit ${sha}: \"${subject}\""
+  if [[ "${EXEMPT_RELEASE_PLEASE:-0}" == "1" \
+        && "${BRANCH_REF:-}" == "${release_please_branch_prefix}"* \
+        && "${author}" == "${release_please_bot_author}" ]]; then
+    echo "Skipping release-please automated commit ${sha}: \"${subject}\""
     continue
   fi
 

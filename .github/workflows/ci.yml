@@ -94,13 +94,15 @@ jobs:
     name: firmware/Cargo.toml version matches workspace version
     runs-on: ubuntu-latest
     # `firmware/` is a DETACHED workspace (see Cargo.toml's own doc comment
-    # and firmware/Cargo.toml's `[workspace]` table) — release-plz manages
-    # the ONE version at the root `[workspace.package].version` and cannot
-    # cross the workspace boundary to bump firmware/Cargo.toml's hardcoded
-    # `version` field too (docs/adr/0004-release-architecture.md). This job
-    # is the guard that keeps the two in lockstep: it fails loudly on any PR
-    # that bumps one without the other, instead of the drift going unnoticed
-    # until release time.
+    # and firmware/Cargo.toml's `[workspace]` table) — release-please manages
+    # the ONE version at the root `[workspace.package].version` and, via its
+    # `extra-files` config (release-please-config.json), also bumps
+    # firmware/Cargo.toml's hardcoded `version` field in the same release PR
+    # (docs/adr/0004-release-architecture.md). This job is a belt-and-
+    # suspenders guard that keeps the two in lockstep regardless: it fails
+    # loudly on any PR that bumps one without the other — whether that's a
+    # human hand-editing one file, or `extra-files` ever misfiring — instead
+    # of the drift going unnoticed until release time.
     steps:
       - uses: actions/checkout@v4
 
@@ -112,7 +114,7 @@ jobs:
           echo "root [workspace.package].version = ${root_version}"
           echo "firmware/Cargo.toml [package].version = ${firmware_version}"
           if [ "${root_version}" != "${firmware_version}" ]; then
-            echo "::error::Version drift: root workspace is ${root_version} but firmware/Cargo.toml is ${firmware_version}. firmware/ is a detached workspace (see Cargo.toml doc) — release-plz cannot bump it directly, so it must be bumped by hand in the same PR as any root version change." >&2
+            echo "::error::Version drift: root workspace is ${root_version} but firmware/Cargo.toml is ${firmware_version}. firmware/ is a detached workspace (see Cargo.toml doc) — release-please's extra-files config should keep these in lockstep automatically; if you bumped one by hand, bump the other to match in the same PR." >&2
             exit 1
           fi
 
