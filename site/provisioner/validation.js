@@ -15,7 +15,7 @@
 // No build step: plain ES module, loaded directly by the browser or by
 // `node` for the test.
 
-import { hexToBytes, MAX_NAME_LEN } from "./codec.js";
+import { hexToBytes, MAX_NAME_LEN, MAX_PIN_LEN } from "./codec.js";
 
 const HEX_ONLY_RE = /^[0-9a-fA-F]*$/;
 
@@ -90,4 +90,31 @@ export function validateDeviceName(input) {
     return { ok: false, error: `device name must be at most ${MAX_NAME_LEN} bytes (UTF-8); got ${byteLen} bytes` };
   }
   return { ok: true, name };
+}
+
+/**
+ * Validate an admin PIN.
+ * Mirrors the device-side `MAX_PIN_LEN` (16) bound that `encode_set_pin`
+ * enforces (`protocol/src/provisioning.rs`) — at most 16 bytes UTF-8 (a BYTE
+ * length, not a character count). Rejects an empty PIN rather than silently
+ * setting a blank one; rejects an over-length PIN rather than silently
+ * truncating it (the wire encoder would truncate, which would set a PIN the
+ * user didn't intend — safer to refuse here).
+ *
+ * Deliberately does NOT return or echo the PIN in the result (it's a secret):
+ * on success it returns only `{ ok: true }`, leaving the caller's own `pin`
+ * reference as the single copy to send and then drop.
+ *
+ * Returns `{ ok: true }` or `{ ok: false, error }`.
+ */
+export function validatePin(input) {
+  const pin = input ?? "";
+  const byteLen = new TextEncoder().encode(pin).length;
+  if (byteLen === 0) {
+    return { ok: false, error: "PIN is required" };
+  }
+  if (byteLen > MAX_PIN_LEN) {
+    return { ok: false, error: `PIN must be at most ${MAX_PIN_LEN} bytes (UTF-8); got ${byteLen} bytes` };
+  }
+  return { ok: true };
 }

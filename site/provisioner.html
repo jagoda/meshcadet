@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Provision MeshCadet — device status and provisioning over Web Serial</title>
-  <meta name="description" content="Connect a MeshCadet T-Deck Plus over USB, read its live provisioning status, identity, and MeshCore contact QR, and manage contacts/channels/notification defaults/device name — straight from your browser, no toolchain install required." />
+  <meta name="description" content="Connect a MeshCadet T-Deck Plus over USB, read its live provisioning status, identity, and MeshCore contact QR, manage contacts/channels/notification defaults/device name, set the admin PIN, and export or clear conversation history — straight from your browser, no toolchain install required. Everything runs client-side; nothing is uploaded." />
 
   <!-- All paths below are relative (no leading "/") — this is a GitHub Pages
        PROJECT site served under /meshcadet/, not a root site. A root-rooted
@@ -37,10 +37,11 @@
           <h1>Provision Mesh<span>Cadet</span></h1>
           <p class="tagline">
             Connect a T-Deck Plus over USB to read its live provisioning
-            status and identity, scan a MeshCore contact QR, and manage
-            contacts, channels, notification defaults, and the device
-            name — straight from your browser. Everything below runs
-            entirely client-side; nothing is sent to a server.
+            status and identity, scan a MeshCore contact QR, manage contacts,
+            channels, notification defaults, and the device name, set the
+            admin PIN, and export or clear conversation history — straight
+            from your browser. Everything below runs entirely client-side;
+            nothing is sent to a server.
           </p>
         </div>
       </div>
@@ -248,6 +249,75 @@
             <button id="commit-button" class="btn btn-primary" type="button">Commit provisioning</button>
           </div>
           <p id="commit-status" class="muted form-status" role="status"></p>
+        </div>
+
+        <div class="flash-panel" id="pin-panel" hidden>
+          <h2>8. Admin PIN</h2>
+          <p>
+            Set (or reset) the PIN that unlocks the on-device admin menu.
+            Physical USB possession is the authentication factor — resetting
+            the PIN needs no old PIN, just the device in your hand.
+          </p>
+          <form id="set-pin-form" class="inline-form footnote" autocomplete="off">
+            <label class="version-label" for="set-pin-input">New PIN (≤16 bytes UTF-8)</label>
+            <input id="set-pin-input" class="text-input mono" type="password" autocomplete="off" placeholder="••••" />
+            <p class="muted">
+              Handled entirely in this browser: the PIN is sent straight to the
+              device over USB and is never written to the page URL, browser
+              storage, the console, or any server. It's cleared from this field
+              as soon as it's sent.
+            </p>
+            <div class="cta-row">
+              <button id="set-pin-button" class="btn btn-primary" type="submit">Set PIN</button>
+            </div>
+            <p id="set-pin-status" class="muted form-status" role="status"></p>
+          </form>
+        </div>
+
+        <div class="flash-panel" id="history-panel" hidden>
+          <h2>9. Export conversation history</h2>
+          <p>
+            Read every stored message (DMs and channels), oldest-first, and
+            save it as a local text file.
+          </p>
+          <p class="muted">
+            <strong>Privacy:</strong> the export contains the full text of
+            private conversations. It is read into this browser and offered to
+            you as a download only — nothing is uploaded, transmitted, or
+            logged. A file is written only when you click
+            <em>Download transcript</em>.
+          </p>
+          <div class="cta-row">
+            <button id="history-read-button" class="btn btn-primary" type="button">Read history from device</button>
+            <button id="history-download-button" class="btn btn-ghost" type="button" hidden>Download transcript</button>
+          </div>
+          <p id="history-status" class="muted form-status" role="status"></p>
+        </div>
+
+        <div class="flash-panel" id="clear-history-panel" hidden>
+          <h2>10. Clear conversation history</h2>
+          <p>
+            Permanently erase <strong>all</strong> stored messages — every DM
+            and channel conversation — from the device's flash.
+          </p>
+          <div class="cta-row">
+            <button id="clear-history-button" class="btn btn-danger" type="button">Clear all history…</button>
+          </div>
+          <div id="clear-history-confirm" class="warn-box" hidden>
+            <p>
+              <strong>This cannot be undone.</strong> Every sent and received
+              message across all conversations will be wiped from the device.
+            </p>
+            <label class="checkbox-label">
+              <input id="clear-history-ack" type="checkbox" />
+              I understand this permanently erases all conversation history.
+            </label>
+            <div class="cta-row">
+              <button id="clear-history-confirm-button" class="btn btn-danger" type="button" disabled>Erase history now</button>
+              <button id="clear-history-cancel-button" class="btn btn-ghost" type="button">Cancel</button>
+            </div>
+          </div>
+          <p id="clear-history-status" class="muted form-status" role="status"></p>
         </div>
 
         <p class="muted">
