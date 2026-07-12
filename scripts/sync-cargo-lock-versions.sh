@@ -46,33 +46,60 @@
 # rather than mis-patch).
 set -euo pipefail
 
-if [[ ! -f Cargo.toml || ! -f Cargo.lock ]]; then
-  echo "error: run this from the repo root (Cargo.toml/Cargo.lock not found in $(pwd))" >&2
+# Under GitHub Actions, `::error::` renders as a Checks-tab annotation
+# instead of a plain log line — same treatment
+# scripts/check-commit-format.sh already gives its own error output.
+die() {
+  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    echo "::error::$*" >&2
+  else
+    echo "error: $*" >&2
+  fi
   exit 1
+}
+
+if [[ ! -f Cargo.toml || ! -f Cargo.lock ]]; then
+  die "run this from the repo root (Cargo.toml/Cargo.lock not found in $(pwd))"
 fi
 
 new_version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
 if [[ -z "${new_version}" ]]; then
-  echo "error: could not read [workspace.package].version from Cargo.toml" >&2
-  exit 1
+  die "could not read [workspace.package].version from Cargo.toml"
 fi
 
 # Root workspace member crate names, derived from Cargo.toml's `members`
 # array (not hardcoded) so this script stays correct if crates are ever
-# added/removed.
-members_line="$(grep -m1 '^members = ' Cargo.toml)"
+# added/removed. Only handles the single-line `members = [...]` form
+# Cargo.toml currently uses — fails loudly below rather than silently
+# skipping the root lockfile if that ever changes (e.g. reformatted to a
+# multi-line array).
+members_line="$(grep -m1 -E '^members = \[.*\]$' Cargo.toml || true)"
+if [[ -z "${members_line}" ]]; then
+  die "could not find a single-line \"members = [...]\" array in Cargo.toml — this script doesn't understand a multi-line members array; update it if Cargo.toml's format changed"
+fi
 mapfile -t member_paths < <(sed -E 's/^members = \[(.*)\]$/\1/' <<<"${members_line}" | tr ',' '\n' | tr -d ' "')
 
 declare -a root_names=()
 for path in "${member_paths[@]}"; do
   [[ -z "${path}" ]] && continue
-  root_names+=("$(grep -m1 '^name = ' "${path}/Cargo.toml" | sed -E 's/name = "(.*)"/\1/')")
+  name="$(grep -m1 '^name = ' "${path}/Cargo.toml" | sed -E 's/name = "(.*)"/\1/')"
+  if [[ -z "${name}" ]]; then
+    die "could not read [package].name from ${path}/Cargo.toml"
+  fi
+  root_names+=("${name}")
 done
+
+if [[ "${#root_names[@]}" -eq 0 ]]; then
+  die "parsed zero workspace members out of Cargo.toml's \"members = [...]\" line — refusing to run and silently skip the root Cargo.lock sync"
+fi
 
 # firmware/'s own crate name — its version is a hardcoded literal bumped
 # separately by release-please's extra-files config, but its Cargo.lock
 # entry needs the same lockstep treatment.
 firmware_name="$(grep -m1 '^name = ' firmware/Cargo.toml | sed -E 's/name = "(.*)"/\1/')"
+if [[ -z "${firmware_name}" ]]; then
+  die "could not read [package].name from firmware/Cargo.toml"
+fi
 
 changed_any=0
 
@@ -90,12 +117,10 @@ sync_one() {
   match_count="$(grep -c "^name = \"${name}\"$" "${lockfile}" || true)"
 
   if [[ "${match_count}" -eq 0 ]]; then
-    echo "error: ${lockfile}: no [[package]] entry named \"${name}\" found" >&2
-    exit 1
+    die "${lockfile}: no [[package]] entry named \"${name}\" found"
   fi
   if [[ "${match_count}" -gt 1 ]]; then
-    echo "error: ${lockfile}: ${match_count} [[package]] entries named \"${name}\" — expected exactly 1 (this script only handles unambiguous local crate names)" >&2
-    exit 1
+    die "${lockfile}: ${match_count} [[package]] entries named \"${name}\" — expected exactly 1 (this script only handles unambiguous local crate names)"
   fi
 
   local name_line version_line
@@ -104,16 +129,14 @@ sync_one() {
   local version_text
   version_text="$(sed -n "${version_line}p" "${lockfile}")"
   if [[ ! "${version_text}" =~ ^version\ =\ \" ]]; then
-    echo "error: ${lockfile}:${version_line}: expected a \"version = ...\" line directly after \"${name}\"'s name line, got: ${version_text}" >&2
-    exit 1
+    die "${lockfile}:${version_line}: expected a \"version = ...\" line directly after \"${name}\"'s name line, got: ${version_text}"
   fi
 
   local source_line=$((version_line + 1))
   local source_text
   source_text="$(sed -n "${source_line}p" "${lockfile}")"
   if [[ "${source_text}" == source\ =\ * ]]; then
-    echo "error: ${lockfile}:${name_line}: \"${name}\" has a \"source =\" line — that's a registry package, not a local workspace member; refusing to touch it" >&2
-    exit 1
+    die "${lockfile}:${name_line}: \"${name}\" has a \"source =\" line — that's a registry package, not a local workspace member; refusing to touch it"
   fi
 
   local target_line="version = \"${new_version}\""

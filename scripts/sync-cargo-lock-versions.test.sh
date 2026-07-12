@@ -186,4 +186,25 @@ if ! grep -q 'registry package, not a local workspace member' "${tmpdir}/case4.l
   exit 1
 fi
 
+# --- Case 5: fail loud rather than silently skip the root lockfile if
+# Cargo.toml's `members = [...]` array isn't the single-line form this
+# script parses (e.g. reformatted to multi-line) — a real regression this
+# would otherwise hide, since an unparsed member list means an empty
+# root_names loop that "succeeds" having synced nothing.
+fixture="${tmpdir}/case5"
+write_fixture "${fixture}" "0.1.0"
+sed -i 's/version = "0.1.0"/version = "0.2.0"/' "${fixture}/Cargo.toml"
+# Reformat `members = [...]` onto multiple lines.
+perl -0pi -e 's/members = \["protocol", "host"\]/members = [\n  "protocol",\n  "host",\n]/' "${fixture}/Cargo.toml"
+if (cd "${fixture}" && "${sync}") >"${tmpdir}/case5.log" 2>&1; then
+  echo "FAIL: expected sync to fail on a multi-line members array instead of silently syncing nothing" >&2
+  cat "${tmpdir}/case5.log" >&2
+  exit 1
+fi
+if ! grep -q 'members = \[\.\.\.\]' "${tmpdir}/case5.log"; then
+  echo "FAIL: expected a clear error naming the members-array parsing limitation" >&2
+  cat "${tmpdir}/case5.log" >&2
+  exit 1
+fi
+
 echo "sync-cargo-lock-versions.test.sh: all cases passed"
