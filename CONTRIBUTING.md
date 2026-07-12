@@ -100,6 +100,18 @@ manual verification checklist used before landing changes in these areas.
 4. No real cryptographic material (identity seeds, channel secrets, peer
    public keys) in commits, issues, or PR descriptions — ever. Use obvious
    dummy values in examples and test fixtures.
+5. **Required, before `git push` / `gh pr create`:** run
+   `scripts/check-commit-format.sh` from the repo root. It validates every
+   commit your branch has added since it diverged from `main` against the
+   same Conventional Commits rule `.github/workflows/commitlint.yml`'s
+   "Lint commit messages" job enforces in CI (both invoke this one script —
+   see the script's own header) — so a non-conventional commit (e.g. an
+   un-squashed WIP/checkpoint commit) is caught locally instead of showing
+   up as a red check after the PR is already open. Also give the PR title
+   itself a Conventional Commits prefix (`feat: …`, `fix: …`, etc.) when you
+   run `gh pr create` — CI lints that separately (`lint-pr-title`), and on
+   this squash-merge-only repo the PR title becomes the commit subject that
+   lands on `main`.
 
 ## Reporting security issues
 
