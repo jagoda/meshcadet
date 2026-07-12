@@ -9,6 +9,11 @@ name: Conventional commits
 # check catches non-conventional commits early, before they can influence a
 # PR title edit or (if the merge method is ever changed) land verbatim.
 #
+# `lint-commit-messages` exempts release-plz's own automated commits on its
+# own release branch (see the job for why, and docs/adr/0004-release-
+# architecture.md §4) — human commits remain fully enforced everywhere,
+# including on that branch.
+#
 # See docs/adr/0004-release-architecture.md for how this fits the release
 # architecture, and https://www.conventionalcommits.org/ for the spec.
 
@@ -40,13 +45,42 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.head_ref }}
         run: |
           set -euo pipefail
           # type(scope)!: subject — scope optional, "!" (breaking) optional.
           pattern='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-zA-Z0-9_./-]+\))?!?: .+'
+
+          # release-plz's own release-PR commits are exempt (see
+          # docs/adr/0004-release-architecture.md §4 "release-plz's own
+          # release-commit subject is exempt"): release-plz 0.36.15 (the
+          # `release_plz_core` pinned by `release-plz/action@v0.5`, latest
+          # as of this writing) force-pushes an *existing, already-open*
+          # release PR's branch using the PR's title from BEFORE this run's
+          # recomputation (`opened_pr.title`, not the freshly re-rendered
+          # `new_pr.title` — see release_plz_core's
+          # `command::release_pr::{update_pr,github_force_push}`), so the
+          # commit subject can legitimately lag one release-plz run behind
+          # `release-plz.toml`'s `pr_name` template, including — as observed
+          # on this repo's first release PR — predating the template's
+          # introduction entirely. Neither a newer release-plz release nor
+          # any `release-plz.toml` knob controls this; it is a fixed
+          # property of how release-plz updates an already-open PR. Only
+          # commits that are BOTH on release-plz's own branch
+          # (`release-plz.toml`'s `pr_branch_prefix`) AND authored by its
+          # bot identity are exempted; a human commit landing on that same
+          # branch is still fully linted.
+          release_plz_branch_prefix='release-plz-'
+          release_plz_bot_author='github-actions[bot]'
+
           fail=0
           for sha in $(git rev-list "${BASE_SHA}..${HEAD_SHA}"); do
             subject="$(git log -1 --format=%s "${sha}")"
+            author="$(git log -1 --format=%an "${sha}")"
+            if [[ "${HEAD_REF}" == "${release_plz_branch_prefix}"* && "${author}" == "${release_plz_bot_author}" ]]; then
+              echo "Skipping release-plz automated commit ${sha}: \"${subject}\""
+              continue
+            fi
             if ! [[ "${subject}" =~ ${pattern} ]]; then
               echo "::error::Commit ${sha} is not a Conventional Commit: \"${subject}\""
               fail=1

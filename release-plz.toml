@@ -91,15 +91,30 @@ dependencies_update = false
 # next to it.
 git_release_enable = false
 
-# `pr_name` becomes BOTH the release PR's title AND the release commit's
-# message (release-plz's Pr::title is reused verbatim as the commit subject
-# it pushes to the release branch — see release_plz_core::command::release_pr
-# `force_push`/`github_create_release_branch`, which both commit
-# `&pr.title`). commitlint.yml's "Lint PR title" and "Lint commit messages"
-# jobs both require a Conventional Commits subject
-# (`type(scope)?: description`), so this template must render one. It
-# deliberately matches cliff.toml's `^chore\(release\)` skip rule below, so
-# release-plz's own release commits stay out of the user-facing CHANGELOG.md
-# (they're bookkeeping, not a user-facing change).
+# `pr_name` controls the release PR's TITLE — the thing that actually lands
+# on `main`, since this repo squash-merges exclusively and GitHub's
+# squash-merge commit subject defaults to the PR title. It does NOT reliably
+# control the commit release-plz pushes to its own branch on every run: only
+# on the FIRST push for a new release PR does release_plz_core commit
+# `&pr.title` (this template's freshly rendered value —
+# `command::release_pr::create_pr`/`github_create_release_branch`). On every
+# SUBSEQUENT push that updates an already-open release PR,
+# `update_pr`/`github_force_push` instead commit `&opened_pr.title` — the
+# PR's title from BEFORE this run's recomputation — so the release branch's
+# commit subject can legitimately lag one release-plz run behind this
+# template. (Verified: PR #10's release commit stayed `release v0.1.0` for
+# one full run after this template was introduced, even though the PR title
+# itself updated correctly to `chore(release): v0.1.0` in that same run.)
+# Neither a newer release-plz release nor any config knob changes this; it's
+# a fixed property of how release-plz updates an already-open PR.
+# commitlint.yml's "Lint commit messages" job exempts release-plz's own
+# automated commits on its own branch for exactly this reason (human commits
+# on that branch are still fully linted) — see that workflow and
+# docs/adr/0004-release-architecture.md §4. This template still matters for
+# the PR title: commitlint.yml's "Lint PR title" job requires it to be a
+# Conventional Commits subject, and it deliberately matches cliff.toml's
+# `^chore\(release\)` skip rule below, so release-plz's own release commits
+# stay out of the user-facing CHANGELOG.md (they're bookkeeping, not a
+# user-facing change).
 pr_name = "chore(release): v{{ version }}"
 pr_branch_prefix = "release-plz-"
