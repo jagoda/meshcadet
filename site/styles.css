@@ -383,6 +383,85 @@ esp-web-install-button {
   word-break: break-all;
 }
 
+/* ── Web provisioner writes (M2: contacts/channels/notif-defaults/commit) ── */
+
+.inline-form h3 {
+  font-size: 14px;
+  margin: 0 0 8px;
+  color: var(--text-primary);
+}
+
+.inline-form + .inline-form {
+  margin-top: 24px;
+  padding-top: 16px;
+  border-top: 1px solid var(--surface-alt);
+}
+
+.text-input {
+  display: block;
+  width: 100%;
+  max-width: 480px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  border-radius: 6px;
+  border: 1px solid var(--surface-alt);
+  background: var(--surface-raised);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 14px;
+}
+
+.text-input.mono {
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  color: var(--text-secondary);
+  margin-bottom: 12px;
+}
+
+.form-status {
+  margin-top: 8px !important;
+  min-height: 1.4em;
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 16px;
+  font-size: 13px;
+}
+
+.data-table th,
+.data-table td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--surface-alt);
+}
+
+.data-table th {
+  color: var(--text-secondary);
+  font-weight: 600;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.data-table td {
+  color: var(--text-primary);
+  word-break: break-word;
+}
+
+.data-table .btn {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
 /* ── Footer ─────────────────────────────────────────────────────────── */
 
 .footer {
