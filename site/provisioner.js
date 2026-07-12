@@ -1,5 +1,8 @@
-// provisioner.js — UI glue for provisioner.html (M1 walking skeleton):
-// Web Serial connect -> read-only status/identity + MeshCore contact QR.
+// provisioner.js — UI glue for provisioner.html: Web Serial connect ->
+// status/identity + MeshCore contact QR (M1), plus the M2 non-sensitive
+// provisioning **writes**: contact/channel list+add/remove, notification
+// defaults, device-name set, and commit. PIN set/reset and history
+// export/clear remain a later (sensitive) campaign milestone.
 //
 // No build step (site/README.md convention): plain ES module, loaded
 // directly by the browser. The QR library is a major-version-pinned CDN
@@ -10,13 +13,17 @@
 //
 // Client-side security model (docs/adr/0007-provisioner-codec.md): no
 // analytics/telemetry, nothing sent to a server (GitHub Pages is fully
-// static), no secrets in this M1 skeleton (pubkey/device name/status counters
-// are not secret — PIN/channel-secret handling is a later campaign
-// milestone that must uphold the same model then).
+// static). The one secret this milestone introduces — a generated channel
+// secret — is created with `crypto.getRandomValues` and only ever placed in
+// this page's own form field / sent to the device over the already-open
+// serial connection; it is never logged, never placed in the URL, and never
+// written to `localStorage`/`sessionStorage`. PIN/history handling is a
+// later campaign milestone that must uphold the same model then.
 
-import { ProvisionerSession } from "./provisioner/session.js";
+import { ProvisionerSession, DeviceError } from "./provisioner/session.js";
 import { bytesToHex } from "./provisioner/codec.js";
 import { buildContactUri } from "./provisioner/contact-uri.js";
+import { validatePubkeyHex, validateChannelSecretHex, validateDeviceName } from "./provisioner/validation.js";
 import QRCode from "https://esm.sh/qrcode@1.5.3";
 
 const unsupportedPanel = document.getElementById("unsupported-panel");
@@ -42,6 +49,50 @@ const fields = {
   gpsClock: document.getElementById("stat-gps-clock"),
 };
 
+// ── M2 write-surface DOM refs ─────────────────────────────────────────────
+
+const setNameForm = document.getElementById("set-name-form");
+const setNameInput = document.getElementById("set-name-input");
+const setNameButton = document.getElementById("set-name-button");
+const setNameStatus = document.getElementById("set-name-status");
+
+const contactsPanel = document.getElementById("contacts-panel");
+const contactsTableBody = document.getElementById("contacts-table-body");
+const addContactForm = document.getElementById("add-contact-form");
+const addContactPubkey = document.getElementById("add-contact-pubkey");
+const addContactName = document.getElementById("add-contact-name");
+const addContactTelemetry = document.getElementById("add-contact-telemetry");
+const addContactButton = document.getElementById("add-contact-button");
+const addContactStatus = document.getElementById("add-contact-status");
+
+const channelsPanel = document.getElementById("channels-panel");
+const channelsTableBody = document.getElementById("channels-table-body");
+const addChannelForm = document.getElementById("add-channel-form");
+const addChannelSecret = document.getElementById("add-channel-secret");
+const addChannelName = document.getElementById("add-channel-name");
+const addChannelPrimary = document.getElementById("add-channel-primary");
+const addChannelButton = document.getElementById("add-channel-button");
+const addChannelStatus = document.getElementById("add-channel-status");
+const genChannel128Button = document.getElementById("gen-channel-128-button");
+const genChannel256Button = document.getElementById("gen-channel-256-button");
+const delChannelForm = document.getElementById("del-channel-form");
+const delChannelSecret = document.getElementById("del-channel-secret");
+const delChannelButton = document.getElementById("del-channel-button");
+const delChannelStatus = document.getElementById("del-channel-status");
+
+const notifPanel = document.getElementById("notif-panel");
+const notifForm = document.getElementById("notif-form");
+const notifVisual = document.getElementById("notif-visual");
+const notifAudible = document.getElementById("notif-audible");
+const notifSaveButton = document.getElementById("notif-save-button");
+const notifStatus = document.getElementById("notif-status");
+
+const commitPanel = document.getElementById("commit-panel");
+const commitButton = document.getElementById("commit-button");
+const commitStatus = document.getElementById("commit-status");
+
+const writePanels = [contactsPanel, channelsPanel, notifPanel, commitPanel];
+
 const session = new ProvisionerSession();
 
 function setStatus(message) {
@@ -63,6 +114,30 @@ if (!ProvisionerSession.isSupported() || !ProvisionerSession.isSecureContext()) 
   // `setStatus`/`textContent`) instead of leaving the default in place.
   disconnectButton.addEventListener("click", () => handleDisconnect());
   refreshButton.addEventListener("click", handleRefresh);
+
+  setNameForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    handleSetName();
+  });
+  addContactForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    handleAddContact();
+  });
+  addChannelForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    handleAddChannel();
+  });
+  delChannelForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    handleDelChannel();
+  });
+  genChannel128Button.addEventListener("click", () => handleGenerateChannelSecret(16));
+  genChannel256Button.addEventListener("click", () => handleGenerateChannelSecret(32));
+  notifForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    handleSetNotifDefaults();
+  });
+  commitButton.addEventListener("click", handleCommit);
 
   // If the OS reports the connected device physically unplugged, tear down
   // the session instead of leaving the UI showing stale "connected" state.
@@ -104,6 +179,9 @@ async function handleConnect() {
   connectButton.hidden = true;
   disconnectButton.hidden = false;
   refreshButton.hidden = false;
+  for (const panel of writePanels) {
+    panel.hidden = false;
+  }
   await queryAndRender();
 }
 
@@ -115,7 +193,38 @@ async function handleDisconnect(message = "Disconnected.") {
   refreshButton.hidden = true;
   statusPanel.hidden = true;
   qrPanel.hidden = true;
+  for (const panel of writePanels) {
+    panel.hidden = true;
+  }
+  clearFormStatuses();
   setStatus(message);
+}
+
+/**
+ * Disable `button` for the duration of `fn()`, always re-enabling it
+ * afterward (success or failure). `session.js` already serializes
+ * concurrent command calls (`ProvisionerSession#exclusive`) so a double
+ * click can't desync the wire protocol, but leaving a submit button live
+ * mid-request invites confusing duplicate submissions and overlapping
+ * status messages — this is the UX half of that guard, applied the same
+ * way `commitButton`/`refreshButton` already disable themselves.
+ */
+async function withButtonDisabled(button, fn) {
+  button.disabled = true;
+  try {
+    return await fn();
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function clearFormStatuses() {
+  setNameStatus.textContent = "";
+  addContactStatus.textContent = "";
+  addChannelStatus.textContent = "";
+  delChannelStatus.textContent = "";
+  notifStatus.textContent = "";
+  commitStatus.textContent = "";
 }
 
 async function handleRefresh() {
@@ -129,6 +238,7 @@ async function queryAndRender() {
     const { status, identity } = await session.queryStatus();
     renderStatus(status, identity);
     await renderQr(identity);
+    await refreshLists();
     setStatus(`Last read at ${new Date().toLocaleTimeString()}.`);
   } catch (err) {
     console.error("MeshCadet provisioner: query_status failed", err);
@@ -136,6 +246,41 @@ async function queryAndRender() {
   } finally {
     refreshButton.disabled = false;
   }
+}
+
+/** Re-read the contact/channel staging lists and re-render both tables. */
+async function refreshLists() {
+  try {
+    const contacts = await session.listContacts();
+    renderContacts(contacts);
+  } catch (err) {
+    console.error("MeshCadet provisioner: list_contacts failed", err);
+    setTableMessage(contactsTableBody, 5, `Couldn't read contacts: ${err.message || err}`);
+  }
+  try {
+    const channels = await session.listChannels();
+    renderChannels(channels);
+  } catch (err) {
+    console.error("MeshCadet provisioner: list_channels failed", err);
+    setTableMessage(channelsTableBody, 5, `Couldn't read channels: ${err.message || err}`);
+  }
+}
+
+/**
+ * Replace `tbody`'s contents with a single full-width message row.
+ * Built via `textContent` (not `innerHTML`) so a device-supplied string
+ * embedded in `message` (e.g. a `DeviceError`'s error text) can never be
+ * interpreted as markup.
+ */
+function setTableMessage(tbody, colspan, message) {
+  tbody.replaceChildren();
+  const tr = document.createElement("tr");
+  const td = document.createElement("td");
+  td.colSpan = colspan;
+  td.className = "muted";
+  td.textContent = message;
+  tr.appendChild(td);
+  tbody.appendChild(tr);
 }
 
 // ── Status/identity rendering ─────────────────────────────────────────────
@@ -188,5 +333,242 @@ async function renderQr(identity) {
   } catch (err) {
     console.error("MeshCadet provisioner: QR render failed", err);
     qrCanvas.hidden = true;
+  }
+}
+
+// ── Set device name (identity --set-name) ────────────────────────────────
+
+async function handleSetName() {
+  const validated = validateDeviceName(setNameInput.value);
+  if (!validated.ok) {
+    setNameStatus.textContent = validated.error;
+    return;
+  }
+  await withButtonDisabled(setNameButton, async () => {
+    setNameStatus.textContent = "Setting name…";
+    try {
+      await session.setDeviceName(validated.name);
+      setNameStatus.textContent = validated.name ? `Device name set: "${validated.name}"` : "Device name cleared.";
+      await queryAndRender(); // re-read identity/QR so the new name shows immediately
+    } catch (err) {
+      reportWriteError(setNameStatus, "set device name", err);
+    }
+  });
+}
+
+// ── Contacts (list-contacts / add-contact / del-contact) ─────────────────
+//
+// Field selection mirrors the host CLI's `list-contacts`/`add-contact`
+// output (host/src/main.rs) — idx, pubkey, telemetry flag, name. Rows are
+// built with `createElement`/`textContent` (never `innerHTML`) since
+// `display_name` is a device-supplied UTF-8 string this page must not treat
+// as markup.
+
+function renderContacts(contacts) {
+  contactsTableBody.replaceChildren();
+  if (contacts.length === 0) {
+    setTableMessage(contactsTableBody, 5, "No contacts configured.");
+    return;
+  }
+  for (const c of contacts) {
+    const tr = document.createElement("tr");
+    tr.appendChild(textCell(String(c.index)));
+    tr.appendChild(textCell(bytesToHex(c.pubkey), "mono"));
+    tr.appendChild(textCell(c.telemetry_enable ? "yes" : "no"));
+    tr.appendChild(textCell(c.display_name || "(unnamed)"));
+    const actionsTd = document.createElement("td");
+    const removeButton = document.createElement("button");
+    removeButton.type = "button";
+    removeButton.className = "btn btn-ghost";
+    removeButton.textContent = "Remove";
+    removeButton.addEventListener("click", () => handleDelContact(c.pubkey, removeButton));
+    actionsTd.appendChild(removeButton);
+    tr.appendChild(actionsTd);
+    contactsTableBody.appendChild(tr);
+  }
+}
+
+function textCell(text, className) {
+  const td = document.createElement("td");
+  if (className) {
+    td.className = className;
+  }
+  td.textContent = text;
+  return td;
+}
+
+async function handleAddContact() {
+  const pubkeyResult = validatePubkeyHex(addContactPubkey.value);
+  if (!pubkeyResult.ok) {
+    addContactStatus.textContent = pubkeyResult.error;
+    return;
+  }
+  await withButtonDisabled(addContactButton, async () => {
+    addContactStatus.textContent = "Adding contact…";
+    try {
+      await session.addContact(pubkeyResult.bytes, addContactTelemetry.checked, addContactName.value);
+      addContactStatus.textContent =
+        "Contact added. Note: reboot the device to apply this to the live mesh (allowlist + telemetry gate are loaded at boot).";
+      addContactForm.reset();
+      await refreshLists();
+    } catch (err) {
+      reportWriteError(addContactStatus, "add contact", err);
+    }
+  });
+}
+
+async function handleDelContact(pubkey, removeButton) {
+  await withButtonDisabled(removeButton, async () => {
+    try {
+      await session.delContact(pubkey);
+      addContactStatus.textContent = `Contact removed: ${bytesToHex(pubkey).slice(0, 8)}…`;
+      await refreshLists();
+    } catch (err) {
+      reportWriteError(addContactStatus, "remove contact", err);
+    }
+  });
+}
+
+// ── Channels (list-channels / add-channel / del-channel) ─────────────────
+//
+// Channel removal needs the exact secret (not the 1-byte hash the list
+// shows) so there is no per-row "Remove" button here — see del-channel-form
+// in provisioner.html.
+
+function renderChannels(channels) {
+  channelsTableBody.replaceChildren();
+  if (channels.length === 0) {
+    setTableMessage(channelsTableBody, 5, "No channels configured.");
+    return;
+  }
+  for (const ch of channels) {
+    const tr = document.createElement("tr");
+    tr.appendChild(textCell(String(ch.index)));
+    tr.appendChild(textCell(`0x${ch.channel_hash.toString(16).toUpperCase().padStart(2, "0")}`, "mono"));
+    tr.appendChild(textCell(String(ch.key_len * 8)));
+    tr.appendChild(textCell(ch.primary ? "yes" : "no"));
+    tr.appendChild(textCell(ch.name || "(unnamed)"));
+    channelsTableBody.appendChild(tr);
+  }
+}
+
+/**
+ * Fill `add-channel-secret` with a fresh, locally generated secret.
+ * `bytesLen` is 16 (128-bit) or 32 (256-bit). Uses `crypto.getRandomValues`
+ * (never `Math.random`) — the generated secret is placed only into this
+ * page's own form field and, on submit, sent directly to the device over
+ * the already-open serial connection; it is never logged, placed in the
+ * URL, or written to `localStorage`/`sessionStorage`.
+ */
+function handleGenerateChannelSecret(bytesLen) {
+  const raw = new Uint8Array(bytesLen);
+  crypto.getRandomValues(raw);
+  addChannelSecret.value = bytesToHex(raw);
+  addChannelStatus.textContent =
+    "Generated locally — copy this secret somewhere safe now; it's the only way to remove this channel later.";
+}
+
+async function handleAddChannel() {
+  const secretResult = validateChannelSecretHex(addChannelSecret.value);
+  if (!secretResult.ok) {
+    addChannelStatus.textContent = secretResult.error;
+    return;
+  }
+  await withButtonDisabled(addChannelButton, async () => {
+    addChannelStatus.textContent = "Adding channel…";
+    try {
+      await session.addChannel(secretResult.bytes, secretResult.keyLen, addChannelPrimary.checked, addChannelName.value);
+      addChannelStatus.textContent = "Channel added.";
+      addChannelForm.reset();
+      await refreshLists();
+    } catch (err) {
+      reportWriteError(addChannelStatus, "add channel", err);
+    }
+  });
+}
+
+async function handleDelChannel() {
+  const secretResult = validateChannelSecretHex(delChannelSecret.value);
+  if (!secretResult.ok) {
+    delChannelStatus.textContent = secretResult.error;
+    return;
+  }
+  await withButtonDisabled(delChannelButton, async () => {
+    delChannelStatus.textContent = "Removing channel…";
+    try {
+      await session.delChannel(secretResult.bytes);
+      delChannelStatus.textContent = "Channel removed.";
+      delChannelForm.reset();
+      await refreshLists();
+    } catch (err) {
+      reportWriteError(delChannelStatus, "remove channel", err);
+    }
+  });
+}
+
+// ── Notification defaults (set-notif-defaults) ────────────────────────────
+//
+// Write-only, mirroring the CLI: there is no QUERY_STATUS field for the
+// current defaults, so this form always starts unchecked rather than
+// reflecting device state.
+
+async function handleSetNotifDefaults() {
+  await withButtonDisabled(notifSaveButton, async () => {
+    notifStatus.textContent = "Saving…";
+    try {
+      await session.setNotifDefaults(notifVisual.checked, notifAudible.checked);
+      notifStatus.textContent = `Notification defaults set: visual=${notifVisual.checked}, audible=${notifAudible.checked}`;
+    } catch (err) {
+      reportWriteError(notifStatus, "set notification defaults", err);
+    }
+  });
+}
+
+// ── Commit provisioning ───────────────────────────────────────────────────
+
+async function handleCommit() {
+  await withButtonDisabled(commitButton, async () => {
+    commitStatus.textContent = "Committing…";
+    try {
+      await session.commit();
+      commitStatus.textContent =
+        "Provisioning committed — config persisted to flash. If this was the device's first commit, it will now reboot into the mesh; reconnect once it's back up.";
+    } catch (err) {
+      if (err instanceof DeviceError) {
+        // A genuine firmware-reported failure (e.g. NVS save failed) — the
+        // firmware never reboots in this path, so this is a real failure to
+        // surface, not the benign reboot-and-USB-re-enumerate race below.
+        console.error("MeshCadet provisioner: commit failed", err);
+        commitStatus.textContent = `Couldn't commit: ${err.message}`;
+      } else {
+        // A transport-level failure here (read/write error, port already
+        // tearing down) is indistinguishable from the expected first-boot
+        // reboot-and-USB-re-enumerate race (firmware/src/provisioning_server.rs
+        // sends RSP_OK, dwells 250ms specifically to outrun it, THEN calls
+        // esp_restart()) — treat it as the benign case rather than surfacing a
+        // failure banner for what is very likely a successful commit. The
+        // `navigator.serial` "disconnect" listener above will report the
+        // resulting disconnect on its own, same as any other unplug.
+        console.warn("MeshCadet provisioner: commit connection closed (likely a first-boot reboot)", err);
+        commitStatus.textContent =
+          "Provisioning committed — the connection closed right after, which is expected on a device's first commit (it reboots into the mesh). Reconnect once it's back up.";
+      }
+    }
+  });
+}
+
+// ── Shared write-error reporting ──────────────────────────────────────────
+
+/**
+ * Render a caught write-command error into `statusEl`. `DeviceError` (the
+ * firmware's own RSP_ERROR) gets its message as-is; anything else (timeout,
+ * transport failure) gets a generic prefix naming the attempted action.
+ */
+function reportWriteError(statusEl, action, err) {
+  console.error(`MeshCadet provisioner: ${action} failed`, err);
+  if (err instanceof DeviceError) {
+    statusEl.textContent = `Couldn't ${action}: ${err.message}`;
+  } else {
+    statusEl.textContent = `Couldn't ${action}: ${(err && err.message) || err}`;
   }
 }

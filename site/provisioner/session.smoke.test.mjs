@@ -21,11 +21,17 @@ import assert from "node:assert/strict";
 import {
   encodeFrame,
   decodeFrame,
+  encodeAddContact,
   FRAME_QUERY_STATUS,
+  FRAME_ADD_CONTACT,
   FRAME_RSP_STATUS,
   FRAME_RSP_IDENTITY,
   FRAME_RSP_ERROR,
   FRAME_RSP_OK,
+  FRAME_RSP_CONTACT,
+  FRAME_RSP_CONTACTS_DONE,
+  FRAME_RSP_CHANNEL,
+  FRAME_RSP_CHANNELS_DONE,
 } from "./codec.js";
 import { ProvisionerSession, DeviceError } from "./session.js";
 
@@ -285,6 +291,213 @@ async function unexpectedFrameAfterStatus() {
   await session.disconnect();
 }
 
+// ── Scenario 6: listContacts streams RSP_CONTACT*N -> RSP_CONTACTS_DONE ──
+
+function buildContactPayload(index, pubkeyByte, telemetry, name) {
+  const nameBytes = new TextEncoder().encode(name);
+  const buf = new Uint8Array(35 + nameBytes.length);
+  buf[0] = index;
+  buf.fill(pubkeyByte, 1, 33);
+  buf[33] = telemetry ? 1 : 0;
+  buf[34] = nameBytes.length;
+  buf.set(nameBytes, 35);
+  return buf;
+}
+
+async function listContactsStreamsToDone() {
+  const { port, push } = makeFakePort(() => {
+    setTimeout(() => {
+      push(encodeFrame(FRAME_RSP_CONTACT, buildContactPayload(0, 0xaa, true, "Alice")));
+      push(encodeFrame(FRAME_RSP_CONTACT, buildContactPayload(1, 0xbb, false, "Bob")));
+      push(encodeFrame(FRAME_RSP_CONTACTS_DONE, new Uint8Array(0)));
+    }, 5);
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  const contacts = await session.listContacts();
+  assert.equal(contacts.length, 2);
+  assert.equal(contacts[0].index, 0);
+  assert.equal(contacts[0].telemetry_enable, true);
+  assert.equal(contacts[0].display_name, "Alice");
+  assert.equal(contacts[1].index, 1);
+  assert.equal(contacts[1].telemetry_enable, false);
+  assert.equal(contacts[1].display_name, "Bob");
+
+  await session.disconnect();
+}
+
+// ── Scenario 7: listChannels streams RSP_CHANNEL*N -> RSP_CHANNELS_DONE ──
+
+function buildChannelPayload(index, hash, keyLen, primary, name) {
+  const nameBytes = new TextEncoder().encode(name);
+  const buf = new Uint8Array(5 + nameBytes.length);
+  buf[0] = index;
+  buf[1] = hash;
+  buf[2] = keyLen;
+  buf[3] = primary ? 1 : 0;
+  buf[4] = nameBytes.length;
+  buf.set(nameBytes, 5);
+  return buf;
+}
+
+async function listChannelsStreamsToDone() {
+  const { port, push } = makeFakePort(() => {
+    setTimeout(() => {
+      push(encodeFrame(FRAME_RSP_CHANNEL, buildChannelPayload(0, 0x12, 32, true, "family")));
+      push(encodeFrame(FRAME_RSP_CHANNELS_DONE, new Uint8Array(0)));
+    }, 5);
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  const channels = await session.listChannels();
+  assert.equal(channels.length, 1);
+  assert.equal(channels[0].channel_hash, 0x12);
+  assert.equal(channels[0].key_len, 32);
+  assert.equal(channels[0].primary, true);
+  assert.equal(channels[0].name, "family");
+
+  await session.disconnect();
+}
+
+// ── Scenario 8: addContact happy path sends the right frame + payload ───
+
+async function addContactSendsCorrectFrame() {
+  const written = [];
+  const { port, push } = makeFakePort((chunk) => {
+    written.push(chunk);
+    setTimeout(() => push(encodeFrame(FRAME_RSP_OK)), 5);
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  const pubkey = new Uint8Array(32).fill(0xcc);
+  await session.addContact(pubkey, true, "Carol");
+
+  assert.equal(written.length, 1);
+  const sent = decodeFrame(written[0]);
+  assert.equal(sent.frameType, FRAME_ADD_CONTACT);
+  assert.deepEqual(Array.from(sent.payload), Array.from(encodeAddContact(pubkey, true, "Carol")));
+
+  await session.disconnect();
+}
+
+// ── Scenario 9: a write command answered with RSP_ERROR surfaces as DeviceError ─
+
+async function writeCommandDeviceError() {
+  const { port, push } = makeFakePort(() => {
+    const msg = new TextEncoder().encode("contact list full");
+    const payload = new Uint8Array(2 + msg.length);
+    payload[0] = 3;
+    payload[1] = msg.length;
+    payload.set(msg, 2);
+    setTimeout(() => push(encodeFrame(FRAME_RSP_ERROR, payload)), 5);
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  await assert.rejects(
+    () => session.addContact(new Uint8Array(32), false, "Dave"),
+    (err) => {
+      assert.ok(err instanceof DeviceError);
+      assert.equal(err.errorCode, 3);
+      assert.match(err.message, /contact list full/);
+      return true;
+    }
+  );
+
+  await session.disconnect();
+}
+
+// ── Scenario 10: commit() resolves on RSP_OK — a first-boot-style port
+//    teardown immediately afterward is not observed by commit() itself ────
+//
+// Mirrors the firmware's real sequence (provisioning_server.rs's "USB-DRAIN
+// GUARD": RSP_OK, THEN a 250ms dwell, THEN esp_restart()): by the time the
+// fake port closes here, commit()'s `await` has already resolved with the
+// decoded RSP_OK frame, so the ensuing teardown cannot retroactively turn
+// that resolved promise into a rejection — exercising exactly the ordering
+// invariant `provisioner.js`'s commit handler relies on.
+
+async function commitResolvesBeforeSimulatedReboot() {
+  const { port, push } = makeFakePort(() => {
+    setTimeout(() => {
+      push(encodeFrame(FRAME_RSP_OK));
+      // Simulate the device closing the port shortly after RSP_OK, as a
+      // first-boot commit's esp_restart() would from the OS's perspective.
+      setTimeout(() => port.close(), 5);
+    }, 5);
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  await session.commit(); // must resolve, not throw
+
+  // Give the simulated post-commit port-close a moment to actually land —
+  // asserts it doesn't retroactively surface as a rejection anywhere (e.g.
+  // an unhandled rejection from #readLoop) by simply letting the test
+  // process continue cleanly past this point.
+  await new Promise((r) => setTimeout(r, 20));
+}
+
+// ── Scenario 11: concurrent command calls are serialized, not interleaved ─
+//
+// `queryStatus`/`listContacts`/`listChannels`/`addContact`/`delContact`/
+// `addChannel`/`delChannel`/`setNotifDefaults`/`setDeviceName`/`commit` all
+// route through `#exclusive` precisely so that two calls issued close
+// together (e.g. a background refresh racing a form submit) never write
+// their frames out of order — the single physical link allows exactly one
+// outstanding request/response at a time. This fires two command calls back
+// to back, without awaiting the first, and asserts the second's frame is
+// only written after the first's full exchange completes.
+
+async function concurrentCommandsAreSerialized() {
+  const written = [];
+  const { port, push } = makeFakePort((chunk) => {
+    written.push(decodeFrame(chunk).frameType);
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  const statusPromise = session.queryStatus();
+  const addPromise = session.addContact(new Uint8Array(32).fill(0xee), false, "Erin");
+
+  // Let both promises' synchronous-ish startup run. If the two command
+  // calls were NOT serialized, ADD_CONTACT's frame would already be written
+  // here, racing QUERY_STATUS's still-unanswered exchange.
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(written.length, 1, "addContact must not write until queryStatus's exchange completes");
+  assert.equal(written[0], FRAME_QUERY_STATUS);
+
+  push(statusFrame);
+  push(identityFrame);
+  const { status, identity } = await statusPromise;
+  assertStatusAndIdentity(status, identity);
+
+  // Only now should addContact's write follow.
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(written.length, 2, "addContact's write should follow queryStatus's completion");
+  assert.equal(written[1], FRAME_ADD_CONTACT);
+
+  push(encodeFrame(FRAME_RSP_OK));
+  await addPromise;
+
+  await session.disconnect();
+}
+
 // ── Run ────────────────────────────────────────────────────────────────────
 
 const scenarios = [
@@ -293,6 +506,12 @@ const scenarios = [
   ["disconnect() before connect() is a no-op", disconnectWithoutConnect],
   ["device RSP_ERROR on QUERY_STATUS surfaces as DeviceError", deviceErrorOnQueryStatus],
   ["unexpected frame after RSP_STATUS surfaces a desync error", unexpectedFrameAfterStatus],
+  ["listContacts streams RSP_CONTACT*N -> RSP_CONTACTS_DONE", listContactsStreamsToDone],
+  ["listChannels streams RSP_CHANNEL*N -> RSP_CHANNELS_DONE", listChannelsStreamsToDone],
+  ["addContact sends FRAME_ADD_CONTACT with the correct payload", addContactSendsCorrectFrame],
+  ["a write command's RSP_ERROR surfaces as DeviceError", writeCommandDeviceError],
+  ["commit() resolves on RSP_OK ahead of a simulated first-boot port close", commitResolvesBeforeSimulatedReboot],
+  ["concurrent command calls are serialized, not interleaved", concurrentCommandsAreSerialized],
 ];
 
 for (const [name, fn] of scenarios) {

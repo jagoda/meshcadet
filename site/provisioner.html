@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Provision MeshCadet — device status over Web Serial</title>
-  <meta name="description" content="Connect a MeshCadet T-Deck Plus over USB and read its live provisioning status, identity, and MeshCore contact QR — straight from your browser, no toolchain install required." />
+  <title>Provision MeshCadet — device status and provisioning over Web Serial</title>
+  <meta name="description" content="Connect a MeshCadet T-Deck Plus over USB, read its live provisioning status, identity, and MeshCore contact QR, and manage contacts/channels/notification defaults/device name — straight from your browser, no toolchain install required." />
 
   <!-- All paths below are relative (no leading "/") — this is a GitHub Pages
        PROJECT site served under /meshcadet/, not a root site. A root-rooted
@@ -36,10 +36,11 @@
           <p class="eyebrow">Mission Control // Web Provisioner</p>
           <h1>Provision Mesh<span>Cadet</span></h1>
           <p class="tagline">
-            Connect a T-Deck Plus over USB and read its live provisioning
-            status, identity, and MeshCore contact QR — straight from your
-            browser. This page is <strong>read-only</strong>: nothing on the
-            device is changed here.
+            Connect a T-Deck Plus over USB to read its live provisioning
+            status and identity, scan a MeshCore contact QR, and manage
+            contacts, channels, notification defaults, and the device
+            name — straight from your browser. Everything below runs
+            entirely client-side; nothing is sent to a server.
           </p>
         </div>
       </div>
@@ -105,6 +106,15 @@
             <dt>GPS clock</dt>
             <dd id="stat-gps-clock">—</dd>
           </dl>
+
+          <form id="set-name-form" class="inline-form footnote">
+            <label class="version-label" for="set-name-input">Set device name (≤32 bytes UTF-8; empty clears it)</label>
+            <div class="cta-row">
+              <input id="set-name-input" class="text-input" type="text" placeholder="Alex's MeshCadet" maxlength="64" />
+              <button id="set-name-button" class="btn btn-ghost" type="submit">Set name</button>
+            </div>
+            <p id="set-name-status" class="muted form-status" role="status"></p>
+          </form>
         </div>
 
         <div class="flash-panel" id="qr-panel" hidden>
@@ -114,6 +124,130 @@
             <canvas id="qr-canvas" width="220" height="220"></canvas>
           </div>
           <p id="qr-uri" class="muted footnote mono qr-uri"></p>
+        </div>
+
+        <div class="flash-panel" id="contacts-panel" hidden>
+          <h2>4. Contacts</h2>
+          <p>
+            Lists the device's in-progress (pre-commit) staging set — pair
+            with add/remove below and <strong>Commit</strong> (section 7) to
+            verify the configured list before persisting it.
+          </p>
+          <table class="data-table">
+            <thead>
+              <tr><th>Idx</th><th>Public key</th><th>Telemetry</th><th>Name</th><th></th></tr>
+            </thead>
+            <tbody id="contacts-table-body">
+              <tr><td colspan="5" class="muted">No contacts read yet.</td></tr>
+            </tbody>
+          </table>
+
+          <form id="add-contact-form" class="inline-form footnote">
+            <h3>Add contact</h3>
+            <label class="version-label" for="add-contact-pubkey">Public key (64 hex characters)</label>
+            <input id="add-contact-pubkey" class="text-input mono" type="text" placeholder="0123456789abcdef… (64 hex chars)" />
+            <label class="version-label" for="add-contact-name">Name (optional)</label>
+            <input id="add-contact-name" class="text-input" type="text" placeholder="Alice" maxlength="64" />
+            <label class="checkbox-label">
+              <input id="add-contact-telemetry" type="checkbox" />
+              Allow this contact to pull telemetry (GPS location)
+            </label>
+            <div class="cta-row">
+              <button id="add-contact-button" class="btn btn-primary" type="submit">Add contact</button>
+            </div>
+            <p id="add-contact-status" class="muted form-status" role="status"></p>
+          </form>
+        </div>
+
+        <div class="flash-panel" id="channels-panel" hidden>
+          <h2>5. Channels</h2>
+          <p>Lists the device's in-progress (pre-commit) staging set. The channel hash shown is computed by the firmware, not this page.</p>
+          <table class="data-table">
+            <thead>
+              <tr><th>Idx</th><th>Hash</th><th>Bits</th><th>Primary</th><th>Name</th></tr>
+            </thead>
+            <tbody id="channels-table-body">
+              <tr><td colspan="5" class="muted">No channels read yet.</td></tr>
+            </tbody>
+          </table>
+
+          <form id="add-channel-form" class="inline-form footnote">
+            <h3>Add channel</h3>
+            <label class="version-label" for="add-channel-secret">Secret (32 hex chars = 128-bit, or 64 hex chars = 256-bit)</label>
+            <input id="add-channel-secret" class="text-input mono" type="text" placeholder="32 or 64 hex characters" />
+            <div class="cta-row">
+              <button id="gen-channel-128-button" class="btn btn-ghost" type="button">Generate 128-bit</button>
+              <button id="gen-channel-256-button" class="btn btn-ghost" type="button">Generate 256-bit</button>
+            </div>
+            <p class="muted">
+              Generated locally with <code>crypto.getRandomValues</code> — the
+              secret is filled into the field above and never leaves this
+              browser. Copy it somewhere safe before adding: it is the only
+              way to remove this channel later.
+            </p>
+            <label class="version-label" for="add-channel-name">Name</label>
+            <input id="add-channel-name" class="text-input" type="text" placeholder="family" maxlength="64" />
+            <label class="checkbox-label">
+              <input id="add-channel-primary" type="checkbox" />
+              Set as the primary (default outgoing) channel
+            </label>
+            <div class="cta-row">
+              <button id="add-channel-button" class="btn btn-primary" type="submit">Add channel</button>
+            </div>
+            <p id="add-channel-status" class="muted form-status" role="status"></p>
+          </form>
+
+          <form id="del-channel-form" class="inline-form footnote">
+            <h3>Remove channel</h3>
+            <p class="muted">
+              Channel removal requires the exact secret used to add it — the
+              list above only shows its 1-byte hash, which isn't enough to
+              identify it for removal.
+            </p>
+            <label class="version-label" for="del-channel-secret">Secret (32 or 64 hex characters)</label>
+            <input id="del-channel-secret" class="text-input mono" type="text" placeholder="32 or 64 hex characters" />
+            <div class="cta-row">
+              <button id="del-channel-button" class="btn btn-ghost" type="submit">Remove channel</button>
+            </div>
+            <p id="del-channel-status" class="muted form-status" role="status"></p>
+          </form>
+        </div>
+
+        <div class="flash-panel" id="notif-panel" hidden>
+          <h2>6. Notification defaults</h2>
+          <p>What happens on message receipt before the user changes them on-device.</p>
+          <form id="notif-form" class="inline-form">
+            <label class="checkbox-label">
+              <input id="notif-visual" type="checkbox" />
+              Visual notifications (screen flash / LED)
+            </label>
+            <label class="checkbox-label">
+              <input id="notif-audible" type="checkbox" />
+              Audible notifications (buzzer / speaker)
+            </label>
+            <div class="cta-row">
+              <button id="notif-save-button" class="btn btn-primary" type="submit">Save notification defaults</button>
+            </div>
+            <p id="notif-status" class="muted form-status" role="status"></p>
+          </form>
+        </div>
+
+        <div class="flash-panel" id="commit-panel" hidden>
+          <h2>7. Commit provisioning</h2>
+          <p>
+            Persist all of the above to flash. Run this after configuring
+            contacts, channels, and notification defaults.
+          </p>
+          <p class="muted">
+            <strong>Note:</strong> on a first-boot device, committing reboots
+            it into the mesh (closing this connection) — reconnect once it's
+            back up. On an already-provisioned device, committing re-persists
+            the live config without rebooting.
+          </p>
+          <div class="cta-row">
+            <button id="commit-button" class="btn btn-primary" type="button">Commit provisioning</button>
+          </div>
+          <p id="commit-status" class="muted form-status" role="status"></p>
         </div>
 
         <p class="muted">

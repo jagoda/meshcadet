@@ -67,6 +67,13 @@ jobs:
         # #[cfg(test)] module — see the test file's own header.
         run: node site/provisioner/contact-uri.test.mjs
 
+      - name: validation.js's hex/byte-length checks match host/src/main.rs's CLI parsers
+        # site/provisioner/validation.js is the M2 write-form counterpart to
+        # host/src/main.rs's `parse_32bytes_hex`/`parse_channel_secret_hex`/
+        # the `Cmd::Identity` set-name length check — see the test file's own
+        # header.
+        run: node site/provisioner/validation.test.mjs
+
   codec-conformance:
     name: site/provisioner/codec.js matches protocol::provisioning byte-for-byte
     runs-on: ubuntu-latest

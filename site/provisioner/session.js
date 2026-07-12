@@ -8,10 +8,13 @@
 // other campaign mission — it is read here only as a reference for
 // orchestration shape (see docs/adr/0007-provisioner-codec.md, Finding 2).
 //
-// M1 walking skeleton: read-only. Only `queryStatus()` (the two-frame
-// QUERY_STATUS -> RSP_STATUS + RSP_IDENTITY handshake) is exposed; the
-// command-frame methods (add/del contact, set pin, commit, …) are later
-// campaign milestones layered on top of the same `#sendRecvWithRetry`.
+// M1 walking skeleton exposed only the read-only `queryStatus()` (the
+// two-frame QUERY_STATUS -> RSP_STATUS + RSP_IDENTITY handshake). M2
+// (this campaign's config child) layers the non-sensitive provisioning
+// **write** commands on top of the same `#sendRecvWithRetry`/`#recvFrame`
+// core: list-contacts/list-channels enumeration, add/del contact, add/del
+// channel, set-notif-defaults, set-device-name, and commit. PIN set/reset
+// and history export/clear remain a later (sensitive) campaign milestone.
 //
 // No build step: plain ES module, loaded directly by the browser.
 
@@ -22,11 +25,33 @@ import {
   decodeRspStatus,
   decodeRspIdentity,
   decodeRspError,
+  decodeRspContact,
+  decodeRspChannel,
+  encodeAddContact,
+  encodeDelContact,
+  encodeAddChannel,
+  encodeDelChannel,
+  encodeSetNotifDefaults,
+  encodeSetDeviceName,
   ProvError,
   FRAME_QUERY_STATUS,
+  FRAME_QUERY_CONTACTS,
+  FRAME_QUERY_CHANNELS,
+  FRAME_ADD_CONTACT,
+  FRAME_DEL_CONTACT,
+  FRAME_ADD_CHANNEL,
+  FRAME_DEL_CHANNEL,
+  FRAME_SET_NOTIF_DEFAULTS,
+  FRAME_SET_DEVICE_NAME,
+  FRAME_COMMIT_PROVISIONING,
   FRAME_RSP_STATUS,
   FRAME_RSP_IDENTITY,
   FRAME_RSP_ERROR,
+  FRAME_RSP_OK,
+  FRAME_RSP_CONTACT,
+  FRAME_RSP_CONTACTS_DONE,
+  FRAME_RSP_CHANNEL,
+  FRAME_RSP_CHANNELS_DONE,
   MAX_RSP_HISTORY_ENTRY_PAYLOAD,
 } from "./codec.js";
 
@@ -74,6 +99,24 @@ export class ProvisionerSession {
   #readLoopPromise = null;
   #accBuf = new Uint8Array(0);
   #waiters = [];
+  /**
+   * FIFO serialization queue for the command methods below (`queryStatus`,
+   * `listContacts`/`listChannels`, `addContact`/`delContact`,
+   * `addChannel`/`delChannel`, `setNotifDefaults`, `setDeviceName`,
+   * `commit`). The physical link allows exactly one outstanding
+   * request/response at a time — `#sendRecvWithRetry`/`#recvFrame` assume
+   * it, matching `host/src/session.rs`'s `&mut self` methods, which the
+   * borrow checker already serializes for free. Nothing enforces that on
+   * this async, single-threaded-but-still-concurrent side: two command
+   * calls issued close together (e.g. a background status refresh racing a
+   * form submit) would otherwise interleave their writes and desync the
+   * request/response protocol — one call could receive the frame meant for
+   * the other. `#exclusive` queues command bodies so only one runs at a
+   * time; `connect`/`disconnect` are connection-lifecycle, not commands,
+   * and deliberately run outside this queue so a stuck request doesn't
+   * block tearing down the connection.
+   */
+  #queue = Promise.resolve();
 
   /** Whether this browser exposes the Web Serial API at all. */
   static isSupported() {
@@ -153,33 +196,198 @@ export class ProvisionerSession {
    * `codec.js`'s `decodeRspStatus`/`decodeRspIdentity`.
    */
   async queryStatus() {
-    const first = await this.#sendRecvWithRetry(FRAME_QUERY_STATUS, new Uint8Array(0));
-    let status;
-    if (first.frameType === FRAME_RSP_STATUS) {
-      status = decodeRspStatus(first.payload);
-    } else if (first.frameType === FRAME_RSP_ERROR) {
-      throw deviceErrorFrom(first.payload);
-    } else {
-      throw new Error(`unexpected response 0x${hex2(first.frameType)} to QUERY_STATUS`);
-    }
+    return this.#exclusive(async () => {
+      const first = await this.#sendRecvWithRetry(FRAME_QUERY_STATUS, new Uint8Array(0));
+      let status;
+      if (first.frameType === FRAME_RSP_STATUS) {
+        status = decodeRspStatus(first.payload);
+      } else if (first.frameType === FRAME_RSP_ERROR) {
+        throw deviceErrorFrom(first.payload);
+      } else {
+        throw new Error(`unexpected response 0x${hex2(first.frameType)} to QUERY_STATUS`);
+      }
 
-    // Consume the trailing RSP_IDENTITY frame the firmware always sends after
-    // RSP_STATUS — leaving it unread would desync the next command, exactly
-    // as documented on `Session::query_status`.
-    const second = await this.#recvFrame(FRAME_TIMEOUT_MS);
-    if (second.frameType !== FRAME_RSP_IDENTITY) {
-      throw new Error(
-        `expected RSP_IDENTITY (0x${hex2(FRAME_RSP_IDENTITY)}) after RSP_STATUS; got 0x${hex2(second.frameType)}`
-      );
-    }
-    const identity = decodeRspIdentity(second.payload);
-    return { status, identity };
+      // Consume the trailing RSP_IDENTITY frame the firmware always sends
+      // after RSP_STATUS — leaving it unread would desync the next command,
+      // exactly as documented on `Session::query_status`.
+      const second = await this.#recvFrame(FRAME_TIMEOUT_MS);
+      if (second.frameType !== FRAME_RSP_IDENTITY) {
+        throw new Error(
+          `expected RSP_IDENTITY (0x${hex2(FRAME_RSP_IDENTITY)}) after RSP_STATUS; got 0x${hex2(second.frameType)}`
+        );
+      }
+      const identity = decodeRspIdentity(second.payload);
+      return { status, identity };
+    });
+  }
+
+  /**
+   * Enumerate the device's configured contacts. Sends `FRAME_QUERY_CONTACTS`,
+   * then consumes the streamed `FRAME_RSP_CONTACT` frames terminated by
+   * `FRAME_RSP_CONTACTS_DONE`. Mirrors `Session::list_contacts`
+   * (`host/src/session.rs`). Returns entries in device-index order.
+   *
+   * Served against the firmware's in-progress (pre-commit) staging config —
+   * pair with `addContact`/`delContact`/`queryStatus` to verify the
+   * configured set before `commit()`.
+   */
+  async listContacts() {
+    return this.#exclusive(() =>
+      this.#streamUntilDone(FRAME_QUERY_CONTACTS, FRAME_RSP_CONTACT, FRAME_RSP_CONTACTS_DONE, decodeRspContact, "contact")
+    );
+  }
+
+  /**
+   * Enumerate the device's configured channels. Sends `FRAME_QUERY_CHANNELS`,
+   * then consumes the streamed `FRAME_RSP_CHANNEL` frames terminated by
+   * `FRAME_RSP_CHANNELS_DONE`. Mirrors `Session::list_channels`
+   * (`host/src/session.rs`). Returns entries in device-index order.
+   */
+  async listChannels() {
+    return this.#exclusive(() =>
+      this.#streamUntilDone(FRAME_QUERY_CHANNELS, FRAME_RSP_CHANNEL, FRAME_RSP_CHANNELS_DONE, decodeRspChannel, "channel")
+    );
+  }
+
+  /**
+   * Add a contact. `pubkey` is a 32-byte `Uint8Array` (Ed25519 public key);
+   * `name` is a UTF-8 display name (empty = device falls back to the routing
+   * hash as a label). Mirrors `Session::add_contact`.
+   */
+  async addContact(pubkey, telemetryEnable, name) {
+    await this.#exclusive(() => this.#sendAndExpectOk(FRAME_ADD_CONTACT, encodeAddContact(pubkey, telemetryEnable, name)));
+  }
+
+  /** Delete a contact by its 32-byte Ed25519 public key. Mirrors `Session::del_contact`. */
+  async delContact(pubkey) {
+    await this.#exclusive(() => this.#sendAndExpectOk(FRAME_DEL_CONTACT, encodeDelContact(pubkey)));
+  }
+
+  /**
+   * Add (or replace) a channel. `secret` is a 32-byte `Uint8Array` (128-bit
+   * secrets zero-padded to 32 bytes by the caller — see
+   * `provisioner/validation.js`'s `validateChannelSecretHex`); `keyLen` is 16
+   * or 32. Mirrors `Session::add_channel`. The channel hash is computed by
+   * the firmware, never by this page.
+   */
+  async addChannel(secret, keyLen, primary, name) {
+    await this.#exclusive(() => this.#sendAndExpectOk(FRAME_ADD_CHANNEL, encodeAddChannel(secret, keyLen, primary, name)));
+  }
+
+  /**
+   * Delete a channel by its 32-byte secret — must match exactly what was
+   * passed to `addChannel` (the device has no other way to identify a
+   * channel for removal; the 1-byte hash alone is not enough). Mirrors
+   * `Session::del_channel`.
+   */
+  async delChannel(secret) {
+    await this.#exclusive(() => this.#sendAndExpectOk(FRAME_DEL_CHANNEL, encodeDelChannel(secret)));
+  }
+
+  /** Set notification defaults (visual/audible). Mirrors `Session::set_notif_defaults`. */
+  async setNotifDefaults(visual, audible) {
+    await this.#exclusive(() => this.#sendAndExpectOk(FRAME_SET_NOTIF_DEFAULTS, encodeSetNotifDefaults(visual, audible)));
+  }
+
+  /**
+   * Set (or clear, with an empty string) the device display name. Persists
+   * to the device's identity store (NVS) immediately, independent of
+   * first-boot provisioning state. Mirrors `Session::set_device_name`.
+   * `name` must be ≤ `MAX_NAME_LEN` (32) bytes UTF-8 — validate with
+   * `provisioner/validation.js`'s `validateDeviceName` before calling.
+   */
+  async setDeviceName(name) {
+    await this.#exclusive(() => this.#sendAndExpectOk(FRAME_SET_DEVICE_NAME, encodeSetDeviceName(name)));
+  }
+
+  /**
+   * Commit provisioning: persist the staged config to flash. Mirrors
+   * `Session::commit` (`host/src/session.rs`) — a plain "send, expect
+   * RSP_OK" call with no special-cased branching here.
+   *
+   * On a first-boot device, the firmware (`firmware/src/provisioning_server.rs`)
+   * sends RSP_OK, dwells 250 ms (specifically to outrun the ensuing
+   * `esp_restart()`'s USB re-enumeration — see that file's "USB-DRAIN GUARD"
+   * comment), then reboots into the mesh, closing the serial connection. An
+   * already-provisioned device's runtime handler
+   * (`firmware/src/admin_server.rs`) replies RSP_OK WITHOUT rebooting. Either
+   * way, by the time this method resolves the RSP_OK has already been
+   * received — the deliberate dwell is what makes that dependable. Any
+   * *subsequent* port teardown (the reboot case) is observed later via
+   * `navigator.serial`'s `"disconnect"` event, which `provisioner.js` already
+   * treats as a benign disconnect, not a failure — this method itself never
+   * needs to distinguish the two cases.
+   */
+  async commit() {
+    await this.#exclusive(() => this.#sendAndExpectOk(FRAME_COMMIT_PROVISIONING, new Uint8Array(0)));
   }
 
   // ── Low-level frame I/O ───────────────────────────────────────────────────
 
+  /**
+   * Run `fn` once every earlier-queued `#exclusive` call has settled, and
+   * queue anyone who calls `#exclusive` while `fn` is running behind it —
+   * a plain FIFO async mutex. `fn`'s rejection propagates to its own caller
+   * without breaking the chain for whoever is queued next.
+   */
+  async #exclusive(fn) {
+    const previous = this.#queue;
+    let release;
+    this.#queue = new Promise((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
   async #sendFrame(frameType, payload) {
     await this.#writer.write(encodeFrame(frameType, payload));
+  }
+
+  /**
+   * Send a command frame and assert the response is `RSP_OK`. Mirrors
+   * `Session::send_and_expect_ok` (`host/src/session.rs`). Throws
+   * `DeviceError` on `RSP_ERROR`, or a plain `Error` on any other
+   * unexpected response frame.
+   */
+  async #sendAndExpectOk(frameType, payload) {
+    const { frameType: ft, payload: rspPayload } = await this.#sendRecvWithRetry(frameType, payload);
+    if (ft === FRAME_RSP_OK) {
+      return;
+    }
+    if (ft === FRAME_RSP_ERROR) {
+      throw deviceErrorFrom(rspPayload);
+    }
+    throw new Error(`unexpected response 0x${hex2(ft)} (expected RSP_OK 0x${hex2(FRAME_RSP_OK)})`);
+  }
+
+  /**
+   * Send `queryFrameType`, then consume the streamed response — repeated
+   * `entryFrameType` frames (decoded with `decodeEntry`) terminated by a
+   * single `doneFrameType` frame. Shared by `listContacts`/`listChannels`,
+   * mirroring `Session::list_contacts`/`Session::list_channels`
+   * (`host/src/session.rs`).
+   */
+  async #streamUntilDone(queryFrameType, entryFrameType, doneFrameType, decodeEntry, label) {
+    let { frameType, payload } = await this.#sendRecvWithRetry(queryFrameType, new Uint8Array(0));
+    const entries = [];
+    while (true) {
+      if (frameType === entryFrameType) {
+        entries.push(decodeEntry(payload));
+      } else if (frameType === doneFrameType) {
+        break;
+      } else if (frameType === FRAME_RSP_ERROR) {
+        throw deviceErrorFrom(payload);
+      } else {
+        throw new Error(`unexpected frame 0x${hex2(frameType)} during ${label} enumeration`);
+      }
+      ({ frameType, payload } = await this.#recvFrame(FRAME_TIMEOUT_MS));
+    }
+    return entries;
   }
 
   /**

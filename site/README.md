@@ -42,12 +42,18 @@ building or publishing anything.
   the browser's single-threaded event loop — `host/src/session.rs` itself is
   read only as a reference and is never modified by this or any downstream
   provisioner mission (see `docs/adr/0007-provisioner-codec.md`, Finding 2).
-  M1 (the walking-skeleton mission) exposes only the read-only
-  `queryStatus()`; command-frame methods (add/del contact, set pin, commit,
-  …) are later campaign milestones layered on the same retry/resync core.
-  Regression-guarded by `provisioner/session.smoke.test.mjs` (a mocked-
-  Web-Serial orchestration test — no Rust counterpart to golden-vector
-  against, unlike `codec.js`), run by `pages-check.yml`'s `check` job.
+  M1 (the walking-skeleton mission) exposed only the read-only
+  `queryStatus()`; M2 (the config mission) layers the non-sensitive
+  provisioning **write** commands on the same retry/resync core:
+  `listContacts`/`listChannels` (streamed enumeration), `addContact`/
+  `delContact`, `addChannel`/`delChannel`, `setNotifDefaults`,
+  `setDeviceName`, and `commit` — each a thin `#sendAndExpectOk`/
+  `#streamUntilDone` wrapper mirroring the correspondingly named
+  `host/src/session.rs` method. PIN set/reset and history export/clear
+  remain a later (sensitive) campaign milestone. Regression-guarded by
+  `provisioner/session.smoke.test.mjs` (a mocked-Web-Serial orchestration
+  test — no Rust counterpart to golden-vector against, unlike `codec.js`),
+  run by `pages-check.yml`'s `check` job.
 - `provisioner/contact-uri.js` — the MeshCore companion contact-add URI
   construction (`meshcore://contact/add?name=&public_key=&type=1`),
   byte-for-byte hand-ported from `host/src/main.rs`'s `url_encode` +
@@ -56,14 +62,28 @@ building or publishing anything.
   `provisioner/contact-uri.test.mjs` checks it against the exact same
   fixtures as `host/src/main.rs`'s own `#[cfg(test)]` module, run by
   `pages-check.yml`'s `check` job.
+- `provisioner/validation.js` — input validation for the M2 write forms:
+  contact-pubkey and channel-secret hex-length checks (mirroring
+  `host/src/main.rs`'s `parse_32bytes_hex`/`parse_channel_secret_hex`,
+  including the 128-bit secret's zero-pad-to-32-bytes behavior) and the
+  device-name byte-length check (mirroring the `Cmd::Identity` `--set-name`
+  check). DOM-free like `contact-uri.js`, so it's testable under plain
+  `node` via `provisioner/validation.test.mjs`, run by `pages-check.yml`'s
+  `check` job.
 - `provisioner.html` + `provisioner.js` — the provisioner page itself:
   connect over Web Serial (mirrors `flash.html`'s Chrome/Edge + HTTPS
-  guidance and unsupported-browser fallback), then render read-only
-  status/identity (via `session.js`) and a MeshCore contact QR (via
-  `contact-uri.js`). The QR itself is rendered by a major-version-pinned CDN
-  import of the `qrcode` npm package via esm.sh (pure JS, no WASM) — the same
-  single-pinned-CDN-import, no-bundler pattern `flash.html` uses for
-  esp-web-tools.
+  guidance and unsupported-browser fallback), then render status/identity
+  (via `session.js`) and a MeshCore contact QR (via `contact-uri.js`). The QR
+  itself is rendered by a major-version-pinned CDN import of the `qrcode`
+  npm package via esm.sh (pure JS, no WASM) — the same single-pinned-CDN-
+  import, no-bundler pattern `flash.html` uses for esp-web-tools. M2 adds the
+  non-sensitive provisioning **writes**: contact/channel list + add/remove
+  (with a client-side `crypto.getRandomValues` channel-secret generator —
+  generated secrets never leave the browser), notification defaults,
+  device-name set, and commit (mirroring the CLI's operator notes —
+  reboot-to-apply-to-the-live-mesh for contacts, first-boot-commit-reboots
+  for commit). Channel deletion needs the exact secret (not just the list
+  view's 1-byte hash), so it has its own form rather than a per-row button.
 - `styles.css` — one stylesheet, no build step. Color tokens at the top
   mirror `firmware/src/ui/theme.slint`'s `Theme` global 1:1, so the site and
   the on-device UI read as the same product. Keep them in sync if the
