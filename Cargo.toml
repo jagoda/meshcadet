@@ -67,7 +67,7 @@ publish = false
 # a separate hardcoded literal, bumped in the same PR via release-please's
 # `extra-files` config, kept honest by CI's version-drift guard
 # (see .github/workflows/ci.yml's `version-drift-guard` job).
-version = "0.1.0"
+version = "0.1.1"
 
 [workspace.dependencies]
 # No `version` field: nothing in this repo's toolchain runs `cargo package`
