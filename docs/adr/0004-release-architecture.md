@@ -69,9 +69,13 @@ change that wired this up, and `firmware/Cargo.toml` was bumped to match.
 ### 2. release-plz: version bump + changelog PR (Implemented)
 
 `release-plz.toml` configures [release-plz](https://release-plz.dev) to:
-- Open (and keep up to date) a PR titled `release v{{ version }}` whenever
-  Conventional Commits land on `main` that warrant a release
-  (`release_always = false` — no PR opens for a no-op push).
+- Open (and keep up to date) a PR titled `chore(release): v{{ version }}`
+  whenever Conventional Commits land on `main` that warrant a release
+  (`release_always = false` — no PR opens for a no-op push). The title
+  doubles as the release commit's message (release-plz pushes it verbatim to
+  the release branch), so it must itself be a Conventional Commit — this is
+  what `.github/workflows/commitlint.yml`'s "Lint PR title" and "Lint commit
+  messages" jobs enforce on every release-plz PR, same as any other PR.
 - Regenerate `CHANGELOG.md` via `cliff.toml` (git-cliff, Keep a Changelog
   shape — see §3).
 - **Never publish to crates.io** (`publish = false`, on top of every

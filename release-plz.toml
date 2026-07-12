@@ -91,5 +91,15 @@ dependencies_update = false
 # next to it.
 git_release_enable = false
 
-pr_name = "release v{{ version }}"
+# `pr_name` becomes BOTH the release PR's title AND the release commit's
+# message (release-plz's Pr::title is reused verbatim as the commit subject
+# it pushes to the release branch — see release_plz_core::command::release_pr
+# `force_push`/`github_create_release_branch`, which both commit
+# `&pr.title`). commitlint.yml's "Lint PR title" and "Lint commit messages"
+# jobs both require a Conventional Commits subject
+# (`type(scope)?: description`), so this template must render one. It
+# deliberately matches cliff.toml's `^chore\(release\)` skip rule below, so
+# release-plz's own release commits stay out of the user-facing CHANGELOG.md
+# (they're bookkeeping, not a user-facing change).
+pr_name = "chore(release): v{{ version }}"
 pr_branch_prefix = "release-plz-"
