@@ -10,6 +10,13 @@ landed before release-plz's first `release vX.Y.Z` PR.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-12
+
+### MeshCadet
+
+- Mesh-radio messaging firmware for the LilyGO T-Deck Plus
+
+
 The first public release of MeshCadet: a deliberately-limited, MeshCore-interop
 firmware for the LilyGo T-Deck Plus. Its limits are design choices for a
 controlled, minimal comms device — MeshCadet is provided "as is" with no
