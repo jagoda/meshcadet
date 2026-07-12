@@ -49,7 +49,23 @@ ARG DEJAVU_CORE_VERSION=2.37-2build1
 # pin from ESP_IDF_VERSION (firmware/.cargo/config.toml) — the Xtensa rustc
 # fork and the ESP-IDF C SDK version separately. Bump deliberately, in its own
 # PR, if this ever needs to move.
-ARG ESP_TOOLCHAIN_VERSION=1.86.0.0
+#
+# Bumped 1.86.0.0 -> 1.90.0.0 (rustc 1.86.0-nightly -> 1.90.0-nightly) 2026-07-12:
+# the v0.1.0 release build failed cargo resolution because the workspace's
+# locked dependency tree had drifted past what 1.86.0.0 (rustc 1.86) can
+# compile — typed-index-collections 3.5.0 (rust-version 1.90.0), smol_str
+# 0.3.6 (rust-version 1.89), slint 1.16.1 (rust-version 1.88) all need newer
+# rustc than the pin provided. Chose to move THIS pin forward rather than
+# pin those crates back down in Cargo.lock: slint in particular would have
+# needed a 3-minor-version downgrade (1.16.1 -> 1.13.x) to clear rustc 1.86,
+# which risks losing UI-toolkit fixes/features already relied on elsewhere in
+# firmware/src/ui and is a far larger, riskier diff than one version-arg
+# bump. 1.90.0.0 is the oldest esp-rs/rust-build release that satisfies all
+# three crates' rust-version floors (exactly meets typed-index-collections'
+# 1.90.0), keeping the toolchain jump minimal. Reproducible-build stability
+# is unaffected: this ARG is still a single exact pinned version, just a
+# newer one — reproducibility requires an exact pin, not a specific old one.
+ARG ESP_TOOLCHAIN_VERSION=1.90.0.0
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CARGO_HOME=/opt/cargo \
@@ -71,11 +87,31 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # none of the others' versions can change the firmware image's bytes: the
 # actual cross-compiler is the separately-pinned `esp` toolchain fork +
 # ESP_IDF_VERSION, not this container's host gcc/cmake/ninja.
+#
+# `fontconfig` (added 2026-07-12, found missing while verifying the
+# ESP_TOOLCHAIN_VERSION bump above): firmware/.cargo/config.toml sets
+# SLINT_EMBED_TEXTURES=1, which makes i-slint-compiler resolve the generic
+# "sans-serif" family to an actual font file via the host's fontconfig at
+# proc-macro expansion time, then pre-rasterize glyph bitmaps from it — a
+# SECOND host-font-dependent codegen path, distinct from build.rs's own
+# build_emoji_font() FreeType/DejaVu shell-out described in the header
+# comment. Without libfontconfig1 + the fontconfig-config generic-alias
+# database, i-slint-compiler fails outright ("internal error: could not
+# determine a default font for sans-serif") — it can't even discover DejaVu
+# Sans, let alone rasterize it. No exact-version pin needed here (unlike
+# freetype/dejavu): with fonts-dejavu-core the only font package installed,
+# fontconfig has exactly one candidate to resolve "sans-serif" to regardless
+# of its own version, and the actual glyph rasterization is done by
+# i-slint-compiler's own vendored Rust rasterizer (pinned via Cargo.lock,
+# not this container) — fontconfig here is purely font *discovery*, not
+# rendering, so it doesn't reach the byte-reproducibility surface the
+# header comment is about.
 # hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential pkg-config curl unzip ca-certificates git \
       wget flex bison gperf python3 python3-pip python3-venv \
       cmake ninja-build ccache libffi-dev libssl-dev dfu-util libusb-1.0-0 \
+      fontconfig \
       "libfreetype6-dev=${FREETYPE_DEV_VERSION}" \
       "fonts-dejavu-core=${DEJAVU_CORE_VERSION}" \
     && apt-mark hold libfreetype6-dev fonts-dejavu-core \
