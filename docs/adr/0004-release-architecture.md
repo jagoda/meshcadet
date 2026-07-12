@@ -3,12 +3,15 @@
 - **Status:** Accepted (2026-07-11); §2/§3/§4 revised (2026-07-12) —
   version/changelog/tag automation moved from release-plz to
   release-please. See §2's "Why release-please, not release-plz" for why.
+  §10 added (2026-07-12) — Cargo.lock/firmware/Cargo.lock kept in lockstep
+  with the version bump via a text-only sync script.
 - **Deciders:** Maintainer design review
 - **Supersedes:** —
 - **Implements:** —
 - **Code:** `release-please-config.json`, `.release-please-manifest.json`,
   `CHANGELOG.md`, `.github/workflows/release-please.yml`,
   `.github/workflows/commitlint.yml`, `scripts/check-commit-format.sh`,
+  `scripts/sync-cargo-lock-versions.sh`,
   `CONTRIBUTING.md` ("Submitting changes"), `.github/workflows/ci.yml`
   (`version-drift-guard` job), `Cargo.toml` (`[workspace.package].version`),
   `firmware/Cargo.toml` (`version`), `firmware/build.rs`
@@ -303,6 +306,66 @@ that `.github/workflows/pages-deploy.yml` populates from live Release data
 at deploy time instead. This section is left brief on purpose so the two
 ADRs don't drift out of sync with each other — see ADR-0006 for the full
 design and its Alternatives Considered.
+
+### 10. Cargo.lock kept in lockstep via a text-only sync script (Implemented)
+
+§1/§2's `extra-files` config bumps the version *string* in Cargo.toml and
+firmware/Cargo.toml, but release-please has no built-in Cargo.lock awareness
+for `release-type: simple` (that's a `rust`/cargo-workspace release-type
+behavior — see §2's "Why release-please, not release-plz" for why this repo
+doesn't use it). Left alone, a release PR's Cargo.lock and
+firmware/Cargo.lock keep pinning the OLD version for every workspace-member
+crate, and `ci.yml`'s `cargo test --locked`/`cargo clippy --locked` hard-fail
+on the release PR: "cannot update the lock file because --locked was
+passed" — `--locked` deliberately refuses to silently regenerate a stale
+lockfile. (Live case: PR #25, `chore(release): v0.1.1`, failed exactly this
+way.)
+
+`.github/workflows/release-please.yml` runs
+`scripts/sync-cargo-lock-versions.sh` immediately after release-please opens
+or updates the release PR (gated on the action's `prs_created` output), and
+pushes a `chore(release): sync Cargo.lock to the version bump above` commit
+back onto the PR branch if either lockfile changed. That script is a
+**text-only substitution**, not a `cargo` invocation — it rewrites just the
+`version = "..."` line of each local workspace-member `[[package]]` stanza
+(these never carry a `source =`/`checksum =` line, unlike registry
+dependencies, which is what makes the substitution unambiguous) and leaves
+every other line of both lockfiles byte-identical. Two things this
+deliberately avoids by not shelling out to `cargo`:
+
+- **The `esp`/Xtensa toolchain problem.** firmware/Cargo.lock's workspace is
+  pinned to the `esp` channel (firmware/rust-toolchain.toml) — any real
+  `cargo` command touching it would need that toolchain installed on the
+  release-please runner, which doesn't have it and shouldn't need to (§2's
+  Alternatives-Considered-style reasoning: this workflow stays
+  toolchain-independent, same motivation as `firmware/`'s workspace split in
+  Context).
+- **Unrelated dependency drift.** `cargo generate-lockfile` (or `cargo
+  update` with no package filter) re-resolves the entire dependency graph
+  against the live registry and can silently pull in unrelated
+  semver-compatible upgrades alongside the version bump — verified
+  empirically while designing this fix: `cargo check --workspace` (which
+  uses the existing lockfile as its resolution baseline) touches ONLY the
+  local package version fields, but `cargo generate-lockfile` rewrote dozens
+  of unrelated registry-dependency entries in the same run. A release PR's
+  diff should be the version bump, not a surprise dependency upgrade.
+
+The commit is pushed authored as `github-actions[bot]
+<41898282+github-actions[bot]@users.noreply.github.com>` — the same identity
+release-please's own commits use — so `scripts/check-commit-format.sh`'s
+existing release-please exemption (§4) covers it on the same
+`release-please--branches--*` prefix without any changes to that script.
+
+**Known caveat, not treated as a blocker:** a push to an existing PR branch
+made with the workflow's default `GITHUB_TOKEN` does not always cause GitHub
+to fire a fresh `pull_request: synchronize` check run (GitHub's recursive
+-workflow-run prevention). Empirically, this repo's `pull_request`-triggered
+checks (`ci.yml`, `commitlint.yml`) DID run automatically off
+release-please's own `GITHUB_TOKEN`-authored commit opening PR #25, so this
+is expected to work the same way for this sync commit in the common case;
+if a future release PR's checks ever look stale after this step runs, a
+maintainer re-running the checks (or pushing any follow-up commit) picks up
+the synced lockfile — the lockfile fix itself lands correctly regardless.
 
 ## Consequences
 
