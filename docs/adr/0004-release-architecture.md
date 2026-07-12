@@ -6,7 +6,8 @@
 - **Implements:** —
 - **Code:** `release-plz.toml`, `cliff.toml`, `CHANGELOG.md`,
   `.github/workflows/release-plz.yml`,
-  `.github/workflows/commitlint.yml`, `.github/workflows/ci.yml`
+  `.github/workflows/commitlint.yml`, `scripts/check-commit-format.sh`,
+  `CONTRIBUTING.md` ("Submitting changes"), `.github/workflows/ci.yml`
   (`version-drift-guard` job), `Cargo.toml` (`[workspace.package].version`),
   `firmware/Cargo.toml` (`version`), `firmware/build.rs`
   (`emit_build_version` / `MESHCADET_RELEASE_VERSION`),
@@ -151,10 +152,21 @@ release-plz's first run.
   squash-merge commit subject defaults to the PR title, so the PR title
   *is* what git-cliff parses into `CHANGELOG.md`.
 - **`lint-commit-messages`** — every individual commit in the PR must also
-  be a Conventional Commit (small dependency-free bash regex check against
-  `git rev-list base..head`). This catches non-conventional commits before
-  a title edit can paper over them, and remains correct if the merge method
-  is ever changed away from squash.
+  be a Conventional Commit: it invokes `scripts/check-commit-format.sh` (a
+  small dependency-free bash regex check against `git rev-list base..head`),
+  the same script contributors are required to run locally before
+  publishing a branch (`CONTRIBUTING.md` "Submitting changes") — this is
+  the left-shift piece (Implemented, 2026-07-12): non-conventional commits
+  (e.g. an un-squashed worker `checkpoint:` commit) are now caught before
+  `git push`/`gh pr create` instead of surfacing only as a CI red check
+  after the PR is already open, and because both call sites run the exact
+  same script, local and CI verdicts cannot drift apart. This catches
+  non-conventional commits before a title edit can paper over them, and
+  remains correct if the merge method is ever changed away from squash.
+  Coverage boundary: this covers commits published through the interactive
+  PR-prep flow (mission/feature branches); release-plz's own auto-generated
+  release-branch commits are exempted here (see below) and handled
+  separately.
 
 `ci.yml`'s existing three jobs (`test`, `fmt`, `clippy`) are untouched and
 stay required; `commitlint.yml` and the new `version-drift-guard` job are
@@ -187,12 +199,16 @@ v{{ version }}"`, the next release-plz run correctly updated PR #10's
 went green) but force-pushed a commit whose subject was still `release
 v0.1.0` — the PR's pre-change title — failing "Lint commit messages". No
 `release-plz.toml` knob and no available release-plz version fixes this; it
-is a fixed property of `update_pr`'s stale-title reuse. `commitlint.yml`'s
-`lint-commit-messages` job therefore exempts commits that are BOTH on
+is a fixed property of `update_pr`'s stale-title reuse.
+`scripts/check-commit-format.sh` therefore exempts commits that are BOTH on
 release-plz's own branch (`pr_branch_prefix`) AND authored by its bot
-identity (`github-actions[bot]`) from the Conventional Commits format check,
-leaving human-commit enforcement — on that branch and everywhere else —
-unchanged.
+identity (`github-actions[bot]`) from the Conventional Commits format check
+— but ONLY when invoked with `EXEMPT_RELEASE_PLZ=1` (`commitlint.yml`'s
+`lint-commit-messages` job sets this; local/manual runs of the script for
+the pre-PR-publish step in `CONTRIBUTING.md` leave it unset, which is
+correct — release-plz's own commits never pass through that interactive
+flow, see §4's coverage-boundary note above) — leaving human-commit
+enforcement, on that branch and everywhere else, unchanged.
 
 ### 5. Squash-merge satisfies `required_signatures` (Implemented — ruleset re-verified/re-added)
 
