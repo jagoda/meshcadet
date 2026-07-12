@@ -71,11 +71,13 @@ change that wired this up, and `firmware/Cargo.toml` was bumped to match.
 `release-plz.toml` configures [release-plz](https://release-plz.dev) to:
 - Open (and keep up to date) a PR titled `chore(release): v{{ version }}`
   whenever Conventional Commits land on `main` that warrant a release
-  (`release_always = false` — no PR opens for a no-op push). The title
-  doubles as the release commit's message (release-plz pushes it verbatim to
-  the release branch), so it must itself be a Conventional Commit — this is
-  what `.github/workflows/commitlint.yml`'s "Lint PR title" and "Lint commit
-  messages" jobs enforce on every release-plz PR, same as any other PR.
+  (`release_always = false` — no PR opens for a no-op push). The title must
+  be a Conventional Commit — `.github/workflows/commitlint.yml`'s "Lint PR
+  title" job enforces this on every release-plz PR, same as any other PR —
+  because it's what actually reaches `main` (squash-merge). The title does
+  **not** reliably double as the release commit's message on every run: see
+  §4 for the verified mechanism and why "Lint commit messages" exempts
+  release-plz's own commits instead of relying on the title matching.
 - Regenerate `CHANGELOG.md` via `cliff.toml` (git-cliff, Keep a Changelog
   shape — see §3).
 - **Never publish to crates.io** (`publish = false`, on top of every
@@ -157,6 +159,40 @@ release-plz's first run.
 `ci.yml`'s existing three jobs (`test`, `fmt`, `clippy`) are untouched and
 stay required; `commitlint.yml` and the new `version-drift-guard` job are
 additive gates, not replacements.
+
+**release-plz's own release-commit subject is exempt (verified root cause,
+2026-07-12):** `release-plz.toml`'s `pr_name` template was originally
+believed to drive both the release PR's title AND the commit release-plz
+pushes to its own branch (release_plz_core's `Pr::title` reused as the
+commit message). That's only half true. Reading `release_plz_core-0.36.15`
+(pinned by `.github/workflows/release-plz.yml`'s `release-plz/action@v0.5`,
+and the latest release-plz version as of this writing — there is no newer
+release to pin instead):
+- `command::release_pr::create_pr`/`github_create_release_branch` — the
+  path taken the FIRST time a release PR is opened — commit the freshly
+  rendered `pr.title` verbatim. `pr_name` controls this commit correctly.
+- `command::release_pr::update_pr`/`github_force_push` — the path taken on
+  every SUBSEQUENT push that updates an *already-open* release PR — commit
+  `opened_pr.title` instead: the PR's title as fetched from GitHub, i.e.
+  from BEFORE this run's `pr_name` template re-render. The freshly rendered
+  title (`new_pr.title`) is only used afterward, to `edit_pr` the PR
+  object's title metadata. So on every update after the first, the commit
+  subject lags one release-plz run behind the PR's actual (and visibly
+  correct) title.
+
+This was caught empirically on this repo's first release PR (#10): after
+`pr_name` was changed from `"release v{{ version }}"` to `"chore(release):
+v{{ version }}"`, the next release-plz run correctly updated PR #10's
+*title* to `chore(release): v0.1.0` (visible immediately, "Lint PR title"
+went green) but force-pushed a commit whose subject was still `release
+v0.1.0` — the PR's pre-change title — failing "Lint commit messages". No
+`release-plz.toml` knob and no available release-plz version fixes this; it
+is a fixed property of `update_pr`'s stale-title reuse. `commitlint.yml`'s
+`lint-commit-messages` job therefore exempts commits that are BOTH on
+release-plz's own branch (`pr_branch_prefix`) AND authored by its bot
+identity (`github-actions[bot]`) from the Conventional Commits format check,
+leaving human-commit enforcement — on that branch and everywhere else —
+unchanged.
 
 ### 5. Squash-merge satisfies `required_signatures` (Implemented — ruleset re-verified/re-added)
 
