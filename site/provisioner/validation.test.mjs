@@ -1,5 +1,6 @@
 // validation.test.mjs — regression coverage for validation.js's
-// `validatePubkeyHex`/`validateChannelSecretHex`/`validateDeviceName`.
+// `validatePubkeyHex`/`validateChannelSecretHex`/`validateDeviceName`/
+// `validatePin`.
 //
 // Plain `node`, zero dependencies (no package.json), matching
 // contact-uri.test.mjs's build-step-free posture. Run directly:
@@ -7,7 +8,7 @@
 //   node site/provisioner/validation.test.mjs
 
 import assert from "node:assert/strict";
-import { validatePubkeyHex, validateChannelSecretHex, validateDeviceName } from "./validation.js";
+import { validatePubkeyHex, validateChannelSecretHex, validateDeviceName, validatePin } from "./validation.js";
 
 let checks = 0;
 function ok(cond, label) {
@@ -129,6 +130,55 @@ function eq(actual, expected, label) {
   // 16 "é" characters = 32 bytes exactly: still valid at the boundary.
   const result = validateDeviceName("é".repeat(16));
   ok(result.ok, "16 two-byte UTF-8 characters (32 bytes) is valid at the boundary");
+}
+
+// ── validatePin ──────────────────────────────────────────────────────────
+
+{
+  const result = validatePin("1234");
+  ok(result.ok, "an ordinary numeric PIN is valid");
+  eq(Object.prototype.hasOwnProperty.call(result, "pin"), false, "result never echoes the PIN back (it's a secret)");
+}
+
+{
+  const result = validatePin("p@ss-w0rd!");
+  ok(result.ok, "a non-numeric UTF-8 PIN within 16 bytes is valid");
+}
+
+{
+  const result = validatePin("");
+  ok(!result.ok, "an empty PIN is rejected (won't silently set a blank PIN)");
+  ok(/required/.test(result.error), `error explains it's required: ${result.error}`);
+}
+
+{
+  const result = validatePin(null);
+  ok(!result.ok, "a null/undefined PIN is rejected");
+}
+
+{
+  const result = validatePin("a".repeat(16));
+  ok(result.ok, "exactly 16 ASCII bytes is valid (the boundary)");
+}
+
+{
+  const result = validatePin("a".repeat(17));
+  ok(!result.ok, "17 ASCII bytes exceeds MAX_PIN_LEN");
+  ok(/16 bytes/.test(result.error), `error names the byte ceiling: ${result.error}`);
+}
+
+{
+  // "é" is 2 UTF-8 bytes; 8 of them is 16 bytes exactly — valid at the boundary.
+  const result = validatePin("é".repeat(8));
+  ok(result.ok, "8 two-byte UTF-8 characters (16 bytes) is valid at the boundary");
+}
+
+{
+  // 9 "é" = 18 bytes: over the ceiling despite being only 9 characters — the
+  // check must count bytes, not characters (a silently truncated PIN would
+  // set one the user didn't intend).
+  const result = validatePin("é".repeat(9));
+  ok(!result.ok, "multi-byte UTF-8 PIN is measured in bytes, not characters");
 }
 
 console.log(`validation.test: OK — ${checks} check(s) passed.`);
