@@ -56,6 +56,11 @@ jobs:
       - name: Mirror recent release firmware assets
         # Populates site/firmware/<tag>/{manifest.json,meshcadet-<tag>-merged.bin,SHA256SUMS}
         # for flash.html/flash.js — see the workflow header comment above.
+        # Also mirrors the app-only Upgrade artifacts (manifest-update.json,
+        # meshcadet-<tag>-app.bin, update-meta.json) added by
+        # docs/adr/0008-nondestructive-update-artifacts.md and consumed by
+        # docs/adr/0009-two-path-flasher.md's Upgrade path — see the
+        # best-effort second `gh release download` call below.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -116,6 +121,23 @@ jobs:
               rm -rf "$dest"
               continue
             fi
+
+            # Best-effort: the app-only Upgrade artifacts (ADR-0008) don't
+            # exist on releases published before that ADR landed (v0.1.0,
+            # v0.2.0) — that's expected, not a failure, so a non-match here
+            # is NOT treated as a mirror failure (no `::warning::`, no
+            # `rm -rf "$dest"`) and doesn't affect the required-assets check
+            # above. site/flash.js's own update-meta.json fetch already
+            # treats "not mirrored" the same as "mirrored but
+            # upgrade_safe:false" (Fresh install only) — see
+            # docs/adr/0009-two-path-flasher.md D2/D6.
+            gh release download "$tag" \
+              --repo "${{ github.repository }}" \
+              --dir "$dest" \
+              --pattern 'manifest-update.json' \
+              --pattern 'meshcadet-*-app.bin' \
+              --pattern 'update-meta.json' \
+              --clobber || true
           done
 
       - name: Configure Pages

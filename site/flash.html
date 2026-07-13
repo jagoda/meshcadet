@@ -70,7 +70,46 @@
           </select>
           <p id="version-status" class="muted version-status" role="status"></p>
 
-          <h2>3. Install</h2>
+          <h2>3. Choose how to flash</h2>
+          <p>
+            <strong>Fresh install</strong> writes the whole firmware image
+            (bootloader, partition table, and app) and erases everything on
+            the device. <strong>Upgrade</strong> writes only the new app
+            firmware in place and leaves your device's identity, config, and
+            conversation history untouched — but only when your device is
+            already running a build with a compatible partition layout (see
+            <a href="https://github.com/jagoda/meshcadet/blob/main/docs/adr/0009-two-path-flasher.md" target="_blank" rel="noopener">ADR-0009</a>).
+          </p>
+
+          <div class="path-choice" role="radiogroup" aria-label="Flash path">
+            <label class="path-option">
+              <input type="radio" name="flash-path" id="path-fresh" value="fresh" checked />
+              <span class="path-option-body">
+                <strong>Fresh install</strong>
+                <span class="muted">
+                  Erases and reinstalls the whole chip. Any settings,
+                  contacts, or history stored on the device are cleared, the
+                  same as a brand-new build.
+                </span>
+              </span>
+            </label>
+            <label class="path-option">
+              <input type="radio" name="flash-path" id="path-upgrade" value="upgrade" disabled />
+              <span class="path-option-body">
+                <strong>Upgrade</strong>
+                <span class="muted">
+                  Writes only the app firmware. Your device identity, config,
+                  and conversation history are preserved — <em>if</em> the
+                  device is already running a compatible build.
+                </span>
+              </span>
+            </label>
+          </div>
+          <p id="upgrade-safety-note" class="note-box" hidden></p>
+        </div>
+
+        <div class="flash-panel" id="fresh-panel">
+          <h2>4. Install</h2>
           <p>
             Flashing erases and reinstalls the whole firmware image
             (bootloader, partition table, and app) — any settings or
@@ -90,15 +129,40 @@
               <a href="https://github.com/jagoda/meshcadet/issues" target="_blank" rel="noopener">open an issue</a>).
             </span>
           </esp-web-install-button>
-
-          <p class="muted footnote">
-            Prefer to flash manually, or want an older/newer version than
-            what's listed? Grab the merged image and
-            <code>manifest.json</code> straight from the
-            <a href="https://github.com/jagoda/meshcadet/releases" target="_blank" rel="noopener">GitHub Releases</a>
-            page instead.
-          </p>
         </div>
+
+        <div class="flash-panel" id="upgrade-panel" hidden>
+          <h2>4. Back up, then install</h2>
+          <p>
+            Upgrade is designed to preserve your conversation history, but
+            flashing over USB can still fail partway — export a transcript
+            first if that history matters to you.
+            <a href="provisioner.html#history-panel" target="_blank" rel="noopener">Open the provisioner's history export&nbsp;→</a>
+          </p>
+          <label class="checkbox-label">
+            <input type="checkbox" id="upgrade-backup-ack" />
+            I've backed up my history (or don't need to) — let me continue
+          </label>
+
+          <p id="upgrade-unsupported" class="muted" hidden>
+            Your browser doesn't support installing firmware over USB, or
+            this page isn't loaded over HTTPS. Use a desktop build of Chrome
+            or Edge, loaded over HTTPS (or from <code>localhost</code>).
+          </p>
+          <div class="cta-row">
+            <button id="upgrade-connect-button" class="btn btn-primary" type="button" disabled>Connect &amp; Upgrade</button>
+          </div>
+          <p id="upgrade-status" class="muted form-status" role="status"></p>
+        </div>
+
+        <p class="muted footnote">
+          Prefer to flash manually, or want an older/newer version than
+          what's listed? Grab the merged image (<code>manifest.json</code>)
+          or the app-only update image (<code>manifest-update.json</code> +
+          <code>update-meta.json</code>) straight from the
+          <a href="https://github.com/jagoda/meshcadet/releases" target="_blank" rel="noopener">GitHub Releases</a>
+          page instead.
+        </p>
 
         <p class="muted">
           MeshCadet is provided as-is, with no warranty and no guarantee of

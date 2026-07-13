@@ -10,6 +10,7 @@
 | [0006](0006-web-flasher.md) | Web Flasher: Version Selector Over a Same-Origin Mirror | Accepted (2026-07-11) |
 | [0007](0007-provisioner-codec.md) | Web Provisioner Codec: Pure JS + Golden-Vector CI Guard | Accepted (2026-07-11) |
 | [0008](0008-nondestructive-update-artifacts.md) | Non-Destructive Update Artifacts: App-Only Image + Layout Compatibility Gate | Accepted (2026-07-13) |
+| [0009](0009-two-path-flasher.md) | Two-Path Web Flasher: Fresh Install vs Non-Destructive Upgrade | Accepted (2026-07-13) |
 
 ADR-0001 is the project's founding charter: the design decisions made before
 any code was written. Subsequent ADRs (UI toolkit choice, provisioning wire
