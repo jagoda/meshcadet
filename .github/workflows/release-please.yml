@@ -56,10 +56,10 @@ jobs:
       # or firmware/Cargo.lock, so both lockfiles keep pinning the OLD
       # version. `ci.yml`'s `cargo test --locked`/`cargo clippy --locked`
       # then hard-fail on the release PR: "cannot update the lock file
-      # because --locked was passed". The three steps below keep both
-      # lockfiles in sync on the release PR branch whenever release-please
-      # opens or updates it (`prs_created` — false on the separate run that
-      # only tags a just-merged release PR, so this is a no-op there).
+      # because --locked was passed". The steps below keep both lockfiles
+      # in sync on the release PR branch whenever release-please opens or
+      # updates it (`prs_created` — false on the separate run that only
+      # tags a just-merged release PR, so this is a no-op there).
       #
       # This still doesn't invoke `cargo` (the property described above):
       # scripts/sync-cargo-lock-versions.sh is a text-only substitution —
@@ -77,29 +77,84 @@ jobs:
         if: steps.release.outputs.prs_created == 'true'
         run: scripts/sync-cargo-lock-versions.sh
 
-      - name: Commit and push the lockfile sync, if anything changed
+      - name: Check whether the lockfile sync changed anything
+        id: lockdiff
         if: steps.release.outputs.prs_created == 'true'
-        env:
-          # Passed via env rather than interpolated directly into the shell
-          # script below (`${{ ... }}` substitution happens before the
-          # shell ever sees the string) — cheap, standard defense against
-          # script injection even though this value is release-please's own
-          # generated branch name, not attacker-controlled input.
-          HEAD_BRANCH: ${{ fromJson(steps.release.outputs.pr).headBranchName }}
         run: |
           set -euo pipefail
           if git diff --quiet -- Cargo.lock firmware/Cargo.lock; then
-            echo "Cargo.lock/firmware/Cargo.lock already in sync; nothing to push."
-            exit 0
+            echo "Cargo.lock/firmware/Cargo.lock already in sync; nothing to commit."
+            echo "changed=false" >>"${GITHUB_OUTPUT}"
+          else
+            echo "changed=true" >>"${GITHUB_OUTPUT}"
           fi
-          # Same bot identity release-please's own commits use (see
-          # scripts/check-commit-format.sh's release-please exemption,
-          # which matches on this exact author name + the
-          # release-please--branches--* prefix) — this commit is exempt
-          # from commitlint.yml's per-commit Conventional Commits check for
-          # the same reason release-please's own commit is.
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add Cargo.lock firmware/Cargo.lock
-          git commit -m 'chore(release): sync Cargo.lock to the version bump above'
-          git push origin "HEAD:${HEAD_BRANCH}"
+
+      # Commits the lockfile sync via the GraphQL `createCommitOnBranch`
+      # mutation instead of a plain in-runner `git commit` + `git push`.
+      # This is NOT a cosmetic choice: this repo's `main` ruleset
+      # (`required_signatures`, docs/adr/0004-release-architecture.md §5)
+      # requires every commit reaching `main` to carry a verified signature,
+      # and GitHub checks the signature status of EVERY commit on a PR
+      # before it will let even a squash-merge through — a PR with one
+      # unverified commit is unmergeable regardless of merge strategy, it
+      # is not enough for the final synthesized squash commit to be signed.
+      # A plain `git commit` made by the runner's local, unconfigured git
+      # identity has no GPG/SSH signature at all ("unverified, reason:
+      # unknown_key" — confirmed live against this repo: commit `4ef0737`
+      # on the since-closed PR #25 is exactly this failure mode). Commits
+      # made through GitHub's own API (REST Contents API or, as here,
+      # GraphQL `createCommitOnBranch`) are instead authored AND signed by
+      # GitHub itself server-side and always show as Verified — the same
+      # mechanism release-please-action's own bump commit already uses
+      # (PR #25's `3a7125d` bump commit is `verified: true` from the same
+      # run that produced the unverified `4ef0737`), which is why this step
+      # mirrors it rather than inventing a separate signing setup.
+      - name: Commit the lockfile sync via a GitHub-signed API commit
+        if: steps.release.outputs.prs_created == 'true' && steps.lockdiff.outputs.changed == 'true'
+        uses: actions/github-script@v7
+        env:
+          HEAD_BRANCH: ${{ fromJson(steps.release.outputs.pr).headBranchName }}
+        with:
+          script: |
+            const fs = require("fs");
+            const { execSync } = require("child_process");
+
+            const headBranch = process.env.HEAD_BRANCH;
+            const headOid = execSync("git rev-parse HEAD").toString().trim();
+            const changedFiles = execSync(
+              "git diff --name-only -- Cargo.lock firmware/Cargo.lock"
+            )
+              .toString()
+              .trim()
+              .split("\n")
+              .filter(Boolean);
+
+            const additions = changedFiles.map((path) => ({
+              path,
+              contents: fs.readFileSync(path).toString("base64"),
+            }));
+
+            const result = await github.graphql(
+              `mutation($input: CreateCommitOnBranchInput!) {
+                createCommitOnBranch(input: $input) {
+                  commit { oid }
+                }
+              }`,
+              {
+                input: {
+                  branch: {
+                    repositoryNameWithOwner: `${context.repo.owner}/${context.repo.repo}`,
+                    branchName: headBranch,
+                  },
+                  message: {
+                    headline: "chore(release): sync Cargo.lock to the version bump above",
+                  },
+                  expectedHeadOid: headOid,
+                  fileChanges: { additions },
+                },
+              }
+            );
+
+            core.info(
+              `created signed commit ${result.createCommitOnBranch.commit.oid} on ${headBranch}`
+            );

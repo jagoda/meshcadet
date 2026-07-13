@@ -4,7 +4,12 @@
   version/changelog/tag automation moved from release-plz to
   release-please. See §2's "Why release-please, not release-plz" for why.
   §10 added (2026-07-12) — Cargo.lock/firmware/Cargo.lock kept in lockstep
-  with the version bump via a text-only sync script.
+  with the version bump via a text-only sync script. §10 revised
+  (2026-07-13) — the sync commit is now created via the GitHub API
+  (`createCommitOnBranch`) instead of a plain in-runner `git commit`, so it
+  carries a verified signature; see §10 and the corrected §5/Consequences
+  note below on why an unsigned commit on the PR branch is NOT safe under
+  `required_signatures`, contrary to this ADR's original assumption.
 - **Deciders:** Maintainer design review
 - **Supersedes:** —
 - **Implements:** —
@@ -238,6 +243,30 @@ re-added `required_signatures` to ruleset `18807600` to close that gap —
 see the ruleset's `updated_at` timestamp and rule list for the corrected
 live state.
 
+**Correction (2026-07-13, this ADR's §10 revision) — the premise above is
+only half right.** The squash-commit synthesis described above is accurate,
+but "satisfied regardless of whether the source branch's commits were
+signed" is not: GitHub's signature check on a `required_signatures`-covered
+target branch validates every commit reachable from the pull request, not
+only the final synthesized squash/merge commit — this is what stops
+squash-merge from being a trivial escape hatch around the requirement.
+Concretely, once a release PR carries release-please's own (signed, via its
+API-based commit creation) bump commit plus an *unsigned* Cargo.lock sync
+commit made by a plain in-runner `git commit`, the PR becomes unmergeable by
+any strategy while `required_signatures` is enforced — not "lands an
+unsigned commit that squash then hides," but blocked outright. This was
+found by a prior mission attempting to exercise this section against a live
+run, and is why §10's sync commit is now created through the GitHub API
+(`createCommitOnBranch`) rather than a raw `git commit`: every commit on the
+release PR branch must itself be verified; the squash-merge boundary does
+not launder an unsigned one. **Second live-state discrepancy found by this
+mission:** as of 2026-07-13, `required_signatures` was again absent from
+ruleset `18807600` (`gh api .../rulesets/18807600/history` shows it present
+as of version `42771384` and gone by `42874592`, dated the same evening as
+the abandoned attempt referenced above) — restored as a separate,
+explicitly-logged action once this fix's own PR no longer depended on it
+being off (see this mission's dossier for the exact sequencing).
+
 ### 6. Boot-version injection seam (Implemented)
 
 `firmware/build.rs::emit_build_version()` reads `MESHCADET_RELEASE_VERSION`
@@ -307,7 +336,7 @@ at deploy time instead. This section is left brief on purpose so the two
 ADRs don't drift out of sync with each other — see ADR-0006 for the full
 design and its Alternatives Considered.
 
-### 10. Cargo.lock kept in lockstep via a text-only sync script (Implemented)
+### 10. Cargo.lock kept in lockstep via a text-only sync script, committed via the GitHub API (Implemented)
 
 §1/§2's `extra-files` config bumps the version *string* in Cargo.toml and
 firmware/Cargo.toml, but release-please has no built-in Cargo.lock awareness
@@ -324,8 +353,15 @@ way.)
 `.github/workflows/release-please.yml` runs
 `scripts/sync-cargo-lock-versions.sh` immediately after release-please opens
 or updates the release PR (gated on the action's `prs_created` output), and
-pushes a `chore(release): sync Cargo.lock to the version bump above` commit
-back onto the PR branch if either lockfile changed. That script is a
+commits a `chore(release): sync Cargo.lock to the version bump above` change
+back onto the PR branch if either lockfile changed — via the GraphQL
+`createCommitOnBranch` mutation (`actions/github-script`), not a plain
+in-runner `git commit` + `git push` (see §5's correction: an unsigned commit
+anywhere on the release PR blocks merge outright under `required_signatures`,
+squash-merge does not launder it). Commits created through GitHub's API are
+signed server-side by GitHub itself and always show `verified: true` — the
+same mechanism `googleapis/release-please-action`'s own bump commit already
+uses. That script is a
 **text-only substitution**, not a `cargo` invocation — it rewrites just the
 `version = "..."` line of each local workspace-member `[[package]]` stanza
 (these never carry a `source =`/`checksum =` line, unlike registry
@@ -350,22 +386,40 @@ deliberately avoids by not shelling out to `cargo`:
   of unrelated registry-dependency entries in the same run. A release PR's
   diff should be the version bump, not a surprise dependency upgrade.
 
-The commit is pushed authored as `github-actions[bot]
-<41898282+github-actions[bot]@users.noreply.github.com>` — the same identity
-release-please's own commits use — so `scripts/check-commit-format.sh`'s
-existing release-please exemption (§4) covers it on the same
-`release-please--branches--*` prefix without any changes to that script.
+The commit is authored as `github-actions[bot]
+<41898282+github-actions[bot]@users.noreply.github.com>` — the default
+identity GitHub attributes to `GITHUB_TOKEN`-authenticated API commits, the
+same one release-please's own commit uses — so
+`scripts/check-commit-format.sh`'s existing release-please exemption (§4)
+covers it on the same `release-please--branches--*` prefix without any
+changes to that script.
 
-**Known caveat, not treated as a blocker:** a push to an existing PR branch
-made with the workflow's default `GITHUB_TOKEN` does not always cause GitHub
-to fire a fresh `pull_request: synchronize` check run (GitHub's recursive
--workflow-run prevention). Empirically, this repo's `pull_request`-triggered
-checks (`ci.yml`, `commitlint.yml`) DID run automatically off
-release-please's own `GITHUB_TOKEN`-authored commit opening PR #25, so this
-is expected to work the same way for this sync commit in the common case;
-if a future release PR's checks ever look stale after this step runs, a
-maintainer re-running the checks (or pushing any follow-up commit) picks up
-the synced lockfile — the lockfile fix itself lands correctly regardless.
+**Live defect this revision fixes:** the original (2026-07-12) version of
+this step used a plain in-runner `git commit` + `git push` under the
+workflow's local, unconfigured git identity, which has no GPG/SSH key at
+all — its commit is unverified (`reason: unknown_key`). Live evidence:
+`4ef0737`, the sync commit on the since-closed PR #25, is exactly this
+(`gh api repos/jagoda/meshcadet/commits/4ef0737` →
+`verification.verified: false`), sitting alongside that same run's
+release-please bump commit `3a7125d`, which IS verified (API-created). A
+prior mission attempted to enforce `required_signatures` against this and
+found the resulting PR unmergeable (§5's correction) — this revision closes
+that gap by committing the sync through the same API path release-please
+itself already uses, rather than through raw git.
+
+**Known caveat, not treated as a blocker:** a ref update to an existing PR
+branch made under the workflow's default `GITHUB_TOKEN` does not always
+cause GitHub to fire a fresh `pull_request: synchronize` check run (GitHub's
+recursive-workflow-run prevention) — true whether the update comes from a
+plain `git push` or the GraphQL mutation used here, since both go through
+the same `GITHUB_TOKEN` identity. Empirically, this repo's
+`pull_request`-triggered checks (`ci.yml`, `commitlint.yml`) DID run
+automatically off release-please's own `GITHUB_TOKEN`-authored commit
+opening PR #25, so this is expected to work the same way for this sync
+commit in the common case; if a future release PR's checks ever look stale
+after this step runs, a maintainer re-running the checks (or pushing any
+follow-up commit) picks up the synced lockfile — the lockfile fix itself
+lands correctly regardless.
 
 ## Consequences
 
@@ -377,12 +431,18 @@ the synced lockfile — the lockfile fix itself lands correctly regardless.
   maintainer typed" — it is now a CI-enforced invariant tied to the root
   workspace version. Bumping one without the other is a build failure, not
   a silent drift.
-- release-please's bot commits are deliberately left unsigned; the security
-  property this project relies on lives entirely in the squash-merge +
-  `required_signatures` mechanism (§5), not in the bot's own signing setup.
-  If the merge method policy on ruleset `18807600` is ever loosened to
-  allow non-squash merges of unreviewed branches, this property needs
-  re-examination.
+- **Correction (2026-07-13):** the line originally here claimed
+  release-please's bot commits are "deliberately left unsigned" and that
+  the security property lives entirely in squash-merge + `required_signatures`
+  (§5). That was wrong on both halves: `googleapis/release-please-action`
+  creates its version-bump commit via the GitHub API, which GitHub signs
+  server-side — it is verified (`verified: true`) same as any other
+  API-created commit, not unsigned-but-squash-covered — and §5's correction
+  above explains why "squash covers an unsigned commit anyway" was never
+  actually true under `required_signatures`. §10's lock-sync commit now uses
+  the same API-commit mechanism for the same reason: every commit on a
+  release PR must be independently verified, not just the eventual
+  squash/merge commit.
 - `firmware/` remains fully outside release-please's reach by design (see
   Context) — every future piece of this architecture that touches firmware
   versioning must go through the drift-guard pattern established in §1,
