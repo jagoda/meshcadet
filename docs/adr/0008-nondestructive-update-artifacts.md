@@ -10,6 +10,8 @@
   frozen as of this ADR's acceptance; a breaking change to either needs its
   own ADR revision, not a silent edit.
 - **Code:** `firmware/release-container/build.sh`,
+  `firmware/release-container/generate-update-meta.sh` (+
+  `generate-update-meta.test.sh`), `firmware/release-container/Dockerfile`,
   `firmware/layout-baseline.txt`, `.github/workflows/release.yml`. Extends
   ADR-0004 §7 (tag-fired release artifacts) and is consumed by the flasher
   design in ADR-0006.
@@ -76,14 +78,23 @@ either the app itself or an adjacent partition.
 
 - **`layout_hash`** = `sha256(bootloader.bin || partition-table.bin)`
   (raw file bytes, concatenated, not a slice of the merged/padded image),
-  computed by `build.sh` from the same `TARGET_DIR/bootloader.bin` +
+  computed from the same `TARGET_DIR/bootloader.bin` +
   `TARGET_DIR/partition-table.bin` cmake outputs the merged image is built
   from.
 - **`upgrade_safe`** is `true` **iff** this release's `layout_hash` equals
   the value committed at `firmware/layout-baseline.txt` — a checked-in file,
-  not a runtime query. `build.sh` fails the build outright if that file is
-  missing or empty (a missing compatibility baseline is a build defect, not
-  a soft-fail case).
+  not a runtime query.
+
+The comparison itself lives in its own script,
+`firmware/release-container/generate-update-meta.sh` (invoked by `build.sh`,
+COPYed into the release container by `./Dockerfile`), specifically so this
+one piece of the pipeline — the thing that decides whether an app-only flash
+is offered as a non-destructive Upgrade — has test coverage
+(`generate-update-meta.test.sh`, synthetic fixtures) independent of a full
+ESP-IDF/docker build. It fails the build outright (not a soft warning) if
+the baseline file is missing or has no non-comment hash line — a missing
+compatibility baseline is a build defect, not a case to silently default
+either way on.
 
 **Why a committed baseline, not "the previous release's metadata" (R1 —
 revises the originating plan's original design):** the original plan
@@ -222,6 +233,15 @@ checksum entry and a provenance attestation — the same invariant ADR-0004
 - `docs/release-reproducibility.md` is updated to describe the widened
   six-asset provenance/checksum surface, keeping that doc's "describes
   exactly what release.yml does" promise (ADR-0004 §8) accurate.
+- **Verified no breakage of ADR-0006's existing site mirror:**
+  `.github/workflows/pages-deploy.yml`'s "Mirror recent release firmware
+  assets" step downloads with three explicit `--pattern` flags
+  (`manifest.json`, `meshcadet-*-merged.bin`, `SHA256SUMS`) and never runs a
+  `sha256sum -c` against the mirrored `SHA256SUMS` — so the three new assets
+  this ADR adds are simply invisible to it (the `-app.bin` suffix does not
+  match the `-merged.bin` glob) until the site-flasher child explicitly adds
+  patterns for `manifest-update.json`/`update-meta.json`/the app image. The
+  existing Fresh-install-only flasher keeps working unmodified.
 
 ## Alternatives Considered
 
