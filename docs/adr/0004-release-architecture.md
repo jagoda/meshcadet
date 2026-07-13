@@ -207,7 +207,7 @@ commits never pass through that interactive flow, see §4's coverage-boundary
 note above) — leaving human-commit enforcement, on that branch and
 everywhere else, unchanged.
 
-### 5. Squash-merge satisfies `required_signatures` (Implemented — ruleset re-verified/re-added)
+### 5. `required_signatures` on `main` (Implemented — ruleset re-verified/re-added; original squash-merge premise corrected below)
 
 This repo requires every commit on `main` to carry `required_signatures`,
 but also merges exclusively via **squash**-merge through the GitHub UI, and
@@ -243,29 +243,41 @@ re-added `required_signatures` to ruleset `18807600` to close that gap —
 see the ruleset's `updated_at` timestamp and rule list for the corrected
 live state.
 
-**Correction (2026-07-13, this ADR's §10 revision) — the premise above is
-only half right.** The squash-commit synthesis described above is accurate,
-but "satisfied regardless of whether the source branch's commits were
-signed" is not: GitHub's signature check on a `required_signatures`-covered
-target branch validates every commit reachable from the pull request, not
-only the final synthesized squash/merge commit — this is what stops
-squash-merge from being a trivial escape hatch around the requirement.
-Concretely, once a release PR carries release-please's own (signed, via its
-API-based commit creation) bump commit plus an *unsigned* Cargo.lock sync
-commit made by a plain in-runner `git commit`, the PR becomes unmergeable by
-any strategy while `required_signatures` is enforced — not "lands an
-unsigned commit that squash then hides," but blocked outright. This was
-found by a prior mission attempting to exercise this section against a live
-run, and is why §10's sync commit is now created through the GitHub API
-(`createCommitOnBranch`) rather than a raw `git commit`: every commit on the
-release PR branch must itself be verified; the squash-merge boundary does
-not launder an unsigned one. **Second live-state discrepancy found by this
+**Correction (2026-07-13) — the squash-merge premise above does not match
+actual practice.** Despite this section's title and the "merges exclusively
+via squash-merge" claim, every PR merge in this repo's real history is a
+**regular (non-squash) merge commit** — `git show --no-patch --format="%P"`
+on any merged PR's merge SHA shows two parents (the pre-merge `main` tip and
+the PR branch's own head), e.g. `2cd1802` (PR #24), `25ead45` (PR #22),
+`5fbada2` (PR #19); `commitlint.yml`'s own header comment states this
+explicitly ("every PR ... via a signed merge commit ... never squash").
+Ruleset `18807600`'s `pull_request` rule permits `merge`/`squash`/`rebase`
+alike, but the merge button has consistently been used in `merge` mode.
+Regular merge does not synthesize a new commit for the PR's own contents —
+it preserves every commit from the PR branch verbatim as an ancestor of the
+new merge commit on `main`. So the mechanism was never "GitHub signs one
+synthesized commit and the rest ride along unsigned" — it is much more
+directly: **every individual commit on a PR branch lands on `main` byte-for-
+byte, so `required_signatures` must be (and is) satisfied by every one of
+them individually**, with no squash step in the picture at all. An unsigned
+commit anywhere in the PR — release-please's own bump commit or the
+Cargo.lock sync commit — is therefore an unsigned commit landing directly on
+`main`, exactly what `required_signatures` exists to reject. This was found
+by a prior mission attempting to exercise this section against a live run
+(the Cargo.lock sync commit's plain `git commit` failed this way), and is
+why §10's sync commit is now created through the GitHub API
+(`createCommitOnBranch`) rather than a raw `git commit`: it needs to be
+signed on its own merits, not by leaning on a squash boundary that this repo
+doesn't actually use. **Second live-state discrepancy found by this
 mission:** as of 2026-07-13, `required_signatures` was again absent from
 ruleset `18807600` (`gh api .../rulesets/18807600/history` shows it present
 as of version `42771384` and gone by `42874592`, dated the same evening as
 the abandoned attempt referenced above) — restored as a separate,
 explicitly-logged action once this fix's own PR no longer depended on it
-being off (see this mission's dossier for the exact sequencing).
+being off (see this mission's dossier for the exact sequencing). The
+squash-merge framing in this section's title/opening paragraphs is left
+in place below as the historical record of the (mistaken) original design
+premise; treat this correction as superseding it.
 
 ### 6. Boot-version injection seam (Implemented)
 
@@ -356,9 +368,11 @@ or updates the release PR (gated on the action's `prs_created` output), and
 commits a `chore(release): sync Cargo.lock to the version bump above` change
 back onto the PR branch if either lockfile changed — via the GraphQL
 `createCommitOnBranch` mutation (`actions/github-script`), not a plain
-in-runner `git commit` + `git push` (see §5's correction: an unsigned commit
-anywhere on the release PR blocks merge outright under `required_signatures`,
-squash-merge does not launder it). Commits created through GitHub's API are
+in-runner `git commit` + `git push` (see §5's correction: this repo merges
+via regular, non-squash merge commits, so every commit on the release PR
+lands on `main` verbatim and must individually satisfy
+`required_signatures` — an unsigned one anywhere on the branch blocks the
+merge outright). Commits created through GitHub's API are
 signed server-side by GitHub itself and always show `verified: true` — the
 same mechanism `googleapis/release-please-action`'s own bump commit already
 uses. That script is a
@@ -434,15 +448,15 @@ lands correctly regardless.
 - **Correction (2026-07-13):** the line originally here claimed
   release-please's bot commits are "deliberately left unsigned" and that
   the security property lives entirely in squash-merge + `required_signatures`
-  (§5). That was wrong on both halves: `googleapis/release-please-action`
-  creates its version-bump commit via the GitHub API, which GitHub signs
-  server-side — it is verified (`verified: true`) same as any other
-  API-created commit, not unsigned-but-squash-covered — and §5's correction
-  above explains why "squash covers an unsigned commit anyway" was never
-  actually true under `required_signatures`. §10's lock-sync commit now uses
-  the same API-commit mechanism for the same reason: every commit on a
-  release PR must be independently verified, not just the eventual
-  squash/merge commit.
+  (§5). That was wrong on both counts: this repo merges via regular
+  (non-squash) merge commits (§5's correction), so every PR commit lands on
+  `main` verbatim and must itself satisfy `required_signatures` — there is
+  no squash-synthesized commit to lean on. And
+  `googleapis/release-please-action` already creates its version-bump commit
+  via the GitHub API, which GitHub signs server-side (`verified: true`) —
+  it was never unsigned to begin with. §10's lock-sync commit now uses that
+  same API-commit mechanism for the same reason: every commit on a release
+  PR must be independently verified.
 - `firmware/` remains fully outside release-please's reach by design (see
   Context) — every future piece of this architecture that touches firmware
   versioning must go through the drift-guard pattern established in §1,
