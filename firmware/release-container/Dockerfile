@@ -137,8 +137,14 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
 # exists once this snippet's PATH additions make `rustup`'s `esp` toolchain
 # reachable) — release-container/build.sh (the container's ENTRYPOINT) does
 # this first.
+# generate-update-meta.sh: the layout-compatibility-gate step build.sh
+# shells out to (docs/adr/0008-nondestructive-update-artifacts.md D2) — split
+# out so it has its own test coverage
+# (release-container/generate-update-meta.test.sh) independent of a full
+# image build; see that script's own header comment.
 COPY release-container/build.sh /opt/build.sh
-RUN chmod +x /opt/build.sh
+COPY release-container/generate-update-meta.sh /opt/generate-update-meta.sh
+RUN chmod +x /opt/build.sh /opt/generate-update-meta.sh
 
 WORKDIR /build
 ENTRYPOINT ["/opt/build.sh"]

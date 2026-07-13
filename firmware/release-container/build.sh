@@ -182,31 +182,12 @@ echo "=== wrote ${APP_BIN} (kept — app-only update artifact, see ADR-0008) ===
 # no release before this one ever emitted a layout_hash to compare against).
 # This mission (ADR-0008) owns bumping that baseline whenever it
 # intentionally changes firmware/partitions.csv or the bootloader layout.
-LAYOUT_BASELINE_FILE="layout-baseline.txt"
-if [[ ! -f "$LAYOUT_BASELINE_FILE" ]]; then
-  echo "build.sh: missing firmware/${LAYOUT_BASELINE_FILE} — the committed layout-hash baseline (see docs/adr/0008-nondestructive-update-artifacts.md)" >&2
-  exit 1
-fi
-LAYOUT_BASELINE="$(grep -v '^[[:space:]]*#' "$LAYOUT_BASELINE_FILE" | grep -v '^[[:space:]]*$' | tr -d '[:space:]')"
-if [[ -z "$LAYOUT_BASELINE" ]]; then
-  echo "build.sh: firmware/${LAYOUT_BASELINE_FILE} has no non-comment hash line" >&2
-  exit 1
-fi
-LAYOUT_HASH="$(cat "$BOOTLOADER_BIN" "$PARTITION_TABLE_BIN" | sha256sum | cut -d' ' -f1)"
-if [[ "$LAYOUT_HASH" == "$LAYOUT_BASELINE" ]]; then
-  UPGRADE_SAFE=true
-else
-  UPGRADE_SAFE=false
-fi
-
-cat > /build/dist/update-meta.json <<EOF
-{
-  "version": "${VERSION}",
-  "layout_hash": "${LAYOUT_HASH}",
-  "layout_baseline": "${LAYOUT_BASELINE}",
-  "upgrade_safe": ${UPGRADE_SAFE},
-  "app_asset": "$(basename "$APP_BIN")",
-  "app_offset": 65536
-}
-EOF
-echo "=== wrote /build/dist/update-meta.json (layout_hash=${LAYOUT_HASH} upgrade_safe=${UPGRADE_SAFE}) ==="
+#
+# Split into its own script (/opt/generate-update-meta.sh, COPYed in by
+# ./Dockerfile) rather than inlined here so this specific comparison — the
+# one piece of this release pipeline that decides whether an app-only flash
+# is offered as a non-destructive Upgrade — has its own test coverage
+# (generate-update-meta.test.sh) against synthetic fixtures, independent of
+# a full ESP-IDF/docker build.
+/opt/generate-update-meta.sh "$VERSION" "$BOOTLOADER_BIN" "$PARTITION_TABLE_BIN" \
+  layout-baseline.txt "$(basename "$APP_BIN")" /build/dist/update-meta.json
