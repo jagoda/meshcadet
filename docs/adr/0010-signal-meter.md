@@ -176,7 +176,11 @@ no meter at all.
   renders anything — `firmware/src/main.rs`'s rx-tap and the Slint
   `SignalMeter` widget are both the UI child's deliverable, consuming this
   frozen API. Until that child lands, `signal_tracker` compiles and tests
-  but has no runtime caller.
+  but has no runtime caller. **Update:** the UI child has since landed —
+  the rx-tap (`firmware/src/main.rs`'s RX-poll block, before the dedup
+  drop) and the `SignalMeter` widget (`firmware/src/ui/signal_meter.slint`,
+  embedded on the four operational screens) both now consume this API
+  exactly as specified above; no change to the frozen contract itself.
 - `SignalConfig`'s fields are all `pub`, giving the UI child (or a later HIL
   follow-on) latitude to retune bars/SNR/decay pacing without touching
   `signal_tracker.rs`'s logic — at the cost of no compile-time guarantee

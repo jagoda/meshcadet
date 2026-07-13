@@ -30,6 +30,7 @@
 slint::slint! {
     import { Theme } from "../theme.slint";
     import { Starfield, CometOnNotify, SpaceBackdrop } from "../motifs.slint";
+    import { SignalMeter } from "../signal_meter.slint";
 
     // A single row in the contact list.
     component ContactRow {
@@ -234,6 +235,11 @@ slint::slint! {
         in property <int>    channels_unread_total;
         in property <string> channels_unread_str;
 
+        // Repeater signal-meter reading (ADR-0010): 0 = direct-only,
+        // 1..=5 = bars. Pushed by `ContactListScreen::set_signal_level`; see
+        // `SignalMeter`'s embedding below.
+        in property <int> signal_level: 0;
+
         // Trackball-driven row highlight, index into whichever list
         // (contacts/channels) `show_contacts` currently selects. `-1` = no
         // highlight (touch taps a row directly and never sets this — see
@@ -382,6 +388,28 @@ slint::slint! {
                         }
                         TouchArea { clicked => { show_contacts = false; } }
                     }
+                    // `SignalMeter` (ADR-0010) — this header has no existing
+                    // trailing spacer to nest into (unlike `gps_status.rs`/
+                    // `message_view.rs`); the gear button already occupies
+                    // the literal top-right corner. A small new flow child,
+                    // placed just before the gear, reserves its own
+                    // non-overlapping slot — the two tabs' `horizontal-
+                    // stretch: 1.0` simply divide the slightly-reduced
+                    // remaining width evenly (each still comfortably wider
+                    // than its "📬 Messages"/"📡 Channels" label), so neither
+                    // tab's touch target, badge, or underline position is
+                    // disturbed beyond that width recompute — nothing here
+                    // is repositioned relative to its own parent.
+                    Rectangle {
+                        width: 26px; height: 36px;
+                        SignalMeter {
+                            signal-level: root.signal_level;
+                            width: 16px;
+                            height: 14px;
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                        }
+                    }
                     // ── Settings / PIN-menu entry ─────────────────────────────
                     HeaderIconButton {
                         width: 44px;
@@ -525,6 +553,13 @@ impl ContactListScreen {
             self.component.set_notify_trigger(true);
         }
         baseline.set(Some(total));
+    }
+
+    /// Push a fresh repeater signal-meter reading (ADR-0010) into the
+    /// header's `SignalMeter` — see `GpsStatusScreen::set_signal_level`'s
+    /// identical doc for the `bars` contract.
+    pub fn set_signal_level(&self, bars: i32) {
+        self.component.set_signal_level(bars);
     }
 
     /// Replace the full contact list model.

@@ -35,6 +35,7 @@ pub mod contact_list;
 pub mod gps_status;
 pub mod keyboard;
 pub mod message_view;
+pub mod signal_meter;
 pub mod splash;
 pub mod theme;
 pub mod touch;

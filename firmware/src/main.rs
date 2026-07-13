@@ -116,6 +116,7 @@ mod provisioning_server;
 #[cfg(not(feature = "hil"))]
 mod history_store;
 mod radio;
+mod signal_tracker;
 mod ui;
 // PIN-menu — pure Rust, no ESP-IDF deps; compiled in ALL builds so that
 // ui/mod.rs can call pin_menu::verify_pin without a #[cfg] gate.
@@ -173,6 +174,7 @@ use battery::BatteryDriver;
 use dispatcher::{AirtimeBudget, DuplicateFilter, TxQueue, lora_airtime_ms};
 use gps::GpsDriver;
 use radio::Radio;
+use signal_tracker::{SignalConfig, SignalTracker};
 
 // ── RX diagnostic log macro ───────────────────────────────────────────────────
 
@@ -1104,6 +1106,12 @@ fn run() -> anyhow::Result<()> {
     let mut budget = AirtimeBudget::new();
     let mut txq    = TxQueue::new();
 
+    // Repeater signal-strength tracker (ADR-0010) — in-memory only, no reboot
+    // persistence (see `SignalTracker::new`'s doc), so it is seeded fresh here
+    // every boot, starting at `SignalLevel::DirectOnly` until the first
+    // hop>=1 packet is recorded by the RX-poll tap below.
+    let mut signal_tracker = SignalTracker::new(SignalConfig::default());
+
     let mut pending_ack: Option<PendingAck> = None;
     let mut pending_channel_ack: Option<PendingChannelAck> = None;
 
@@ -1264,6 +1272,20 @@ fn run() -> anyhow::Result<()> {
             }
         }
 
+        // Refresh the signal-meter reading — no cross-thread mutex needed
+        // (unlike GPS/battery above): the tracker is local dispatcher-loop
+        // state, read only by this same thread's UI push, so this runs in
+        // every build (not gated on `not(feature = "hil")`). `level(now)`
+        // recomputes the tracker's max-with-decay reading fresh every
+        // iteration (see `SignalTracker::level`'s doc); pushing it is what
+        // lets the four operational screens' meter age down live even with
+        // no further packets arriving. `UiRuntime::set_signal_level` no-ops
+        // routing the value to a screen that has no meter (splash,
+        // unprovisioned, pin_entry, admin_menu — ADR-0010 D5).
+        if let Some(ref mut ui) = ui_opt {
+            ui.set_signal_level(signal_tracker.level(now));
+        }
+
         // ── Enqueue periodic TEST DM (HIL only) ──────────────────────────────
         #[cfg(feature = "hil")]
         if now.saturating_sub(last_tx_ms) >= TX_INTERVAL_MS {
@@ -1401,6 +1423,33 @@ fn run() -> anyhow::Result<()> {
                     let snr_db   = (snr_raw as i32) / 4;
                     log::info!("RX RxDone: {} bytes, rssi={}dBm snr={}dB (raw {}/{})",
                                n, rssi_dbm, snr_db, rssi_raw, snr_raw);
+
+                    // ── Signal-meter rx-tap (ADR-0010) ────────────────────────
+                    // Record on EVERY RxDone, including a frame the dedup check
+                    // right below is about to drop — a dedup'd duplicate from a
+                    // repeater still proves it is audible right now (decision 6
+                    // in the ADR), so this MUST run before that drop, not after.
+                    // `frame_buf[1]` is the `path_len` byte (`n >= 2` guards the
+                    // index — a frame this short is truncated garbage the rest
+                    // of this match arm would reject anyway). `hop_count == 0`
+                    // (a zero-hop, direct-from-origin packet) is filtered out
+                    // here explicitly, mirroring the ADR's "hop >= 1" gate —
+                    // `SignalTracker::record` would also no-op on it internally,
+                    // but gating here avoids the call entirely on MeshCadet's
+                    // single-hop-common-case traffic. `rssi_dbm`/`snr_db` are
+                    // already decoded above; `now` is this dispatcher-loop
+                    // iteration's real monotonic `esp_timer_get_time`-backed
+                    // clock (`uptime_ms()`), never a loop-iteration counter.
+                    if n >= 2 {
+                        let hop_count = PathLen(frame_buf[1]).hop_count();
+                        if hop_count >= 1 {
+                            signal_tracker.record(rssi_dbm as i16, snr_db as i8, hop_count, now);
+                            rx_diag!(
+                                "signal-meter: recorded hop_count={} rssi={}dBm snr={}dB -> level={:?}",
+                                hop_count, rssi_dbm, snr_db, signal_tracker.level(now),
+                            );
+                        }
+                    }
                 } else {
                     log::info!("RX RxDone: {} bytes (GetPacketStatus failed)", n);
                 }

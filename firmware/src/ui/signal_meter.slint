@@ -1,0 +1,104 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// signal_meter.slint — phone-style repeater-signal-strength widget.
+//
+// Consumes ADR-0010's frozen `firmware_core::signal_tracker::SignalLevel`
+// contract via a plain `0..=5` int (`firmware_core::ui::signal_meter::
+// level_to_bars` converts the enum on the Rust side before it ever reaches
+// this markup — Slint properties can't carry a Rust enum directly):
+//   - `0`    = `DirectOnly` (no hop>=1 packet heard within the tracker's
+//              decay window) — renders the direct-only ring below, NOT a
+//              bars glyph.
+//   - `1..5` = `Bars(n)` — renders `n` filled bars out of 5, ascending in
+//              height left-to-right; bars beyond `n` render dim/unfilled so
+//              the "out of 5" scale stays visible even at 1 bar.
+//
+// # Honest framing (ADR-0010 D6 — mandatory, not a suggestion)
+//
+// This is a DOWNLINK AUDIBILITY proxy, never a delivery guarantee: it says
+// how well this device can hear the nearest repeater, nothing about whether
+// that repeater (or anything past it) can hear THIS device, and nothing
+// about the health of the rest of the mesh. Bars = "I can hear the nearest
+// repeater this well." The direct-only ring (level 0) reads as "no repeater
+// heard recently — a direct/unassisted send is still possible", an
+// aspirational statement about what MIGHT still work, not a measured
+// guarantee of anything — it is deliberately NOT rendered as an error/alert
+// glyph (no `Theme.alert` red, no cross/X): a direct send genuinely can
+// still succeed at level 0.
+//
+// # No text glyphs
+//
+// Every stroke here is a `Rectangle` (bars, ring) — no `Text` glyph is used,
+// so this widget carries none of the custom bitmap-emoji-font
+// glyph-coverage risk `gen_emoji_font.c`'s own doc warns about (a codepoint
+// absent from that curated, build-time-generated font renders silently
+// blank on real hardware — see that file's SYNC INVARIANT comments and the
+// historical 📍/🔔/🔊/💤/🔋 blank-glyph defects it now guards against). A
+// signal-bars glyph has no natural single-codepoint emoji analog anyway.
+//
+// # Sizing
+//
+// Declared at its natural ~24x16 px default; every geometry expression below
+// is a FRACTION of `root.width`/`root.height` (never a hardcoded pixel), so
+// an embedding screen can override `width`/`height` — same convention
+// `motifs.slint`'s `RingedPlanetCorner`/`Comet` already establish (e.g.
+// `Comet { width: 22px; height: 11px; }` in `gps_status.rs`) — and the bars/
+// ring scale proportionally instead of clipping or mis-centering. Every
+// screen this campaign embeds `SignalMeter` on (`contact_list`,
+// `message_view`, `compose`, `gps_status`) overrides it down to a uniform
+// 16x14 px so it fits each header's own free space — see each screen's own
+// placement comment for why that particular corner was chosen.
+import { Theme } from "theme.slint";
+
+export component SignalMeter {
+    in property <int> signal-level: 0;
+
+    width: 24px;
+    height: 16px;
+
+    // Defensive clamp: `signal-level` is Rust-driven
+    // (`firmware_core::ui::signal_meter::level_to_bars`, which only ever
+    // emits `0..=5`), but clamping here means a future out-of-range value
+    // (e.g. a tracker retune that widens `MAX_BARS`) degrades to the nearest
+    // valid bar count instead of painting a bar past the widget's own
+    // geometry or indexing a bar that doesn't exist.
+    property <int> filled-bars: max(0, min(5, signal-level));
+
+    // Shared bar geometry — five ascending-height bars, bottom-aligned,
+    // left to right. Explicit x/y placement (not a HorizontalLayout) so
+    // each bar's bottom-anchored height is exact, not subject to a box
+    // layout's own stretch/alignment pass.
+    property <length> bar-w: 0.125 * root.width;
+    property <length> bar-gap: 0.06 * root.width;
+
+    // ── Bars mode (filled-bars >= 1) ──────────────────────────────────────
+    // One `for` per bar index `i` (0..=4, i.e. bar `i+1` of 5): height rises
+    // linearly from 2/6 of the widget's height (bar 1, shortest) to a full
+    // 6/6 (bar 5, tallest); a bar is filled iff `filled-bars >= i + 1`.
+    if filled-bars >= 1 : Rectangle {
+        width: parent.width;
+        height: parent.height;
+
+        for i in 5 : Rectangle {
+            x: i * (bar-w + bar-gap);
+            width: bar-w;
+            height: (i + 2) * root.height / 6;
+            y: parent.height - self.height;
+            background: filled-bars >= i + 1 ? Theme.brand-signal : Theme.text-muted.with-alpha(0.35);
+        }
+    }
+
+    // ── Direct-only mode (filled-bars == 0) ────────────────────────────────
+    // A small unfilled ring — deliberately NOT a solid dot, cross, or
+    // `Theme.alert` red (see the honest-framing doc above): reads as
+    // "listening, nothing heard yet", not "broken"/"error".
+    if filled-bars == 0 : Rectangle {
+        width: 0.55 * root.height;
+        height: 0.55 * root.height;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: self.width / 2;
+        border-width: 0.12 * root.height;
+        border-color: Theme.brand-signal;
+        background: transparent;
+    }
+}

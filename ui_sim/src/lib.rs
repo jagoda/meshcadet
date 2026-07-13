@@ -114,6 +114,14 @@ pub mod splash_lineart;
 /// path.
 pub mod list_pane_backdrop;
 
+/// Host-sim render rig —
+/// proves the standalone `SignalMeter` widget (`ui/signal_meter.slint`,
+/// ADR-0010 / `meshcadet-signal-meter` campaign) renders its direct-only
+/// ring at level 0 and the correct filled-bar count at levels 1..=5. See
+/// that module's own doc for why it is a separate, narrower component/render
+/// path.
+pub mod signal_meter;
+
 pub const WIDTH: u32 = 320;
 pub const HEIGHT: u32 = 240;
 
