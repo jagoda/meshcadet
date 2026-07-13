@@ -1,0 +1,23 @@
+# MeshCadet firmware layout-compatibility baseline — see
+# docs/adr/0008-nondestructive-update-artifacts.md.
+#
+# The single non-comment line below is
+# sha256(bootloader.bin || partition-table.bin) for the shipped v0.1.0/v0.2.0
+# layout. firmware/partitions.csv has been byte-identical since the initial
+# commit, so this is also THIS release's baseline: the first app-only release
+# is correctly upgrade_safe:true (release-container/build.sh compares its own
+# freshly-built layout_hash against this file).
+#
+# Verified by extracting bootloader.bin/partition-table.bin directly from the
+# published v0.1.0 AND v0.2.0 merged release images (both hash identically):
+# the bootloader image ends at file offset 0x5130 (last non-0xFF byte before
+# the 0x8000 partition-table region; 0xFF-padded merge_bin gap from there to
+# 0x8000), and the partition-table region is exactly 160 bytes
+# (0x8000..0x80a0 — 4 partition entries + 1 MD5-sum entry, gen_esp32part.py's
+# standard trailer), also 0xFF-padded out to nvs's 0x9000 offset.
+#
+# Bump this value ONLY in a release that intentionally changes
+# firmware/partitions.csv or the bootloader layout, and mark that release
+# upgrade_safe:false (forcing Fresh install for that hop) — never bump it
+# silently. Record the bump and its rationale in an ADR-0008 addendum.
+8c2f016672527d802f58b67787e2d63f441191f0b6d4f0dc49140d5d66eeff36
