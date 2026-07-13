@@ -3,9 +3,14 @@
 #
 # Runs INSIDE the pinned release-container (see ./Dockerfile) as its
 # ENTRYPOINT. Builds PRODUCTION firmware (default features — no diagnostics,
-# no hil) and merges bootloader + custom partition table + app into one
-# flashable image. Same script for CI (.github/workflows/release.yml) and a
-# third-party local reproduction — see docs/release-reproducibility.md.
+# no hil), merges bootloader + custom partition table + app into one
+# flashable image (the Fresh-install artifact), AND keeps the standalone app
+# image plus a compatibility-gate metadata file as a second, app-only update
+# artifact (see docs/adr/0008-nondestructive-update-artifacts.md — this is
+# the CONTRACT the site flasher child consumes; ADR-0004 §7 covers the
+# merged/Fresh-install artifact this augments). Same script for CI
+# (.github/workflows/release.yml) and a third-party local reproduction — see
+# docs/release-reproducibility.md.
 #
 # Usage: build.sh <version e.g. v0.1.0> <source-date-epoch>
 #
@@ -137,7 +142,12 @@ done
 echo "    flash_mode=${flash_mode} flash_freq=${flash_freq} flash_size=${flash_size} (from ${SDKCONFIG_RESOLVED})"
 
 mkdir -p /build/dist
-APP_BIN=/build/dist/app.bin
+# Tag-named, same convention as MERGED_BIN below — this is the app-only
+# update-artifact asset (ADR-0008): the bare `factory` app image, meant to be
+# flashed ALONE at 0x10000 to upgrade a device without touching `nvs`@0x9000
+# or `mc_hist`@0x610000. Unlike the old behavior, this file is a KEPT build
+# output, not a scratch intermediate — do not `rm` it after merge_bin below.
+APP_BIN="/build/dist/meshcadet-${VERSION}-app.bin"
 MERGED_BIN="/build/dist/meshcadet-${VERSION}-merged.bin"
 
 "$IDF_PYTHON" -m esptool --chip esp32s3 elf2image \
@@ -157,5 +167,27 @@ MERGED_BIN="/build/dist/meshcadet-${VERSION}-merged.bin"
   0x8000  "$PARTITION_TABLE_BIN" \
   0x10000 "$APP_BIN"
 
-rm -f "$APP_BIN"
-echo "=== wrote ${MERGED_BIN} ==="
+echo "=== wrote ${MERGED_BIN} (Fresh-install artifact — unchanged) ==="
+echo "=== wrote ${APP_BIN} (kept — app-only update artifact, see ADR-0008) ==="
+
+# ── Compatibility-gate metadata (ADR-0008, plan D2 revised by R1) ──────────
+#
+# An app-only flash at 0x10000 is only safe over a device whose installed
+# bootloader + partition table are byte-identical to THIS release's — a
+# resized/moved partition means the app would either not fit or misalign
+# against the device's actual layout. `layout_hash` is that fingerprint;
+# `upgrade_safe` records whether it matches the COMMITTED baseline
+# (firmware/layout-baseline.txt — the source of truth, seeded from the
+# shipped v0.1.0/v0.2.0 layout; NOT the previous release's own metadata, since
+# no release before this one ever emitted a layout_hash to compare against).
+# This mission (ADR-0008) owns bumping that baseline whenever it
+# intentionally changes firmware/partitions.csv or the bootloader layout.
+#
+# Split into its own script (/opt/generate-update-meta.sh, COPYed in by
+# ./Dockerfile) rather than inlined here so this specific comparison — the
+# one piece of this release pipeline that decides whether an app-only flash
+# is offered as a non-destructive Upgrade — has its own test coverage
+# (generate-update-meta.test.sh) against synthetic fixtures, independent of
+# a full ESP-IDF/docker build.
+/opt/generate-update-meta.sh "$VERSION" "$BOOTLOADER_BIN" "$PARTITION_TABLE_BIN" \
+  layout-baseline.txt "$(basename "$APP_BIN")" /build/dist/update-meta.json

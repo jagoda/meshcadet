@@ -15,10 +15,19 @@ name: release
 #      flashable image via `esptool merge_bin`
 #      (firmware/release-container/build.sh has the exact offsets/rationale;
 #      see also firmware/scripts/flash-with-partition-table.sh, which flashes
-#      the same three components separately for local dev);
-#   4. publishes a GitHub Release: the merged image, an esp-web-tools
-#      `manifest.json`, and `SHA256SUMS`;
-#   5. attests SLSA build provenance over those three published assets.
+#      the same three components separately for local dev) — this is the
+#      Fresh-install artifact, unchanged;
+#   4. ALSO keeps the standalone app image (build.sh no longer discards it)
+#      as a second, app-only UPDATE artifact, plus release-time compatibility
+#      metadata (`layout_hash`/`upgrade_safe`, computed by build.sh against
+#      the committed `firmware/layout-baseline.txt`) — see
+#      docs/adr/0008-nondestructive-update-artifacts.md, the CONTRACT the
+#      site flasher child consumes;
+#   5. publishes a GitHub Release: the merged image, the app-only image, an
+#      esp-web-tools `manifest.json` (Fresh install) and `manifest-update.json`
+#      (app-only Upgrade, single part @ 0x10000), `update-meta.json`
+#      (layout_hash/upgrade_safe), and `SHA256SUMS`;
+#   6. attests SLSA build provenance over those six published assets.
 #
 # See docs/release-reproducibility.md for the full rebuild + third-party
 # verification recipe (this workflow and that doc must describe the exact
@@ -122,6 +131,19 @@ jobs:
           path: dist/meshcadet-${{ steps.version.outputs.tag }}-merged.bin
           if-no-files-found: error
 
+      # The app-only update artifact + its compatibility-gate metadata
+      # (docs/adr/0008-nondestructive-update-artifacts.md) — build.sh writes
+      # both directly, since layout_hash needs the raw bootloader.bin/
+      # partition-table.bin bytes only available inside the build container.
+      - name: Upload update-artifact + metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: update-artifacts
+          path: |
+            dist/meshcadet-${{ steps.version.outputs.tag }}-app.bin
+            dist/update-meta.json
+          if-no-files-found: error
+
   release:
     name: publish GitHub Release + attest provenance
     needs: build
@@ -132,6 +154,11 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: merged-image
+          path: dist
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: update-artifacts
           path: dist
 
       - name: Generate esp-web-tools manifest.json
@@ -154,16 +181,56 @@ jobs:
           }
           EOF
 
+      # The app-only Upgrade counterpart to manifest.json above — a single
+      # part at 0x10000 (65536, the `factory` app partition offset —
+      # firmware/partitions.csv), never at 0 (which would be a Fresh-install/
+      # erasing manifest). `new_install_prompt_erase: false` per
+      # docs/adr/0008-nondestructive-update-artifacts.md D4: the manifest
+      # shape must not itself force a full-chip erase — esp-web-tools' own
+      # erase semantics for a genuinely non-erasing write are resolved live
+      # by the site child; this manifest is what makes that resolution
+      # possible in the first place. `update-meta.json` (mirrored alongside)
+      # carries `upgrade_safe` — the site child must gate offering this
+      # manifest on that flag, since a layout-incompatible device flashed
+      # app-only would be corrupted regardless of what this manifest itself
+      # says.
+      - name: Generate esp-web-tools manifest-update.json
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cat > dist/manifest-update.json <<EOF
+          {
+            "name": "MeshCadet (Upgrade)",
+            "version": "${TAG}",
+            "new_install_prompt_erase": false,
+            "builds": [
+              {
+                "chipFamily": "ESP32-S3",
+                "parts": [
+                  { "path": "meshcadet-${TAG}-app.bin", "offset": 65536 }
+                ]
+              }
+            ]
+          }
+          EOF
+
       - name: Generate SHA256SUMS
         env:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           cd dist
-          sha256sum "meshcadet-${TAG}-merged.bin" manifest.json > SHA256SUMS
+          sha256sum \
+            "meshcadet-${TAG}-merged.bin" \
+            "meshcadet-${TAG}-app.bin" \
+            manifest.json \
+            manifest-update.json \
+            update-meta.json \
+            > SHA256SUMS
           cd -
 
-      # Provenance for exactly the three published assets, over their final
+      # Provenance for exactly the six published assets, over their final
       # bytes (post-manifest/checksum generation, pre-upload) — see
       # docs/release-reproducibility.md for the `gh attestation verify`
       # third-party re-check this pairs with.
@@ -172,7 +239,10 @@ jobs:
         with:
           subject-path: |
             dist/meshcadet-${{ github.ref_name }}-merged.bin
+            dist/meshcadet-${{ github.ref_name }}-app.bin
             dist/manifest.json
+            dist/manifest-update.json
+            dist/update-meta.json
             dist/SHA256SUMS
 
       - name: Extract release notes from CHANGELOG.md
@@ -192,7 +262,7 @@ jobs:
       # KNOWN FAILURE MODE: `gh release create` uploads its file arguments
       # sequentially after creating the Release object — a network blip
       # partway through can leave a published Release missing one or more of
-      # the three assets, with no automatic retry/rollback here. Re-running
+      # the six assets, with no automatic retry/rollback here. Re-running
       # this job (e.g. via workflow_dispatch or by re-running the failed
       # run) does NOT recreate the tag, so recovery is manual:
       # `gh release upload "${TAG}" <missing-file>` for whichever asset(s)
@@ -208,7 +278,10 @@ jobs:
         run: |
           gh release create "${TAG}" \
             "dist/meshcadet-${TAG}-merged.bin" \
+            "dist/meshcadet-${TAG}-app.bin" \
             "dist/manifest.json" \
+            "dist/manifest-update.json" \
+            "dist/update-meta.json" \
             "dist/SHA256SUMS" \
             --title "MeshCadet ${TAG}" \
             --notes-file release-notes.md
