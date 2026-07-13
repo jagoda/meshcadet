@@ -108,6 +108,32 @@ screens/unprovisioned.rs` (M1's pilot) does NOT import `motifs.slint` — the
 design excludes it from the 7-screen fan-out, so it is left exactly
 as originally verified.
 
+## Landing-page promo screenshots
+
+Four more render rigs (`contact_list_promo`, `message_view_promo`,
+`compose_promo`, `splash_promo`) produce the promotional screenshots on
+`site/index.html`'s `#screenshots` gallery. Unlike every rig above — each a
+narrow, single-mechanism proof — these copy their target production
+screen's full `slint::slint!{}` markup (`firmware/src/ui/screens/
+{contact_list,message_view,compose,splash}.rs`) VERBATIM, because the
+deliverable is a screenshot of the REAL screen, seeded with tasteful,
+OSS-appropriate sample data (space-mission callsigns, no PII, no internal
+vernacular), not a narrow proof. Same real `theme.slint`/`motifs.slint`
+relative-path imports as every rig above.
+
+```sh
+cargo run -p ui_sim --bin contact_list_promo_render  # site/assets/screenshot-contacts.png
+cargo run -p ui_sim --bin message_view_promo_render  # site/assets/screenshot-messages.png
+cargo run -p ui_sim --bin compose_promo_render       # site/assets/screenshot-compose.png
+cargo run -p ui_sim --bin splash_promo_render         # site/assets/screenshot-splash.png
+```
+
+Regenerate all four after any change to one of those four screens' markup,
+`theme.slint`, or `motifs.slint` by re-copying the updated markup into the
+corresponding `ui_sim::*_promo` module and re-running its binary — see
+`site/README.md`'s `assets/` bullet for the site-side half of this
+contract.
+
 ## Env requirements
 
 `SLINT_EMBED_TEXTURES=1` and `SLINT_EMBED_RESOURCES=embed-for-software-renderer`
