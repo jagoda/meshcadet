@@ -62,11 +62,17 @@ docker build -f firmware/release-container/Dockerfile -t meshcadet-release-build
 mkdir -p dist
 docker run --rm -v "$PWD:/build" meshcadet-release-builder "vX.Y.Z" "$SOURCE_DATE_EPOCH"
 
-sha256sum "dist/meshcadet-vX.Y.Z-merged.bin"
+sha256sum "dist/meshcadet-vX.Y.Z-merged.bin" "dist/meshcadet-vX.Y.Z-app.bin"
 ```
 
 Compare that `sha256sum` output against the `SHA256SUMS` file attached to the
-`vX.Y.Z` GitHub Release. They must match exactly.
+`vX.Y.Z` GitHub Release. They must match exactly. The same `docker run` also
+writes `dist/update-meta.json` (`layout_hash`/`upgrade_safe` — see
+`docs/adr/0008-nondestructive-update-artifacts.md`); `manifest.json` and
+`manifest-update.json` are generated separately, by `release.yml` itself,
+not by this container (they're pure text, no build output needed) — so
+there's nothing to reproduce-and-compare for those two, only to diff against
+the published copy.
 
 **If `docker build` fails to install the pinned `libfreetype6-dev`/
 `fonts-dejavu-core` versions** because Ubuntu's archive has since pruned
@@ -80,10 +86,13 @@ this doc + the Dockerfile's `ARG` defaults together in one PR.
 
 ## Verifying the provenance attestation
 
-Every release is attested via `actions/attest-build-provenance` over the
-three published assets (`meshcadet-vX.Y.Z-merged.bin`, `manifest.json`,
-`SHA256SUMS`). Verify a downloaded asset against GitHub's attestation
-transparency log with the `gh` CLI:
+Every release is attested via `actions/attest-build-provenance` over the six
+published assets (`meshcadet-vX.Y.Z-merged.bin`, `meshcadet-vX.Y.Z-app.bin`,
+`manifest.json`, `manifest-update.json`, `update-meta.json`, `SHA256SUMS` —
+see `docs/adr/0008-nondestructive-update-artifacts.md` for the three assets
+added alongside the original merged-image/`manifest.json`/`SHA256SUMS` set
+ADR-0004 §7/§8 established). Verify a downloaded asset against GitHub's
+attestation transparency log with the `gh` CLI:
 
 ```sh
 gh attestation verify meshcadet-vX.Y.Z-merged.bin --repo jagoda/meshcadet
@@ -111,8 +120,15 @@ already document for this hardware:
 | `0x8000` | the custom `partition-table.bin` (carries the `mc_hist` history partition) |
 | `0x10000`| the app image (`factory` partition)                  |
 
-A bare app `.bin` flashed alone (without the custom partition table at
-`0x8000`) will not boot correctly against this project's partition layout —
-see `firmware/scripts/flash-with-partition-table.sh`'s header comment for the
+A bare app `.bin` flashed alone onto a device that does **not already**
+carry this project's custom partition table (a fresh/unprovisioned device,
+or one whose installed layout doesn't match) will not boot correctly — see
+`firmware/scripts/flash-with-partition-table.sh`'s header comment for the
 full story on why this project's partition table can't just be passed to
-`espflash --partition-table` directly.
+`espflash --partition-table` directly. As of
+`docs/adr/0008-nondestructive-update-artifacts.md`, the app image
+(`meshcadet-vX.Y.Z-app.bin`) is ALSO published standalone, specifically to be
+flashed alone at `0x10000` over a device that already runs a
+layout-compatible MeshCadet build (i.e. an in-place, non-destructive
+upgrade) — that ADR is the compatibility-gate design (`layout_hash`/
+`upgrade_safe`) governing when doing so is safe.
