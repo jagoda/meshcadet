@@ -317,6 +317,38 @@ a {
   font-size: 13px;
 }
 
+/* ── Screenshots gallery ────────────────────────────────────────────── */
+
+.screenshot-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 28px;
+}
+
+.screenshot-card {
+  margin: 0;
+  text-align: center;
+}
+
+/* Subtle device-frame treatment — rounded corners + a soft drop-shadow,
+   deliberately restrained (no bezel/notch chrome) so the on-device UI
+   itself stays the focus. Images are the real 320x240 device resolution;
+   `max-width: 100%` lets the grid shrink them responsively without
+   upscaling past their native size. */
+.screenshot-card img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 14px;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45);
+  border: 1px solid var(--surface-alt);
+}
+
+.screenshot-card figcaption {
+  margin-top: 12px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
 /* ── Web flasher (flash.html) ──────────────────────────────────────── */
 
 .hero-flash {
