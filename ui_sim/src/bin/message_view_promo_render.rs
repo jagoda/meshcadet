@@ -57,6 +57,9 @@ fn main() {
             },
         ],
     );
+    // Good repeater signal (ADR-0010) — a compelling, on-brand default for
+    // the promo shot rather than the direct-only ring.
+    frame.set_signal_level(4);
     // Same wall-clock fade-in note as `contact_list_promo_render.rs` — sleep
     // past `content_opacity`'s 200ms `animate` before capturing.
     std::thread::sleep(Duration::from_millis(250));

@@ -36,6 +36,7 @@ pub const HEIGHT: u32 = 240;
 slint::slint! {
     import { Theme } from "../../firmware/src/ui/theme.slint";
     import { RocketOnSend, SpaceBackdrop } from "../../firmware/src/ui/motifs.slint";
+    import { SignalMeter } from "../../firmware/src/ui/signal_meter.slint";
 
     // Verbatim copy of `compose.rs`'s markup — see this file's module doc
     // for why a copy (not an import) is used here.
@@ -153,6 +154,9 @@ slint::slint! {
         in-out property <string>        draft;
         in-out property <bool>          picker_open: false;
         in-out property <bool>          show_completions: false;
+        // Repeater signal-meter reading (ADR-0010): 0 = direct-only,
+        // 1..=5 = bars. See `SignalMeter`'s embedding below.
+        in property <int>               signal_level: 0;
         in-out property <bool>          rocket_trigger: false;
         in-out property <bool>          sent: false;
 
@@ -197,6 +201,17 @@ slint::slint! {
                         horizontal-stretch: 1.0;
                         horizontal-alignment: left;
                         vertical-alignment: center;
+                    }
+
+                    Rectangle {
+                        width: 26px; height: 36px;
+                        SignalMeter {
+                            signal-level: root.signal_level;
+                            width: 16px;
+                            height: 14px;
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                        }
                     }
                 }
             }
@@ -351,6 +366,12 @@ impl ComposePromoFrame {
 
     pub fn set_to_name(&self, name: &str) {
         self.ui.set_to_name(name.into());
+    }
+
+    /// Set the header's repeater signal-meter reading (ADR-0010): 0 =
+    /// direct-only ring, 1..=5 = filled-bar count.
+    pub fn set_signal_level(&self, bars: i32) {
+        self.ui.set_signal_level(bars);
     }
 
     pub fn set_draft(&self, text: &str) {

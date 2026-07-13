@@ -11,7 +11,8 @@
 //! explanation). Unlike this crate's other narrow, single-mechanism proof
 //! rigs (`compose_send.rs`, `gps_status_rows.rs`, …), this module copies
 //! `ContactListScreenUi`'s markup VERBATIM in full — every row, the tab
-//! bar, the header icon button, the full-window backdrop — because the
+//! bar, the header icon button, the header `SignalMeter` (ADR-0010), the
+//! full-window backdrop — because the
 //! deliverable here is a promotional screenshot of the REAL screen, not a
 //! narrow proof of one previously-unproven mechanism. Imports the REAL
 //! `theme.slint` / `motifs.slint` by relative path (not forked token values
@@ -40,6 +41,7 @@ pub const HEIGHT: u32 = 240;
 slint::slint! {
     import { Theme } from "../../firmware/src/ui/theme.slint";
     import { Starfield, CometOnNotify, SpaceBackdrop } from "../../firmware/src/ui/motifs.slint";
+    import { SignalMeter } from "../../firmware/src/ui/signal_meter.slint";
 
     // Verbatim copy of `contact_list.rs`'s markup — see this file's module
     // doc for why a copy (not an import) is used here.
@@ -203,6 +205,10 @@ slint::slint! {
         in property <int>    channels_unread_total;
         in property <string> channels_unread_str;
 
+        // Repeater signal-meter reading (ADR-0010): 0 = direct-only,
+        // 1..=5 = bars. See `SignalMeter`'s embedding below.
+        in property <int> signal_level: 0;
+
         in property <int> selected_index: -1;
 
         callback contact_selected(int);
@@ -297,6 +303,16 @@ slint::slint! {
                             background: Theme.brand-signal;
                         }
                         TouchArea { clicked => { show_contacts = false; } }
+                    }
+                    Rectangle {
+                        width: 26px; height: 36px;
+                        SignalMeter {
+                            signal-level: root.signal_level;
+                            width: 16px;
+                            height: 14px;
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                        }
                     }
                     HeaderIconButton {
                         width: 44px;
@@ -413,6 +429,12 @@ impl ContactListPromoFrame {
         ui.show().expect("ContactListPromoUi::show");
 
         ContactListPromoFrame { window, ui }
+    }
+
+    /// Set the header's repeater signal-meter reading (ADR-0010): 0 =
+    /// direct-only ring, 1..=5 = filled-bar count.
+    pub fn set_signal_level(&self, bars: i32) {
+        self.ui.set_signal_level(bars);
     }
 
     /// Seed the Contacts tab with `contacts` and compute the aggregate

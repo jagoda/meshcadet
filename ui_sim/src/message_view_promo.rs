@@ -32,6 +32,7 @@ pub const HEIGHT: u32 = 240;
 slint::slint! {
     import { Theme } from "../../firmware/src/ui/theme.slint";
     import { Comet, CometOnNotify, RocketOnSend, SpaceBackdrop } from "../../firmware/src/ui/motifs.slint";
+    import { SignalMeter } from "../../firmware/src/ui/signal_meter.slint";
 
     // Verbatim copy of `message_view.rs`'s markup — see this file's module
     // doc for why a copy (not an import) is used here.
@@ -164,6 +165,9 @@ slint::slint! {
 
         in property <string>          contact_name;
         in property <[MessageEntry]>  messages;
+        // Repeater signal-meter reading (ADR-0010): 0 = direct-only,
+        // 1..=5 = bars. See `SignalMeter`'s embedding below.
+        in property <int>             signal_level: 0;
 
         callback back_pressed;
         callback compose_pressed;
@@ -210,7 +214,16 @@ slint::slint! {
                         vertical-alignment: center;
                     }
 
-                    Rectangle { width: 44px; height: 36px; }
+                    Rectangle {
+                        width: 44px; height: 36px;
+                        SignalMeter {
+                            signal-level: root.signal_level;
+                            width: 16px;
+                            height: 14px;
+                            x: 1px;
+                            y: 3px;
+                        }
+                    }
                 }
 
                 Comet {
@@ -339,6 +352,12 @@ impl MessageViewPromoFrame {
         ui.show().expect("MessageViewPromoUi::show");
 
         MessageViewPromoFrame { window, ui }
+    }
+
+    /// Set the header's repeater signal-meter reading (ADR-0010): 0 =
+    /// direct-only ring, 1..=5 = filled-bar count.
+    pub fn set_signal_level(&self, bars: i32) {
+        self.ui.set_signal_level(bars);
     }
 
     /// Seed the thread with `contact_name` + `messages`, and scroll to the

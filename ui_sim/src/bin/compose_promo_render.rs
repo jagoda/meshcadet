@@ -22,6 +22,9 @@ fn main() {
     let frame = ComposePromoFrame::new();
     frame.set_to_name("Nova");
     frame.set_draft("Meet at the north ridge for the meteor shower tonight - bring a blanket!");
+    // Good repeater signal (ADR-0010) — a compelling, on-brand default for
+    // the promo shot rather than the direct-only ring.
+    frame.set_signal_level(4);
     // Render once at the REST state first — Slint only animates a VALUE
     // CHANGE relative to an already-rendered previous value (see
     // `compose_send_render.rs`'s identical note); triggering before any

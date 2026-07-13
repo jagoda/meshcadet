@@ -61,6 +61,9 @@ fn main() {
             unread: 0,
         },
     ]);
+    // Good repeater signal (ADR-0010) — a compelling, on-brand default for
+    // the promo shot rather than the direct-only ring.
+    frame.set_signal_level(4);
     // The screen's one-shot `content_opacity` fade-in (see
     // `ui_sim::contact_list_promo`'s copied markup) animates over 200ms of
     // REAL WALL-CLOCK TIME from component construction — sleep past it
