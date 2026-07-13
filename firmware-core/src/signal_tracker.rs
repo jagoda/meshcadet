@@ -470,8 +470,8 @@ mod tests {
         t.record(-60, 10, 1, 0); // 5 bars, no further packets ever heard
         let hold = 60_000u64;
         let step = 45_000u64;
-        assert_eq!(t.level(hold + 0 * step), SignalLevel::Bars(5));
-        assert_eq!(t.level(hold + 1 * step), SignalLevel::Bars(4));
+        assert_eq!(t.level(hold), SignalLevel::Bars(5));
+        assert_eq!(t.level(hold + step), SignalLevel::Bars(4));
         assert_eq!(t.level(hold + 2 * step), SignalLevel::Bars(3));
         assert_eq!(t.level(hold + 3 * step), SignalLevel::Bars(2));
         assert_eq!(t.level(hold + 4 * step), SignalLevel::Bars(1));
