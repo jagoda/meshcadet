@@ -147,6 +147,7 @@
 slint::slint! {
     import { Theme } from "../theme.slint";
     import { RocketOnSend, SpaceBackdrop } from "../motifs.slint";
+    import { SignalMeter } from "../signal_meter.slint";
 
     // ── Emoji picker overlay ──────────────────────────────────────────────────
 
@@ -310,6 +311,10 @@ slint::slint! {
         in-out property <string>        draft;         // two-way bound to TextInput
         in-out property <bool>          picker_open: false;
         in-out property <bool>          show_completions: false;
+        // Repeater signal-meter reading (ADR-0010): 0 = direct-only,
+        // 1..=5 = bars. Pushed by `ComposeScreen::set_signal_level`; see
+        // `SignalMeter`'s embedding below.
+        in property <int>               signal_level: 0;
 
         // Drives the Send button's `RocketOnSend` one-shot (see module doc's
         // "Outer-space theme" section) — flipped `true` in the Send button's
@@ -420,6 +425,27 @@ slint::slint! {
                         // layout — see the ASCII diagram at the top of this file.
                         horizontal-alignment: left;
                         vertical-alignment: center;
+                    }
+
+                    // `SignalMeter` (ADR-0010) — this header has no existing
+                    // trailing spacer to nest into (unlike `gps_status.rs`/
+                    // `message_view.rs`, whose centered titles already carry
+                    // one for balance; "To: <name>" here is left-reading, not
+                    // centered, so there is nothing to balance). A small new
+                    // flow child at the end reserves just enough width for
+                    // the meter; the "To: <name>" Text above simply gets
+                    // `horizontal-stretch: 1.0`'s remaining space minus this
+                    // reservation — it stays left-aligned and un-clipped for
+                    // every contact/channel name this header has ever shown.
+                    Rectangle {
+                        width: 26px; height: 36px;
+                        SignalMeter {
+                            signal-level: root.signal_level;
+                            width: 16px;
+                            height: 14px;
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                        }
                     }
                 }
             }
@@ -609,6 +635,13 @@ impl ComposeScreen {
 
     pub fn set_to_name(&self, name: &str) {
         self.component.set_to_name(name.into());
+    }
+
+    /// Push a fresh repeater signal-meter reading (ADR-0010) into the
+    /// header's `SignalMeter` — see `GpsStatusScreen::set_signal_level`'s
+    /// identical doc for the `bars` contract.
+    pub fn set_signal_level(&self, bars: i32) {
+        self.component.set_signal_level(bars);
     }
 
     pub fn get_draft(&self) -> String {

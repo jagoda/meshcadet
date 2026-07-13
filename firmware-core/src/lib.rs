@@ -44,7 +44,7 @@
 //! | [`gps`]           | `gps::GpsDriver` (UART1, baud probing, NVS baud cache)          |
 //! | [`battery`]       | `battery::BatteryDriver` (ADC1 sampling)                        |
 //! | [`runtime_settings_store`] | `runtime_settings_store::{load, save}` (`EspNvs`)     |
-//! | [`signal_tracker`] | *(rx-tap in `firmware/src/main.rs` + a Slint `SignalMeter` widget — the UI child of the `meshcadet-signal-meter` campaign; not yet present)* |
+//! | [`signal_tracker`] | rx-tap in `firmware/src/main.rs` + the Slint `SignalMeter` widget (`ui/signal_meter.slint`, glue in [`ui::signal_meter`]) |
 //!
 //! `firmware/src/<module>.rs` re-consumes the moved logic via a thin
 //! `pub use firmware_core::<module>::*;` shim, so every existing call site

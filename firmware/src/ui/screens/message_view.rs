@@ -124,6 +124,7 @@
 slint::slint! {
     import { Theme } from "../theme.slint";
     import { Comet, CometOnNotify, RocketOnSend, SpaceBackdrop } from "../motifs.slint";
+    import { SignalMeter } from "../signal_meter.slint";
 
     struct MessageEntry {
         text:         string,
@@ -389,6 +390,10 @@ slint::slint! {
 
         in property <string>          contact_name;
         in property <[MessageEntry]>  messages;
+        // Repeater signal-meter reading (ADR-0010): 0 = direct-only,
+        // 1..=5 = bars. Pushed by `MessageViewScreen::set_signal_level`; see
+        // `SignalMeter`'s embedding below.
+        in property <int>             signal_level: 0;
 
         callback back_pressed;
         callback compose_pressed;
@@ -477,7 +482,29 @@ slint::slint! {
                     // the title only centers in the space beside the back
                     // button, landing right of true screen center — the
                     // same fix `gps_status.rs`'s header already carries.
-                    Rectangle { width: 44px; height: 36px; }
+                    //
+                    // The `SignalMeter` (ADR-0010) nests INSIDE this spacer
+                    // (same "don't touch the spacer's own reserved width"
+                    // reasoning as `gps_status.rs`'s identical placement),
+                    // but — unlike that screen — this header's top-right
+                    // corner is already occupied by the static `Comet` motif
+                    // floating just below, at this same Rectangle's
+                    // `parent.width - 34px .. - 6px`, `y: 4px..18px` box (see
+                    // that `Comet` instance's own comment). So the meter is
+                    // pinned to the LEFT edge of this spacer instead of the
+                    // right, at `x: 1px..17px, y: 3px..17px` — clear of the
+                    // Comet's box AND the `CometOnNotify` sweep band
+                    // (`y: parent.height - 14px..`, i.e. `22px..36px`) below.
+                    Rectangle {
+                        width: 44px; height: 36px;
+                        SignalMeter {
+                            signal-level: root.signal_level;
+                            width: 16px;
+                            height: 14px;
+                            x: 1px;
+                            y: 3px;
+                        }
+                    }
                 }
 
                 // Static comet motif — declared after the HorizontalLayout so it
@@ -658,6 +685,13 @@ impl MessageViewScreen {
 
     pub fn set_contact_name(&self, name: &str) {
         self.component.set_contact_name(name.into());
+    }
+
+    /// Push a fresh repeater signal-meter reading (ADR-0010) into the
+    /// header's `SignalMeter` — see `GpsStatusScreen::set_signal_level`'s
+    /// identical doc for the `bars` contract.
+    pub fn set_signal_level(&self, bars: i32) {
+        self.component.set_signal_level(bars);
     }
 
     pub fn set_messages(&self, messages: &[MessageItem]) {

@@ -83,6 +83,7 @@
 slint::slint! {
     import { Theme } from "../theme.slint";
     import { RingedPlanetCorner, Comet, SpaceBackdrop } from "../motifs.slint";
+    import { SignalMeter } from "../signal_meter.slint";
 
     component StatusRow {
         in property <string> label;
@@ -167,6 +168,11 @@ slint::slint! {
         in property <string> sat_count_text: "0 satellites";
         in property <string> coords_text: "\u{2014}";
         in property <string> time_sync_text: "Not synced";
+        // Repeater signal-meter reading (ADR-0010): 0 = direct-only,
+        // 1..=5 = bars. Pushed by `GpsStatusScreen::set_signal_level`
+        // (`UiRuntime::set_signal_level` in `ui/mod.rs`); see
+        // `SignalMeter`'s embedding below.
+        in property <int> signal_level: 0;
 
         callback back_pressed;
 
@@ -226,8 +232,27 @@ slint::slint! {
                         vertical-alignment: center;
                     }
 
-                    // Balance the back button's width so the title stays centered.
-                    Rectangle { width: 44px; height: 36px; }
+                    // Balance the back button's width so the title stays
+                    // centered — same 44px spacer as before. The
+                    // `SignalMeter` (ADR-0010) nests INSIDE it, right-aligned
+                    // with a small margin, rather than adding a new flow
+                    // sibling: nesting keeps the spacer's own reserved width
+                    // (and so the title's centering) byte-identical, and this
+                    // is the one operational-screen header with an otherwise
+                    // completely empty top-right corner — no existing motif
+                    // or touch target to avoid here (unlike message_view.rs's
+                    // header, which already carries a static `Comet` in this
+                    // same zone).
+                    Rectangle {
+                        width: 44px; height: 36px;
+                        SignalMeter {
+                            signal-level: root.signal_level;
+                            width: 16px;
+                            height: 14px;
+                            x: parent.width - self.width - 4px;
+                            y: (parent.height - self.height) / 2;
+                        }
+                    }
                 }
             }
 
@@ -295,6 +320,15 @@ impl GpsStatusScreen {
         self.component.set_time_sync_text(
             format_time_sync(status.clock_synced, status.clock_sync_age_secs).into(),
         );
+    }
+
+    /// Push a fresh repeater signal-meter reading (ADR-0010) into the
+    /// header's `SignalMeter`. `bars` is `0` (direct-only) or `1..=5`
+    /// (`firmware_core::ui::signal_meter::level_to_bars`'s output) — the
+    /// caller (`UiRuntime::set_signal_level`) owns the `SignalLevel` ->
+    /// `int` conversion so every screen's wrapper takes the same plain type.
+    pub fn set_signal_level(&self, bars: i32) {
+        self.component.set_signal_level(bars);
     }
 
     pub fn on_back_pressed(&self, cb: impl Fn() + 'static) {

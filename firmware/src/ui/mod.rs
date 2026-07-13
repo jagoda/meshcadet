@@ -94,6 +94,12 @@ use crate::gps;
 // `battery::BatteryStatus` is likewise a plain Copy struct — used here purely
 // as a display-state type for the admin-menu battery row.
 use crate::battery;
+// `signal_tracker::SignalLevel` is likewise a plain Copy enum (ADR-0010) —
+// used here purely as the cached display-state value the four operational
+// screens' `SignalMeter` widget renders; `level_to_bars` below converts it
+// to the plain `int` Slint property those screens expose.
+use crate::signal_tracker::SignalLevel;
+use firmware_core::ui::signal_meter::level_to_bars;
 
 // The pure, host-testable half of this module's own `UiRuntime`-level logic
 // (previously `#[cfg(test)]`-covered here but never executed — see the NOTE
@@ -524,6 +530,14 @@ pub struct UiRuntime<'d> {
     /// `gps_status`: an AdminMenu screen opened later reflects the current
     /// reading immediately rather than a stale boot-time value.
     battery_status: battery::BatteryStatus,
+    /// Latest repeater signal-meter reading (ADR-0010), refreshed every
+    /// `main.rs` dispatcher-loop iteration via [`Self::set_signal_level`].
+    /// Cached here for the same reason as `gps_status`/`battery_status`: a
+    /// freshly-navigated-to operational screen (`ContactList`/`MessageView`/
+    /// `Compose`/`GpsStatus`) seeds its `SignalMeter` from this value
+    /// immediately, instead of showing an empty/default reading until the
+    /// next dispatcher-loop push.
+    signal_level: SignalLevel,
 
     // ── Screen-sleep (backlight-off) state ────────────────────────────────
     //
@@ -874,6 +888,9 @@ impl<'d> UiRuntime<'d> {
             pending_compose_seed: None,
             gps_status: gps::GpsStatus::never(),
             battery_status: battery::BatteryStatus::unknown(),
+            // Matches `SignalTracker::new`'s own boot default (see that
+            // constructor's doc) — device-just-booted, no repeater heard yet.
+            signal_level: SignalLevel::DirectOnly,
             screen_asleep: false,
             // Overwritten by the first `step()` call — see the field doc.
             last_activity_ms: 0,
@@ -1208,6 +1225,37 @@ impl<'d> UiRuntime<'d> {
             if let ActiveScreen::AdminMenu(ref scr) = self.active_screen {
                 scr.set_battery_display(&screens::admin_menu::format_battery_display(status));
             }
+        }
+    }
+
+    /// Refresh the cached signal-meter reading (ADR-0010) and route it to
+    /// whichever of the four operational screens — `ContactList`,
+    /// `MessageView`, `Compose`, `GpsStatus` — is currently active. A no-op
+    /// for every other screen (`Splash`, `Unprovisioned`, `PinEntry`,
+    /// `AdminMenu`): those carry no `SignalMeter` at all (ADR-0010 D5 — the
+    /// meter is meaningless before the radio/provisioning are up). Called
+    /// every `main.rs` dispatcher-loop iteration with
+    /// `signal_tracker.level(now_ms)`, so the meter ages down live via
+    /// [`crate::signal_tracker::SignalTracker`]'s own max-with-decay curve
+    /// even with no further packets arriving — early-returns on no change
+    /// (same "skip an identical push" shape as `set_gps_status`) so an
+    /// unchanged reading (the common case between decay steps) never
+    /// re-touches the active screen's Slint property.
+    pub fn set_signal_level(&mut self, level: SignalLevel) {
+        if level == self.signal_level {
+            return;
+        }
+        self.signal_level = level;
+        let bars = level_to_bars(level);
+        match &self.active_screen {
+            ActiveScreen::ContactList(scr) => scr.set_signal_level(bars),
+            ActiveScreen::MessageView(scr) => scr.set_signal_level(bars),
+            ActiveScreen::Compose(scr) => scr.set_signal_level(bars),
+            ActiveScreen::GpsStatus(scr) => scr.set_signal_level(bars),
+            ActiveScreen::Splash(_)
+            | ActiveScreen::Unprovisioned(_)
+            | ActiveScreen::PinEntry(_)
+            | ActiveScreen::AdminMenu(_) => {}
         }
     }
 
@@ -2288,6 +2336,9 @@ impl<'d> UiRuntime<'d> {
         self.hide_active_screen();
         let screen = screens::GpsStatusScreen::new()?;
         screen.set_status(&self.gps_status);
+        // Seed the header's SignalMeter — see `navigate_to_contact_list`'s
+        // identical seeding comment.
+        screen.set_signal_level(level_to_bars(self.signal_level));
 
         let pn_back = self.pending_nav.clone();
         screen.on_back_pressed(move || {
@@ -2378,6 +2429,10 @@ impl<'d> UiRuntime<'d> {
         self.hide_active_screen();
 
         let screen = screens::ContactListScreen::new()?;
+        // Seed the header's SignalMeter from the cached reading (ADR-0010) —
+        // otherwise a freshly-built screen would show the widget's declared
+        // `0` default until the next dispatcher-loop `set_signal_level` push.
+        screen.set_signal_level(level_to_bars(self.signal_level));
 
         // Re-wire the settings gear + row taps so repeated navigation keeps
         // working after a return to the list.
@@ -2566,6 +2621,9 @@ impl<'d> UiRuntime<'d> {
         let screen = screens::MessageViewScreen::new()?;
 
         screen.set_contact_name(&self.convo_title(hash, is_channel));
+        // Seed the header's SignalMeter — see `navigate_to_contact_list`'s
+        // identical seeding comment.
+        screen.set_signal_level(level_to_bars(self.signal_level));
 
         let known = self.known_names();
         let items = self.messages.get(&hash)
@@ -2635,6 +2693,9 @@ impl<'d> UiRuntime<'d> {
 
         let screen = screens::ComposeScreen::new()?;
         screen.set_to_name(&self.convo_title(hash, is_channel));
+        // Seed the header's SignalMeter — see `navigate_to_contact_list`'s
+        // identical seeding comment.
+        screen.set_signal_level(level_to_bars(self.signal_level));
 
         // Pre-load the draft when this navigation was triggered by a
         // printable keypress in MessageView rather than the Write button
