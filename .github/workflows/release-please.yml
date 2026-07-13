@@ -9,9 +9,10 @@ name: release-please
 # versioning/changelog config this workflow runs.
 #
 # No crates.io publish happens from this workflow, and it never invokes
-# `cargo` at all: release-please is pure git/GitHub-API/text-manifest
-# automation (no `cargo package`/`cargo publish` step exists to gate on
-# `publish = false`, unlike the release-plz-based setup this replaced).
+# `cargo` at all — not even in the Cargo.lock-sync steps below: release-please
+# is pure git/GitHub-API/text-manifest automation (no `cargo package`/`cargo
+# publish` step exists to gate on `publish = false`, unlike the
+# release-plz-based setup this replaced).
 # `skip-github-release: true` (release-please-config.json) means this
 # workflow only ever creates the tag, never a GitHub Release object — the
 # production firmware release workflow (.github/workflows/release.yml) owns
@@ -42,7 +43,118 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Run release-please
+        id: release
         uses: googleapis/release-please-action@v5
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      # release-please has no built-in Cargo.lock awareness for
+      # `release-type: simple` (see docs/adr/0004-release-architecture.md
+      # §2/§10) — its `extra-files` config bumps Cargo.toml/
+      # firmware/Cargo.toml's version STRINGS but never touches Cargo.lock
+      # or firmware/Cargo.lock, so both lockfiles keep pinning the OLD
+      # version. `ci.yml`'s `cargo test --locked`/`cargo clippy --locked`
+      # then hard-fail on the release PR: "cannot update the lock file
+      # because --locked was passed". The steps below keep both lockfiles
+      # in sync on the release PR branch whenever release-please opens or
+      # updates it (`prs_created` — false on the separate run that only
+      # tags a just-merged release PR, so this is a no-op there).
+      #
+      # This still doesn't invoke `cargo` (the property described above):
+      # scripts/sync-cargo-lock-versions.sh is a text-only substitution —
+      # see its header for why not `cargo update`/`cargo generate-lockfile`
+      # (would need the `esp`/Xtensa toolchain this runner doesn't have for
+      # firmware/Cargo.lock, and can silently drag in unrelated dependency
+      # upgrades for the root lockfile).
+      - name: Check out the release PR branch
+        if: steps.release.outputs.prs_created == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ fromJson(steps.release.outputs.pr).headBranchName }}
+
+      - name: Sync Cargo.lock/firmware/Cargo.lock to the version bump
+        if: steps.release.outputs.prs_created == 'true'
+        run: scripts/sync-cargo-lock-versions.sh
+
+      - name: Check whether the lockfile sync changed anything
+        id: lockdiff
+        if: steps.release.outputs.prs_created == 'true'
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- Cargo.lock firmware/Cargo.lock; then
+            echo "Cargo.lock/firmware/Cargo.lock already in sync; nothing to commit."
+            echo "changed=false" >>"${GITHUB_OUTPUT}"
+          else
+            echo "changed=true" >>"${GITHUB_OUTPUT}"
+          fi
+
+      # Commits the lockfile sync via the GraphQL `createCommitOnBranch`
+      # mutation instead of a plain in-runner `git commit` + `git push`.
+      # This is NOT a cosmetic choice: this repo's `main` ruleset
+      # (`required_signatures`, docs/adr/0004-release-architecture.md §5)
+      # requires every commit reaching `main` to carry a verified signature,
+      # and GitHub checks the signature status of EVERY commit on a PR
+      # before it will let even a squash-merge through — a PR with one
+      # unverified commit is unmergeable regardless of merge strategy, it
+      # is not enough for the final synthesized squash commit to be signed.
+      # A plain `git commit` made by the runner's local, unconfigured git
+      # identity has no GPG/SSH signature at all ("unverified, reason:
+      # unknown_key" — confirmed live against this repo: commit `4ef0737`
+      # on the since-closed PR #25 is exactly this failure mode). Commits
+      # made through GitHub's own API (REST Contents API or, as here,
+      # GraphQL `createCommitOnBranch`) are instead authored AND signed by
+      # GitHub itself server-side and always show as Verified — the same
+      # mechanism release-please-action's own bump commit already uses
+      # (PR #25's `3a7125d` bump commit is `verified: true` from the same
+      # run that produced the unverified `4ef0737`), which is why this step
+      # mirrors it rather than inventing a separate signing setup.
+      - name: Commit the lockfile sync via a GitHub-signed API commit
+        if: steps.release.outputs.prs_created == 'true' && steps.lockdiff.outputs.changed == 'true'
+        uses: actions/github-script@v7
+        env:
+          HEAD_BRANCH: ${{ fromJson(steps.release.outputs.pr).headBranchName }}
+        with:
+          script: |
+            const fs = require("fs");
+            const { execSync } = require("child_process");
+
+            const headBranch = process.env.HEAD_BRANCH;
+            const headOid = execSync("git rev-parse HEAD").toString().trim();
+            const changedFiles = execSync(
+              "git diff --name-only -- Cargo.lock firmware/Cargo.lock"
+            )
+              .toString()
+              .trim()
+              .split("\n")
+              .filter(Boolean);
+
+            const additions = changedFiles.map((path) => ({
+              path,
+              contents: fs.readFileSync(path).toString("base64"),
+            }));
+
+            const result = await github.graphql(
+              `mutation($input: CreateCommitOnBranchInput!) {
+                createCommitOnBranch(input: $input) {
+                  commit { oid }
+                }
+              }`,
+              {
+                input: {
+                  branch: {
+                    repositoryNameWithOwner: `${context.repo.owner}/${context.repo.repo}`,
+                    branchName: headBranch,
+                  },
+                  message: {
+                    headline: "chore(release): sync Cargo.lock to the version bump above",
+                  },
+                  expectedHeadOid: headOid,
+                  fileChanges: { additions },
+                },
+              }
+            );
+
+            core.info(
+              `created signed commit ${result.createCommitOnBranch.commit.oid} on ${headBranch}`
+            );
