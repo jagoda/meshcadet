@@ -122,6 +122,24 @@ pub mod list_pane_backdrop;
 /// path.
 pub mod signal_meter;
 
+/// Promotional landing-page screenshot render rig for the contact-list
+/// screen (`site/index.html`'s screenshots gallery). See that module's own
+/// doc for why it copies the real screen's markup in full rather than a
+/// narrow single-mechanism proof.
+pub mod contact_list_promo;
+
+/// Promotional landing-page screenshot render rig for the message-view
+/// screen. See `contact_list_promo`'s module doc for the shared rationale.
+pub mod message_view_promo;
+
+/// Promotional landing-page screenshot render rig for the compose screen.
+/// See `contact_list_promo`'s module doc for the shared rationale.
+pub mod compose_promo;
+
+/// Promotional landing-page screenshot render rig for the boot splash
+/// screen. See `contact_list_promo`'s module doc for the shared rationale.
+pub mod splash_promo;
+
 pub const WIDTH: u32 = 320;
 pub const HEIGHT: u32 = 240;
 
