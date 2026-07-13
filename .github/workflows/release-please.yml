@@ -109,17 +109,34 @@ jobs:
       # (PR #25's `3a7125d` bump commit is `verified: true` from the same
       # run that produced the unverified `4ef0737`), which is why this step
       # mirrors it rather than inventing a separate signing setup.
+      # headBranch is derived from the already-checked-out working tree
+      # (`git rev-parse --abbrev-ref HEAD`) rather than re-reading it off
+      # `steps.release.outputs.pr`/`.prs`: those release-please-action
+      # outputs are unset (empty string) on every run where `prs_created`
+      # is false — including the routine "just tagged a merged release PR,
+      # no open PR this run" case documented above the checkout step — and
+      # `fromJson('')` throws "The template is not valid ... Error reading
+      # JToken from JsonReader". Critically, a step's `env:` block is
+      # evaluated by the runner BEFORE its `if:` gate is checked (`with:`
+      # inputs, like the checkout step's `ref:` above, are not — they're
+      # only resolved once `if:` passes), so that fromJson(...) blew up on
+      # *every* tag-only run regardless of this step's own `if:` guard
+      # (confirmed live: run 29216419373, ##[error] at line 116, on a
+      # `prs_created == false` run). The preceding "Check out the release
+      # PR branch" step already resolved and checked out that exact branch
+      # by name (actions/checkout@v4 running `git checkout -B <branch>
+      # origin/<branch>` for a plain branch ref — an attached HEAD, not
+      # detached), so `git rev-parse --abbrev-ref HEAD` here reproduces the
+      # same value without ever touching the unset-output/fromJson path.
       - name: Commit the lockfile sync via a GitHub-signed API commit
         if: steps.release.outputs.prs_created == 'true' && steps.lockdiff.outputs.changed == 'true'
         uses: actions/github-script@v7
-        env:
-          HEAD_BRANCH: ${{ fromJson(steps.release.outputs.pr).headBranchName }}
         with:
           script: |
             const fs = require("fs");
             const { execSync } = require("child_process");
 
-            const headBranch = process.env.HEAD_BRANCH;
+            const headBranch = execSync("git rev-parse --abbrev-ref HEAD").toString().trim();
             const headOid = execSync("git rev-parse HEAD").toString().trim();
             const changedFiles = execSync(
               "git diff --name-only -- Cargo.lock firmware/Cargo.lock"
