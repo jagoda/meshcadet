@@ -14,16 +14,33 @@ building or publishing anything.
   nav; add a new one the same way and it shows up in nav + on the page
   without touching anything else. Two placeholder comments at the bottom of
   `<main>` mark likely next sections (hardware/build gallery, roadmap).
-- `flash.html` + `flash.js` — the [esp-web-tools](https://github.com/esphome/esp-web-tools)
-  web flasher. `flash.js` fetches `api.github.com/repos/jagoda/meshcadet/releases`
-  client-side to populate the version dropdown, then points
-  `<esp-web-install-button>` at `firmware/<tag>/manifest.json` — **not**
+- `flash.html` + `flash.js` — the two-path web flasher: **Fresh install**
+  (the [esp-web-tools](https://github.com/esphome/esp-web-tools)
+  `<esp-web-install-button>`, unchanged mechanism, erases the whole chip) vs
+  **Upgrade** (a hand-rolled `esptool-js` flow, writes only the app region,
+  preserves device identity/config/history). `flash.js` fetches
+  `api.github.com/repos/jagoda/meshcadet/releases` client-side to populate
+  the version dropdown (shared by both paths), then either points
+  `<esp-web-install-button>` at `firmware/<tag>/manifest.json` (Fresh) or
+  drives `esptool-js` directly against `firmware/<tag>/<app_asset>` (Upgrade,
+  gated on `firmware/<tag>/update-meta.json`'s `upgrade_safe`) — **not**
   directly at the GitHub Release asset, which is cross-origin-blocked (no
   `Access-Control-Allow-Origin` on the release-asset redirect chain,
-  verified live). See ADR-0006 (`docs/adr/0006-web-flasher.md`) for the full
-  design and `.github/workflows/pages-deploy.yml`'s "Mirror recent release
-  firmware assets" step for how `firmware/<tag>/` gets populated at deploy
-  time (git-ignored, not checked in — see below).
+  verified live). See ADR-0006 (`docs/adr/0006-web-flasher.md`) for the
+  original single-path design and ADR-0009
+  (`docs/adr/0009-two-path-flasher.md`) for the Upgrade path + why
+  `<esp-web-install-button>` can't be used for it; `.github/workflows/pages-deploy.yml`'s
+  "Mirror recent release firmware assets" step populates `firmware/<tag>/`
+  at deploy time (git-ignored, not checked in — see below).
+- `upgrade-gate.js` — DOM-free validation for the Upgrade path's
+  `update-meta.json` gate: `isValidUpdateMeta` checks both `upgrade_safe` and
+  that `app_asset`/`app_offset` have the exact shape `flash.js`'s Upgrade
+  flow expects, failing closed (Fresh install only) on anything else — a
+  missing field, a wrong offset, or an `app_asset` that doesn't match
+  `release.yml`'s naming convention (guards against path traversal via a
+  malformed/corrupted metadata file). Tested under plain `node` via
+  `upgrade-gate.test.mjs`, run by `pages-check.yml`'s `check` job — see
+  `docs/adr/0009-two-path-flasher.md` D2.
 - `provisioner/codec.js` — pure-JS port of the USB-serial provisioning wire
   protocol (`protocol/src/provisioning.rs`): frame encode/decode, CRC-16/ARC,
   `find_magic_start` log-noise resync, and the payload codecs a browser

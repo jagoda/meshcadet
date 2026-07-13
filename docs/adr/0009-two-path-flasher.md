@@ -224,6 +224,18 @@ both the required and the optional download call.
   regardless of app length (ADR-0008 D1), so this is a pre-existing
   property of the underlying esptool write primitive, not something specific
   to the two-path design.
+- **A device disconnected or power-lost mid-Upgrade-write is not bricked.**
+  Because the write path never touches the bootloader or partition-table
+  regions (D5 — `eraseAll: false` plus a single `{data, address: 0x10000}`
+  part), an interrupted Upgrade can leave the `factory` app partition
+  corrupted/non-bootable, but the bootloader, partition table, `nvs`, and
+  `mc_hist` all remain exactly as they were before the attempt — the device
+  is always recoverable via another Upgrade attempt or Fresh install, never
+  left in a state where nothing can be written to it again. This is a
+  strictly safer failure mode than an interrupted Fresh install (which can
+  leave the bootloader/partition-table region itself half-written), and is
+  the reason `runUpgradeFlash`'s own error message tells the user it's
+  "safe to retry" rather than only pointing at Fresh install.
 - The two-path UI, the update-meta.json gate, the backup advisory, and the
   mirror step are all additive; `site/flash.js`'s existing Fresh-install
   code path (manifest.json → `<esp-web-install-button>`) is unmodified

@@ -43,6 +43,7 @@
 // fetching and inspecting it) exporting `ESPLoader`/`Transport`, the same
 // two classes esp-web-tools' own src/flash.ts drives.
 import { ESPLoader, Transport } from "https://unpkg.com/esptool-js@0.5.7/bundle.js";
+import { isValidUpdateMeta } from "./upgrade-gate.js";
 
 const REPO = "jagoda/meshcadet";
 const RELEASES_API = `https://api.github.com/repos/${REPO}/releases`;
@@ -128,7 +129,23 @@ function updateUpgradeConnectEnabled() {
     upgradeBusy ||
     !WEB_SERIAL_SUPPORTED ||
     !upgradeBackupAck.checked ||
-    !(currentUpdateMeta && currentUpdateMeta.upgrade_safe === true);
+    !isValidUpdateMeta(currentUpdateMeta);
+}
+
+// Locks the version selector and path choice while an Upgrade write is in
+// flight — switching versions or paths mid-write wouldn't affect the
+// in-progress esptool-js session (its tag/meta are captured in local
+// variables at the start of runUpgradeFlash, not re-read from shared
+// state), but it would leave the visible UI (dropdown, radios, the
+// Fresh-install button) in a confusing, actionable-looking state while a
+// serial port is actively in use — e.g. clicking "Connect & Install" for
+// Fresh install while an Upgrade write is still running would contend for
+// the same physical port. Simpler to just disable the choice than to reason
+// about two concurrent esptool-js sessions.
+function setUpgradeControlsLocked(locked) {
+  select.disabled = locked || select.options.length === 0;
+  pathFreshRadio.disabled = locked;
+  pathUpgradeRadio.disabled = locked || !isValidUpdateMeta(currentUpdateMeta);
 }
 
 pathFreshRadio.addEventListener("change", applyPathChoice);
@@ -139,7 +156,7 @@ upgradeBackupAck.addEventListener("change", updateUpgradeConnectEnabled);
 
 function applyUpdateMeta(meta) {
   currentUpdateMeta = meta;
-  const safe = meta !== null && meta.upgrade_safe === true;
+  const safe = isValidUpdateMeta(meta);
 
   pathUpgradeRadio.disabled = !safe;
   if (safe) {
@@ -149,7 +166,7 @@ function applyUpdateMeta(meta) {
     upgradeSafetyNote.textContent =
       meta === null
         ? "Upgrade metadata isn't available for this version (an older release published before Upgrade support, or the site mirror hasn't caught up yet) — Fresh install only."
-        : "This version's partition layout differs from the committed baseline, so an app-only write can't be guaranteed safe — Upgrade isn't offered for it; use Fresh install.";
+        : "This version isn't offered for Upgrade (a layout-changing release, or its update metadata doesn't match what this page expects) — use Fresh install.";
   }
 
   // A version switch can invalidate a previously-safe Upgrade selection —
@@ -300,7 +317,7 @@ async function runUpgradeFlash() {
   if (upgradeBusy) {
     return;
   }
-  if (!currentUpdateMeta || currentUpdateMeta.upgrade_safe !== true) {
+  if (!isValidUpdateMeta(currentUpdateMeta)) {
     // Defense in depth — the button is disabled in this state already
     // (updateUpgradeConnectEnabled), so this should be unreachable.
     setUpgradeStatus("Upgrade isn't available for the selected version.");
@@ -312,22 +329,21 @@ async function runUpgradeFlash() {
 
   upgradeBusy = true;
   updateUpgradeConnectEnabled();
-
-  let port;
-  try {
-    setUpgradeStatus("Requesting device access…");
-    port = await navigator.serial.requestPort();
-  } catch (err) {
-    // User dismissed the browser's port picker — not an error worth
-    // logging.
-    setUpgradeStatus("No device selected.");
-    upgradeBusy = false;
-    updateUpgradeConnectEnabled();
-    return;
-  }
+  setUpgradeControlsLocked(true);
 
   let transport;
   try {
+    let port;
+    try {
+      setUpgradeStatus("Requesting device access…");
+      port = await navigator.serial.requestPort();
+    } catch (err) {
+      // User dismissed the browser's port picker — not an error worth
+      // logging.
+      setUpgradeStatus("No device selected.");
+      return;
+    }
+
     setUpgradeStatus(`Downloading ${meta.app_asset}…`);
     const appUrl = `firmware/${tag}/${meta.app_asset}`;
     const appResponse = await fetch(appUrl);
@@ -391,6 +407,7 @@ async function runUpgradeFlash() {
     }
   } finally {
     upgradeBusy = false;
+    setUpgradeControlsLocked(false);
     updateUpgradeConnectEnabled();
   }
 }
