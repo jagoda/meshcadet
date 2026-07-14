@@ -53,6 +53,17 @@ building or publishing anything.
   `.github/workflows/pages-deploy.yml`'s "Mirror recent release firmware
   assets" step populates `firmware/<tag>/` at deploy time (git-ignored, not
   checked in — see below).
+- `flash-image-encoding.js` — the Uint8Array -> Latin-1 binary-string
+  conversion `flash.js`'s Fresh and Upgrade paths both apply to a downloaded
+  firmware image before handing it to esptool-js's `ESPLoader.writeFlash`,
+  which requires that shape for `fileArray[].data` (calls `.charCodeAt()` on
+  it internally) and throws `TypeError: ...charCodeAt is not a function`
+  partway into the write — after Fresh install's full-chip erase has already
+  started — if handed a Uint8Array instead. DOM-free, tested under plain
+  `node` via `flash-image-encoding.test.mjs`, run by `pages-check.yml`'s
+  `check` job; the real write-past-erase confirmation is a manual
+  hardware step, same as the rest of this page's esptool-js mechanics — see
+  `docs/adr/0011-unified-esptool-js-flasher.md`.
 - `flash-manifest.js` — DOM-free validation for the Fresh-install path's
   `manifest.json` shape: `resolveFreshInstallParts` picks the
   chip-family-matched `{path, offset}` parts to write, or fails closed

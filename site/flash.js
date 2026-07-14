@@ -51,6 +51,7 @@
 import { ESPLoader, Transport } from "https://unpkg.com/esptool-js@0.5.7/bundle.js";
 import { isValidUpdateMeta } from "./upgrade-gate.js";
 import { resolveFreshInstallParts } from "./flash-manifest.js";
+import { ui8ToBstr } from "./flash-image-encoding.js";
 
 const REPO = "jagoda/meshcadet";
 const RELEASES_API = `https://api.github.com/repos/${REPO}/releases`;
@@ -451,7 +452,13 @@ async function runFreshFlash() {
       if (!assetResponse.ok) {
         throw new Error(`Downloading ${part.path} failed: ${assetResponse.status}`);
       }
-      fileArray.push({ data: new Uint8Array(await assetResponse.arrayBuffer()), address: part.offset });
+      // esptool-js's writeFlash wants each part's `data` as a Latin-1
+      // binary string, not a Uint8Array — see flash-image-encoding.js's
+      // header for why (and for the crash this conversion fixes).
+      fileArray.push({
+        data: ui8ToBstr(new Uint8Array(await assetResponse.arrayBuffer())),
+        address: part.offset,
+      });
     }
 
     setFlashPhase("Connecting to device…");
@@ -583,7 +590,11 @@ async function runUpgradeFlash() {
     if (!appResponse.ok) {
       throw new Error(`Downloading ${meta.app_asset} failed: ${appResponse.status}`);
     }
-    const appBytes = new Uint8Array(await appResponse.arrayBuffer());
+    // esptool-js's writeFlash wants `data` as a Latin-1 binary string, not
+    // a Uint8Array — see flash-image-encoding.js's header. (The name keeps
+    // "app" — it's still the app image — but holds a binary string now,
+    // not raw bytes.)
+    const appImageData = ui8ToBstr(new Uint8Array(await appResponse.arrayBuffer()));
 
     setFlashPhase("Connecting to device…");
     transport = new Transport(port);
@@ -600,7 +611,7 @@ async function runUpgradeFlash() {
 
     setFlashPhase("Writing app image — do not disconnect…");
     await esploader.writeFlash({
-      fileArray: [{ data: appBytes, address: meta.app_offset }],
+      fileArray: [{ data: appImageData, address: meta.app_offset }],
       flashSize: "keep",
       flashMode: "keep",
       flashFreq: "keep",
