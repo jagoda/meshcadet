@@ -19,10 +19,33 @@ name: Deploy Pages
 # re-runs this mirror step, so it self-heals if a release-triggered deploy
 # ever fails partway.
 #
+# BUT `release: published` never actually fires in practice for THIS repo's
+# releases (confirmed live: zero `event == "release"` runs of this workflow
+# exist despite v0.1.0/v0.2.0/v0.3.0 all having published — see
+# meshcadet-flasher-metadata-and-flash-status mission). Cause: GitHub Actions
+# does not dispatch new workflow runs for events produced by the built-in
+# `GITHUB_TOKEN` (the standard anti-recursion guard — see
+# https://docs.github.com/en/actions/using-workflows/triggering-a-workflow#triggering-a-workflow-from-a-workflow),
+# and release.yml's "Publish GitHub Release" step authenticates `gh release
+# create` with exactly that token. The `release: published` trigger above is
+# kept (it still fires for a release published by a human through the GitHub
+# UI/a PAT, which isn't GITHUB_TOKEN-authored) but cannot be relied on alone.
+#
+# The `workflow_run` trigger below is the actual fix: it fires on the
+# completion of the (separate) "release" workflow run itself, which is a
+# real event regardless of what token that run used internally — so it is
+# NOT subject to the same suppression. This is the documented workaround for
+# exactly this GITHUB_TOKEN limitation. Until this lands, a release with no
+# immediately-following site/**-touching push (e.g. v0.3.0, published with
+# no site push until this fix's own PR) sits unmirrored — 404 on
+# firmware/<tag>/{manifest.json,update-meta.json} — and flash.js's fetches
+# read that as "not available" rather than "not yet deployed".
+#
 # `workflow_dispatch` is kept as a trigger (parity with the pre-split
-# workflow) but build/deploy still guard on `github.event_name` being `push`
-# or `release`, so a manual dispatch reaches the runner without actually
-# publishing — it's not a bypass around the publish-on-push-or-release path.
+# workflow) but build/deploy still guard on `github.event_name` being `push`,
+# `release`, or a successful `workflow_run`, so a manual dispatch reaches the
+# runner without actually publishing — it's not a bypass around the
+# publish-on-push-or-release(-or-release-workflow-completion) path.
 on:
   push:
     branches: [main]
@@ -31,6 +54,9 @@ on:
       - ".github/workflows/pages-deploy.yml"
   release:
     types: [published]
+  workflow_run:
+    workflows: ["release"]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
@@ -44,7 +70,10 @@ concurrency:
 
 jobs:
   build:
-    if: github.event_name == 'push' || github.event_name == 'release'
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'release' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -150,7 +179,10 @@ jobs:
 
   deploy:
     needs: build
-    if: github.event_name == 'push' || github.event_name == 'release'
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'release' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     permissions:
       pages: write

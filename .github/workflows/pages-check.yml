@@ -59,6 +59,14 @@ jobs:
         # independent of a browser/DOM, same pattern as validation.js below.
         run: node site/upgrade-gate.test.mjs
 
+      - name: flash-manifest.js picks the right Fresh-install flash address before a byte is written
+        # site/flash-manifest.js's resolveFreshInstallParts is the Fresh-
+        # install counterpart to upgrade-gate.js above: it decides which
+        # bytes get written to which flash address from manifest.json, and
+        # fails closed on anything malformed/unexpected — see
+        # docs/adr/0011-unified-esptool-js-flasher.md.
+        run: node site/flash-manifest.test.mjs
+
       - name: session.js orchestration smoke test (mocked Web Serial)
         # site/provisioner/session.js (the async Web Serial transport +
         # QUERY_STATUS handshake driving provisioner.html) has no Rust
