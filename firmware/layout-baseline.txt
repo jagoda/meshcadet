@@ -1,23 +1,52 @@
 # MeshCadet firmware layout-compatibility baseline — see
-# docs/adr/0008-nondestructive-update-artifacts.md.
+# docs/adr/0008-nondestructive-update-artifacts.md, and that ADR's
+# "Correction (2026-07-14)" addendum for the incident that produced this
+# value (the original seed below was wrong — see history below).
 #
 # The single non-comment line below is
-# sha256(bootloader.bin || partition-table.bin) for the shipped v0.1.0/v0.2.0
-# layout. firmware/partitions.csv has been byte-identical since the initial
-# commit, so this is also THIS release's baseline: the first app-only release
-# is correctly upgrade_safe:true (release-container/build.sh compares its own
-# freshly-built layout_hash against this file).
+# sha256(bootloader.bin || partition-table.bin), where both files are the
+# RAW, unmodified build outputs generate-update-meta.sh actually hashes at
+# release time (TARGET_DIR/bootloader.bin, TARGET_DIR/partition-table.bin —
+# NOT a byte-range sliced out of a merged/padded image; see the Correction
+# below for why that distinction matters). firmware/partitions.csv has been
+# byte-identical since the initial commit, and the bootloader/partition-table
+# region has been independently verified byte-for-byte identical across the
+# published v0.1.0, v0.2.0, and v0.3.0 merged release images (full
+# [0x0, 0x9000) span, i.e. bootloader + partition-table + all gap-fill up to
+# nvs) — so this value is this project's one true layout baseline for as
+# long as that stays true.
 #
-# Verified by extracting bootloader.bin/partition-table.bin directly from the
-# published v0.1.0 AND v0.2.0 merged release images (both hash identically):
-# the bootloader image ends at file offset 0x5130 (last non-0xFF byte before
-# the 0x8000 partition-table region; 0xFF-padded merge_bin gap from there to
-# 0x8000), and the partition-table region is exactly 160 bytes
-# (0x8000..0x80a0 — 4 partition entries + 1 MD5-sum entry, gen_esp32part.py's
-# standard trailer), also 0xFF-padded out to nvs's 0x9000 offset.
+# ORIGINAL SEED (WRONG, in place for the v0.3.0 release):
+# 8c2f016672527d802f58b67787e2d63f441191f0b6d4f0dc49140d5d66eeff36 — derived
+# by manually extracting bootloader.bin (0x0..0x5130, correct) but only a
+# 160-byte SLICE of the partition-table region (0x8000..0x80a0 — just the 4
+# partition entries + 1 MD5-sum entry, gen_esp32part.py's used-content
+# length) out of the v0.1.0/v0.2.0 published merged images. The real raw
+# partition-table.bin cmake output gen_esp32part.py actually emits — the
+# exact file generate-update-meta.sh hashes — is 3072 bytes (0xC00,
+# gen_esp32part.py's own MAX_PARTITION_LENGTH, 0xFF-padded past the used
+# content). Hashing 160 bytes of partition-table content instead of the real
+# 3072-byte file structurally could never match generate-update-meta.sh's
+# own computation, for ANY build, layout-changed or not — this was a
+# baseline-derivation bug, not a real v0.3.0 layout-compat break. See
+# ADR-0008's Correction section for the full incident writeup and the
+# verification (byte-identical merged-image regions across v0.1.0/v0.2.0/
+# v0.3.0, plus an actual reproduced release-container build of v0.3.0 whose
+# generate-update-meta.sh output exactly matches the CURRENT value below —
+# which is also the value already live in v0.3.0's own published
+# update-meta.json).
+#
+# CURRENT (correct) baseline — matches generate-update-meta.sh's real
+# raw-file hashing convention, verified by an actual `docker build` +
+# `docker run` reproduction of the v0.3.0 release build:
 #
 # Bump this value ONLY in a release that intentionally changes
 # firmware/partitions.csv or the bootloader layout, and mark that release
 # upgrade_safe:false (forcing Fresh install for that hop) — never bump it
-# silently. Record the bump and its rationale in an ADR-0008 addendum.
-8c2f016672527d802f58b67787e2d63f441191f0b6d4f0dc49140d5d66eeff36
+# silently. When you do, derive the new value by actually running
+# generate-update-meta.sh (or reading a real build's own update-meta.json
+# layout_hash) against that release's real TARGET_DIR/bootloader.bin +
+# TARGET_DIR/partition-table.bin — NEVER by manually slicing a merged/padded
+# image; that shortcut is exactly what produced this incident. Record the
+# bump and its rationale in an ADR-0008 addendum.
+011e0de9f9a66590aeaaf6a4bf0653306f0c81933f343ad5f7557387c203c0b2
