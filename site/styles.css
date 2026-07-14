@@ -101,6 +101,14 @@ a {
   color: var(--brand-signal-bright);
 }
 
+/* Marks the nav item for the page you're already on — same item set/order
+   appears on every page (site/README.md "Conventions"), so this is the only
+   visual cue distinguishing "you are here" from the other tool link. */
+.topnav a[aria-current="page"] {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
 /* ── Hero ───────────────────────────────────────────────────────────── */
 
 .hero {

@@ -10,18 +10,27 @@ building or publishing anything.
 ## Structure
 
 - `index.html` — the landing page. Sections are self-contained
-  `<section id="...">` blocks (`#getting-started`, `#about`, `#screenshots`,
-  `#design`, …) linked from the top nav; add a new one the same way and it
-  shows up in nav + on the page without touching anything else.
-  `#getting-started` is the flash → provision → message flow, right after
-  the hero: three numbered `.steps` cards, each with a CTA to `flash.html` /
-  `provisioner.html` / the project docs, plus a subtle Web Serial
-  browser-requirement note. Two placeholder comments at the
-  bottom of `<main>` mark likely next sections (hardware/build gallery,
-  roadmap). `#screenshots` is a responsive `.screenshot-grid` of four
+  `<section id="...">` blocks (`#about`, `#screenshots`, `#getting-started`,
+  `#design`, …), in that reading order after the hero — what it is, then
+  proof (screenshots), then how to get started, then the deeper design/scope
+  note — and linked from the top nav in the same order; add a new one the
+  same way and it shows up in nav + on the page without touching anything
+  else. `#about` ("What it does") is a `.card-grid` of the core feature/policy
+  points. `#screenshots` is a responsive `.screenshot-grid` of four
   device-resolution (320x240) PNGs, each in a subtle rounded-corner +
   drop-shadow `.screenshot-card` frame (`styles.css`) — see the `assets/`
-  bullet below for their provenance.
+  bullet below for their provenance. `#getting-started` is the flash →
+  provision → message flow: three numbered `.steps` cards, each with a CTA to
+  `flash.html` / `provisioner.html` / the project docs, plus a subtle Web
+  Serial browser-requirement note. `#design` closes the page with the
+  project's scope/philosophy note and the no-warranty disclaimer, right
+  before the footer. Two placeholder comments at the bottom of `<main>` mark
+  likely next sections (hardware/build gallery, roadmap). The top nav is the
+  same 7 items in the same order on `index.html`, `flash.html`, and
+  `provisioner.html` — the four story anchors, then `flash.html` /
+  `provisioner.html`, then GitHub; whichever tool page you're on marks its own
+  nav item with `aria-current="page"` instead of linking to `flash.html` /
+  `provisioner.html`.
 - `flash.html` + `flash.js` — the two-path web flasher: **Fresh install**
   (the [esp-web-tools](https://github.com/esphome/esp-web-tools)
   `<esp-web-install-button>`, unchanged mechanism, erases the whole chip) vs

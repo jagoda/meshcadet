@@ -18,9 +18,9 @@
     <div class="wrap topbar-inner">
       <a class="wordmark" href="#top">Mesh<span>Cadet</span></a>
       <nav class="topnav">
-        <a href="#getting-started">Getting started</a>
         <a href="#about">What it does</a>
         <a href="#screenshots">Screenshots</a>
+        <a href="#getting-started">Getting started</a>
         <a href="#design">Design</a>
         <a href="flash.html">Flash firmware</a>
         <a href="provisioner.html">Provision device</a>
@@ -57,8 +57,69 @@
       <img class="hero-horizon" src="assets/planet-horizon.png" alt="" aria-hidden="true" />
     </section>
 
+    <!-- ── About / what it does ────────────────────────────────────────── -->
+    <section id="about" class="section">
+      <div class="wrap">
+        <h2>What it does</h2>
+        <div class="card-grid">
+          <div class="card">
+            <img src="assets/rocket.png" alt="" aria-hidden="true" />
+            <h3>Byte-exact MeshCore interop</h3>
+            <p>Talks real MeshCore over LoRa (SX1262) — DMs, channel messages,
+              ACKs, and pull-only location telemetry — on the air alongside any
+              other MeshCore node.</p>
+          </div>
+          <div class="card">
+            <img src="assets/crescent-moon.png" alt="" aria-hidden="true" />
+            <h3>Allowlist-only, no discovery</h3>
+            <p>An admin provisions every contact and channel over USB. The
+              device never auto-adds anyone and never advertises itself on
+              the mesh.</p>
+          </div>
+          <div class="card">
+            <img src="assets/planet-corner.png" alt="" aria-hidden="true" />
+            <h3>Touch UI for contacts &amp; messages</h3>
+            <p>A Slint touch-screen interface for contacts, conversations, and
+              composing messages with a curated <code>:shortcode:</code>
+              emoji set.</p>
+          </div>
+          <div class="card">
+            <img src="assets/comet.png" alt="" aria-hidden="true" />
+            <h3>PIN-gated admin menu</h3>
+            <p>Lightweight on-device runtime toggles behind a PIN, plus a USB
+              host CLI for provisioning, PIN reset, and history export.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Screenshots gallery ──────────────────────────────────────────── -->
+    <section id="screenshots" class="section section-alt">
+      <div class="wrap">
+        <h2>See it in action</h2>
+        <div class="screenshot-grid">
+          <figure class="screenshot-card">
+            <img src="assets/screenshot-splash.png" alt="MeshCadet boot splash screen: the radio-logo wordmark, Cadet mascot, and firmware version over a starfield backdrop." width="320" height="240" loading="lazy" />
+            <figcaption>Boot splash</figcaption>
+          </figure>
+          <figure class="screenshot-card">
+            <img src="assets/screenshot-contacts.png" alt="MeshCadet contact list screen, showing several allowlisted contacts with unread badges and last-message previews." width="320" height="240" loading="lazy" />
+            <figcaption>Contacts</figcaption>
+          </figure>
+          <figure class="screenshot-card">
+            <img src="assets/screenshot-messages.png" alt="MeshCadet message thread screen, showing a sent and received conversation with delivery acknowledgement checkmarks." width="320" height="240" loading="lazy" />
+            <figcaption>Conversation</figcaption>
+          </figure>
+          <figure class="screenshot-card">
+            <img src="assets/screenshot-compose.png" alt="MeshCadet compose screen, showing a draft message and the armed, star-gold Send button." width="320" height="240" loading="lazy" />
+            <figcaption>Compose</figcaption>
+          </figure>
+        </div>
+      </div>
+    </section>
+
     <!-- ── Getting started ──────────────────────────────────────────────── -->
-    <section id="getting-started" class="section section-alt">
+    <section id="getting-started" class="section">
       <div class="wrap">
         <h2>Get messaging in three steps</h2>
         <p class="section-intro">
@@ -105,42 +166,6 @@
       </div>
     </section>
 
-    <!-- ── About / what it does ────────────────────────────────────────── -->
-    <section id="about" class="section">
-      <div class="wrap">
-        <h2>What it does</h2>
-        <div class="card-grid">
-          <div class="card">
-            <img src="assets/rocket.png" alt="" aria-hidden="true" />
-            <h3>Byte-exact MeshCore interop</h3>
-            <p>Talks real MeshCore over LoRa (SX1262) — DMs, channel messages,
-              ACKs, and pull-only location telemetry — on the air alongside any
-              other MeshCore node.</p>
-          </div>
-          <div class="card">
-            <img src="assets/crescent-moon.png" alt="" aria-hidden="true" />
-            <h3>Allowlist-only, no discovery</h3>
-            <p>An admin provisions every contact and channel over USB. The
-              device never auto-adds anyone and never advertises itself on
-              the mesh.</p>
-          </div>
-          <div class="card">
-            <img src="assets/planet-corner.png" alt="" aria-hidden="true" />
-            <h3>Touch UI for contacts &amp; messages</h3>
-            <p>A Slint touch-screen interface for contacts, conversations, and
-              composing messages with a curated <code>:shortcode:</code>
-              emoji set.</p>
-          </div>
-          <div class="card">
-            <img src="assets/comet.png" alt="" aria-hidden="true" />
-            <h3>PIN-gated admin menu</h3>
-            <p>Lightweight on-device runtime toggles behind a PIN, plus a USB
-              host CLI for provisioning, PIN reset, and history export.</p>
-          </div>
-        </div>
-      </div>
-    </section>
-
     <!-- ── Design / scope note ─────────────────────────────────────────── -->
     <section id="design" class="section section-alt">
       <div class="wrap wrap-narrow">
@@ -161,31 +186,6 @@
           <a href="https://github.com/jagoda/meshcadet#-disclaimer--no-warranty-no-guarantee-of-safety-use-at-your-own-risk" target="_blank" rel="noopener">project README</a>
           before you build, flash, or rely on it.
         </p>
-      </div>
-    </section>
-
-    <!-- ── Screenshots gallery ──────────────────────────────────────────── -->
-    <section id="screenshots" class="section">
-      <div class="wrap">
-        <h2>See it in action</h2>
-        <div class="screenshot-grid">
-          <figure class="screenshot-card">
-            <img src="assets/screenshot-splash.png" alt="MeshCadet boot splash screen: the radio-logo wordmark, Cadet mascot, and firmware version over a starfield backdrop." width="320" height="240" loading="lazy" />
-            <figcaption>Boot splash</figcaption>
-          </figure>
-          <figure class="screenshot-card">
-            <img src="assets/screenshot-contacts.png" alt="MeshCadet contact list screen, showing several allowlisted contacts with unread badges and last-message previews." width="320" height="240" loading="lazy" />
-            <figcaption>Contacts</figcaption>
-          </figure>
-          <figure class="screenshot-card">
-            <img src="assets/screenshot-messages.png" alt="MeshCadet message thread screen, showing a sent and received conversation with delivery acknowledgement checkmarks." width="320" height="240" loading="lazy" />
-            <figcaption>Conversation</figcaption>
-          </figure>
-          <figure class="screenshot-card">
-            <img src="assets/screenshot-compose.png" alt="MeshCadet compose screen, showing a draft message and the armed, star-gold Send button." width="320" height="240" loading="lazy" />
-            <figcaption>Compose</figcaption>
-          </figure>
-        </div>
       </div>
     </section>
 
