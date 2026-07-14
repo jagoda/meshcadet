@@ -24,6 +24,8 @@ import {
   encodeAddContact,
   encodeSetPin,
   FRAME_QUERY_STATUS,
+  FRAME_QUERY_CONTACTS,
+  FRAME_QUERY_CHANNELS,
   FRAME_ADD_CONTACT,
   FRAME_SET_PIN,
   FRAME_EXPORT_HISTORY,
@@ -234,6 +236,72 @@ async function retryOnDroppedFirstResponse() {
   const { status, identity } = await session.queryStatus();
   assertStatusAndIdentity(status, identity);
   assert.equal(writeCount, 2, "expected exactly one retry (two sends total)");
+
+  await session.disconnect();
+}
+
+// ── Scenario 2b: a retry's stale duplicate reply must not desync a LATER,
+//    unrelated command ─────────────────────────────────────────────────────
+//
+// Reproduces the reported field defect: `queryStatus()`'s first attempt
+// times out (per-attempt 500ms) and `#sendRecvWithRetry` retries, but the
+// device actually answers BOTH the original attempt (late) and the retry.
+// `queryStatus()` only ever consumes the retry's two frames and resolves —
+// the original's duplicate RSP_STATUS/RSP_IDENTITY pair arrives afterward,
+// once nothing is waiting on it, and must be discarded rather than left to
+// desync whatever command runs next. Without the cross-command residue
+// guard in `#sendRecvWithRetry`, `listContacts()` (called after the
+// duplicate has landed, mirroring `provisioner.js`'s real
+// queryStatus -> render -> listContacts -> listChannels sequence) reads the
+// leftover RSP_STATUS (0x82) as its own response and throws "unexpected
+// frame 0x82 during contact enumeration"; `listChannels()` then inherits the
+// leftover RSP_IDENTITY (0x83) the same way — exactly the two "unexpected
+// frame" defects reported against a real device.
+async function staleRetryDuplicateDoesNotDesyncNextCommand() {
+  let writeCount = 0;
+  const { port, push } = makeFakePort((chunk) => {
+    writeCount++;
+    const { frameType } = decodeFrame(chunk);
+    if (writeCount === 1) {
+      // The original QUERY_STATUS attempt: the device answers, but only
+      // after the 500ms per-attempt timeout has already elapsed and
+      // #sendRecvWithRetry has moved on to a retry.
+      setTimeout(() => {
+        push(statusFrame);
+        push(identityFrame);
+      }, 600);
+    } else if (writeCount === 2) {
+      // The retry: device answers promptly, and #sendRecvWithRetry/
+      // queryStatus() resolve from this pair alone.
+      setTimeout(() => {
+        push(statusFrame);
+        push(identityFrame);
+      }, 5);
+    } else if (frameType === FRAME_QUERY_CONTACTS) {
+      setTimeout(() => push(encodeFrame(FRAME_RSP_CONTACTS_DONE)), 5);
+    } else if (frameType === FRAME_QUERY_CHANNELS) {
+      setTimeout(() => push(encodeFrame(FRAME_RSP_CHANNELS_DONE)), 5);
+    }
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  const { status, identity } = await session.queryStatus();
+  assertStatusAndIdentity(status, identity);
+  assert.equal(writeCount, 2, "expected exactly one retry (two sends total)");
+
+  // Let the original attempt's late, duplicate reply land — mirrors the real
+  // gap between a status refresh resolving/rendering and the next user- or
+  // poll-driven command (listContacts) actually being issued.
+  await new Promise((r) => setTimeout(r, 200));
+
+  const contacts = await session.listContacts();
+  assert.deepEqual(contacts, []);
+
+  const channels = await session.listChannels();
+  assert.deepEqual(channels, []);
 
   await session.disconnect();
 }
@@ -658,6 +726,7 @@ async function clearHistorySendsCorrectFrame() {
 const scenarios = [
   ["happy path: two-frame handshake + magic-resync past log noise", happyPathWithLogNoiseResync],
   ["send_recv_with_retry retries a dropped first response", retryOnDroppedFirstResponse],
+  ["a retry's stale duplicate reply does not desync a later command", staleRetryDuplicateDoesNotDesyncNextCommand],
   ["disconnect() before connect() is a no-op", disconnectWithoutConnect],
   ["device RSP_ERROR on QUERY_STATUS surfaces as DeviceError", deviceErrorOnQueryStatus],
   ["unexpected frame after RSP_STATUS surfaces a desync error", unexpectedFrameAfterStatus],
