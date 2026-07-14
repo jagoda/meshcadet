@@ -67,6 +67,17 @@ jobs:
         # docs/adr/0011-unified-esptool-js-flasher.md.
         run: node site/flash-manifest.test.mjs
 
+      - name: flash-image-encoding.js's ui8ToBstr matches esptool-js's writeFlash data-type contract
+        # site/flash-image-encoding.js converts each downloaded firmware
+        # image from a Uint8Array to the Latin-1 binary string esptool-js's
+        # ESPLoader.writeFlash actually requires for fileArray[].data — see
+        # the module's own header for the "A.charCodeAt is not a function"
+        # mid-write crash this closes (both Fresh install and Upgrade wrote
+        # a Uint8Array straight through before this fix). Plain-node
+        # round-trip coverage of the data-type boundary; the real write
+        # itself is verified against hardware, not this suite.
+        run: node site/flash-image-encoding.test.mjs
+
       - name: session.js orchestration smoke test (mocked Web Serial)
         # site/provisioner/session.js (the async Web Serial transport +
         # QUERY_STATUS handshake driving provisioner.html) has no Rust
