@@ -8,6 +8,14 @@ Versioning is managed by [release-please](https://github.com/googleapis/release-
 The entry below documents everything landed before release-please's first
 `chore(release): vX.Y.Z` PR.
 
+## [0.3.2](https://github.com/jagoda/meshcadet/compare/v0.3.1...v0.3.2) (2026-07-14)
+
+
+### Fixed
+
+* **release:** let release-please complete its tag+label hand-off ([80b9cff](https://github.com/jagoda/meshcadet/commit/80b9cffeb79f2d713c2000daf5c81a88f5c54e6f))
+* **release:** let release-please complete its tag+label hand-off ([7065f88](https://github.com/jagoda/meshcadet/commit/7065f88cdd77fde230433da664869278fa691c1a))
+
 ## [0.3.1](https://github.com/jagoda/meshcadet/compare/v0.3.0...v0.3.1) (2026-07-14)
 
 
