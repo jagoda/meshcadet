@@ -304,6 +304,14 @@ slint::slint! {
                         }
                         TouchArea { clicked => { show_contacts = false; } }
                     }
+                    HeaderIconButton {
+                        width: 44px;
+                        icon: "⚙";
+                        clicked => { root.settings_pressed(); }
+                    }
+                    // `SignalMeter` moved to AFTER the gear — mirrors
+                    // `contact_list.rs`'s real-screen header reposition (this
+                    // module is a verbatim copy; see this file's module doc).
                     Rectangle {
                         width: 26px; height: 36px;
                         SignalMeter {
@@ -313,11 +321,6 @@ slint::slint! {
                             x: (parent.width - self.width) / 2;
                             y: (parent.height - self.height) / 2;
                         }
-                    }
-                    HeaderIconButton {
-                        width: 44px;
-                        icon: "⚙";
-                        clicked => { root.settings_pressed(); }
                     }
                 }
 

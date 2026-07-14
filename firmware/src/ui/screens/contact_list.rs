@@ -388,11 +388,19 @@ slint::slint! {
                         }
                         TouchArea { clicked => { show_contacts = false; } }
                     }
+                    // ── Settings / PIN-menu entry ─────────────────────────────
+                    HeaderIconButton {
+                        width: 44px;
+                        icon: "⚙";
+                        clicked => { root.settings_pressed(); }
+                    }
                     // `SignalMeter` (ADR-0010) — this header has no existing
                     // trailing spacer to nest into (unlike `gps_status.rs`/
-                    // `message_view.rs`); the gear button already occupies
-                    // the literal top-right corner. A small new flow child,
-                    // placed just before the gear, reserves its own
+                    // `message_view.rs`). Declared AFTER the gear button (it
+                    // previously sat before it, which read as part of the
+                    // "📡 Channels" tab beside it) so it now renders as the
+                    // rightmost header element, clear of the gear's touch
+                    // target. A small new flow child reserves its own
                     // non-overlapping slot — the two tabs' `horizontal-
                     // stretch: 1.0` simply divide the slightly-reduced
                     // remaining width evenly (each still comfortably wider
@@ -409,12 +417,6 @@ slint::slint! {
                             x: (parent.width - self.width) / 2;
                             y: (parent.height - self.height) / 2;
                         }
-                    }
-                    // ── Settings / PIN-menu entry ─────────────────────────────
-                    HeaderIconButton {
-                        width: 44px;
-                        icon: "⚙";
-                        clicked => { root.settings_pressed(); }
                     }
                 }
 
