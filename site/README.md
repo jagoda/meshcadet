@@ -10,9 +10,13 @@ building or publishing anything.
 ## Structure
 
 - `index.html` — the landing page. Sections are self-contained
-  `<section id="...">` blocks (`#about`, `#screenshots`, `#design`, …) linked
-  from the top nav; add a new one the same way and it shows up in nav + on
-  the page without touching anything else. Two placeholder comments at the
+  `<section id="...">` blocks (`#getting-started`, `#about`, `#screenshots`,
+  `#design`, …) linked from the top nav; add a new one the same way and it
+  shows up in nav + on the page without touching anything else.
+  `#getting-started` is the flash → provision → message flow, right after
+  the hero: three numbered `.steps` cards, each with a CTA to `flash.html` /
+  `provisioner.html` / the project docs, plus a subtle Web Serial
+  browser-requirement note. Two placeholder comments at the
   bottom of `<main>` mark likely next sections (hardware/build gallery,
   roadmap). `#screenshots` is a responsive `.screenshot-grid` of four
   device-resolution (320x240) PNGs, each in a subtle rounded-corner +

@@ -18,6 +18,7 @@
     <div class="wrap topbar-inner">
       <a class="wordmark" href="#top">Mesh<span>Cadet</span></a>
       <nav class="topnav">
+        <a href="#getting-started">Getting started</a>
         <a href="#about">What it does</a>
         <a href="#screenshots">Screenshots</a>
         <a href="#design">Design</a>
@@ -54,6 +55,54 @@
         </div>
       </div>
       <img class="hero-horizon" src="assets/planet-horizon.png" alt="" aria-hidden="true" />
+    </section>
+
+    <!-- ── Getting started ──────────────────────────────────────────────── -->
+    <section id="getting-started" class="section section-alt">
+      <div class="wrap">
+        <h2>Get messaging in three steps</h2>
+        <p class="section-intro">
+          No toolchain, no soldering — flash from your browser, provision
+          over USB, and you're on the mesh.
+        </p>
+        <ol class="steps">
+          <li class="step">
+            <span class="step-number">1</span>
+            <div class="step-body">
+              <h3>Flash your T-Deck Plus</h3>
+              <p>One-click firmware install, straight from this page — no
+                cables to configure, no build to run.</p>
+              <a class="btn btn-primary" href="flash.html">Flash firmware</a>
+            </div>
+          </li>
+          <li class="step">
+            <span class="step-number">2</span>
+            <div class="step-body">
+              <h3>Provision your device</h3>
+              <p>Register contacts and channels over USB. The device stays
+                allowlist-only and off the mesh until you say so.</p>
+              <a class="btn btn-primary" href="provisioner.html">Provision device</a>
+            </div>
+          </li>
+          <li class="step">
+            <span class="step-number">3</span>
+            <div class="step-body">
+              <h3>Add a contact and start messaging</h3>
+              <p>Scan the on-device QR from a MeshCore companion app, or add
+                a contact straight from the provisioner — then send your
+                first message.</p>
+              <a class="learn-more" href="https://github.com/jagoda/meshcadet#what-it-does">Learn more in the project docs&nbsp;→</a>
+            </div>
+          </li>
+        </ol>
+        <p class="muted browser-note">
+          Flashing and provisioning run in the browser over
+          <a href="https://developer.mozilla.org/en-US/docs/Web/API/Web_Serial_API" target="_blank" rel="noopener">Web Serial</a>,
+          which needs a desktop build of <strong>Chrome</strong> or
+          <strong>Microsoft Edge</strong>, loaded over <strong>HTTPS</strong>
+          (this page qualifies).
+        </p>
+      </div>
     </section>
 
     <!-- ── About / what it does ────────────────────────────────────────── -->

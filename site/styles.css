@@ -317,6 +317,79 @@ a {
   font-size: 13px;
 }
 
+/* ── Getting started ────────────────────────────────────────────────── */
+
+.section-intro {
+  color: var(--text-secondary);
+  font-size: 15px;
+  max-width: 640px;
+  margin: 0 0 32px;
+}
+
+.steps {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 24px;
+  margin: 0 0 24px;
+  padding: 0;
+  list-style: none;
+}
+
+.step {
+  display: flex;
+  gap: 16px;
+  background: var(--surface-raised);
+  border: 1px solid var(--surface-alt);
+  border-radius: 10px;
+  padding: 24px;
+}
+
+.step-number {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--brand-signal);
+  color: #06141f;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 15px;
+}
+
+.step-body h3 {
+  font-size: 16px;
+  margin: 0 0 8px;
+  color: var(--text-primary);
+}
+
+.step-body p {
+  font-size: 14px;
+  color: var(--text-secondary);
+  margin: 0 0 16px;
+}
+
+.step-body .btn {
+  margin-top: 4px;
+}
+
+.step-body .learn-more {
+  display: inline-block;
+  font-size: 14px;
+  color: var(--brand-signal-bright);
+  text-decoration: none;
+}
+
+.step-body .learn-more:hover {
+  text-decoration: underline;
+}
+
+.browser-note {
+  margin-top: 4px !important;
+}
+
 /* ── Screenshots gallery ────────────────────────────────────────────── */
 
 .screenshot-grid {
