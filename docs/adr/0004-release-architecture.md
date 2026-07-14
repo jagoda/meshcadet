@@ -9,7 +9,12 @@
   (`createCommitOnBranch`) instead of a plain in-runner `git commit`, so it
   carries a verified signature; see §10 and the corrected §5/Consequences
   note below on why an unsigned commit on the PR branch is NOT safe under
-  `required_signatures`, contrary to this ADR's original assumption.
+  `required_signatures`, contrary to this ADR's original assumption. §2/§7
+  and Alternatives Considered §C corrected, §11 added (2026-07-14) —
+  `skip-github-release: true` turned out to structurally deadlock every
+  release (v0.2.0 and v0.3.0 both needed manual recovery); §11 records the
+  root cause and the fix (release-please now owns the initial Release
+  object, `release.yml` enriches it rather than creating a competing one).
 - **Deciders:** Maintainer design review
 - **Supersedes:** —
 - **Implements:** —
@@ -90,11 +95,16 @@ that wired this up, and `firmware/Cargo.toml` was bumped to match.
 to open (and keep up to date) a PR titled `chore(release): vX.Y.Z` whenever
 Conventional Commits land on `main` that warrant a release, and — in the
 same workflow run that detects such a PR was just merged — create the
-`vX.Y.Z` git tag consumed by the production firmware release workflow (§7).
-It never publishes to crates.io and never opens its own GitHub Release
-object (`skip-github-release: true`) — the production firmware release
-workflow owns the user-facing Release for a given tag (§7); two separate
-"release" objects on the same tag would be redundant and confusing.
+`vX.Y.Z` git tag consumed by the production firmware release workflow (§7),
+plus a GitHub Release object for that tag (changelog notes only, no
+assets). It never publishes to crates.io. **This Release object is no
+longer skipped (`skip-github-release` was removed 2026-07-14 — see §11):**
+release-please's own tag+label hand-off is only reachable through that
+object, so skipping it structurally deadlocked every release (§11). The
+production firmware release workflow (§7) still owns the *user-facing*
+shape of the Release for a given tag — it finds the one release-please
+already created and edits/uploads onto it, rather than creating a second,
+competing Release.
 
 **Why release-please, not release-plz (this section's original tool):**
 release-plz's `git_only` mode — needed because every crate here is
@@ -301,12 +311,15 @@ bootloader (`0x0`) + the custom `partition-table.bin` carrying `mc_hist`
 (`0x8000`) + the app image (`0x10000`, `factory`) into one flashable image via
 `esptool merge_bin` (`firmware/release-container/build.sh` — offsets per
 `firmware/partitions.csv`; a bare app `.bin` will not boot against this
-project's custom partition table), and publishes a GitHub Release carrying
-`meshcadet-vX.Y.Z-merged.bin`, an esp-web-tools `manifest.json` (chip family
-`ESP32-S3`, single part at offset `0`), and a `SHA256SUMS`. UF2 and the raw
-ELF are deliberately not published (serial flashing only, out of scope for
-now). Release notes are extracted from the matching `CHANGELOG.md` section
-(§3) rather than hand-written per release.
+project's custom partition table), and publishes onto the Release
+release-please already created for this tag (§2/§11) the merged image, an
+esp-web-tools `manifest.json` (chip family `ESP32-S3`, single part at offset
+`0`), the app-only update image, its manifest/metadata counterparts, and a
+`SHA256SUMS` — `gh release edit` + `gh release upload --clobber`, not `gh
+release create` (§11). UF2 and the raw ELF are deliberately not published
+(serial flashing only, out of scope for now). Release notes are extracted
+from the matching `CHANGELOG.md` section (§3) rather than hand-written per
+release.
 
 ### 8. Reproducibility + provenance (Implemented)
 
@@ -435,6 +448,123 @@ after this step runs, a maintainer re-running the checks (or pushing any
 follow-up commit) picks up the synced lockfile — the lockfile fix itself
 lands correctly regardless.
 
+### 11. Closing the tag/label deadlock: release-please owns the initial Release object (Implemented)
+
+**The defect.** `skip-github-release: true` (§2's original text) was meant
+to avoid two competing Release objects on the same tag, but it silently
+disabled release-please's own tag-on-merge completion. Reading
+release-please's source (`src/strategies/base.js`, `src/manifest.js`,
+version `17.10.3`, the version `googleapis/release-please-action@v5`
+itself pins): `Strategy.buildRelease()` returns immediately, before ever
+computing a tag, whenever `this.skipGitHubRelease` is set — so
+`Manifest.buildReleases()` produces zero candidate releases for a merged
+release PR, `Manifest.createReleases()` never calls
+`createReleasesForPullRequest()` for that PR, and the unconditional
+`removeIssueLabels(pending)` + `addIssueLabels(tagged)` swap inside
+`createReleasesForPullRequest()` — the ONLY place in release-please that
+flips the label — never runs. The PR's `autorelease: pending` label
+therefore never becomes `autorelease: tagged`, and every subsequent
+release-please run aborts with "There are untagged, merged release PRs
+outstanding" (`Manifest.createPullRequests()`'s own check on that same
+label). This is not a transient bug: it recurs on **every** release, and
+bit both v0.2.0 and v0.3.0, each requiring a hand-created tag + a
+hand-applied label swap to unblock (missions
+`meshcadet-release-v0-2-0-stranded-tag-20260713-012022784` and
+`meshcadet-release-v0-3-0-deadlock-clear-20260714-023732442`).
+
+**The fix.** Remove `skip-github-release` from `release-please-config.json`
+entirely (defaults to `false`), so `buildRelease()` runs its full path:
+computes the tag, calls `createRelease()` (creates the real tag + a Release
+object — changelog notes only, no firmware assets), and
+`createReleasesForPullRequest()` then unconditionally performs the label
+swap on every path through it (the plain-success branch and the
+duplicate-release branch both call it) — the deadlock cannot recur, because
+the label flip is no longer gated on anything `release.yml` controls.
+`.github/workflows/release.yml`'s "Publish or update GitHub Release" step
+changed from a bare `gh release create` (which would now fail outright —
+the tag already has a Release) to: check for an existing Release on the tag
+(`gh release view`), `gh release edit` its title/notes if found (the normal
+case — release-please already made it), `gh release create` as a fallback
+only if the tag was pushed by hand with no release-please-created Release
+at all, then `gh release upload --clobber` the six production assets onto
+it either way. `--clobber` also makes a re-run after a partial upload
+idempotent, closing a secondary, non-structural failure mode the old
+`gh release create`-only step had (§7's prior "KNOWN FAILURE MODE" comment).
+
+**A second defect caught during this fix's own review, before landing:** a
+release-please-created Release publishes immediately (not draft by
+default), which fires GitHub's `release: published` event right away — the
+same event `.github/workflows/pages-deploy.yml` listens for to mirror a new
+release's firmware assets onto the site flasher (ADR-0006). Published
+immediately, that Release has no assets yet (the firmware build hasn't even
+started), so the mirror step would run against an empty release; and
+because `gh release edit` (used later to attach the real assets) fires
+`release: edited`, not `published`, the site would never get a second
+chance to pick up this tag's real assets. Fixed by also setting
+`release-please-config.json`'s `draft: true` (the Release release-please
+creates stays hidden from the public until explicitly published) and
+`force-tag-creation: true` (GitHub otherwise defers creating the underlying
+git tag until a draft release is published, which would silently break
+`release.yml`'s own `push: tags` trigger). `release.yml` un-drafts the
+Release (`gh release edit "${TAG}" --draft=false`) as its very last step,
+after the real notes and every asset are already attached — so
+`release: published` fires exactly once, against a complete Release. The
+manual-tag fallback branch (`gh release create` with no release-please
+Release to inherit) is unaffected: it still publishes immediately, same as
+this step always did before this change, since there's no draft state to
+manage in that path.
+
+**Alternative considered and rejected: a bespoke label-flip mechanism with
+`skip-github-release` left in place** (option (b) from this fix's own
+mission brief) — e.g. a second workflow, triggered on `release-please.yml`
+completing, that inspects the merged PR and manually swaps the label the
+way the two stranded-tag recovery missions did by hand. Rejected: this
+reimplements, as bespoke bookkeeping this repo would have to maintain
+forever, exactly the state machine release-please already ships and tests
+upstream — every future release-please upgrade would need re-verifying
+against a parallel, hand-rolled label-flip path. Enabling the tool's native
+Release-based completion is strictly less code and less to maintain, and is
+the supported way the upstream project expects this hand-off to work.
+
+**Preserved:** GitHub still authors/signs the tag exactly as before (no
+change to how `push: tags` fires `release.yml`, and no local/YubiKey
+signing enters this path either way); the published Release still ends up
+in the v0.1.0/v0.2.0/v0.3.0 shape (same title format, same six assets, same
+SLSA provenance), and — thanks to the draft/un-draft handling above — a
+downloading user or the site flasher never observes an incomplete Release:
+what release-please creates stays a draft, invisible outside the repo,
+until `release.yml` un-drafts it with everything already attached. The tag
+itself still appears immediately (`force-tag-creation: true`), so
+`release.yml`'s own build starts without waiting on anything.
+
+**Verification.** A live release could not be cut in-mission from this
+sandboxed context (GPG/SSH commit signing requires a physical YubiKey touch
+that the automated worker cannot supply — confirmed live, `git commit`
+timed out waiting on the signing agent). Verification instead traced the
+actual mechanism end to end against the pinned library version: read
+`buildRelease()`'s `skipGitHubRelease` early-return and
+`createReleasesForPullRequest()`'s unconditional label swap directly in the
+installed `release-please@17.10.3` source (the same major version
+`release-please-action@v5` depends on, confirmed via that action's own
+`package.json`), confirmed `draft`/`force-tag-creation` are real,
+supported top-level config keys against that same package's own JSON
+schema (including the schema's own note that `force-tag-creation` is
+"particularly useful when draft is enabled" for exactly the lazy-tag reason
+above), traced `github-api.js`'s `createRelease()` to confirm `forceTag`
+issues a standalone `git.createRef` for the tag *before* the (draft)
+`repos.createRelease` call — so the tag ref, and this repo's
+`push: tags`-triggered `release.yml`, fire immediately regardless of the
+Release's draft state — and exercised the corrected `release.yml` step's
+existence-check
+logic live and read-only against the real repository (`gh release view
+v0.3.0` correctly selects the "edit" branch; `gh release view` against a
+nonexistent tag correctly selects the "create" fallback branch). Read
+`.github/workflows/pages-deploy.yml`'s own trigger (`release: types:
+[published]`) directly to ground the second defect above, rather than
+assuming GitHub's draft/edit/publish event semantics. Both workflow YAMLs
+and the config JSON parse cleanly. The next real release cycle is the
+end-to-end confirmation that no manual tag/label recovery is needed.
+
 ## Consequences
 
 - Contributors must write Conventional Commit messages and PR titles going
@@ -485,8 +615,18 @@ in one place instead of splitting it across two mechanisms.
 
 ### C. Let release-please open a GitHub Release itself
 
-Rejected per §2: the production firmware workflow (§7) needs to own the
-Release object for a given `vX.Y.Z` tag (it's where the flashable
-image/manifest/checksums live) — a second, empty release-please-created
-Release on the same tag would be redundant and confusing to a downloading
-user.
+Originally rejected per §2's first text: the concern was that a second,
+empty release-please-created Release alongside the production firmware
+workflow's (§7) own would be redundant and confusing to a downloading user.
+**Corrected 2026-07-14 (§11):** that concern conflated "release-please
+creates *a* Release object" with "release-please creates a *second, visible*
+Release" — the two are not the same thing. release-please's tag-on-merge
+completion (and the `autorelease: pending` -> `autorelease: tagged` label
+flip that depends on it) is only reachable through its own
+`createReleasesForPullRequest()`, which requires a Release object to exist;
+skipping it (`skip-github-release: true`) didn't avoid a redundant Release,
+it disabled release-please's own hand-off entirely, deadlocking every
+release. §11's fix keeps this alternative's original goal — one coherent,
+asset-bearing Release per tag, not two — by having `release.yml` **edit**
+release-please's Release object in place rather than creating a competing
+one, so the end state a downloading user sees is unchanged.
