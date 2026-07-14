@@ -517,8 +517,26 @@ export class ProvisionerSession {
    * `#readLoop` continuously drains the port into `#accBuf` there is no
    * separate kernel buffer accumulating behind the scenes to flush — clearing
    * `#accBuf` itself (below) is the JS-side equivalent.
+   *
+   * CROSS-COMMAND RESIDUE GUARD: every top-level command (`queryStatus`,
+   * `listContacts`, ...) enters here exactly once as its first frame I/O.
+   * `#exclusive` guarantees no other command can be mid-exchange when that
+   * happens, so any bytes already sitting in `#accBuf` at this point cannot
+   * belong to the command about to be sent — they can only be leftovers from
+   * an *earlier* command's exchange (most commonly: a retry whose original,
+   * pre-timeout attempt the device answered anyway, arriving after that
+   * exchange had already resolved on the retry's reply — mirrors the "stray
+   * reply to an earlier command" scenario `Session::export_history` documents
+   * on the Rust side, except here it can poison a *different, later* command
+   * instead of just the same one). Rust doesn't need this guard: each CLI
+   * invocation opens a fresh port/process, so there is no cross-command
+   * lifetime for residue to leak across. The browser session is long-lived
+   * across many commands, so it must discard that residue itself before
+   * starting a new exchange, or the next command reads someone else's
+   * response and misreports it as "unexpected frame".
    */
   async #sendRecvWithRetry(frameType, payload) {
+    this.#accBuf = new Uint8Array(0);
     const overallDeadline = Date.now() + RETRY_TOTAL_MS;
     while (true) {
       await this.#sendFrame(frameType, payload);
