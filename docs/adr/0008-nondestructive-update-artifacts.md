@@ -136,6 +136,67 @@ Consequences) — `upgrade_safe:false` alone is the gate a consumer must
 honor; the site-flasher child (ADR-0006) must not offer the Upgrade path
 for a release whose `upgrade_safe` is `false`.
 
+**Correction (2026-07-14) — the baseline-provenance methodology above was
+wrong, and mis-gated v0.3.0.** `firmware/v0.3.0/update-meta.json` published
+`layout_hash: 011e0de9..` against the baseline `8c2f016672..` above,
+`upgrade_safe: false` — read by a reasonable consumer as "v0.3.0's bootloader
+changed, app-only upgrade is genuinely unsafe." It hadn't, and it wasn't.
+Root cause: **the two hashes were computed over a different number of bytes
+of the same underlying content**, not over different content.
+
+`generate-update-meta.sh` hashes the RAW `TARGET_DIR/bootloader.bin` +
+`TARGET_DIR/partition-table.bin` cmake build outputs directly (D2's own
+text, correctly). But the baseline's "verified" provenance procedure
+described above did *not* do that — it manually extracted byte ranges out of
+a downloaded, merged/padded image: `bootloader.bin` correctly (0x0..0x5130,
+which does happen to equal that raw file's true length), but
+`partition-table.bin` as a **160-byte slice** (0x8000..0x80a0 — just the 4
+partition entries + 1 MD5-sum trailer, the table's *used* content). The real
+raw `partition-table.bin` `gen_esp32part.py` emits — the exact file
+`generate-update-meta.sh` hashes — is **3072 bytes** (`0xC00`,
+`gen_esp32part.py`'s own `MAX_PARTITION_LENGTH`, 0xFF-padded past the used
+content); merge_bin places that whole 3072-byte file at `0x8000` verbatim,
+then itself pads *further* with 0xFF out to `nvs`'s `0x9000`. Hashing a
+160-byte slice of partition-table content can never equal hashing the real
+3072-byte file, for **any** build, layout-changed or not — the baseline was
+structurally incapable of ever matching `generate-update-meta.sh`'s live
+output, from the moment it was seeded. v0.3.0 wasn't caught by a real
+compatibility break; it was the first release the gate ever actually ran
+against, so it was the first release to expose a bug that had existed since
+the baseline was committed.
+
+**Verification the real layout never changed:** downloaded the actual
+published `v0.1.0`, `v0.2.0`, and `v0.3.0` `-merged.bin` release assets and
+diffed the full `[0x0, 0x9000)` span (bootloader + partition-table + all
+gap-fill up to `nvs`) byte-for-byte across all three — identical. Separately,
+reproduced the real `v0.3.0` release build end-to-end (`docker build` +
+`docker run` against the pinned release container, tag `v0.3.0`, real
+`SOURCE_DATE_EPOCH`) and confirmed its `generate-update-meta.sh` output
+reproduces the exact `011e0de9..` value CI published — not a fluke, and not
+a genuine layout break; a real, deterministic build output, just compared
+against a baseline that was never computable to match it.
+
+**Fix:** `firmware/layout-baseline.txt` is re-seeded to `011e0de9..` —
+derived by actually running `generate-update-meta.sh` against a real build's
+raw outputs, per the corrected baseline-derivation rule now in that file's
+own header comment (never hand-slice a merged image again). This is
+verified to restore `upgrade_safe:true` for an (still) unchanged layout —
+confirmed by re-running `generate-update-meta.sh` against the real
+reproduced `v0.3.0` build outputs and the corrected baseline.
+
+**v0.3.0's already-published `update-meta.json` is not retroactively
+edited by this correction.** It was built, checksummed, and attested by
+`release.yml` as `upgrade_safe:false`; hand-patching a live release asset
+outside that pipeline would satisfy the JSON content but leave its
+`SHA256SUMS` entry and `actions/attest-build-provenance` attestation stale —
+exactly the invariant D5 exists to prevent. v0.2.0 users therefore still see
+"Fresh install only" for the v0.3.0 hop specifically; this correction's
+effect is forward from the next tagged release built at or after this
+commit (recommended: a `v0.3.1` patch release, cut through the normal
+tag-triggered pipeline, so the corrected gate goes live with a properly
+attested `update-meta.json`) — not a mutation of a past one. See the owning
+mission's dossier for the full incident record.
+
 ### D3 — `manifest-update.json`: esp-web-tools manifest shaped for a non-erasing flash
 
 A second esp-web-tools manifest, `manifest-update.json`, generated in
