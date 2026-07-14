@@ -2,27 +2,49 @@ name: release-please
 
 # Opens/updates a "chore(release): vX.Y.Z" PR (version bump + CHANGELOG.md)
 # from Conventional Commits landed on `main`, and — in the SAME run that
-# detects such a PR was just merged — creates the `vX.Y.Z` git tag that
-# fires the (separate, later) production firmware release workflow. See
-# docs/adr/0004-release-architecture.md for the full release architecture
-# and release-please-config.json/.release-please-manifest.json for the
-# versioning/changelog config this workflow runs.
+# detects such a PR was just merged — creates the `vX.Y.Z` git tag (which
+# fires the separate, later production firmware release workflow) and a
+# matching GitHub Release object. See docs/adr/0004-release-architecture.md
+# for the full release architecture and release-please-config.json/
+# .release-please-manifest.json for the versioning/changelog config this
+# workflow runs.
 #
 # No crates.io publish happens from this workflow, and it never invokes
 # `cargo` at all — not even in the Cargo.lock-sync steps below: release-please
 # is pure git/GitHub-API/text-manifest automation (no `cargo package`/`cargo
 # publish` step exists to gate on `publish = false`, unlike the
 # release-plz-based setup this replaced).
-# `skip-github-release: true` (release-please-config.json) means this
-# workflow only ever creates the tag, never a GitHub Release object — the
-# production firmware release workflow (.github/workflows/release.yml) owns
-# that, publishing the flashable image/manifest/checksums for the tag.
+#
+# release-please-config.json does NOT set `skip-github-release` (see §2's
+# revision history in docs/adr/0004-release-architecture.md for why): a
+# release-please-managed GitHub Release, changelog-only and asset-free, is
+# what release-please itself uses to flip a merged release PR's
+# `autorelease: pending` label to `autorelease: tagged` — that label flip is
+# unreachable when `skip-github-release: true`, which is exactly why every
+# release used to deadlock with "untagged, merged release PRs outstanding"
+# on the very next run. The production firmware release workflow
+# (.github/workflows/release.yml) still owns the *user-facing* shape of that
+# same Release object — it finds the Release release-please already created
+# for the tag and edits/uploads onto it (flashable image, manifest, SLSA
+# provenance) rather than creating a second, competing Release.
+#
+# `draft: true` + `force-tag-creation: true` (also release-please-config.json):
+# the Release release-please creates here stays a draft — invisible to the
+# public — until release.yml un-drafts it once the real assets are attached,
+# so `.github/workflows/pages-deploy.yml`'s `release: published` trigger (it
+# mirrors this release's firmware assets onto the site flasher) fires
+# exactly once, with everything already in place, instead of firing early
+# against an asset-free placeholder. `force-tag-creation` is required
+# alongside `draft` because GitHub otherwise defers creating the underlying
+# git tag until a draft release is published — without it, this workflow's
+# own `push: tags` trigger would never fire.
 #
 # Unlike the release-plz-based setup this replaced (two separate jobs, one
 # for "open/update the PR", one for "tag on merge"), release-please-action
 # does both in a single step: it detects on every run whether the current
 # state of `main` is an unreleased accumulation of commits (open/update the
-# PR) or a just-merged release PR (create the tag), so one job covers both.
+# PR) or a just-merged release PR (create the tag + Release), so one job
+# covers both.
 
 on:
   push:

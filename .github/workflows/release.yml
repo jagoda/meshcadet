@@ -23,11 +23,21 @@ name: release
 #      the committed `firmware/layout-baseline.txt`) — see
 #      docs/adr/0008-nondestructive-update-artifacts.md, the CONTRACT the
 #      site flasher child consumes;
-#   5. publishes a GitHub Release: the merged image, the app-only image, an
-#      esp-web-tools `manifest.json` (Fresh install) and `manifest-update.json`
-#      (app-only Upgrade, single part @ 0x10000), `update-meta.json`
-#      (layout_hash/upgrade_safe), and `SHA256SUMS`;
+#   5. publishes onto the GitHub Release for this tag: the merged image, the
+#      app-only image, an esp-web-tools `manifest.json` (Fresh install) and
+#      `manifest-update.json` (app-only Upgrade, single part @ 0x10000),
+#      `update-meta.json` (layout_hash/upgrade_safe), and `SHA256SUMS`;
 #   6. attests SLSA build provenance over those six published assets.
+#
+# release-please (.github/workflows/release-please.yml) already created the
+# Release object for this tag — changelog notes only, no assets — in the
+# same run that created the tag; that Release is how release-please's own
+# `autorelease: pending` -> `autorelease: tagged` label flip happens (see
+# release-please.yml's header comment and docs/adr/0004-release-architecture.md
+# §2/§7 for why that flip is otherwise unreachable). This workflow does not
+# create a second, competing Release for the same tag — it finds the one
+# release-please made and edits/uploads onto it (title + real release notes,
+# then the six assets below).
 #
 # See docs/release-reproducibility.md for the full rebuild + third-party
 # verification recipe (this workflow and that doc must describe the exact
@@ -259,29 +269,81 @@ jobs:
             echo "No CHANGELOG.md section found for [${VERSION}] — see CHANGELOG.md." > release-notes.md
           fi
 
-      # KNOWN FAILURE MODE: `gh release create` uploads its file arguments
-      # sequentially after creating the Release object — a network blip
-      # partway through can leave a published Release missing one or more of
-      # the six assets, with no automatic retry/rollback here. Re-running
-      # this job (e.g. via workflow_dispatch or by re-running the failed
-      # run) does NOT recreate the tag, so recovery is manual:
-      # `gh release upload "${TAG}" <missing-file>` for whichever asset(s)
-      # are absent, or `gh release delete "${TAG}"` + re-run this job if
-      # starting over is simpler. Recovery is a documented manual step
-      # rather than scripted retry logic, since a real release is a rare,
-      # human-observed event — revisit if releases become frequent enough
-      # for this to bite in practice.
-      - name: Publish GitHub Release
+      # Idempotent by design (both the release-object step and the asset
+      # upload): re-running this job (workflow_dispatch or re-running a
+      # failed run) safely repeats "point the Release at the real
+      # title/notes, then re-upload all six assets" rather than needing the
+      # manual `gh release upload <missing-file>` / `gh release delete` +
+      # re-run recovery a plain, non-idempotent `gh release create` would
+      # require after a network blip mid-upload.
+      - name: Publish or update GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
-          gh release create "${TAG}" \
+          set -euo pipefail
+          # release-please already created the Release object for this tag —
+          # as a DRAFT, changelog notes only, no assets — in the same run
+          # that created the tag itself (release-please-config.json's
+          # `draft: true` + `force-tag-creation: true`; the latter is
+          # required so the git tag is created immediately instead of only
+          # upon publishing the draft, which is what actually fires this
+          # workflow — see this workflow's header comment and
+          # docs/adr/0004-release-architecture.md §2/§7/§11). Keeping it a
+          # draft until everything below is attached matters: a non-draft
+          # Release fires GitHub's `release: published` event immediately,
+          # which `.github/workflows/pages-deploy.yml` listens for to mirror
+          # this release's firmware assets onto the site flasher — firing
+          # that before any asset exists would mirror nothing, and a later
+          # `gh release edit` does NOT refire `published` (only `edited`),
+          # so the site would never pick up this tag's real assets at all.
+          # `gh release edit` here replaces the draft's placeholder
+          # title/notes with the real ones; `gh release create` is the
+          # fallback for a tag pushed by hand (bypassing release-please
+          # entirely), which has no Release yet and is created published
+          # immediately, same as this step always did before this change.
+          #
+          # This step runs after the multi-minute firmware build job above,
+          # long after release-please's own job (tag + Release, a handful of
+          # API calls) has finished — so the Release is normally already
+          # visible on the very first check. The short retry loop below is a
+          # defensive margin against GitHub API read-after-write lag, not a
+          # load-bearing wait for release-please to finish.
+          release_exists=false
+          for _ in 1 2 3 4 5; do
+            if gh release view "${TAG}" >/dev/null 2>&1; then
+              release_exists=true
+              break
+            fi
+            sleep 5
+          done
+
+          if [ "${release_exists}" = "true" ]; then
+            echo "Release ${TAG} already exists (release-please's draft) — updating its title/notes."
+            gh release edit "${TAG}" \
+              --title "MeshCadet ${TAG}" \
+              --notes-file release-notes.md
+          else
+            echo "No existing Release for ${TAG} (manually pushed tag?) — creating it directly."
+            gh release create "${TAG}" \
+              --title "MeshCadet ${TAG}" \
+              --notes-file release-notes.md
+          fi
+
+          # --clobber: overwrite any asset a prior partial run already
+          # uploaded, rather than failing with "asset already exists".
+          gh release upload "${TAG}" --clobber \
             "dist/meshcadet-${TAG}-merged.bin" \
             "dist/meshcadet-${TAG}-app.bin" \
             "dist/manifest.json" \
             "dist/manifest-update.json" \
             "dist/update-meta.json" \
-            "dist/SHA256SUMS" \
-            --title "MeshCadet ${TAG}" \
-            --notes-file release-notes.md
+            "dist/SHA256SUMS"
+
+          # Un-draft last, now that the real notes and every asset are in
+          # place, so `release: published` fires exactly once with a
+          # complete Release — never on the `gh release create` fallback
+          # branch above, which already published on creation.
+          if [ "${release_exists}" = "true" ]; then
+            gh release edit "${TAG}" --draft=false
+          fi
