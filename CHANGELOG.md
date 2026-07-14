@@ -8,6 +8,18 @@ Versioning is managed by [release-please](https://github.com/googleapis/release-
 The entry below documents everything landed before release-please's first
 `chore(release): vX.Y.Z` PR.
 
+## [0.3.1](https://github.com/jagoda/meshcadet/compare/v0.3.0...v0.3.1) (2026-07-14)
+
+
+### Fixed
+
+* **release:** re-seed layout-baseline.txt to match generate-update-meta.sh's real hashing convention ([c104e9c](https://github.com/jagoda/meshcadet/commit/c104e9c1204e4228a31671d16264099275a9586f))
+* **release:** re-seed layout-baseline.txt to match generate-update-meta.sh's real hashing convention ([69c95e9](https://github.com/jagoda/meshcadet/commit/69c95e96338eac46d50e5f05bd748340ef4973a2))
+* **site:** convert flasher images to binary strings before esptool-js writeFlash ([d678abc](https://github.com/jagoda/meshcadet/commit/d678abc99b0a1653ea5f9a71143bb5bbb0697271))
+* **site:** convert flasher images to binary strings before esptool-js writeFlash ([bfda9d4](https://github.com/jagoda/meshcadet/commit/bfda9d47f31a649eadefa459cd6f16ab322d101d))
+* **site:** mirror release assets promptly + fix the web flasher's Fresh-install flow ([abbb8ea](https://github.com/jagoda/meshcadet/commit/abbb8eaf138b9e1d70c42a70274bd199e95019ca))
+* **site:** mirror release assets promptly + fix the web flasher's Fresh-install flow ([53f917c](https://github.com/jagoda/meshcadet/commit/53f917cac4de831e65e302834092f45b8c997413))
+
 ## [0.3.0](https://github.com/jagoda/meshcadet/compare/v0.2.0...v0.3.0) (2026-07-14)
 
 

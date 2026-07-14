@@ -1292,7 +1292,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "firmware-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "protocol",
 ]
@@ -1726,7 +1726,7 @@ dependencies = [
 
 [[package]]
 name = "host"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3504,7 +3504,7 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aes",
  "curve25519-dalek",
@@ -4714,7 +4714,7 @@ dependencies = [
 
 [[package]]
 name = "ui_perf"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "firmware-core",
  "protocol",
@@ -4724,7 +4724,7 @@ dependencies = [
 
 [[package]]
 name = "ui_sim"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "image",
  "slint",
@@ -5529,7 +5529,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "hex",
  "protocol",
