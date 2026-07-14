@@ -721,9 +721,15 @@ a {
   word-break: break-word;
 }
 
+/* The auto table-layout algorithm gives the mono pubkey/hash column most of
+   the row's width and compresses the actions column below the "Remove"
+   label's natural width — `.btn`'s default `white-space: normal` then lets
+   the label wrap onto two lines mid-word. `nowrap` keeps the label's full
+   width as the column's minimum, so layout compresses elsewhere instead. */
 .data-table .btn {
   padding: 4px 10px;
   font-size: 12px;
+  white-space: nowrap;
 }
 
 /* ── Footer ─────────────────────────────────────────────────────────── */
