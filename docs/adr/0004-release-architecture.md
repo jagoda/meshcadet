@@ -15,6 +15,14 @@
   release (v0.2.0 and v0.3.0 both needed manual recovery); §11 records the
   root cause and the fix (release-please now owns the initial Release
   object, `release.yml` enriches it rather than creating a competing one).
+  §12 added (2026-07-14) — §11's fix, while it closed the tag/label
+  deadlock, introduced a new one: release-please's tag creation now runs as
+  GITHUB_TOKEN, and GitHub suppresses `push`-triggered workflow runs
+  authored by GITHUB_TOKEN, so `release.yml` never fired and every release
+  (v0.3.2 confirmed live) stranded as an empty draft. §12 records the root
+  cause and the fix (`release-please.yml` explicitly dispatches
+  `release.yml` via `workflow_dispatch`, one of the documented exceptions to
+  that suppression).
 - **Deciders:** Maintainer design review
 - **Supersedes:** —
 - **Implements:** —
@@ -564,6 +572,104 @@ nonexistent tag correctly selects the "create" fallback branch). Read
 assuming GitHub's draft/edit/publish event semantics. Both workflow YAMLs
 and the config JSON parse cleanly. The next real release cycle is the
 end-to-end confirmation that no manual tag/label recovery is needed.
+
+### 12. Closing the GITHUB_TOKEN recursion-suppression deadlock: `workflow_dispatch` chaining (Implemented)
+
+**The defect.** §11 made release-please itself create the `vX.Y.Z` tag (and
+a draft Release) in the same run that detects a merged release PR. That
+tag-creation runs as `GITHUB_TOKEN` (the only credential
+`release-please-action` is configured with — no PAT, no GitHub App
+installation token). GitHub deliberately suppresses `push`- and
+`create`-triggered workflow runs for refs/commits created by `GITHUB_TOKEN`
+itself — a recursion-prevention rule documented under "Triggering a
+workflow from a workflow" in GitHub's own Actions docs, and unrelated to
+any repo-level "Allow GitHub Actions to create and approve pull requests"
+setting. `release.yml`'s only trigger was `on: push: tags: "v*.*.*"`, so
+every release-please-created tag silently failed to fire it — confirmed
+live: the `v0.3.2` tag (created by release-please run `29370203650` at
+21:37Z) never started a `release.yml` run at all, and the draft Release
+release-please created for it sat with 0 assets. The old (pre-§11) manual
+recovery dance happened to work only because a human, using their own user
+token, pushed the tag by hand — `push` events from a real user account are
+never suppressed, only ones authored by `GITHUB_TOKEN`. §11 did not
+reintroduce the *old* tag/label deadlock, but it traded it for this new,
+equally total one: with §11 alone, **zero** releases would auto-publish
+assets, every one requiring the same manual-tag workaround §11 was written
+to eliminate.
+
+**The fix.** `workflow_dispatch` (and `repository_dispatch`) are documented
+exceptions to the `GITHUB_TOKEN` suppression rule — a workflow run
+requested via either trigger fires regardless of which token/actor
+requested it. `.github/workflows/release.yml` gained a `workflow_dispatch`
+trigger (`tag` input, required) alongside its existing `push: tags` trigger
+(kept, for a tag pushed by hand outside release-please entirely).
+`.github/workflows/release-please.yml` gained a step, gated on
+`steps.release.outputs.release_created == 'true'`, that calls
+`github.rest.actions.createWorkflowDispatch` (via `actions/github-script`,
+already a dependency of this workflow's §10 lockfile-sync step) against
+`workflow_id: "release.yml"` with `ref: <the tag_name output>` and
+`inputs: { tag: <the same tag_name> }`. Passing `ref:` (not just the `tag`
+input) is what makes `release.yml`'s own `github.ref_name` resolve to the
+tag — `actions/checkout` then checks out the tag commit exactly as a real
+`push: tags` event would, so **no change was needed to any of
+`release.yml`'s existing tag-derivation logic** (asset naming, the
+container build, etc. all still key off `github.ref_name`). The `tag` input
+is cross-checked against `github.ref_name` in "Verify tag matches workspace
+version": if they disagree (only possible via a manual dispatch that filled
+in the `tag` field but left the ref selector on `main`), the run fails
+loudly with an explicit error rather than silently building the wrong
+commit as a "release". This requires `actions: write` added to
+`release-please.yml`'s `permissions:` block (new; `contents: write` and
+`pull-requests: write` alone cannot call the workflow-dispatch API) — no
+new secret.
+
+**Alternative considered and rejected: a fine-grained PAT or GitHub App
+installation token with `contents: write`**, configured as
+`release-please-action`'s `token:` input in place of the ambient
+`GITHUB_TOKEN` — the official release-please-recommended fix for exactly
+this class of problem, since a non-`GITHUB_TOKEN` actor's tag push is never
+suppressed in the first place (this is the same reason the old *manual*
+hand-pushed-tag recovery always worked). Rejected in favor of the
+`workflow_dispatch` chain because it achieves the identical end state
+(release.yml fires automatically, unmodified trigger semantics for
+hand-pushed tags) with **zero new secrets to provision, rotate, or scope**
+— a fine-grained PAT would need to be minted by the Commander outside this
+mission (a worker cannot self-issue repo credentials), stored as a new
+Actions secret, and re-provisioned on expiry/rotation forever after; a
+GitHub App installation token is even more infrastructure (an App
+registration + installation) for the same outcome. `workflow_dispatch` is
+built entirely out of permissions already expressible in-repo
+(`permissions: actions: write` on the existing `GITHUB_TOKEN`). If a future
+need arises that `workflow_dispatch`/`repository_dispatch` genuinely cannot
+satisfy (e.g. triggering a workflow in a *different* repository that
+doesn't grant this repo's `GITHUB_TOKEN` any scope), the PAT/App path
+remains available and this section's rationale for preferring the
+no-secret route should be revisited against that specific need.
+
+**Verification.** Confirmed root cause by re-reading GitHub's own
+documented `GITHUB_TOKEN` recursion-suppression rule and cross-referencing
+against the live, reproduced failure (`v0.3.2`'s tag/run pair above) rather
+than assuming from the "no workflow triggers another workflow" folk
+version of this rule — the actual scope is narrower (`GITHUB_TOKEN`-authored
+events specifically, not "any workflow-originated event") and
+`workflow_dispatch`/`repository_dispatch` are explicitly, individually
+carved out as exceptions in that same documentation. Confirmed
+`googleapis/release-please-action@v5`'s actual output contract (its own
+`README.md`, `## Outputs` / `### Root component outputs`, matching this
+repo's root-only `packages: { ".": {} }` config in
+`release-please-config.json`) provides both `release_created` (boolean)
+and `tag_name` (string) as root-component outputs — the exact two values
+this fix's dispatch step consumes — rather than assuming their names.
+Parsed both modified workflow YAMLs with a YAML loader after editing;
+both parse cleanly. A live end-to-end release cycle could not be run from
+this sandboxed context (§11's verification note applies identically here:
+commit signing requires a physical YubiKey touch this worker cannot
+supply, and a real release-please run additionally requires new
+Conventional Commits landing on `main` first) — the next real release
+cycle (or a manual `gh workflow run release.yml --ref <existing tag>`
+exercised directly against the tag from #12's release, e.g. `v0.3.2`, once
+this lands) is the end-to-end confirmation that no manual intervention is
+needed and the six assets attach automatically.
 
 ## Consequences
 

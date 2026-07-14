@@ -3,7 +3,12 @@ name: release
 # Tag-fired production firmware release. Fires on `vX.Y.Z` tags (created by
 # release-please once a "chore(release): vX.Y.Z" PR merges — see
 # .github/workflows/release-please.yml + docs/adr/0004-release-architecture.md
-# §7/§8) and:
+# §7/§8) — in practice via the `workflow_dispatch` trigger below, which
+# release-please.yml calls explicitly, since GitHub suppresses the `push:
+# tags` trigger for GITHUB_TOKEN-authored tags (recursion prevention; see
+# §12 and the `workflow_dispatch:` block's own comment). `push: tags`
+# remains for a tag pushed by hand outside release-please. Either way, this
+# workflow then:
 #   1. verifies the tag's version matches the checked-out Cargo.toml version
 #      (the same drift-guard spirit as ci.yml's version-drift-guard job, just
 #      against the tag instead of firmware/Cargo.toml);
@@ -56,6 +61,26 @@ on:
   push:
     tags:
       - "v*.*.*"
+  # release-please.yml chains into this trigger (`actions.createWorkflowDispatch`,
+  # `ref: <the tag it just created>`) because GITHUB_TOKEN-authored tag
+  # pushes never fire the `push: tags` trigger above (GitHub's recursion
+  # suppression) — workflow_dispatch is a documented exception to that
+  # suppression. See release-please.yml's "Dispatch the production release
+  # build" step and docs/adr/0004-release-architecture.md §12. The `tag`
+  # input is cross-checked against `github.ref_name` in "Verify tag matches
+  # workspace version" below — dispatching with `ref:` set to the tag is
+  # what makes `github.ref_name` equal the tag at all; the input is a
+  # defensive check against a manual dispatch that forgot to move the ref
+  # selector off `main`.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Tag being released (e.g. v0.3.3). Must match the ref this run is
+          dispatched against — release-please.yml always sets both to the
+          same tag; a manual "Run workflow" dispatch must select that tag
+          from the branch/tag ref selector too, not just fill in this field.
+        required: true
 
 permissions:
   contents: write
@@ -88,9 +113,23 @@ jobs:
       # tag bypasses both, so check it here too.
       - name: Verify tag matches workspace version
         id: version
+        env:
+          DISPATCH_TAG: ${{ github.event.inputs.tag }}
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
+          # workflow_dispatch cross-check: this run must have been
+          # dispatched with `ref:` set to the same tag named in the `tag`
+          # input (release-please.yml always does this — see that
+          # workflow's "Dispatch the production release build" step). If
+          # they disagree, the ref selector was left on the wrong
+          # branch/tag (e.g. a manual dispatch that forgot to move it off
+          # `main`) — fail loudly instead of silently building the wrong
+          # ref as if it were a release.
+          if [ -n "${DISPATCH_TAG}" ] && [ "${DISPATCH_TAG}" != "${tag}" ]; then
+            echo "::error::workflow_dispatch input tag=${DISPATCH_TAG} does not match the ref this run was dispatched against (github.ref_name=${tag}). Re-run with the ref selector set to ${DISPATCH_TAG}." >&2
+            exit 1
+          fi
           version="${tag#v}"
           root_version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
           firmware_version=$(grep -m1 '^version = ' firmware/Cargo.toml | sed -E 's/version = "(.*)"/\1/')

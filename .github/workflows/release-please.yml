@@ -54,6 +54,10 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  # Needed only for the "Dispatch the production release build" step below
+  # (`actions.createWorkflowDispatch` against release.yml) — see that step's
+  # comment and docs/adr/0004-release-architecture.md §12.
+  actions: write
 
 concurrency:
   group: release-please-${{ github.ref }}
@@ -70,6 +74,68 @@ jobs:
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      # release-please's tag creation above (`release_created == 'true'`)
+      # runs entirely as GITHUB_TOKEN, and GitHub deliberately suppresses
+      # downstream workflow triggers — including release.yml's own
+      # `push: tags` — for refs/commits/releases created by GITHUB_TOKEN
+      # (recursion prevention; see "Triggering a workflow from a workflow"
+      # in the GitHub Actions docs). Confirmed live: v0.3.2's tag (run
+      # 29370203650) never fired release.yml, stranding the release as an
+      # empty draft with none of its six assets. workflow_dispatch and
+      # repository_dispatch are the documented exceptions to that
+      # suppression — they fire a run regardless of which token requested
+      # it — so this step explicitly dispatches release.yml instead of
+      # relying on the (silently-suppressed) tag push.
+      #
+      # `ref: tag_name` is what makes release.yml's own `github.ref_name`
+      # resolve to the tag (not `main`) — actions/checkout in that workflow
+      # then checks out the tag commit exactly as a real `push: tags` event
+      # would, with no change needed to any of its tag-derivation logic.
+      # `inputs.tag` is passed too and cross-checked there against
+      # `github.ref_name`: belt-and-suspenders in case this ever gets
+      # dispatched by hand with the ref selector left on the wrong branch —
+      # see release.yml's "Verify tag matches workspace version" step.
+      #
+      # No new secret/token is introduced: `actions: write` on the ambient
+      # GITHUB_TOKEN (permissions: above) is sufficient to call this API,
+      # unlike the rejected alternative of a fine-grained PAT/GitHub App
+      # token (docs/adr/0004-release-architecture.md §12).
+      - name: Dispatch the production release build for the new tag
+        if: steps.release.outputs.release_created == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Same defensive shape as release.yml's own "Publish or update
+            // GitHub Release" retry loop (gh release view, 5x/5s): a short
+            // retry against read-after-write lag on GitHub's side between
+            // the tag `createRelease()` just made (previous step) and this
+            // dispatch call needing that ref to already resolve. Not
+            // expected to ever exhaust in practice (the tag-creation call
+            // above already awaited its own response), but cheap insurance
+            // for the one step this whole mission exists to make reliable.
+            const ref = "${{ steps.release.outputs.tag_name }}";
+            const maxAttempts = 3;
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+              try {
+                await github.rest.actions.createWorkflowDispatch({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  workflow_id: "release.yml",
+                  ref,
+                  inputs: { tag: ref },
+                });
+                core.info(`Dispatched release.yml for ${ref} (attempt ${attempt}/${maxAttempts}).`);
+                break;
+              } catch (error) {
+                if (attempt === maxAttempts) {
+                  core.setFailed(`Failed to dispatch release.yml for ${ref} after ${maxAttempts} attempts: ${error.message}`);
+                  throw error;
+                }
+                core.warning(`Dispatch attempt ${attempt}/${maxAttempts} for ${ref} failed: ${error.message} — retrying in 5s.`);
+                await new Promise((resolve) => setTimeout(resolve, 5000));
+              }
+            }
 
       # release-please has no built-in Cargo.lock awareness for
       # `release-type: simple` (see docs/adr/0004-release-architecture.md
