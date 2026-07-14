@@ -87,6 +87,27 @@ which trigger fired it) re-runs the mirror step against live GitHub data, so
 a failed or delayed release-triggered deploy self-heals on the next site
 push rather than leaving Pages permanently behind.
 
+### 3a. Amendment (2026-07-14) — `release: published` doesn't actually fire
+
+Live-verified against this repo's actual Actions run history
+(`meshcadet-flasher-metadata-and-flash-status` mission): **zero**
+`pages-deploy.yml` runs with `event == "release"` exist despite v0.1.0,
+v0.2.0, and v0.3.0 all having published. Cause: `release.yml`'s "Publish
+GitHub Release" step authenticates `gh release create` with the workflow's
+own `GITHUB_TOKEN`, and GitHub Actions does not dispatch new workflow runs
+for events produced by that token (the built-in anti-recursion guard) — so
+the `release: published` event this section describes is real (visible in
+the API) but never reaches this workflow's trigger. In practice, a release
+was only ever mirrored onto Pages by the *next* unrelated `site/**` push,
+which is why v0.3.0 (no site push since it published) showed "Upgrade
+metadata isn't available" for a release that genuinely has valid metadata.
+Fixed by adding a `workflow_run: workflows: ["release"], types: [completed]`
+trigger (`pages-deploy.yml`) — a `workflow_run` completion event is real
+regardless of what token the upstream run used internally, so it isn't
+subject to the same suppression. `release: published` is left in place
+(still correct for a human-published release, which isn't GITHUB_TOKEN-
+authored) but is no longer the only, or the reliable, path.
+
 ### 4. The MAX_VERSIONS/max_versions coupling is a manual invariant
 
 `site/README.md`'s "no build step, on purpose" convention (plain HTML/CSS/JS,

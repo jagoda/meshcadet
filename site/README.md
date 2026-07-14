@@ -32,23 +32,35 @@ building or publishing anything.
   nav item with `aria-current="page"` instead of linking to `flash.html` /
   `provisioner.html`.
 - `flash.html` + `flash.js` — the two-path web flasher: **Fresh install**
-  (the [esp-web-tools](https://github.com/esphome/esp-web-tools)
-  `<esp-web-install-button>`, unchanged mechanism, erases the whole chip) vs
-  **Upgrade** (a hand-rolled `esptool-js` flow, writes only the app region,
-  preserves device identity/config/history). `flash.js` fetches
+  (erases the whole chip) vs **Upgrade** (writes only the app region,
+  preserves device identity/config/history). Both paths drive a shared
+  hand-rolled `esptool-js` flow (no `esp-web-tools`/`<esp-web-install-button>`
+  dependency at all — see ADR-0011) plus a shared page-level status bar +
+  expandable console. `flash.js` fetches
   `api.github.com/repos/jagoda/meshcadet/releases` client-side to populate
-  the version dropdown (shared by both paths), then either points
-  `<esp-web-install-button>` at `firmware/<tag>/manifest.json` (Fresh) or
-  drives `esptool-js` directly against `firmware/<tag>/<app_asset>` (Upgrade,
-  gated on `firmware/<tag>/update-meta.json`'s `upgrade_safe`) — **not**
-  directly at the GitHub Release asset, which is cross-origin-blocked (no
-  `Access-Control-Allow-Origin` on the release-asset redirect chain,
-  verified live). See ADR-0006 (`docs/adr/0006-web-flasher.md`) for the
-  original single-path design and ADR-0009
-  (`docs/adr/0009-two-path-flasher.md`) for the Upgrade path + why
-  `<esp-web-install-button>` can't be used for it; `.github/workflows/pages-deploy.yml`'s
-  "Mirror recent release firmware assets" step populates `firmware/<tag>/`
-  at deploy time (git-ignored, not checked in — see below).
+  the version dropdown (shared by both paths), then writes either
+  `firmware/<tag>/manifest.json`'s merged-image parts (Fresh, shape-checked
+  by `flash-manifest.js`'s `resolveFreshInstallParts`) or
+  `firmware/<tag>/<app_asset>` from `firmware/<tag>/update-meta.json`
+  (Upgrade, gated on `upgrade_safe`, shape-checked by `upgrade-gate.js`'s
+  `isValidUpdateMeta`) — **not** directly at the GitHub Release asset, which
+  is cross-origin-blocked (no `Access-Control-Allow-Origin` on the
+  release-asset redirect chain, verified live). See ADR-0006
+  (`docs/adr/0006-web-flasher.md`) for the version-selector/mirror design,
+  ADR-0009 (`docs/adr/0009-two-path-flasher.md`) for the two-path split, and
+  ADR-0011 (`docs/adr/0011-unified-esptool-js-flasher.md`) for why Fresh
+  install also moved onto the hand-rolled flow;
+  `.github/workflows/pages-deploy.yml`'s "Mirror recent release firmware
+  assets" step populates `firmware/<tag>/` at deploy time (git-ignored, not
+  checked in — see below).
+- `flash-manifest.js` — DOM-free validation for the Fresh-install path's
+  `manifest.json` shape: `resolveFreshInstallParts` picks the
+  chip-family-matched `{path, offset}` parts to write, or fails closed
+  (`null`) on anything malformed/unexpected — same "fail closed" contract as
+  `upgrade-gate.js`'s `isValidUpdateMeta` for `update-meta.json`. Tested
+  under plain `node` via `flash-manifest.test.mjs`, run by
+  `pages-check.yml`'s `check` job — see `docs/adr/0011-unified-esptool-js-
+  flasher.md`.
 - `upgrade-gate.js` — DOM-free validation for the Upgrade path's
   `update-meta.json` gate: `isValidUpdateMeta` checks both `upgrade_safe` and
   that `app_asset`/`app_offset` have the exact shape `flash.js`'s Upgrade

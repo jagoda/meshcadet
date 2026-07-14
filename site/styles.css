@@ -486,11 +486,6 @@ a {
   margin-top: 8px !important;
 }
 
-esp-web-install-button {
-  display: inline-block;
-  margin-top: 4px;
-}
-
 .footnote {
   margin-top: 24px !important;
   padding-top: 16px;
@@ -559,6 +554,56 @@ esp-web-install-button {
   background: var(--surface-raised);
   font-size: 13px !important;
   color: var(--text-secondary) !important;
+}
+
+/* ── Shared flash status bar + expandable console (ADR-0011) ──────────── */
+
+.flash-status-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 4px 0 12px;
+  padding: 12px 16px;
+  border: 1px solid var(--surface-alt);
+  border-left: 3px solid var(--brand-signal);
+  border-radius: 6px;
+  background: var(--surface-raised);
+}
+
+.flash-status-phase {
+  font-size: 14px;
+  color: var(--text-primary);
+}
+
+.flash-console {
+  margin-top: 4px;
+}
+
+.flash-console summary {
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-secondary);
+  user-select: none;
+}
+
+.flash-console summary:hover {
+  color: var(--brand-signal-bright);
+}
+
+.flash-console-log {
+  margin: 10px 0 0;
+  padding: 12px;
+  max-height: 240px;
+  overflow-y: auto;
+  border: 1px solid var(--surface-alt);
+  border-radius: 6px;
+  background: var(--bg-space);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 /* ── Web provisioner (provisioner.html) ────────────────────────────── */

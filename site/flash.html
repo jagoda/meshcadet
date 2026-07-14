@@ -12,12 +12,6 @@
        site/README.md "Conventions" and .github/workflows/pages-check.yml). -->
   <link rel="icon" type="image/png" href="assets/favicon.png" />
   <link rel="stylesheet" href="styles.css" />
-
-  <!-- esp-web-tools: major-version-pinned CDN import, per upstream's own
-       recommended usage (https://github.com/esphome/esp-web-tools). No
-       bundler/build step — consistent with this site's "no build step, on
-       purpose" convention (site/README.md). -->
-  <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/install-button.js"></script>
 </head>
 <body>
 
@@ -120,18 +114,14 @@
             build.
           </p>
 
-          <esp-web-install-button id="install-button" hidden>
-            <button slot="activate" class="btn btn-primary" type="button">Connect &amp; Install</button>
-            <span slot="unsupported" class="muted">
-              Your browser doesn't support installing firmware over USB. Use
-              a desktop build of Chrome or Edge.
-            </span>
-            <span slot="not-allowed" class="muted">
-              This page needs to be loaded over HTTPS to install firmware
-              (it is here — if you're seeing this, something's off; please
-              <a href="https://github.com/jagoda/meshcadet/issues" target="_blank" rel="noopener">open an issue</a>).
-            </span>
-          </esp-web-install-button>
+          <p id="fresh-unsupported" class="muted" hidden>
+            Your browser doesn't support installing firmware over USB, or
+            this page isn't loaded over HTTPS. Use a desktop build of Chrome
+            or Edge, loaded over HTTPS (or from <code>localhost</code>).
+          </p>
+          <div class="cta-row">
+            <button id="fresh-connect-button" class="btn btn-primary" type="button" disabled>Connect &amp; Install</button>
+          </div>
         </div>
 
         <div class="flash-panel" id="upgrade-panel" hidden>
@@ -155,7 +145,21 @@
           <div class="cta-row">
             <button id="upgrade-connect-button" class="btn btn-primary" type="button" disabled>Connect &amp; Upgrade</button>
           </div>
-          <p id="upgrade-status" class="muted form-status" role="status"></p>
+        </div>
+
+        <div class="flash-panel" id="flash-progress-panel">
+          <h2>Flash status</h2>
+          <p class="muted">
+            Shown once you start a Fresh install or Upgrade above. Leave this
+            page open and your device connected until it reads "Done".
+          </p>
+          <div id="flash-status-bar" class="flash-status-bar" role="status" hidden>
+            <span id="flash-status-phase" class="flash-status-phase">Idle</span>
+          </div>
+          <details id="flash-console" class="flash-console">
+            <summary>Console (detailed log)</summary>
+            <pre id="flash-console-log" class="flash-console-log">No flash operation has run yet.</pre>
+          </details>
         </div>
 
         <p class="muted footnote">
