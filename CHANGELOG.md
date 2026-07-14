@@ -8,6 +8,50 @@ Versioning is managed by [release-please](https://github.com/googleapis/release-
 The entry below documents everything landed before release-please's first
 `chore(release): vX.Y.Z` PR.
 
+## [0.3.0](https://github.com/jagoda/meshcadet/compare/v0.2.0...v0.3.0) (2026-07-14)
+
+
+### Added
+
+* **firmware-core:** add repeater signal-strength tracker ([474c4cf](https://github.com/jagoda/meshcadet/commit/474c4cfc3f16fda4e6b927f358d320382aa0d99e))
+* **firmware-core:** repeater signal-strength tracker + ADR-0010 ([9e046df](https://github.com/jagoda/meshcadet/commit/9e046dff0e483e0c28fdcf1819a3e121c7b47cbf))
+* **firmware:** wire the repeater signal meter into the rx path and UI ([4001c2c](https://github.com/jagoda/meshcadet/commit/4001c2c2e7ac95898551a24bd16e790fc9b806f9))
+* **firmware:** wire the repeater signal meter into the rx path and UI ([35c39ec](https://github.com/jagoda/meshcadet/commit/35c39ecebe694c451097ec9519b9cef693429ab1))
+* **release:** publish an app-only update artifact + layout compatibility gate ([75b45e2](https://github.com/jagoda/meshcadet/commit/75b45e2d6b6b3fcd35f9ced11eeb4aba6a2e2230))
+* **release:** publish non-destructive app-only update artifacts ([2b585b3](https://github.com/jagoda/meshcadet/commit/2b585b31392a0f1ad582e0283503e163527eb4df))
+* **site:** add a Getting Started section to the landing page ([62f6c57](https://github.com/jagoda/meshcadet/commit/62f6c57d9b217275e3dc2486b5908b9f1571b533))
+* **site:** add a Getting Started section to the landing page ([b4fc37e](https://github.com/jagoda/meshcadet/commit/b4fc37ee19075dc63347a5435845492bd328762d))
+* **site:** add promotional UI screenshots to the landing page ([b8f5bb9](https://github.com/jagoda/meshcadet/commit/b8f5bb95a4722a1c69c73ee094fc10ea311cc532))
+* **site:** harden the Upgrade path per post-green + hardware-safety review ([ea3c972](https://github.com/jagoda/meshcadet/commit/ea3c97264564454d297e3dcdff52d84faa5939ff))
+* **site:** two-path web flasher — Fresh install vs non-destructive Upgrade ([f74ba05](https://github.com/jagoda/meshcadet/commit/f74ba05db2240d4da109d6db52d2af9a9f4e6d19))
+* **site:** two-path web flasher — Fresh install vs non-destructive Upgrade ([a6c1672](https://github.com/jagoda/meshcadet/commit/a6c16722463b9c90ba32aae8f1f1801beedbc5df))
+* **site:** wire the four promo screenshots into the landing page gallery ([0cf3c0c](https://github.com/jagoda/meshcadet/commit/0cf3c0cba2485d68892e5f2469280cb28620aaee))
+* **ui_sim:** add promo screenshot render rigs for four production screens ([91cbd16](https://github.com/jagoda/meshcadet/commit/91cbd16353a4b377fd72eca030e872281ac5860d))
+
+
+### Fixed
+
+* **firmware-core:** silence clippy on decay boundary test ([3876f6f](https://github.com/jagoda/meshcadet/commit/3876f6f3f78a748f0568ad0b670b56269acbf480))
+* **release:** stop crashing the lockfile-sync commit step on every tag-only run ([1cc3c8c](https://github.com/jagoda/meshcadet/commit/1cc3c8c78011c1e13e6fbb49e5789a9946feae17))
+* **release:** stop crashing the lockfile-sync commit step on every tag-only run ([cd63409](https://github.com/jagoda/meshcadet/commit/cd63409293f74b7c14c4e0aeb620ae1fd09174c1))
+* **ui_sim:** sync promo screen markup with the merged signal-meter widget ([20c4493](https://github.com/jagoda/meshcadet/commit/20c44933e6d7aacdb32075f6eb31c5dab4058a0a))
+* **ui:** move contact/channel-list signal meter to the right of the gear ([71d31c6](https://github.com/jagoda/meshcadet/commit/71d31c6e6b93e82d82a45c4d793b820a9dc171e8))
+* **ui:** move contact/channel-list signal meter to the right of the gear ([7598a44](https://github.com/jagoda/meshcadet/commit/7598a445793fb6c9e5e7e3d20e2ae0eb40aa8013))
+
+
+### Changed
+
+* **release:** extract the layout-compatibility gate into a tested script ([e9d1053](https://github.com/jagoda/meshcadet/commit/e9d105384aebc83c3d0c569ed2cdb91f9b157d52))
+* **site:** reorder landing page and unify navigation ([a2856fa](https://github.com/jagoda/meshcadet/commit/a2856faf5f0c00e81d1863e70fe22c43f79e685f))
+* **site:** reorder landing page and unify navigation ([75df9b1](https://github.com/jagoda/meshcadet/commit/75df9b1a0f8a23d3c1abcfd58789d527de952449))
+
+
+### Documentation
+
+* **adr:** add ADR-0008 for non-destructive update artifacts ([5603611](https://github.com/jagoda/meshcadet/commit/5603611a9290463930b2dfbbe85b68f2818f3080))
+* **adr:** add ADR-0010 for the repeater signal meter design ([399729a](https://github.com/jagoda/meshcadet/commit/399729aec113dcc278a0ceebad29e44e4e9c0715))
+* **adr:** note the extracted gate script + verified site-mirror compatibility ([cec144a](https://github.com/jagoda/meshcadet/commit/cec144a6ee698a55bab9556b302d41195b17d68d))
+
 ## [0.2.0](https://github.com/jagoda/meshcadet/compare/v0.1.0...v0.2.0) (2026-07-13)
 
 
