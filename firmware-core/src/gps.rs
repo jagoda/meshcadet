@@ -1233,7 +1233,7 @@ mod tests {
             (2099, 12, 31, 23, 59, 59),
         ];
         for &(y, mo, d, h, mi, s) in cases {
-            let secs = unix_timestamp(y, mo as u32, d as u32, h as u32, mi as u32, s as u32);
+            let secs = unix_timestamp(y, mo, d, h, mi, s);
             assert_eq!(
                 civil_from_unix(secs),
                 (y, mo, d, h, mi, s),
@@ -1261,10 +1261,7 @@ mod tests {
         // the existing clock_sync_age_secs convention elsewhere in this
         // module).
         let anchor = Some((10_000u64, 1_700_000_000i64));
-        assert_eq!(
-            synced_wall_clock_secs(15_900, anchor),
-            Some(1_700_000_005)
-        );
+        assert_eq!(synced_wall_clock_secs(15_900, anchor), Some(1_700_000_005));
     }
 
     #[test]
