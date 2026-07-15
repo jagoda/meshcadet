@@ -846,6 +846,151 @@ async function oversizedAdvertFrameSurvivesLogNoiseResync() {
   await session.disconnect();
 }
 
+// ── Scenario 20: regression guard — a stray leftover frame ahead of
+//    QUERY_ADVERT's real answer must not cascade one-command-behind through
+//    contact and channel enumeration ─────────────────────────────────────
+//
+// Reproduces the exact field defect (meshcadet-provisioner-advert-frame-
+// desync-regression, filed against a real device post PR #54): a leftover
+// RSP_STATUS arrives ahead of QUERY_ADVERT's real RSP_ADVERT reply (e.g. a
+// duplicate reply to an earlier retried QUERY_STATUS, still trickling in
+// over USB — see `#sendRecvWithRetry`'s CROSS-COMMAND RESIDUE GUARD doc
+// comment for why this can happen on real hardware but never in the
+// existing `staleRetryDuplicateDoesNotDesyncNextCommand` scenario, which
+// only covers residue that has FULLY arrived before the next command
+// starts).
+//
+// Before the fix, `queryAdvert()` read that leftover RSP_STATUS as if it
+// were its own answer and threw `unexpected response 0x82 to QUERY_ADVERT
+// (expected RSP_ADVERT 0x8A)` — verbatim the Commander's HIL report — while
+// the device's real (correct, just slow — advert-card signing + an NVS
+// write) RSP_ADVERT reply was left orphaned in the buffer. That orphaned
+// reply then became `listContacts()`'s own stray ("unexpected frame 0x8A
+// during contact enumeration"), whose own real RSP_CONTACT reply in turn
+// became `listChannels()`'s stray ("unexpected frame 0x86 during channel
+// enumeration") — the reported one-command-behind cascade, precisely
+// because nothing IN QUERY_ADVERT's read waited past the first wrong frame
+// for its own real answer.
+//
+// After the fix, `#recvUntilExpected` discards the stray in place — inside
+// the read for the command it arrived on — so the real answer to each
+// command is consumed by that SAME command, and the whole chain
+// (status -> advert -> contacts -> channels) succeeds cleanly, exactly as
+// it must on real hardware.
+
+async function advertResidueDoesNotCascadeThroughContactsAndChannels() {
+  const cardPayload = buildAdvertCardPayload("Cadet");
+  const advertFrame = encodeFrame(FRAME_RSP_ADVERT, cardPayload);
+  const contactFrame = encodeFrame(FRAME_RSP_CONTACT, buildContactPayload(0, 0xaa, true, "Alice"));
+  const contactsDoneFrame = encodeFrame(FRAME_RSP_CONTACTS_DONE, new Uint8Array(0));
+  const channelsDoneFrame = encodeFrame(FRAME_RSP_CHANNELS_DONE, new Uint8Array(0));
+
+  const { port, push } = makeFakePort((chunk) => {
+    const { frameType } = decodeFrame(chunk);
+    if (frameType === FRAME_QUERY_STATUS) {
+      setTimeout(() => {
+        push(statusFrame);
+        push(identityFrame);
+      }, 5);
+    } else if (frameType === FRAME_QUERY_ADVERT) {
+      // A leftover RSP_STATUS lands almost immediately (residue already in
+      // flight); the REAL RSP_ADVERT — slower, mirroring the device's
+      // signing + NVS write — follows well after.
+      setTimeout(() => push(statusFrame), 5);
+      setTimeout(() => push(advertFrame), 40);
+    } else if (frameType === FRAME_QUERY_CONTACTS) {
+      setTimeout(() => push(contactFrame), 5);
+      setTimeout(() => push(contactsDoneFrame), 40);
+    } else if (frameType === FRAME_QUERY_CHANNELS) {
+      setTimeout(() => push(channelsDoneFrame), 5);
+    }
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  const { status, identity } = await session.queryStatus();
+  assertStatusAndIdentity(status, identity);
+
+  // Pre-fix, this rejects with "unexpected response 0x82 to QUERY_ADVERT
+  // (expected RSP_ADVERT 0x8A)" — the leftover RSP_STATUS above.
+  const card = await session.queryAdvert();
+  assert.deepEqual(Array.from(card), Array.from(cardPayload));
+
+  // Pre-fix, this rejects with "unexpected frame 0x8A during contact
+  // enumeration" — the RSP_ADVERT that queryAdvert() never waited for.
+  const contacts = await session.listContacts();
+  assert.equal(contacts.length, 1);
+  assert.equal(contacts[0].display_name, "Alice");
+
+  // Pre-fix, this rejects with "unexpected frame 0x86 during channel
+  // enumeration" — the RSP_CONTACT that listContacts() never waited for.
+  const channels = await session.listChannels();
+  assert.deepEqual(channels, []);
+
+  await session.disconnect();
+}
+
+// ── Scenario 21: a genuinely unrecognized frame type is NOT tolerated as
+//    stray residue — it still surfaces immediately ───────────────────────
+//
+// `#recvUntilExpected`'s stray tolerance (Scenario 20 above) only applies to
+// *recognized* provisioning response types (`ALL_RSP_FRAME_TYPES`) — this
+// guards the other half of that invariant: a byte that decodes to a valid
+// frame (correct magic/CRC) but an unknown frame-type value is genuine
+// protocol corruption or a version mismatch, not late residue, and must
+// still fail fast rather than being silently absorbed.
+
+async function unrecognizedFrameTypeIsNotToleratedAsStray() {
+  const UNKNOWN_FRAME_TYPE = 0x99; // not in ALL_RSP_FRAME_TYPES
+  const { port, push } = makeFakePort((chunk) => {
+    const { frameType } = decodeFrame(chunk);
+    if (frameType === FRAME_QUERY_ADVERT) {
+      setTimeout(() => push(encodeFrame(UNKNOWN_FRAME_TYPE, new Uint8Array(0))), 5);
+    }
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  await assert.rejects(() => session.queryAdvert(), /unexpected frame 0x99/);
+
+  await session.disconnect();
+}
+
+// ── Scenario 22: stray-frame tolerance is bounded, not infinite ──────────
+//
+// A device wedged into replaying the same well-formed-but-wrong response
+// forever (or a genuinely corrupted stream that happens to keep producing
+// recognized frame types) must still surface as an error within bounded
+// time — `MAX_STRAY_FRAMES` exists precisely so `#recvUntilExpected` cannot
+// spin silently until the outer retry budget (10s) is exhausted one frame
+// at a time. Uses a shortened per-attempt timeout so the bound (not the
+// timeout) is what trips, keeping the test fast.
+
+async function strayFrameToleranceIsBounded() {
+  const { port, push } = makeFakePort((chunk) => {
+    const { frameType } = decodeFrame(chunk);
+    if (frameType === FRAME_QUERY_ADVERT) {
+      // Flood well past MAX_STRAY_FRAMES (64) with a recognized-but-wrong
+      // response type; the real RSP_ADVERT never comes.
+      for (let i = 0; i < 70; i++) {
+        push(statusFrame);
+      }
+    }
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  await assert.rejects(() => session.queryAdvert(), /too many stray frames/);
+
+  await session.disconnect();
+}
+
 // ── Run ────────────────────────────────────────────────────────────────────
 
 const scenarios = [
@@ -869,6 +1014,9 @@ const scenarios = [
   ["queryAdvert sends FRAME_QUERY_ADVERT with the browser's real unix time and decodes the card", queryAdvertSendsCorrectFrameAndDecodesTheCard],
   ["queryAdvert surfaces a device RSP_ERROR as DeviceError", queryAdvertDeviceError],
   ["an oversized RSP_ADVERT frame survives log-noise resync (plen-guard regression)", oversizedAdvertFrameSurvivesLogNoiseResync],
+  ["a stray leftover frame ahead of QUERY_ADVERT's reply does not cascade through contacts/channels (one-behind desync regression)", advertResidueDoesNotCascadeThroughContactsAndChannels],
+  ["a genuinely unrecognized frame type is not tolerated as stray residue", unrecognizedFrameTypeIsNotToleratedAsStray],
+  ["stray-frame tolerance is bounded, not infinite", strayFrameToleranceIsBounded],
 ];
 
 for (const [name, fn] of scenarios) {
