@@ -33,6 +33,7 @@ import {
   decodeRspContact,
   decodeRspChannel,
   decodeRspHistoryEntry,
+  decodeRspAdvert,
   encodeAddContact,
   encodeDelContact,
   encodeAddChannel,
@@ -40,10 +41,12 @@ import {
   encodeSetNotifDefaults,
   encodeSetDeviceName,
   encodeSetPin,
+  encodeQueryAdvert,
   ProvError,
   FRAME_QUERY_STATUS,
   FRAME_QUERY_CONTACTS,
   FRAME_QUERY_CHANNELS,
+  FRAME_QUERY_ADVERT,
   FRAME_ADD_CONTACT,
   FRAME_DEL_CONTACT,
   FRAME_ADD_CHANNEL,
@@ -64,7 +67,9 @@ import {
   FRAME_RSP_CHANNELS_DONE,
   FRAME_RSP_HISTORY_ENTRY,
   FRAME_RSP_HISTORY_DONE,
+  FRAME_RSP_ADVERT,
   MAX_RSP_HISTORY_ENTRY_PAYLOAD,
+  MAX_ADVERT_CARD_LEN,
 } from "./codec.js";
 
 // Matches the host CLI's `--baud` default (`host/src/main.rs`).
@@ -75,6 +80,20 @@ const BAUD_RATE = 115200;
 const RETRY_ATTEMPT_MS = 500;
 const RETRY_TOTAL_MS = 10_000;
 const FRAME_TIMEOUT_MS = 5_000;
+
+/**
+ * Upper bound on any legitimate provisioning frame payload — used only by
+ * `#tryExtractFrame`'s false-`PROV_MAGIC`-in-log-noise guard to tell a
+ * genuine frame header apart from ASCII log traffic that happens to contain
+ * the two magic bytes. Must track the single largest payload any frame type
+ * can carry. Mirrors `MAX_VALID_FRAME_PAYLOAD_LEN` (`host/src/session.rs`):
+ * `FRAME_RSP_ADVERT`'s self-advert card (up to `MAX_ADVERT_CARD_LEN` = 134
+ * bytes) is currently the largest, ahead of `FRAME_RSP_HISTORY_ENTRY`
+ * (`MAX_RSP_HISTORY_ENTRY_PAYLOAD` = 73 bytes) — a guard hardcoded to the
+ * smaller of the two would misclassify every genuine advert-card frame as
+ * noise and byte-drain it into a timeout.
+ */
+const MAX_VALID_FRAME_PAYLOAD_LEN = Math.max(MAX_RSP_HISTORY_ENTRY_PAYLOAD, MAX_ADVERT_CARD_LEN);
 
 /**
  * Thrown when the device answers a command with `RSP_ERROR`.
@@ -230,6 +249,40 @@ export class ProvisionerSession {
       }
       const identity = decodeRspIdentity(second.payload);
       return { status, identity };
+    });
+  }
+
+  /**
+   * Ask the device to build and return its signed self-advert "biz card"
+   * (`protocol::advert::build_self_advert_card`). Mirrors `Session::query_advert`
+   * (`host/src/session.rs`): sends `FRAME_QUERY_ADVERT` carrying the
+   * BROWSER's current wall-clock unix time — the device has no RTC of its
+   * own and stamps the card with this value — and returns the raw card
+   * bytes from `FRAME_RSP_ADVERT`, validated by `codec.js`'s
+   * `decodeRspAdvert`.
+   *
+   * This is "Format B" — the string `meshcore-cli import-contact <URI>`
+   * expects, rendered via `contact-uri.js`'s `cardToUri`. Campaign guard:
+   * the browser cannot synthesize this card itself (the signature needs the
+   * device's Ed25519 private key, which never leaves it) — this call is the
+   * only legitimate source of one; never build a Format B card client-side.
+   */
+  async queryAdvert() {
+    return this.#exclusive(async () => {
+      const hostUnixTime = Math.floor(Date.now() / 1000);
+      const { frameType, payload } = await this.#sendRecvWithRetry(
+        FRAME_QUERY_ADVERT,
+        encodeQueryAdvert(hostUnixTime)
+      );
+      if (frameType === FRAME_RSP_ADVERT) {
+        return decodeRspAdvert(payload);
+      }
+      if (frameType === FRAME_RSP_ERROR) {
+        throw deviceErrorFrom(payload);
+      }
+      throw new Error(
+        `unexpected response 0x${hex2(frameType)} to QUERY_ADVERT (expected RSP_ADVERT 0x${hex2(FRAME_RSP_ADVERT)})`
+      );
     });
   }
 
@@ -598,10 +651,10 @@ export class ProvisionerSession {
       }
       const plen = this.#accBuf[3] | (this.#accBuf[4] << 8);
       // Guard against a false PROV_MAGIC in log traffic: every real payload
-      // fits within MAX_RSP_HISTORY_ENTRY_PAYLOAD, so a larger plen means the
+      // fits within MAX_VALID_FRAME_PAYLOAD_LEN, so a larger plen means the
       // "MC" bytes were ASCII log noise, not a real frame header. Advance 1
       // byte and re-scan.
-      if (plen > MAX_RSP_HISTORY_ENTRY_PAYLOAD) {
+      if (plen > MAX_VALID_FRAME_PAYLOAD_LEN) {
         this.#accBuf = this.#accBuf.slice(1);
         continue;
       }

@@ -155,12 +155,37 @@ check("decodeRspHistoryEntry returns null on an unrecognised msg_type byte", () 
   assert.equal(codec.decodeRspHistoryEntry(payload), null);
 });
 
+// decodeRspAdvert has no protocol::provisioning ProvError counterpart to
+// golden-vector against (see the op's own header comment above) — its two
+// error paths mirror Session::query_advert's two anyhow::bail! sites
+// (host/src/session.rs) exactly, so they're covered here as plain-Error
+// local checks, the same way the other decoders' error paths are above.
+
+check("decodeRspAdvert rejects a payload shorter than the 102-byte structural floor", () => {
+  assert.throws(() => codec.decodeRspAdvert(new Uint8Array(101)), /too short/);
+});
+
+check("decodeRspAdvert rejects a payload with the wrong header byte", () => {
+  const payload = new Uint8Array(102);
+  payload[0] = 0x00; // anything other than 0x11 (VER0 | ADVERT<<2 | FLOOD)
+  assert.throws(() => codec.decodeRspAdvert(payload), /unexpected header byte/);
+});
+
+check("decodeRspAdvert accepts a minimal 102-byte structurally valid payload (empty appdata)", () => {
+  const payload = new Uint8Array(102);
+  payload[0] = 0x11;
+  const card = codec.decodeRspAdvert(payload);
+  assert.equal(card.length, 102);
+  assert.notEqual(card, payload, "must return a copy, not an alias of the input buffer");
+});
+
 // ── Golden-vector conformance ─────────────────────────────────────────────────
 
 const ENCODE_OPS = {
   query_status: () => new Uint8Array(0),
   query_contacts: () => new Uint8Array(0),
   query_channels: () => new Uint8Array(0),
+  query_advert: (p) => codec.encodeQueryAdvert(p.host_unix_time),
   commit_provisioning: () => new Uint8Array(0),
   export_history: () => new Uint8Array(0),
   clear_history: () => new Uint8Array(0),
@@ -180,12 +205,19 @@ const DECODE_OPS = {
   rsp_contact: codec.decodeRspContact,
   rsp_channel: codec.decodeRspChannel,
   rsp_history_entry: codec.decodeRspHistoryEntry,
+  rsp_advert: codec.decodeRspAdvert,
 };
 
 // Fields that are raw byte arrays (`Uint8Array`) in codec.js's decoded
 // objects but hex strings in the golden vector's `expect` — hex-encode
-// before comparing.
+// before comparing. `decodeRspAdvert` is the one decoder that returns the
+// raw bytes directly (not wrapped in a field-object, since the card is
+// opaque signed data with no sub-fields `protocol::provisioning` parses) —
+// hex-encode it the same way a `Uint8Array` field would be.
 function normalizeForCompare(decoded) {
+  if (decoded instanceof Uint8Array) {
+    return codec.bytesToHex(decoded);
+  }
   const out = {};
   for (const [key, value] of Object.entries(decoded)) {
     out[key] = value instanceof Uint8Array ? codec.bytesToHex(value) : value;

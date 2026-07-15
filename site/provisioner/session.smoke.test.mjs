@@ -26,6 +26,7 @@ import {
   FRAME_QUERY_STATUS,
   FRAME_QUERY_CONTACTS,
   FRAME_QUERY_CHANNELS,
+  FRAME_QUERY_ADVERT,
   FRAME_ADD_CONTACT,
   FRAME_SET_PIN,
   FRAME_EXPORT_HISTORY,
@@ -40,6 +41,8 @@ import {
   FRAME_RSP_CHANNELS_DONE,
   FRAME_RSP_HISTORY_ENTRY,
   FRAME_RSP_HISTORY_DONE,
+  FRAME_RSP_ADVERT,
+  MAX_RSP_HISTORY_ENTRY_PAYLOAD,
   HISTORY_MSG_TYPE_DM,
   HISTORY_MSG_TYPE_GRP_TXT,
 } from "./codec.js";
@@ -152,6 +155,28 @@ function buildIdentityPayload() {
 
 const statusFrame = encodeFrame(FRAME_RSP_STATUS, buildStatusPayload());
 const identityFrame = encodeFrame(FRAME_RSP_IDENTITY, buildIdentityPayload());
+
+/**
+ * Build a wire-shaped (but unsigned — `decodeRspAdvert` never checks the
+ * signature, only structure) self-advert card payload:
+ * `header(1)=0x11 | path_len(1)=0x00 | pubkey(32) | timestamp(4 LE) |
+ * signature(64) | flags(1)=0x81 | name`. Mirrors `protocol::advert`'s wire
+ * format. Deliberately sized well past `MAX_RSP_HISTORY_ENTRY_PAYLOAD` (73
+ * B) for any non-trivial name — every real card is — so tests using it
+ * exercise `#tryExtractFrame`'s plen guard at the size that matters.
+ */
+function buildAdvertCardPayload(name) {
+  const nameBytes = new TextEncoder().encode(name);
+  const buf = new Uint8Array(102 + 1 + nameBytes.length);
+  buf[0] = 0x11; // header: VER0 | ADVERT<<2 | FLOOD
+  buf[1] = 0x00; // path_len
+  buf.fill(0xaa, 2, 34); // pubkey
+  new DataView(buf.buffer).setUint32(34, 1_700_000_000, true); // timestamp
+  buf.fill(0xbb, 38, 102); // signature (unverified by decodeRspAdvert)
+  buf[102] = 0x81; // appdata flags: ADV_TYPE_CHAT | ADV_NAME_MASK
+  buf.set(nameBytes, 103);
+  return buf;
+}
 
 function assertStatusAndIdentity(status, identity) {
   assert.equal(status.provisioned, true);
@@ -721,6 +746,106 @@ async function clearHistorySendsCorrectFrame() {
   await session.disconnect();
 }
 
+// ── Scenario 17: queryAdvert() sends FRAME_QUERY_ADVERT carrying the
+//    browser's real wall-clock unix time, and decodes the returned card ───
+
+async function queryAdvertSendsCorrectFrameAndDecodesTheCard() {
+  const cardPayload = buildAdvertCardPayload("Cadet");
+  assert.ok(
+    cardPayload.length > MAX_RSP_HISTORY_ENTRY_PAYLOAD,
+    "fixture card must exceed the legacy (pre-fix) plen guard to exercise it"
+  );
+  const written = [];
+  const { port, push } = makeFakePort((chunk) => {
+    written.push(chunk);
+    setTimeout(() => push(encodeFrame(FRAME_RSP_ADVERT, cardPayload)), 5);
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  const before = Math.floor(Date.now() / 1000);
+  const card = await session.queryAdvert();
+  assert.deepEqual(Array.from(card), Array.from(cardPayload));
+
+  assert.equal(written.length, 1);
+  const sent = decodeFrame(written[0]);
+  assert.equal(sent.frameType, FRAME_QUERY_ADVERT);
+  assert.equal(sent.payload.length, 4);
+  const sentUnixTime = new DataView(sent.payload.buffer, sent.payload.byteOffset, 4).getUint32(0, true);
+  const after = Math.floor(Date.now() / 1000);
+  assert.ok(
+    sentUnixTime >= before && sentUnixTime <= after,
+    `QUERY_ADVERT payload must carry the browser's real wall-clock unix time (sent ${sentUnixTime}, expected [${before}, ${after}])`
+  );
+
+  await session.disconnect();
+}
+
+// ── Scenario 18: queryAdvert() surfaces a device RSP_ERROR as DeviceError ─
+
+async function queryAdvertDeviceError() {
+  const { port, push } = makeFakePort(() => {
+    const msg = new TextEncoder().encode("no identity yet");
+    const payload = new Uint8Array(2 + msg.length);
+    payload[0] = 4;
+    payload[1] = msg.length;
+    payload.set(msg, 2);
+    setTimeout(() => push(encodeFrame(FRAME_RSP_ERROR, payload)), 5);
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  await assert.rejects(
+    () => session.queryAdvert(),
+    (err) => {
+      assert.ok(err instanceof DeviceError, `expected DeviceError, got ${err}`);
+      assert.equal(err.errorCode, 4);
+      assert.match(err.message, /no identity yet/);
+      return true;
+    }
+  );
+
+  await session.disconnect();
+}
+
+// ── Scenario 19: regression guard — an oversized (>73 B) RSP_ADVERT frame
+//    must survive log-noise resync, not be misclassified as false PROV_MAGIC
+//    noise ─────────────────────────────────────────────────────────────────
+//
+// Before this mission, `#tryExtractFrame`'s plen guard was hardcoded to
+// `MAX_RSP_HISTORY_ENTRY_PAYLOAD` (73 B) — the largest payload that existed
+// prior to FRAME_RSP_ADVERT. A genuine card frame (up to 134 B) would trip
+// "plen too large -> treat as false magic -> advance 1 byte", shredding the
+// real frame one byte at a time until the read timed out. This uses a
+// deliberately long name so the fixture card lands well past 73 B, and
+// interleaves ESP-IDF-style log noise ahead of it exactly like a real T-Deck
+// would, mirroring `happyPathWithLogNoiseResync` above but for RSP_ADVERT.
+
+async function oversizedAdvertFrameSurvivesLogNoiseResync() {
+  const cardPayload = buildAdvertCardPayload("Field Cadet Twelve");
+  assert.ok(cardPayload.length > MAX_RSP_HISTORY_ENTRY_PAYLOAD, "fixture card must exceed the legacy plen guard");
+  const advertFrame = encodeFrame(FRAME_RSP_ADVERT, cardPayload);
+
+  const { port, push } = makeFakePort(() => {});
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  const logNoise = new TextEncoder().encode("I (5678) prov_server: building self-advert card\n");
+  const queryPromise = session.queryAdvert();
+  push(concat(logNoise, advertFrame));
+
+  const card = await queryPromise;
+  assert.deepEqual(Array.from(card), Array.from(cardPayload));
+
+  await session.disconnect();
+}
+
 // ── Run ────────────────────────────────────────────────────────────────────
 
 const scenarios = [
@@ -741,6 +866,9 @@ const scenarios = [
   ["exportHistory tolerates a bounded stray reply before the stream", exportHistoryToleratesStrayFrame],
   ["exportHistory surfaces a device RSP_ERROR as DeviceError", exportHistoryDeviceError],
   ["clearHistory sends FRAME_CLEAR_HISTORY and expects RSP_OK", clearHistorySendsCorrectFrame],
+  ["queryAdvert sends FRAME_QUERY_ADVERT with the browser's real unix time and decodes the card", queryAdvertSendsCorrectFrameAndDecodesTheCard],
+  ["queryAdvert surfaces a device RSP_ERROR as DeviceError", queryAdvertDeviceError],
+  ["an oversized RSP_ADVERT frame survives log-noise resync (plen-guard regression)", oversizedAdvertFrameSurvivesLogNoiseResync],
 ];
 
 for (const [name, fn] of scenarios) {

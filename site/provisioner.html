@@ -122,12 +122,35 @@
         </div>
 
         <div class="flash-panel" id="qr-panel" hidden>
-          <h2>3. MeshCore contact QR</h2>
+          <h2>3. MeshCore contact URLs</h2>
+          <p>
+            Two ways to hand this node to a MeshCore peer — pick whichever
+            fits: Format A for a companion-app QR scan, Format B for
+            <code>meshcore-cli</code>.
+          </p>
+
+          <h3>Format A — companion-app QR</h3>
           <p>Scan with a MeshCore companion app to add this node as a contact.</p>
           <div class="qr-wrap">
             <canvas id="qr-canvas" width="220" height="220"></canvas>
           </div>
           <p id="qr-uri" class="muted footnote mono qr-uri"></p>
+
+          <div id="card-uri-block" class="inline-form footnote">
+            <h3>Format B — <code>meshcore-cli</code> card URI</h3>
+            <p class="muted">
+              Fetched fresh from the device over Web Serial every time — the
+              browser cannot generate this itself (the signature needs the
+              device's private key, which never leaves it). Copy and paste
+              <strong>verbatim</strong> into
+              <code>meshcore-cli import-contact &lt;URI&gt;</code>.
+            </p>
+            <p id="card-uri" class="muted footnote mono qr-uri">—</p>
+            <div class="cta-row">
+              <button id="card-uri-copy-button" class="btn btn-ghost" type="button">Copy Format B URI</button>
+            </div>
+            <p id="card-uri-status" class="muted form-status" role="status"></p>
+          </div>
         </div>
 
         <div class="flash-panel" id="contacts-panel" hidden>

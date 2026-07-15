@@ -41,6 +41,7 @@ use protocol::history::{
     decode_rsp_history_entry, encode_rsp_history_entry, HistoryEntry, HistoryMsgType,
 };
 use protocol::provisioning::*;
+use protocol::{build_self_advert_card, Identity, MAX_ADVERT_CARD_LEN};
 
 // ── Minimal JSON writer ──────────────────────────────────────────────────────
 //
@@ -398,6 +399,36 @@ fn rsp_history_entry_vector(
     )
 }
 
+/// Builds a golden vector for `FRAME_RSP_ADVERT`: the device's signed
+/// self-advert "biz card", carried as the frame's ENTIRE payload verbatim
+/// (no inner length field — see `FRAME_RSP_ADVERT`'s doc comment in
+/// `provisioning.rs`). Unlike every other decode vector, there is no
+/// `protocol::provisioning::decode_*` function to round-trip through: the
+/// card is opaque signed bytes the host/browser can only validate
+/// structurally and pass through (see `Session::query_advert`,
+/// `host/src/session.rs`), never parse into fields. `expect` is therefore
+/// just the card's own hex — proving codec.js's `decodeRspAdvert` reproduces
+/// the payload verbatim after its structural sanity check passes, exactly
+/// mirroring what the Rust host CLI does with the same bytes.
+fn rsp_advert_vector(
+    name: &'static str,
+    seed: [u8; 32],
+    timestamp: u32,
+    card_name: &str,
+) -> Vector {
+    let identity = Identity::from_seed(seed);
+    let mut card_buf = [0u8; MAX_ADVERT_CARD_LEN];
+    let n_card = build_self_advert_card(&identity, timestamp, card_name, &mut card_buf);
+    let card = &card_buf[..n_card];
+    decode_vector(
+        name,
+        "rsp_advert",
+        FRAME_RSP_ADVERT,
+        card,
+        Json::Str(hex::encode(card)),
+    )
+}
+
 // ── The vector set ───────────────────────────────────────────────────────────
 
 fn build_vectors() -> Vec<Vector> {
@@ -426,6 +457,22 @@ fn build_vectors() -> Vec<Vector> {
         &[],
         Json::Obj(vec![]),
     ));
+
+    {
+        // Payload: `host_unix_time(4 LE)` — the browser sends its own wall-clock
+        // unix time here (the device has no RTC); see FRAME_QUERY_ADVERT's doc
+        // comment in provisioning.rs.
+        let host_unix_time: u32 = 0x6789_ABCD;
+        let mut buf = [0u8; 4];
+        let plen = encode_query_advert(host_unix_time, &mut buf);
+        v.push(encode_vector(
+            "query_advert",
+            "query_advert",
+            FRAME_QUERY_ADVERT,
+            &buf[..plen],
+            Json::Obj(vec![("host_unix_time", n(host_unix_time as i64))]),
+        ));
+    }
 
     {
         let pubkey = [0xABu8; 32];
@@ -722,6 +769,13 @@ fn build_vectors() -> Vec<Vector> {
     v.push(frame_only_vector(
         "rsp_channels_done",
         FRAME_RSP_CHANNELS_DONE,
+    ));
+
+    v.push(rsp_advert_vector(
+        "rsp_advert",
+        [0x2au8; 32],
+        1_700_000_000,
+        "Cadet Card",
     ));
 
     v.push(rsp_history_entry_vector(
