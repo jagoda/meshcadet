@@ -13,7 +13,7 @@ name = "firmware"
 # belt-and-suspenders check in case anyone ever bumps one file by hand
 # without the other, or `extra-files` is ever misconfigured. See
 # docs/adr/0004-release-architecture.md.
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 # GPLv3 — this crate is the one that forces the project-wide license choice:
 # it reaches into `i-slint-core` internals (RendererSealed et al, see the
