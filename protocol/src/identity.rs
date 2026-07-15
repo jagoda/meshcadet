@@ -11,6 +11,7 @@
 //! 4. AES key = shared_secret[0:16]; HMAC key = shared_secret[0:32].
 
 use curve25519_dalek::edwards::CompressedEdwardsY;
+use ed25519_dalek::Signer;
 use rand_core::{CryptoRng, RngCore};
 use sha2::{Digest, Sha512};
 use x25519_dalek::{PublicKey as X25519PubKey, StaticSecret};
@@ -47,6 +48,13 @@ impl Identity {
     /// The 1-byte routing hash: `pub_key[0]`.
     pub fn pub_hash(&self) -> u8 {
         self.pubkey[0]
+    }
+
+    /// Sign `msg` with this identity's Ed25519 key, returning the raw
+    /// 64-byte signature (mirrors `LocalIdentity::sign()` in MeshCore).
+    pub fn sign(&self, msg: &[u8]) -> [u8; 64] {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&self.seed);
+        signing_key.sign(msg).to_bytes()
     }
 
     /// Compute the 32-byte X25519 shared secret with a remote Ed25519 public key.
@@ -158,6 +166,36 @@ mod tests {
         // Just check it's non-zero-all and non-one-all
         assert_ne!(id.pubkey, [0u8; 32]);
         assert_ne!(id.pubkey, [0xFFu8; 32]);
+    }
+
+    #[test]
+    fn sign_is_deterministic_and_verifies() {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+        let id = Identity::from_seed(seed_a());
+        let msg = b"pubkey || timestamp || appdata goes here";
+
+        let sig1 = id.sign(msg);
+        let sig2 = id.sign(msg);
+        assert_eq!(
+            sig1, sig2,
+            "signing must be deterministic (Ed25519, no RNG)"
+        );
+
+        let verifying_key = VerifyingKey::from_bytes(&id.pubkey).unwrap();
+        let signature = Signature::from_bytes(&sig1);
+        assert!(
+            verifying_key.verify(msg, &signature).is_ok(),
+            "signature must verify against the identity's own pubkey"
+        );
+    }
+
+    #[test]
+    fn sign_different_messages_give_different_signatures() {
+        let id = Identity::from_seed(seed_a());
+        let sig_a = id.sign(b"message A");
+        let sig_b = id.sign(b"message B");
+        assert_ne!(sig_a, sig_b);
     }
 
     #[test]

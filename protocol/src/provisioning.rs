@@ -68,6 +68,12 @@ pub const FRAME_QUERY_CONTACTS: u8 = 0x02;
 /// [`FRAME_RSP_CHANNELS_DONE`].
 pub const FRAME_QUERY_CHANNELS: u8 = 0x03;
 
+/// Ask the device to build and return its self-advert "biz card"
+/// (see [`crate::advert::build_self_advert_card`]).  Payload: `u32` LE host
+/// unix time — the device has no RTC of its own and stamps the card with
+/// this value.  The device replies [`FRAME_RSP_ADVERT`].
+pub const FRAME_QUERY_ADVERT: u8 = 0x04;
+
 /// Add a contact entry.
 pub const FRAME_ADD_CONTACT: u8 = 0x10;
 /// Delete a contact entry by pubkey.
@@ -142,6 +148,12 @@ pub const FRAME_RSP_CONTACTS_DONE: u8 = 0x87;
 pub const FRAME_RSP_CHANNEL: u8 = 0x88;
 /// Response: terminal frame of a channel enumeration stream (no payload).
 pub const FRAME_RSP_CHANNELS_DONE: u8 = 0x89;
+/// Response: answer to [`FRAME_QUERY_ADVERT`].  Payload: the raw self-advert
+/// card bytes, verbatim (see [`crate::advert::build_self_advert_card`]).
+/// The frame's own 2-byte `payload_len` already carries the card length, so
+/// there is deliberately no inner length field — decode with
+/// [`decode_frame`] and treat the whole payload slice as the card.
+pub const FRAME_RSP_ADVERT: u8 = 0x8A;
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -437,6 +449,14 @@ pub fn encode_add_contact(
     34 + name_len
 }
 
+/// Encode a `QueryAdvert` payload.  Returns bytes written (always 4).
+///
+/// Wire layout: `host_unix_time(4 LE)`
+pub fn encode_query_advert(host_unix_time: u32, out: &mut [u8]) -> usize {
+    out[0..4].copy_from_slice(&host_unix_time.to_le_bytes());
+    4
+}
+
 /// Encode a `DelContact` payload.  Returns bytes written (always 32).
 ///
 /// Wire layout: `pubkey(32)`
@@ -621,6 +641,14 @@ pub fn decode_add_contact(payload: &[u8]) -> Result<AddContactPayload, ProvError
         display_name,
         display_name_len: name_len as u8,
     })
+}
+
+/// Decode a `QueryAdvert` payload, returning the host unix time.
+pub fn decode_query_advert(payload: &[u8]) -> Result<u32, ProvError> {
+    if payload.len() < 4 {
+        return Err(ProvError::TruncatedPayload);
+    }
+    Ok(u32::from_le_bytes(payload[0..4].try_into().unwrap()))
 }
 
 /// Decode a `DelContact` payload.
@@ -1414,6 +1442,51 @@ mod tests {
         assert_eq!(FRAME_CLEAR_HISTORY, 0x72);
         assert_ne!(FRAME_CLEAR_HISTORY, FRAME_COMMIT_PROVISIONING);
         assert_ne!(FRAME_CLEAR_HISTORY, FRAME_EXPORT_HISTORY);
+    }
+
+    // ── QueryAdvert / RspAdvert frames ───────────────────────────────────────
+
+    #[test]
+    fn query_advert_frame_roundtrip() {
+        let mut payload_buf = [0u8; 4];
+        let plen = encode_query_advert(0x6789_ABCD, &mut payload_buf);
+        assert_eq!(plen, 4);
+
+        let mut frame_buf = [0u8; 16];
+        let n = encode_frame(FRAME_QUERY_ADVERT, &payload_buf[..plen], &mut frame_buf);
+        let (ft, payload) = decode_frame(&frame_buf[..n]).unwrap();
+        assert_eq!(ft, FRAME_QUERY_ADVERT);
+        assert_eq!(decode_query_advert(payload).unwrap(), 0x6789_ABCD);
+    }
+
+    #[test]
+    fn decode_query_advert_truncated() {
+        assert_eq!(
+            decode_query_advert(&[0u8; 3]),
+            Err(ProvError::TruncatedPayload)
+        );
+    }
+
+    #[test]
+    fn rsp_advert_frame_carries_raw_card_with_no_inner_length_field() {
+        // The card bytes ARE the payload verbatim; the frame's own
+        // payload_len is the only length field on the wire.
+        let card = [0xAAu8; 134];
+        let mut frame_buf = [0u8; 160];
+        let n = encode_frame(FRAME_RSP_ADVERT, &card, &mut frame_buf);
+        let (ft, payload) = decode_frame(&frame_buf[..n]).unwrap();
+        assert_eq!(ft, FRAME_RSP_ADVERT);
+        assert_eq!(payload, &card[..]);
+    }
+
+    #[test]
+    fn advert_frame_types_are_the_documented_next_free_ids() {
+        assert_eq!(FRAME_QUERY_ADVERT, 0x04);
+        assert_eq!(FRAME_RSP_ADVERT, 0x8A);
+        assert_ne!(FRAME_QUERY_ADVERT, FRAME_QUERY_STATUS);
+        assert_ne!(FRAME_QUERY_ADVERT, FRAME_QUERY_CONTACTS);
+        assert_ne!(FRAME_QUERY_ADVERT, FRAME_QUERY_CHANNELS);
+        assert_ne!(FRAME_RSP_ADVERT, FRAME_RSP_CHANNELS_DONE);
     }
 
     // ── CRC-16 sanity ────────────────────────────────────────────────────────

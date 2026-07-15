@@ -19,6 +19,7 @@
 //! | `header`     | `Header` (1-byte packet header) and `PathLen` (path_len encoding) |
 //! | `crypto`     | AES-128-ECB, HMAC-SHA256-2, SHA-256, encrypt-then-MAC |
 //! | `identity`   | `Identity` (Ed25519 keypair), X25519 ECDH shared secret |
+//! | `advert`     | Self-advert "biz card" builder (signed ADVERT) + `meshcore://` URI rendering |
 //! | `codec`      | DM, ACK, GRP_TXT, PATH-return encode/decode |
 //! | `policy`     | `PolicyFilter` — allowlist-only DM filter + telemetry gate |
 //! | `telemetry`  | GPS telemetry: bespoke `?loc` text codec + MeshCore-native REQ/RESPONSE (companion-app) codec |
@@ -91,6 +92,7 @@ pub enum PayloadType {
 
 // ── Sub-modules ───────────────────────────────────────────────────────────────
 
+pub mod advert;
 pub mod codec;
 pub mod crypto;
 pub mod dedup;
@@ -107,6 +109,10 @@ pub mod telemetry;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
+pub use advert::{
+    build_self_advert_card, card_to_uri, ADVERT_APPDATA_FLAGS, CARD_URI_SCHEME,
+    MAX_ADVERT_CARD_LEN, MAX_ADVERT_NAME_LEN, MAX_CARD_URI_LEN,
+};
 pub use codec::{
     channel_hash, channel_hash_var, compute_ack_hash, decode_dm_payload, decode_grp_txt,
     decode_grp_txt_var, decode_path_return, decode_txt_msg_plaintext, encode_dm_payload,
