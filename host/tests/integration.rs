@@ -2077,3 +2077,31 @@ fn test_cli_identity_help_lists_raw_flag() {
         "identity --help output must list the --raw flag:\n{stdout}"
     );
 }
+
+/// Regression guard: `meshcadet identity --help` must tell users to pipe the
+/// card URI into `meshcore-cli import_contact` (underscore) — the command
+/// meshcore-cli actually dispatches (verified against the real meshcore-cli
+/// source: `import_contact` / alias `ic`). The hyphenated `import-contact`
+/// is not a command meshcore-cli recognizes, so the "paste verbatim" promise
+/// silently breaks if this spelling regresses.
+#[test]
+fn test_cli_identity_help_names_the_real_meshcore_cli_import_command() {
+    let exe = env!("CARGO_BIN_EXE_meshcadet");
+    let output = std::process::Command::new(exe)
+        .args(["--port", "/dev/null", "identity", "--help"])
+        .output()
+        .expect("meshcadet identity --help must run");
+    assert!(
+        output.status.success(),
+        "identity --help must exit successfully"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("import_contact"),
+        "identity --help must name meshcore-cli's real import_contact command:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("import-contact"),
+        "identity --help must not use the hyphenated `import-contact`, which meshcore-cli does not dispatch:\n{stdout}"
+    );
+}
