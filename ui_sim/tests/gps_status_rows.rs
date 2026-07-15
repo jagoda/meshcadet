@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Integration test: renders the
-//! three-row stack through `ui_sim::gps_status_rows` and asserts the
+//! four-row stack through `ui_sim::gps_status_rows` and asserts the
 //! `StatusRow.icon-kind` selector paints the right motif (or none) in each
-//! row.
+//! row, and that the Time-sync row's second (`value2`) line — the GPS
+//! status time-row-overflow fix — actually fits inside its own
+//! `row-height: 60px` without bleeding past it.
 //!
 //! Lives under `tests/` (a separate Cargo integration-test binary, hence
 //! its own process) so it can install its own Slint `Platform` singleton
@@ -11,7 +13,7 @@
 //! full "why a second render path" rationale, which applies identically
 //! here.
 
-use ui_sim::gps_status_rows::{rgb8, GpsStatusRowsFrame, ROW_HEIGHT, WIDTH};
+use ui_sim::gps_status_rows::{rgb8, GpsStatusRowsFrame, ROW_HEIGHT, TIME_SYNC_ROW_HEIGHT, WIDTH};
 
 /// RGB565 is lossy (5/6/5 bits per channel) — round an 8-bit-per-channel hex
 /// color through the same pack/expand path the renderer itself uses, same
@@ -39,6 +41,16 @@ fn row_contains(
     color: (u8, u8, u8),
 ) -> bool {
     (0..WIDTH).any(|x| (y0..y0 + ROW_HEIGHT).any(|y| at(fb, x, y) == color))
+}
+
+/// Whether ANY non-`bg` pixel appears within `[y0, y1)`.
+fn range_has_non_bg(
+    fb: &[slint::platform::software_renderer::Rgb565Pixel],
+    y0: u32,
+    y1: u32,
+    bg: (u8, u8, u8),
+) -> bool {
+    (0..WIDTH).any(|x| (y0..y1).any(|y| at(fb, x, y) != bg))
 }
 
 /// Single test — see module doc: exactly one `GpsStatusRowsFrame` (and
@@ -96,5 +108,44 @@ fn icon_kind_selects_the_right_motif_per_row_and_leaves_iconless_rows_blank() {
     assert!(
         !row_contains(&fb, row2_y0, star_gold),
         "Coordinates row (icon-kind: planet) must not show the comet motif"
+    );
+
+    // Row 3 ("Time sync", row-height: 60px): the GPS status time-row-
+    // overflow fix. Three lines (label / absolute date+time / relative
+    // age) must all fit inside this row's own 60px allocation — nothing
+    // may bleed past it into the window's remaining, otherwise-untouched
+    // background below. (This render has no header, unlike the real
+    // screen — `firmware/src/ui/screens/gps_status.rs`'s own comment on the
+    // `row-height: 60px` binding is where the "36 (header) + 48*3 + 60 ==
+    // 240" whole-screen arithmetic is asserted; this test proves the
+    // narrower, portable claim: the row's OWN content fits its OWN height.)
+    let row3_y0 = 3 * ROW_HEIGHT;
+    let row3_y1 = row3_y0 + TIME_SYNC_ROW_HEIGHT;
+    assert!(
+        row3_y1 <= ui_sim::gps_status_rows::HEIGHT,
+        "Time sync row must fit inside this render's window"
+    );
+    // Sanity: the row renders at all (label + both value lines painted
+    // something other than plain background).
+    assert!(
+        range_has_non_bg(&fb, row3_y0, row3_y1, bg_space),
+        "Time sync row should render its label/value/value2 text"
+    );
+    // The `value2` line (relative age) sits near the BOTTOM of the row,
+    // below the label + primary value lines — assert content reaches that
+    // far down, proving the second line actually painted, not just the
+    // first two.
+    assert!(
+        range_has_non_bg(&fb, row3_y1 - 12, row3_y1, bg_space),
+        "Time sync row's value2 (relative-age) line should paint near the row's bottom"
+    );
+    // The regression guard proper: nothing from this row (or anything else
+    // in this render) may bleed past its own 60px allocation into the
+    // window's remaining background — this is the literal "row overflow"
+    // failure mode the fix addresses, now caught mechanically instead of
+    // by eyeballing a screenshot.
+    assert!(
+        !range_has_non_bg(&fb, row3_y1, ui_sim::gps_status_rows::HEIGHT, bg_space),
+        "Time sync row's content must not bleed past its own row-height into the window below it"
     );
 }

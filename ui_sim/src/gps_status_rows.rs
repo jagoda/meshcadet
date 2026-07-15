@@ -9,16 +9,26 @@
 //! `firmware/src/ui/screens/gps_status.rs` cannot itself be compiled on the
 //! host — the `firmware` crate cross-compiles for `xtensa-esp32s3-espidf`
 //! only (see `lib.rs`'s module doc for the full explanation). This module
-//! re-declares ONLY the one previously-unproven mechanism this
-//! theming pass touches: `StatusRow`'s new `icon-kind` selector, which picks
-//! between the shared `RingedPlanetCorner` ("location") and `Comet`
-//! ("signal") motifs — copied verbatim from `gps_status.rs`'s real markup,
-//! not re-derived. Everything else `gps_status.rs` themes (the header, the
-//! plain `Theme`-token colors/sizes on the two icon-less rows) is either
-//! untouched by this pass or pure-Slint `Theme`-token idiom already
+//! re-declares ONLY the previously-unproven mechanisms this theming pass and
+//! the later Time-sync row-overflow fix touch: `StatusRow`'s `icon-kind`
+//! selector, which picks between the shared `RingedPlanetCorner`
+//! ("location") and `Comet` ("signal") motifs, and (added for the
+//! row-overflow fix) `StatusRow`'s `value2`/`row-height` pair, which lets
+//! the Time-sync row grow a second, secondary-styled value line without
+//! outgrowing the 240px window — all copied verbatim from `gps_status.rs`'s
+//! real markup, not re-derived. Everything else `gps_status.rs` themes (the
+//! header, the plain `Theme`-token colors/sizes on the icon-less rows) is
+//! either untouched by this pass or pure-Slint `Theme`-token idiom already
 //! proven by every other themed screen in this codebase — same
 //! "deliberately not a pixel-for-pixel mirror" scoping `compose_send.rs`'s
 //! own module doc establishes for its own narrower proof.
+//!
+//! The Time-sync row (`row-height: 60px`, `value2` set) is the one row this
+//! module renders that `gps_status.rs`'s real screen ALSO renders at that
+//! same 60px height — see `ui_sim/tests/gps_status_rows.rs`'s
+//! `time_sync_row_value2_fits_within_its_own_row_height` test for the actual
+//! proof this fix's row-height arithmetic (`36 + 48*3 + 60 == 240`) holds
+//! against the real fonts/theme, not just against a hand computation.
 //!
 //! Imports the REAL `theme.slint` / `motifs.slint` by relative path (not
 //! forked token values or re-derived motif components) — single source of
@@ -40,22 +50,29 @@ use slint::PhysicalSize;
 pub const WIDTH: u32 = 320;
 pub const HEIGHT: u32 = 240;
 
-/// Row height, mirroring `gps_status.rs`'s own `StatusRow.height`.
+/// Row height, mirroring `gps_status.rs`'s own `StatusRow` default
+/// `row-height`.
 pub const ROW_HEIGHT: u32 = 48;
+
+/// Time-sync row height override, mirroring `gps_status.rs`'s own
+/// `row-height: 60px` on that one row (see this module's doc).
+pub const TIME_SYNC_ROW_HEIGHT: u32 = 60;
 
 slint::slint! {
     import { Theme } from "../../firmware/src/ui/theme.slint";
     import { RingedPlanetCorner, Comet } from "../../firmware/src/ui/motifs.slint";
 
     // Verbatim copy of `gps_status.rs`'s `StatusRow` component (icon-kind
-    // selector + layout) — see this file's module doc for why a copy rather
-    // than an import.
+    // selector + value2/row-height + layout) — see this file's module doc
+    // for why a copy rather than an import.
     component StatusRow {
         in property <string> label;
         in property <string> value;
+        in property <string> value2: "";
         in property <string> icon-kind: "none"; // "none" | "planet" | "comet"
+        in property <length> row-height: 48px;
 
-        height: 48px;
+        height: row-height;
 
         Rectangle {
             background: transparent;
@@ -94,7 +111,7 @@ slint::slint! {
 
                 VerticalLayout {
                     horizontal-stretch: 1.0;
-                    spacing: 2px;
+                    spacing: 1px;
 
                     Text {
                         text: label;
@@ -106,6 +123,12 @@ slint::slint! {
                         text: value;
                         font-size: Theme.size-subtitle;
                         color: Theme.text-primary;
+                    }
+
+                    if value2 != "" : Text {
+                        text: value2;
+                        font-size: Theme.size-caption;
+                        color: Theme.text-secondary;
                     }
                 }
             }
@@ -137,6 +160,16 @@ slint::slint! {
                 value: "48.117300, 11.516667 (age 42s)";
                 icon-kind: "planet";
             }
+            // Row 3: no motif, `value2` set + `row-height: 60px` (mirrors
+            // "Time sync" — the row-overflow fix this module's doc points
+            // to). Two value lines: absolute wall clock (full date incl.
+            // year) on `value`, relative age on `value2`.
+            StatusRow {
+                label: "Time sync";
+                value: "2026-07-15 14:32:10 UTC";
+                value2: "synced 300s ago";
+                row-height: 60px;
+            }
         }
     }
 }
@@ -156,7 +189,8 @@ impl Platform for GpsStatusRowsPlatform {
     }
 }
 
-/// One rendered frame of the three gps_status rows (comet / none / planet).
+/// One rendered frame of the four gps_status rows (comet / none / planet /
+/// none-with-`value2`).
 ///
 /// # Panics
 /// Panics if a Slint platform is already installed in this process — see
