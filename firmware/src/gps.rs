@@ -405,6 +405,16 @@ pub struct GpsDriver<'d> {
     /// Uptime ms when the system clock was last set from a valid RMC
     /// date+time sentence.  `None` until the first successful sync.
     last_clock_sync_uptime_ms: Option<u64>,
+    /// The Unix time (`settimeofday`'s `tv_sec`) the system clock was set to
+    /// at that same instant — paired with `last_clock_sync_uptime_ms` as the
+    /// `sync_anchor` fed to
+    /// [`firmware_core::gps::synced_wall_clock_secs`] via
+    /// [`synced_wall_clock_secs`](Self::synced_wall_clock_secs), the source
+    /// of both `main.rs`'s `tx_epoch_base` rebase (app timestamps — see the
+    /// dispatcher loop's rebase right after `gps.poll`) and
+    /// [`status`](Self::status)'s `clock_unix_secs` (GPS status screen).
+    /// `None` exactly when `last_clock_sync_uptime_ms` is.
+    last_clock_sync_unix_secs: Option<i64>,
 
     // ── Liveness / acquisition-status state ─────────────────────────────────
     /// Uptime ms of the most recently observed NMEA sentence (any talker, any
@@ -550,6 +560,7 @@ impl<'d> GpsDriver<'d> {
             reprobe_len: 0,
             cached_fix: None,
             last_clock_sync_uptime_ms: None,
+            last_clock_sync_unix_secs: None,
             last_nmea_seen_uptime_ms: None,
             last_sat_count: 0,
             active: true,          // start active to obtain first fix quickly
@@ -913,10 +924,30 @@ impl<'d> GpsDriver<'d> {
         Some((fix.lat_e7, fix.lon_e7, age_secs))
     }
 
-    /// Return a read-only status snapshot: three-state fix status, coordinates
-    /// + age, satellite count, and clock-sync state + age.  Used by the
-    /// admin-menu GPS status screen; the has-fix/coords/age/clock-sync subset
-    /// is mirrored into the host `status` command output.
+    /// The `(sync_uptime_ms, sync_unix_secs)` anchor pair fed to
+    /// `firmware_core::gps::synced_wall_clock_secs` — `None` until the first
+    /// successful GPS clock sync since boot.
+    fn clock_sync_anchor(&self) -> Option<(u64, i64)> {
+        self.last_clock_sync_uptime_ms.zip(self.last_clock_sync_unix_secs)
+    }
+
+    /// Return the current GPS-synced wall-clock Unix time, or `None` if the
+    /// system clock has never been GPS-synced since boot.
+    ///
+    /// Ticks forward with `now_ms` off the sync anchor rather than
+    /// re-reading the OS clock — see
+    /// [`firmware_core::gps::synced_wall_clock_secs`]'s doc for why that is
+    /// equivalent to a fresh `gettimeofday` and host-testable either way.
+    pub fn synced_wall_clock_secs(&self, now_ms: u64) -> Option<u32> {
+        firmware_core::gps::synced_wall_clock_secs(now_ms, self.clock_sync_anchor())
+    }
+
+    /// Return the current read-only status snapshot: three-state fix status,
+    /// coordinates + age, satellite count, and clock-sync state + age +
+    /// actual synced wall-clock time.  Used by the admin-menu GPS status
+    /// screen; the has-fix/coords/age/clock-sync subset (not
+    /// `clock_unix_secs`, which is local-display-only) is mirrored into the
+    /// host `status` command output.
     pub fn status(&self, now_ms: u64) -> GpsStatus {
         let (has_fix, lat_e7, lon_e7, fix_age_secs) = match self.get_fix_and_age(now_ms) {
             Some((lat, lon, age)) => (true, lat, lon, age),
@@ -933,6 +964,7 @@ impl<'d> GpsDriver<'d> {
             Some(sync_ms) => (true, (now_ms.saturating_sub(sync_ms) / 1000) as u32),
             None => (false, 0),
         };
+        let clock_unix_secs = self.synced_wall_clock_secs(now_ms);
         GpsStatus {
             has_fix,
             fix_state,
@@ -942,6 +974,7 @@ impl<'d> GpsDriver<'d> {
             sat_count: self.last_sat_count,
             clock_synced,
             clock_sync_age_secs,
+            clock_unix_secs,
         }
     }
 
@@ -1076,12 +1109,13 @@ impl<'d> GpsDriver<'d> {
             }
         }
         if let Some(dt) = parse_rmc_datetime(line) {
-            if set_system_clock_from_utc(dt) {
+            if let Some(unix_secs) = set_system_clock_from_utc(dt) {
                 log::info!(
                     "GPS clock sync: {:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
                     dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second,
                 );
                 self.last_clock_sync_uptime_ms = Some(now_ms);
+                self.last_clock_sync_unix_secs = Some(unix_secs);
             }
         }
     }
@@ -1093,7 +1127,9 @@ impl<'d> GpsDriver<'d> {
 // below reference them unqualified via that glob.
 
 /// Set the system clock (`settimeofday`) from a decoded UTC date+time.
-/// Returns `true` on success.
+/// Returns `Some(unix_secs)` on success (the Unix time it was just set to —
+/// callers stash this as the [`GpsDriver::clock_sync_anchor`] pairing for
+/// [`firmware_core::gps::synced_wall_clock_secs`]), `None` on failure.
 ///
 /// Not `cfg`-gated to a host-native fallback: this module already imports
 /// `esp_idf_hal::uart::UartDriver` unconditionally at the top (see the module
@@ -1101,7 +1137,7 @@ impl<'d> GpsDriver<'d> {
 /// functions — it only ever builds for the `xtensa-esp32s3-espidf` target
 /// pinned in `firmware/.cargo/config.toml`; a host-native fallback branch
 /// would be permanently dead code, never compiled or run by any real build.
-fn set_system_clock_from_utc(dt: NmeaDateTime) -> bool {
+fn set_system_clock_from_utc(dt: NmeaDateTime) -> Option<i64> {
     let unix_secs = unix_timestamp(
         dt.year as i64, dt.month as u32, dt.day as u32,
         dt.hour as u32, dt.minute as u32, dt.second as u32,
@@ -1112,9 +1148,9 @@ fn set_system_clock_from_utc(dt: NmeaDateTime) -> bool {
     let ret = unsafe { esp_idf_svc::sys::settimeofday(&tv, core::ptr::null()) };
     if ret != 0 {
         log::warn!("GPS clock sync: settimeofday failed (errno path, ret={})", ret);
-        return false;
+        return None;
     }
-    true
+    Some(unix_secs)
 }
 
 // `unix_timestamp`, `parse_rmc_datetime`, the NMEA GGA parser

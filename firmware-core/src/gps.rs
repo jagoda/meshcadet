@@ -267,6 +267,12 @@ pub struct GpsStatus {
     /// Seconds since the last successful clock sync. Only meaningful when
     /// `clock_synced`.
     pub clock_sync_age_secs: u32,
+    /// The current GPS-synced wall-clock Unix time (ticks forward every
+    /// status refresh — see [`synced_wall_clock_secs`]). `None` when
+    /// `clock_synced` is `false`; only meaningful when it is `true`. Distinct
+    /// from `clock_sync_age_secs`: this is the actual synced date+time for
+    /// display (GPS status screen), not just an elapsed-seconds counter.
+    pub clock_unix_secs: Option<u32>,
 }
 
 impl GpsStatus {
@@ -283,6 +289,7 @@ impl GpsStatus {
             sat_count: 0,
             clock_synced: false,
             clock_sync_age_secs: 0,
+            clock_unix_secs: None,
         }
     }
 }
@@ -330,6 +337,51 @@ pub fn unix_timestamp(year: i64, month: u32, day: u32, hour: u32, minute: u32, s
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
     let days = era * 146_097 + doe - 719_468; // days since 1970-01-01
     days * 86_400 + hour as i64 * 3600 + minute as i64 * 60 + second as i64
+}
+
+/// Convert a Unix timestamp (seconds since 1970-01-01T00:00:00Z) to a UTC
+/// civil date+time: `(year, month, day, hour, minute, second)`.  Inverse of
+/// [`unix_timestamp`] — Howard Hinnant's `civil_from_days` algorithm, valid
+/// for the full proleptic Gregorian calendar without any external
+/// date/time dependency.
+pub fn civil_from_unix(unix_secs: i64) -> (i64, u32, u32, u32, u32, u32) {
+    let days = unix_secs.div_euclid(86_400);
+    let secs_of_day = unix_secs.rem_euclid(86_400);
+    let hour = (secs_of_day / 3600) as u32;
+    let minute = ((secs_of_day % 3600) / 60) as u32;
+    let second = (secs_of_day % 60) as u32;
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]: Mar=0 .. Feb=11
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+
+    (y, m, d, hour, minute, second)
+}
+
+/// Compute the current GPS-synced wall-clock Unix time, given the anchor
+/// captured at the moment the system clock was last set (see
+/// `firmware::gps::GpsDriver`'s `last_clock_sync_uptime_ms` /
+/// `last_clock_sync_unix_secs` fields).
+///
+/// `sync_anchor` is `Some((sync_uptime_ms, sync_unix_secs))` — the monotonic
+/// uptime and the Unix time it corresponded to at the last successful GPS
+/// clock sync — or `None` if the clock has never been synced since boot
+/// (this device has no battery-backed RTC, so "never synced" is the normal
+/// power-on state; see `firmware::gps`'s module doc). Returns the CURRENT
+/// Unix time by adding elapsed uptime since that anchor: equivalent to
+/// re-reading the system RTC (which `settimeofday` set from the very same
+/// anchor) without a second syscall, and pure/host-testable either way.
+pub fn synced_wall_clock_secs(now_ms: u64, sync_anchor: Option<(u64, i64)>) -> Option<u32> {
+    let (sync_uptime_ms, sync_unix_secs) = sync_anchor?;
+    let elapsed_secs = now_ms.saturating_sub(sync_uptime_ms) / 1000;
+    Some((sync_unix_secs + elapsed_secs as i64).max(0) as u32)
 }
 
 /// Parse a `$GPRMC` or `$GNRMC` NMEA sentence for UTC date+time.
@@ -1144,6 +1196,80 @@ mod tests {
         assert_eq!(s.fix_state, FixState::NoSignal);
         assert_eq!(s.sat_count, 0);
         assert!(!s.clock_synced);
+        assert_eq!(s.clock_unix_secs, None);
+    }
+
+    // ── civil_from_unix ───────────────────────────────────────────────────────
+
+    #[test]
+    fn civil_from_unix_epoch_is_1970_01_01() {
+        assert_eq!(civil_from_unix(0), (1970, 1, 1, 0, 0, 0));
+    }
+
+    #[test]
+    fn civil_from_unix_known_answer() {
+        // Same known-answer instant as `unix_timestamp_known_answer`.
+        assert_eq!(civil_from_unix(1_704_067_200), (2024, 1, 1, 0, 0, 0));
+    }
+
+    #[test]
+    fn civil_from_unix_time_of_day_decodes() {
+        // 2026-07-15T14:32:10Z.
+        let secs = unix_timestamp(2026, 7, 15, 14, 32, 10);
+        assert_eq!(civil_from_unix(secs), (2026, 7, 15, 14, 32, 10));
+    }
+
+    #[test]
+    fn civil_from_unix_round_trips_unix_timestamp() {
+        // Property: civil_from_unix is the exact inverse of unix_timestamp
+        // across a spread of known dates, including a leap day and a
+        // year/century boundary.
+        let cases: &[(i64, u32, u32, u32, u32, u32)] = &[
+            (1970, 1, 1, 0, 0, 0),
+            (2000, 1, 1, 0, 0, 0),
+            (2024, 2, 29, 12, 0, 0), // leap day
+            (2025, 12, 31, 23, 59, 59),
+            (2026, 1, 1, 0, 0, 0),
+            (2099, 12, 31, 23, 59, 59),
+        ];
+        for &(y, mo, d, h, mi, s) in cases {
+            let secs = unix_timestamp(y, mo, d, h, mi, s);
+            assert_eq!(
+                civil_from_unix(secs),
+                (y, mo, d, h, mi, s),
+                "round trip failed for {y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z"
+            );
+        }
+    }
+
+    // ── synced_wall_clock_secs ───────────────────────────────────────────────
+
+    #[test]
+    fn synced_wall_clock_secs_none_when_never_synced() {
+        assert_eq!(synced_wall_clock_secs(60_000, None), None);
+    }
+
+    #[test]
+    fn synced_wall_clock_secs_at_the_sync_instant() {
+        let anchor = Some((10_000u64, 1_700_000_000i64));
+        assert_eq!(synced_wall_clock_secs(10_000, anchor), Some(1_700_000_000));
+    }
+
+    #[test]
+    fn synced_wall_clock_secs_ticks_forward_with_uptime() {
+        // 5.9s later must still read as +5s (whole seconds only, matching
+        // the existing clock_sync_age_secs convention elsewhere in this
+        // module).
+        let anchor = Some((10_000u64, 1_700_000_000i64));
+        assert_eq!(synced_wall_clock_secs(15_900, anchor), Some(1_700_000_005));
+    }
+
+    #[test]
+    fn synced_wall_clock_secs_ignores_now_ms_before_the_anchor() {
+        // Defensive: `now_ms` before the anchor (should not happen — uptime
+        // is monotonic — but `saturating_sub` must not panic or underflow).
+        let anchor = Some((10_000u64, 1_700_000_000i64));
+        assert_eq!(synced_wall_clock_secs(0, anchor), Some(1_700_000_000));
     }
 
     // ── FixState (via GpsDriver::status — exercised indirectly since the

@@ -1,17 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Persisted self-advert timestamp — NVS-backed anti-replay counter.
 //!
-//! MeshCadet has no RTC: `tx_epoch_base` in `main.rs` is a per-boot
-//! `esp_random()` value, fine for the existing DM/channel traffic (only ever
-//! compared against itself, never persisted) but unusable for an advert's
-//! `timestamp` field — a receiving peer replay-guards an incoming advert on
+//! MeshCadet has no RTC: `tx_epoch_base` in `main.rs` starts each boot as a
+//! random `esp_random()` value and — once `gps` GPS-syncs the system clock —
+//! is rebased every dispatcher-loop tick onto the real GPS wall-clock time
+//! (see `main.rs`'s dispatcher loop, right after `gps.poll`). Either way it
+//! is fine for the existing DM/channel traffic (only ever compared against
+//! itself, never persisted) but unusable as-is for an advert's `timestamp`
+//! field — it is never persisted across a reboot, so even once GPS-synced it
+//! carries no memory of the highest timestamp this device has EVER issued a
+//! card with. A receiving peer replay-guards an incoming advert on
 //! `timestamp <= from->last_advert_timestamp` already on file for that
-//! contact (`BaseChatMesh.cpp:124`), so a fresh random value on every boot
-//! would make a re-share (e.g. after a device rename) silently fail to
-//! update the peer's contact. This store keeps a durable,
-//! monotonically-increasing counter across reboots;
+//! contact (`BaseChatMesh.cpp:124`), so a value that can regress across a
+//! reboot (a random reseed, or a fresh device power-on before GPS has
+//! re-synced) would make a re-share (e.g. after a device rename) silently
+//! fail to update the peer's contact. This store keeps a durable,
+//! monotonically-increasing counter across reboots instead;
 //! `firmware_core::advert::next_advert_timestamp` combines it with the
-//! host-supplied wall-clock hint carried in the `QUERY_ADVERT` payload.
+//! host-supplied wall-clock hint carried in the `QUERY_ADVERT` payload —
+//! independent of both `tx_epoch_base` and GPS sync, since advert generation
+//! is a USB-only, host-driven path with its own (typically more available,
+//! network-synced) time source.
 //!
 //! # NVS layout
 //!

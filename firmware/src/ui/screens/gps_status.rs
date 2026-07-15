@@ -15,9 +15,12 @@
 //! 3. Coordinates + age — the cached fix's lat/lon and how many seconds old
 //!    it is (the driver never discards a stale fix; staleness is surfaced,
 //!    not hidden — mirrors `gps::GpsDriver::get_fix_and_age`'s doc contract).
-//! 4. Time-sync state — whether the system clock has been set from a valid
-//!    GPS date+time sentence since boot (the T-Deck Plus has no
-//!    battery-backed RTC, so this resets to "not synced" every power-off).
+//! 4. Time-sync state — when synced, the actual GPS-synced wall-clock
+//!    date+time plus how long ago the sync happened (`"2026-07-15 14:32:10
+//!    UTC (synced 5s ago)"`); `"Not synced"` if the system clock has never
+//!    been set from a valid GPS date+time sentence since boot (the T-Deck
+//!    Plus has no battery-backed RTC, so this resets to "not synced" every
+//!    power-off — see `gps::GpsDriver`'s module doc's "Clock sync" section).
 //!
 //! All display strings are formatted Rust-side (`firmware_core::ui::
 //! gps_status::format_*`, imported below) and passed to Slint as plain text —
@@ -318,7 +321,7 @@ impl GpsStatusScreen {
             format_coords(status.has_fix, status.lat_e7, status.lon_e7, status.fix_age_secs).into(),
         );
         self.component.set_time_sync_text(
-            format_time_sync(status.clock_synced, status.clock_sync_age_secs).into(),
+            format_time_sync(status.clock_unix_secs, status.clock_sync_age_secs).into(),
         );
     }
 
