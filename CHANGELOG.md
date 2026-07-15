@@ -8,6 +8,41 @@ Versioning is managed by [release-please](https://github.com/googleapis/release-
 The entry below documents everything landed before release-please's first
 `chore(release): vX.Y.Z` PR.
 
+## [0.4.0](https://github.com/jagoda/meshcadet/compare/v0.3.2...v0.4.0) (2026-07-15)
+
+
+### Added
+
+* **firmware:** generate signed self-advert card on-device, USB-only ([1ab0346](https://github.com/jagoda/meshcadet/commit/1ab03468f3970a41ac28504fa4f74543e9276667))
+* **firmware:** generate signed self-advert card on-device, USB-only ([410c9d3](https://github.com/jagoda/meshcadet/commit/410c9d3ca992d66b441c773939db669454c3c94f))
+* **host:** surface both advert-card contact URLs ([42f3746](https://github.com/jagoda/meshcadet/commit/42f37467974e59d3b74448c073f94cf0fb5f823b))
+* **host:** surface both contact URLs in CLI via signed self-advert card ([59f9e51](https://github.com/jagoda/meshcadet/commit/59f9e51dc6a88e2b5baf0e29a239049579c7d062))
+* **protocol:** add signed self-advert card + wire frames ([3e93a57](https://github.com/jagoda/meshcadet/commit/3e93a57c819fdbfaab0d5ab4962a0a8d0a209693))
+* **protocol:** add signed self-advert card wire protocol ([d92760d](https://github.com/jagoda/meshcadet/commit/d92760d65d8d4c0de2c38670ca68b264fa6c0234))
+* **site:** show Format B (meshcore-cli card URI) in the web provisioner ([92ab2d5](https://github.com/jagoda/meshcadet/commit/92ab2d5c7a473dae7487a2aaa8cef6873eca1cba))
+* **site:** show Format B (meshcore-cli card URI) in the web provisioner ([c72fd06](https://github.com/jagoda/meshcadet/commit/c72fd06089e25c724fcc5d3a80247141ba26e646))
+
+
+### Fixed
+
+* correct stale v1.16 ACK breaking-change claim ([52d73a9](https://github.com/jagoda/meshcadet/commit/52d73a98452bc847fa58ac38707ae8cfe4abc6e0))
+* correct stale v1.16 ACK breaking-change claim ([3689db5](https://github.com/jagoda/meshcadet/commit/3689db55b76fa1cef0322b5ddad53ad2f8f257da))
+* discard stale response residue at each command's start ([99a4fb8](https://github.com/jagoda/meshcadet/commit/99a4fb81cae6cea2cd75d3d682edb4ad39593fae))
+* discard stale response residue at each command's start ([7b2aada](https://github.com/jagoda/meshcadet/commit/7b2aada77bde981c738a7cd5da701c48a9bb8a92))
+* **firmware:** repoint app timestamps at GPS-synced wall-clock time ([ff29cec](https://github.com/jagoda/meshcadet/commit/ff29cecfc9f3b905810f188e99516d1bbb78f873))
+* **firmware:** repoint app timestamps at GPS-synced wall-clock time ([4d03327](https://github.com/jagoda/meshcadet/commit/4d0332710e340a61a255962328c8567b4a10710d))
+* **firmware:** satisfy fmt and clippy on GPS-sync test code ([04bda8a](https://github.com/jagoda/meshcadet/commit/04bda8a33dea7c572c1253151b48e73324c8c256))
+* **firmware:** split GPS time-sync row into two lines ([2b9434b](https://github.com/jagoda/meshcadet/commit/2b9434b03db7b211445955971d4a26314da51e60))
+* **firmware:** split GPS time-sync row into two lines ([f7cb0aa](https://github.com/jagoda/meshcadet/commit/f7cb0aa8938c541888dbc22617767baecd2be674))
+* **host:** correct meshcore-cli import command spelling in user-facing text ([7471a00](https://github.com/jagoda/meshcadet/commit/7471a002bdf57fd5e4b735c9423ed5107d2450af))
+* **host:** correct meshcore-cli import command spelling in user-facing text ([cf72f30](https://github.com/jagoda/meshcadet/commit/cf72f300e90e76bd9ef0ea05d5a65726eed95043))
+* keep the contacts-list Remove button label on one line ([e777b2e](https://github.com/jagoda/meshcadet/commit/e777b2e02b1d98db2b2bfc063fd238af1606277a))
+* keep the contacts-list Remove button label on one line ([c5d9303](https://github.com/jagoda/meshcadet/commit/c5d930356a2602829cb24f505b11e2d2b7a13c23))
+* **release:** dispatch release.yml explicitly so tags actually build ([9af9257](https://github.com/jagoda/meshcadet/commit/9af9257fc9da6ba2bf4c4c5da523d26a6e648780))
+* **release:** dispatch release.yml explicitly so tags actually build ([cd6660e](https://github.com/jagoda/meshcadet/commit/cd6660ea67c1f01b8f863c4a824b7f69da72135a))
+* **site:** discard mid-wait stray frames so advert query can't desync the read chain ([6db9222](https://github.com/jagoda/meshcadet/commit/6db922241b8587a9d564583a2ccbb690582fd65e))
+* **site:** discard mid-wait stray frames so advert query can't desync the read chain ([44b87c7](https://github.com/jagoda/meshcadet/commit/44b87c7038b009f421da525b4040594b4eb8ebd8))
+
 ## [0.3.2](https://github.com/jagoda/meshcadet/compare/v0.3.1...v0.3.2) (2026-07-14)
 
 
