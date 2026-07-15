@@ -103,6 +103,11 @@ mod battery;
 mod dispatcher;
 mod gps;
 mod gps_baud_store;
+// Persisted self-advert anti-replay timestamp — production builds only
+// (mirrors `identity_store`/`config_store`'s HIL gate: HIL never emits an
+// advert and never touches NVS for it).
+#[cfg(not(feature = "hil"))]
+mod advert_ts_store;
 // NVS-backed identity is only used by production builds; HIL builds pin a
 // fixed seed and never touch NVS, so gate the module out to keep them warning-free.
 #[cfg(not(feature = "hil"))]
@@ -171,7 +176,7 @@ static BATTERY_STATUS: std::sync::Mutex<battery::BatteryStatus> =
     std::sync::Mutex::new(battery::BatteryStatus::unknown());
 
 use battery::BatteryDriver;
-use dispatcher::{AirtimeBudget, DuplicateFilter, TxQueue, lora_airtime_ms};
+use dispatcher::{AirtimeBudget, DuplicateFilter, TxQueue, lora_airtime_ms, tx_guard_allows};
 use gps::GpsDriver;
 use radio::Radio;
 use signal_tracker::{SignalConfig, SignalTracker};
@@ -1073,12 +1078,14 @@ fn run() -> anyhow::Result<()> {
 
         // Pass the shared HISTORY mutex so the server reads and main-thread
         // appends are mutually excluded (history_store module-level discipline).
-        // Also pass the identity pubkey, the loaded provisioned config (the
+        // Also pass a clone of the identity (the seed is needed to sign the
+        // QUERY_ADVERT self-advert card, not just report the pubkey — see
+        // admin_server::run's doc comment), the loaded provisioned config (the
         // mutable source of truth for QUERY_STATUS / QUERY_CONTACTS /
         // QUERY_CHANNELS and the ADD_*/DEL_* edits), and an NVS handle so runtime
         // edits persist back to flash.  The config + NVS handle are moved into
         // the thread.
-        let own_pubkey = identity.pubkey;
+        let identity_for_admin = identity.clone();
         let nvs_for_parent = nvs_partition.clone();
         std::thread::Builder::new()
             .name("admin_server".into())
@@ -1092,7 +1099,7 @@ fn run() -> anyhow::Result<()> {
                     &HISTORY,
                     &GPS_STATUS,
                     &BATTERY_STATUS,
-                    own_pubkey,
+                    identity_for_admin,
                     provisioned_config,
                     nvs_for_parent,
                 );
@@ -1358,55 +1365,72 @@ fn run() -> anyhow::Result<()> {
                     let n = txq.peek(&mut tx_frame);
                     if n > 0 {
                         let payload_type = (tx_frame[0] >> 2) & 0x0F;
-                        debug_assert!(
-                            !PolicyFilter::is_advert_type(payload_type),
-                            "policy violation: attempted to transmit an ADVERT frame (0x{:02x})",
-                            payload_type,
-                        );
-                        let required = lora_airtime_ms(n);
-                        if budget.can_transmit(now, required) {
-                            match radio.transmit(&tx_frame[..n]) {
-                                Ok(airtime) => {
-                                    txq.pop_front();
-                                    budget.record_tx(now, airtime);
-                                    // Mark our own transmission as seen so a relay
-                                    // flooding it back to us is dropped rather than
-                                    // displayed as an inbound copy (MeshCore marks
-                                    // its sends seen — Mesh.cpp:636). Keyed on
-                                    // payload_type||payload, so the echo (same
-                                    // payload, mutated path) matches.
-                                    dedup.insert(&tx_frame[..n]);
-                                    log::info!("TX: {} bytes, {}ms airtime", n, airtime);
-                                }
-                                Err(e) => {
-                                    // Frame stays queued (no pop_front) — retried
-                                    // next iteration. Back off like a CAD-busy
-                                    // result so a persistent radio fault doesn't
-                                    // hot-spin retrying the same frame every
-                                    // ~5-50ms; a transient one (the common case)
-                                    // just retries on the very next backoff-free
-                                    // pass once the gate reopens.
-                                    let backoff_ms = 1000u64 + (identity.pub_hash() as u64 % 2000);
-                                    log::warn!(
-                                        "TX error: {:?} — frame retained for retry in {}ms",
-                                        e, backoff_ms,
-                                    );
-                                    cad_backoff_until_ms = now + backoff_ms;
-                                }
-                            }
-                        } else {
-                            // Same reasoning as the TX-error arm: the frame is
-                            // NOT dropped, only deferred. The airtime budget
-                            // window slides forward every ms, so a short
-                            // backoff is enough for `can_transmit` to clear on
-                            // retry without hammering the check every loop
-                            // iteration in the meantime.
-                            let backoff_ms = 1000u64 + (identity.pub_hash() as u64 % 2000);
-                            log::debug!(
-                                "TX deferred: airtime budget exhausted, retry in {}ms",
-                                backoff_ms,
+                        // RELEASE-LIVE policy enforcement (not a `debug_assert!`,
+                        // which `[profile.release]` — root `Cargo.toml` — compiles
+                        // to a no-op, since `debug-assertions` is not enabled
+                        // there): "MeshCadet never emits an ADVERT" must hold in
+                        // shipped firmware, not just debug builds.
+                        // `PolicyFilter::is_advert_type` itself is unmodified; only
+                        // this guard around it is new. A frame that ever reaches
+                        // here with an ADVERT payload_type is a policy violation in
+                        // the calling code (nothing legitimate enqueues one — see
+                        // `admin_server::run`'s `FRAME_QUERY_ADVERT` handler, which
+                        // replies over the provisioning serial link directly and
+                        // never touches `txq`) — refuse to transmit it and drop the
+                        // frame outright rather than retry it forever.
+                        if !tx_guard_allows(payload_type) {
+                            log::error!(
+                                "policy violation: refusing to transmit an ADVERT frame \
+                                 (0x{:02x}) — dropped, not retried",
+                                payload_type,
                             );
-                            cad_backoff_until_ms = now + backoff_ms;
+                            txq.pop_front();
+                        } else {
+                            let required = lora_airtime_ms(n);
+                            if budget.can_transmit(now, required) {
+                                match radio.transmit(&tx_frame[..n]) {
+                                    Ok(airtime) => {
+                                        txq.pop_front();
+                                        budget.record_tx(now, airtime);
+                                        // Mark our own transmission as seen so a relay
+                                        // flooding it back to us is dropped rather than
+                                        // displayed as an inbound copy (MeshCore marks
+                                        // its sends seen — Mesh.cpp:636). Keyed on
+                                        // payload_type||payload, so the echo (same
+                                        // payload, mutated path) matches.
+                                        dedup.insert(&tx_frame[..n]);
+                                        log::info!("TX: {} bytes, {}ms airtime", n, airtime);
+                                    }
+                                    Err(e) => {
+                                        // Frame stays queued (no pop_front) — retried
+                                        // next iteration. Back off like a CAD-busy
+                                        // result so a persistent radio fault doesn't
+                                        // hot-spin retrying the same frame every
+                                        // ~5-50ms; a transient one (the common case)
+                                        // just retries on the very next backoff-free
+                                        // pass once the gate reopens.
+                                        let backoff_ms = 1000u64 + (identity.pub_hash() as u64 % 2000);
+                                        log::warn!(
+                                            "TX error: {:?} — frame retained for retry in {}ms",
+                                            e, backoff_ms,
+                                        );
+                                        cad_backoff_until_ms = now + backoff_ms;
+                                    }
+                                }
+                            } else {
+                                // Same reasoning as the TX-error arm: the frame is
+                                // NOT dropped, only deferred. The airtime budget
+                                // window slides forward every ms, so a short
+                                // backoff is enough for `can_transmit` to clear on
+                                // retry without hammering the check every loop
+                                // iteration in the meantime.
+                                let backoff_ms = 1000u64 + (identity.pub_hash() as u64 % 2000);
+                                log::debug!(
+                                    "TX deferred: airtime budget exhausted, retry in {}ms",
+                                    backoff_ms,
+                                );
+                                cad_backoff_until_ms = now + backoff_ms;
+                            }
                         }
                     }
                 }

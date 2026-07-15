@@ -18,3 +18,8 @@ diagnostics = []
 
 [dependencies]
 protocol.workspace = true
+
+[dev-dependencies]
+# Signature verification in advert.rs's round-trip tests only — protocol
+# itself already carries the signing half as a direct (non-dev) dependency.
+ed25519-dalek = { version = "2", default-features = false }
