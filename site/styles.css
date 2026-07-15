@@ -453,6 +453,12 @@ a {
   margin-top: 0;
 }
 
+.flash-panel h3 {
+  font-size: 14px;
+  margin: 20px 0 8px;
+  color: var(--text-primary);
+}
+
 .flash-panel p {
   color: var(--text-secondary);
   font-size: 14px;

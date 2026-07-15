@@ -54,3 +54,26 @@ export function buildContactUri(identity) {
       : `MeshCadet-${identity.pubkey[0].toString(16).toUpperCase().padStart(2, "0")}`;
   return `meshcore://contact/add?name=${urlEncode(name)}&public_key=${bytesToHex(identity.pubkey)}&type=1`;
 }
+
+// URI scheme prefix mirroring `protocol::advert::CARD_URI_SCHEME`
+// (`Serial.print("meshcore://")` in the upstream MeshCore `card` REPL
+// command, and the `import`/QR-scan side that consumes it). Format A above
+// reuses the same literal scheme string for its own, differently-shaped
+// `contact/add?...` URI — the two formats share a scheme, not a shape.
+const CARD_URI_SCHEME = "meshcore://";
+
+/**
+ * Render a self-advert card (the raw bytes `codec.js`'s `decodeRspAdvert`
+ * returns) as a `meshcore://<lowercase-hex>` URI — "Format B", a
+ * byte-for-byte hand port of `protocol::advert::card_to_uri`. This is the
+ * exact string `meshcore-cli import-contact <URI>` expects.
+ *
+ * Unlike `buildContactUri` (Format A, built locally from an `RspIdentity`
+ * readout), this card can only come from the device itself over Web Serial
+ * — the signature requires the device's Ed25519 private key, which never
+ * leaves it (campaign guard: the browser MUST NOT synthesize a Format B
+ * card). Always pass bytes fetched fresh via `session.queryAdvert()`.
+ */
+export function cardToUri(card) {
+  return CARD_URI_SCHEME + bytesToHex(card);
+}

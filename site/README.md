@@ -84,13 +84,16 @@ building or publishing anything.
 - `provisioner/codec.js` — pure-JS port of the USB-serial provisioning wire
   protocol (`protocol/src/provisioning.rs`): frame encode/decode, CRC-16/ARC,
   `find_magic_start` log-noise resync, and the payload codecs a browser
-  provisioner page needs. No build step — plain ES module. Guarded against
-  drift from the Rust codec by `provisioner/codec.conformance.test.mjs` +
-  `xtask --bin gen-prov-golden-vectors`, run by `pages-check.yml`'s
-  `codec-conformance` job on every PR touching either side. See
-  `docs/adr/0007-provisioner-codec.md` for the full design (why pure JS
-  instead of WASM, and the client-side security model the rest of the
-  provisioner page must uphold).
+  provisioner page needs — including `FRAME_QUERY_ADVERT`/`FRAME_RSP_ADVERT`
+  (`encodeQueryAdvert`/`decodeRspAdvert`), the query/response pair the device's
+  signed self-advert "biz card" travels over (see the `provisioner.html +
+  provisioner.js` bullet below, "Format B"). No build step — plain ES module.
+  Guarded against drift from the Rust codec by
+  `provisioner/codec.conformance.test.mjs` + `xtask --bin
+  gen-prov-golden-vectors`, run by `pages-check.yml`'s `codec-conformance` job
+  on every PR touching either side. See `docs/adr/0007-provisioner-codec.md`
+  for the full design (why pure JS instead of WASM, and the client-side
+  security model the rest of the provisioner page must uphold).
 - `provisioner/session.js` — async Web Serial transport + session
   orchestration (`send_recv_with_retry`, the `recv_frame` accumulation loop,
   `find_magic_start` resync, the two-frame `QUERY_STATUS` ->
@@ -110,18 +113,37 @@ building or publishing anything.
   three: `setPin` (masked admin PIN — scrubs its own payload buffer after
   send), `exportHistory` (streamed `RSP_HISTORY_ENTRY` -> `_DONE`, oldest-
   first, with the same bounded stray-frame tolerance as
-  `Session::export_history`), and `clearHistory`. Regression-guarded by
-  `provisioner/session.smoke.test.mjs` (a mocked-Web-Serial orchestration
+  `Session::export_history`), and `clearHistory`. The
+  `meshcadet-usb-advert-card` campaign's web child adds `queryAdvert`
+  (mirrors `Session::query_advert`): sends `FRAME_QUERY_ADVERT` carrying the
+  BROWSER's real wall-clock unix time (the device has no RTC), and returns
+  the device's signed self-advert card via `codec.js`'s `decodeRspAdvert`
+  after the same structural sanity check the host CLI performs. That mission
+  also fixed a real defect this frame type exposed:
+  `#tryExtractFrame`'s false-`PROV_MAGIC` plen guard was hardcoded to
+  `MAX_RSP_HISTORY_ENTRY_PAYLOAD` (73 B), which would have misclassified any
+  genuine `RSP_ADVERT` frame (up to `MAX_ADVERT_CARD_LEN` = 134 B) as log
+  noise; it now tracks the larger of the two, mirroring
+  `MAX_VALID_FRAME_PAYLOAD_LEN` in `host/src/session.rs`. Regression-guarded
+  by `provisioner/session.smoke.test.mjs` (a mocked-Web-Serial orchestration
   test — no Rust counterpart to golden-vector against, unlike `codec.js`),
   run by `pages-check.yml`'s `check` job.
-- `provisioner/contact-uri.js` — the MeshCore companion contact-add URI
-  construction (`meshcore://contact/add?name=&public_key=&type=1`),
-  byte-for-byte hand-ported from `host/src/main.rs`'s `url_encode` +
-  URI-construction logic. Pulled out of `provisioner.js` into its own
+- `provisioner/contact-uri.js` — two contact-sharing URI formats. Format A,
+  the MeshCore companion contact-add URI construction (`meshcore://contact/
+  add?name=&public_key=&type=1`, `buildContactUri`), is byte-for-byte
+  hand-ported from `host/src/main.rs`'s `url_encode` + URI-construction
+  logic. Format B, `cardToUri`, renders the device's signed self-advert card
+  (`codec.js`'s `decodeRspAdvert` output) as a `meshcore://<lowercase-hex>`
+  URI — a byte-for-byte hand port of `protocol::advert::card_to_uri` — which
+  is the exact string `meshcore-cli import-contact <URI>` expects. Format B
+  can only come from the device itself over Web Serial (the signature needs
+  the device's Ed25519 private key, which never leaves it); this module
+  never synthesizes one. Pulled out of `provisioner.js` into its own
   DOM-free module specifically so it's testable under plain `node` —
-  `provisioner/contact-uri.test.mjs` checks it against the exact same
-  fixtures as `host/src/main.rs`'s own `#[cfg(test)]` module, run by
-  `pages-check.yml`'s `check` job.
+  `provisioner/contact-uri.test.mjs` checks `buildContactUri` against the
+  exact same fixtures as `host/src/main.rs`'s own `#[cfg(test)]` module, and
+  `cardToUri` against the same fixture `protocol/src/advert.rs`'s own test
+  uses, run by `pages-check.yml`'s `check` job.
 - `provisioner/validation.js` — input validation for the M2 write forms:
   contact-pubkey and channel-secret hex-length checks (mirroring
   `host/src/main.rs`'s `parse_32bytes_hex`/`parse_channel_secret_hex`,
@@ -142,10 +164,24 @@ building or publishing anything.
 - `provisioner.html` + `provisioner.js` — the provisioner page itself:
   connect over Web Serial (mirrors `flash.html`'s Chrome/Edge + HTTPS
   guidance and unsupported-browser fallback), then render status/identity
-  (via `session.js`) and a MeshCore contact QR (via `contact-uri.js`). The QR
-  itself is rendered by a major-version-pinned CDN import of the `qrcode`
-  npm package via esm.sh (pure JS, no WASM) — the same single-pinned-CDN-
-  import, no-bundler pattern `flash.html` uses for esp-web-tools. M2 adds the
+  (via `session.js`) and BOTH contact-sharing formats (via `contact-uri.js`),
+  exactly mirroring the host CLI's `identity` command: **Format A**, a
+  MeshCore companion-app QR, rendered by a major-version-pinned CDN import of
+  the `qrcode` npm package via esm.sh (pure JS, no WASM) — the same
+  single-pinned-CDN-import, no-bundler pattern `flash.html` uses for
+  esp-web-tools; and **Format B**, the device's signed self-advert card
+  fetched fresh over Web Serial every read (`session.queryAdvert()`) and
+  rendered as a copyable `meshcore://<hex>` string (`cardToUri`) for
+  `meshcore-cli import-contact`. Format B's fetch is non-fatal on failure
+  (e.g. older firmware predating `FRAME_QUERY_ADVERT`) — the page degrades to
+  "Format A only" rather than losing output it already rendered, matching the
+  host CLI's own non-fatal `identity` degrade. The full URI string (217-279
+  chars) is placed in a plain text node, never CSS-truncated, with an
+  explicit "Copy" button (`navigator.clipboard.writeText`) as the primary
+  copy affordance — the campaign guard applies here too: the browser
+  **cannot** synthesize a Format B card itself (the signature needs the
+  device's Ed25519 private key), so it is always sourced fresh from the
+  device, never generated client-side. M2 adds the
   non-sensitive provisioning **writes**: contact/channel list + add/remove
   (with a client-side `crypto.getRandomValues` channel-secret generator —
   generated secrets never leave the browser), notification defaults,

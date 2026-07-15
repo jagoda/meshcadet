@@ -31,12 +31,22 @@ export const MAX_ERR_MSG_LEN = 64;
 // From protocol::history — shared by FRAME_RSP_HISTORY_ENTRY's payload.
 export const MAX_HISTORY_TEXT_LEN = 64;
 export const MAX_RSP_HISTORY_ENTRY_PAYLOAD = 73;
+// From protocol::advert — the self-advert "biz card" FRAME_RSP_ADVERT carries
+// as its whole payload, verbatim (see FRAME_RSP_ADVERT's doc comment below).
+export const MAX_ADVERT_CARD_LEN = 134;
 
 // ── Frame-type constants (mirrors provisioning.rs "Frame type constants") ───
 
 export const FRAME_QUERY_STATUS = 0x01;
 export const FRAME_QUERY_CONTACTS = 0x02;
 export const FRAME_QUERY_CHANNELS = 0x03;
+/**
+ * Ask the device to build and return its self-advert "biz card" (see
+ * `crate::advert::build_self_advert_card`). Payload: `u32` LE host unix
+ * time — the device has no RTC of its own and stamps the card with this
+ * value. The device replies `FRAME_RSP_ADVERT`.
+ */
+export const FRAME_QUERY_ADVERT = 0x04;
 
 export const FRAME_ADD_CONTACT = 0x10;
 export const FRAME_DEL_CONTACT = 0x11;
@@ -63,6 +73,14 @@ export const FRAME_RSP_CONTACT = 0x86;
 export const FRAME_RSP_CONTACTS_DONE = 0x87;
 export const FRAME_RSP_CHANNEL = 0x88;
 export const FRAME_RSP_CHANNELS_DONE = 0x89;
+/**
+ * Response: answer to `FRAME_QUERY_ADVERT`. Payload: the raw self-advert
+ * card bytes, verbatim. The frame's own 2-byte `payload_len` already carries
+ * the card length, so there is deliberately no inner length field — decode
+ * with `decodeFrame` and validate/pass through the whole payload with
+ * `decodeRspAdvert`.
+ */
+export const FRAME_RSP_ADVERT = 0x8a;
 
 // `protocol::history::HistoryMsgType`.
 export const HISTORY_MSG_TYPE_DM = 0;
@@ -242,6 +260,19 @@ export function encodeAddContact(pubkey, telemetryEnable, name) {
   out[32] = telemetryEnable ? 1 : 0;
   out[33] = nameBytes.length;
   out.set(nameBytes, 34);
+  return out;
+}
+
+/**
+ * Encode a `QueryAdvert` payload. Wire layout: `host_unix_time(4 LE)`.
+ * `hostUnixTime` is the BROWSER's current wall-clock unix time (seconds) —
+ * the device has no RTC of its own and stamps the returned card with this
+ * value; see `Session::query_advert` (`host/src/session.rs`), which sends
+ * the same field from the host's clock.
+ */
+export function encodeQueryAdvert(hostUnixTime) {
+  const out = new Uint8Array(4);
+  new DataView(out.buffer).setUint32(0, hostUnixTime >>> 0, true);
   return out;
 }
 
@@ -431,4 +462,46 @@ export function decodeRspHistoryEntry(payload) {
     text_len: textLen,
     is_ours: isOurs,
   };
+}
+
+// ── FRAME_RSP_ADVERT payload validation ──────────────────────────────────────
+//
+// Unlike every decoder above, this has no `protocol::provisioning::decode_*`
+// counterpart: FRAME_RSP_ADVERT carries the device's signed self-advert
+// "biz card" as its entire payload, verbatim, with no inner length field
+// (see FRAME_RSP_ADVERT's doc comment). Nothing in `protocol::provisioning`
+// parses it further — the structural sanity check below is host-CLI logic
+// (`Session::query_advert`, `host/src/session.rs`), not part of the
+// `ProvError` surface, so — mirroring that Rust function exactly — it
+// throws a plain `Error` (not `ProvError`) on a malformed card.
+
+const MIN_ADVERT_CARD_LEN = 102; // header(1)+path_len(1)+pubkey(32)+timestamp(4)+signature(64)
+const ADVERT_HEADER_BYTE = 0x11; // VER 0 | PAYLOAD_TYPE_ADVERT<<2 | ROUTE_TYPE_FLOOD
+
+function hex2(byte) {
+  return byte.toString(16).toUpperCase().padStart(2, "0");
+}
+
+/**
+ * Validate a `FRAME_RSP_ADVERT` payload and return the raw card bytes (a
+ * fresh `Uint8Array`, not a struct — the card is opaque signed data; render
+ * it with `contact-uri.js`'s `cardToUri`). Mirrors the structural sanity
+ * check `Session::query_advert` performs before trusting the payload:
+ * header(1) + path_len(1) + pubkey(32) + timestamp(4) + signature(64) = 102
+ * bytes is the fixed prefix every card carries ahead of its variable-length
+ * appdata, and the header byte must be the advert header (0x11 — see
+ * `protocol::advert`'s wire-format doc comment).
+ */
+export function decodeRspAdvert(payload) {
+  if (payload.length < MIN_ADVERT_CARD_LEN) {
+    throw new Error(
+      `RSP_ADVERT payload too short (${payload.length} bytes; need at least ${MIN_ADVERT_CARD_LEN} for a structurally valid card)`
+    );
+  }
+  if (payload[0] !== ADVERT_HEADER_BYTE) {
+    throw new Error(
+      `RSP_ADVERT card has unexpected header byte 0x${hex2(payload[0])} (expected 0x${hex2(ADVERT_HEADER_BYTE)})`
+    );
+  }
+  return payload.slice();
 }

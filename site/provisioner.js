@@ -25,7 +25,7 @@
 
 import { ProvisionerSession, DeviceError } from "./provisioner/session.js";
 import { bytesToHex } from "./provisioner/codec.js";
-import { buildContactUri } from "./provisioner/contact-uri.js";
+import { buildContactUri, cardToUri } from "./provisioner/contact-uri.js";
 import { validatePubkeyHex, validateChannelSecretHex, validateDeviceName, validatePin } from "./provisioner/validation.js";
 import { formatHistoryTranscript } from "./provisioner/history-format.js";
 import QRCode from "https://esm.sh/qrcode@1.5.3";
@@ -40,6 +40,9 @@ const statusPanel = document.getElementById("status-panel");
 const qrPanel = document.getElementById("qr-panel");
 const qrCanvas = document.getElementById("qr-canvas");
 const qrUri = document.getElementById("qr-uri");
+const cardUriEl = document.getElementById("card-uri");
+const cardUriCopyButton = document.getElementById("card-uri-copy-button");
+const cardUriStatus = document.getElementById("card-uri-status");
 
 const fields = {
   provisioned: document.getElementById("stat-provisioned"),
@@ -144,6 +147,7 @@ if (!ProvisionerSession.isSupported() || !ProvisionerSession.isSecureContext()) 
   // `setStatus`/`textContent`) instead of leaving the default in place.
   disconnectButton.addEventListener("click", () => handleDisconnect());
   refreshButton.addEventListener("click", handleRefresh);
+  cardUriCopyButton.addEventListener("click", handleCopyCardUri);
 
   setNameForm.addEventListener("submit", (event) => {
     event.preventDefault();
@@ -274,6 +278,8 @@ function clearFormStatuses() {
   setPinStatus.textContent = "";
   historyStatus.textContent = "";
   clearHistoryStatus.textContent = "";
+  cardUriStatus.textContent = "";
+  cardUriEl.textContent = "—";
   // Scrub sensitive UI state on teardown: drop any typed PIN, forget any
   // read-but-not-downloaded transcript, and re-arm the clear-history gate.
   setPinInput.value = "";
@@ -293,6 +299,7 @@ async function queryAndRender() {
     const { status, identity } = await session.queryStatus();
     renderStatus(status, identity);
     await renderQr(identity);
+    await renderCardUri();
     await refreshLists();
     setStatus(`Last read at ${new Date().toLocaleTimeString()}.`);
   } catch (err) {
@@ -388,6 +395,52 @@ async function renderQr(identity) {
   } catch (err) {
     console.error("MeshCadet provisioner: QR render failed", err);
     qrCanvas.hidden = true;
+  }
+}
+
+// ── Format B: device-signed self-advert card URI ─────────────────────────
+//
+// Fetched fresh from the device every read (`session.queryAdvert()` — sends
+// the browser's real wall-clock unix time; see session.js's doc comment).
+// The browser cannot synthesize this string itself: the signature needs the
+// device's Ed25519 private key, which never leaves it (campaign guard). A
+// fetch failure is treated as NON-FATAL, mirroring the host CLI's `identity`
+// command: Format A above has already rendered successfully by the time
+// this runs, so this page degrades to "Format A only" rather than losing
+// output it already had (e.g. older firmware predating FRAME_QUERY_ADVERT,
+// or a transient serial error).
+//
+// The full URI is placed in a plain text node (`cardUriEl.textContent`),
+// never truncated or clipped by CSS (`.qr-uri`'s `word-break: break-all`
+// only controls where it visually wraps) — the 217-279 char string is
+// always fully present and selectable, and the Copy button below reads it
+// back out of the DOM verbatim so a single click reliably grabs the whole
+// thing regardless of how it's wrapped on screen.
+async function renderCardUri() {
+  cardUriCopyButton.disabled = true;
+  try {
+    const card = await session.queryAdvert();
+    cardUriEl.textContent = cardToUri(card);
+    cardUriStatus.textContent = "";
+    cardUriCopyButton.disabled = false;
+  } catch (err) {
+    console.error("MeshCadet provisioner: query_advert failed", err);
+    cardUriEl.textContent = "—";
+    cardUriStatus.textContent = `Couldn't fetch the device's card (${err.message || err}). Format A above is still valid.`;
+  }
+}
+
+async function handleCopyCardUri() {
+  const text = cardUriEl.textContent;
+  if (!text || text === "—") {
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(text);
+    cardUriStatus.textContent = "Copied to clipboard.";
+  } catch (err) {
+    console.error("MeshCadet provisioner: clipboard write failed", err);
+    cardUriStatus.textContent = "Couldn't copy automatically — select the text above and copy it manually.";
   }
 }
 
