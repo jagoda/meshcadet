@@ -31,21 +31,55 @@ name: Deploy Pages
 # kept (it still fires for a release published by a human through the GitHub
 # UI/a PAT, which isn't GITHUB_TOKEN-authored) but cannot be relied on alone.
 #
-# The `workflow_run` trigger below is the actual fix: it fires on the
-# completion of the (separate) "release" workflow run itself, which is a
-# real event regardless of what token that run used internally — so it is
-# NOT subject to the same suppression. This is the documented workaround for
-# exactly this GITHUB_TOKEN limitation. Until this lands, a release with no
+# The `workflow_run` trigger below fires on the completion of the (separate)
+# "release" workflow run itself, which is a real event regardless of what
+# token that run used internally — so it is NOT subject to the same
+# suppression. This is the documented workaround for exactly this
+# GITHUB_TOKEN limitation, and it's sufficient for a release.yml run that was
+# itself triggered by a plain `push: tags` (confirmed live: v0.3.0/v0.3.1/
+# v0.3.2 all mirrored this way). Until this landed, a release with no
 # immediately-following site/**-touching push (e.g. v0.3.0, published with
 # no site push until this fix's own PR) sits unmirrored — 404 on
 # firmware/<tag>/{manifest.json,update-meta.json} — and flash.js's fetches
 # read that as "not available" rather than "not yet deployed".
 #
-# `workflow_dispatch` is kept as a trigger (parity with the pre-split
-# workflow) but build/deploy still guard on `github.event_name` being `push`,
-# `release`, or a successful `workflow_run`, so a manual dispatch reaches the
-# runner without actually publishing — it's not a bypass around the
-# publish-on-push-or-release(-or-release-workflow-completion) path.
+# BUT `workflow_run` itself turns out to have the SAME GITHUB_TOKEN-cascade
+# problem one hop further down the chain: release-please.yml's "Dispatch the
+# production release build" step (see that workflow) calls release.yml via
+# `workflow_dispatch` — using its own GITHUB_TOKEN — specifically because a
+# GITHUB_TOKEN-authored `push: tags` doesn't fire release.yml at all.
+# `workflow_dispatch` is a documented exception to the anti-recursion
+# suppression, so that call DOES create a release.yml run (confirmed live:
+# v0.4.0's release.yml run 29455396055, event=workflow_dispatch, succeeded).
+# But THAT run's own completion — a `workflow_run` event this workflow
+# listens for below — is once again GITHUB_TOKEN-cascaded and gets
+# suppressed just like the original tag push was, so pages-deploy.yml never
+# fired for v0.4.0 (confirmed live: no Deploy Pages run followed the
+# 22:26:15Z release.yml completion at all — see mission
+# meshcadet-pages-mirror-missed-dispatched-release). Every release from here
+# on will be workflow_dispatch'd this same way (release-please.yml's `push:
+# tags` fallback is now dead code for GITHUB_TOKEN-created tags), so this
+# was not a one-off.
+#
+# The `repository_dispatch` trigger below is the fix for THAT gap:
+# release.yml's own "Notify Pages to mirror this release" step fires it
+# directly, as the very last thing that workflow does once the Release is
+# actually published — a `repository_dispatch` call is, like
+# `workflow_dispatch`, exempt from GITHUB_TOKEN cascade suppression, and
+# because release.yml raises it itself (rather than relying on GitHub to
+# cascade a *further* event off of its own completion), it works
+# identically regardless of whether release.yml was reached via `push` or
+# `workflow_dispatch`. `workflow_run` is kept too — still correct, and now
+# redundant-but-harmless belt-and-suspenders for the push-triggered case it
+# already covers.
+#
+# `workflow_dispatch` is kept as a trigger on THIS workflow (parity with the
+# pre-split workflow, and a way to force a Pages redeploy by hand) but
+# build/deploy still guard on `github.event_name` being `push`, `release`, a
+# successful `workflow_run`, or `repository_dispatch`, so a manual dispatch
+# of pages-deploy.yml reaches the runner without actually publishing — it's
+# not a bypass around the publish-on-push-or-release(-or-release-workflow-
+# completion-or-release-notification) path.
 on:
   push:
     branches: [main]
@@ -57,6 +91,8 @@ on:
   workflow_run:
     workflows: ["release"]
     types: [completed]
+  repository_dispatch:
+    types: [release-published]
   workflow_dispatch:
 
 permissions:
@@ -73,6 +109,7 @@ jobs:
     if: >-
       github.event_name == 'push' ||
       github.event_name == 'release' ||
+      github.event_name == 'repository_dispatch' ||
       (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     permissions:
@@ -182,6 +219,7 @@ jobs:
     if: >-
       github.event_name == 'push' ||
       github.event_name == 'release' ||
+      github.event_name == 'repository_dispatch' ||
       (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     permissions:

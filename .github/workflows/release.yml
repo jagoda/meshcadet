@@ -386,3 +386,35 @@ jobs:
           if [ "${release_exists}" = "true" ]; then
             gh release edit "${TAG}" --draft=false
           fi
+
+      # Explicitly (rather than implicitly, via GitHub cascading a further
+      # event off of this run's own completion) tells pages-deploy.yml to
+      # mirror this release's assets onto the site flasher. This run's own
+      # completion already raises a `workflow_run` event that
+      # pages-deploy.yml listens for — but when THIS run was itself reached
+      # via release-please.yml's GITHUB_TOKEN-authored `workflow_dispatch`
+      # call (the normal path now — see release-please.yml's "Dispatch the
+      # production release build" step), that `workflow_run` completion
+      # event is itself GITHUB_TOKEN-cascaded and gets silently suppressed
+      # one hop further down the chain, exactly like the original `push:
+      # tags` was (confirmed live: v0.4.0 sat unmirrored — see mission
+      # meshcadet-pages-mirror-missed-dispatched-release).
+      # `repository_dispatch`, like `workflow_dispatch`, is a documented
+      # exception to that suppression regardless of how many hops deep it
+      # is raised, so firing it directly here — rather than depending on
+      # this job's own completion to cascade something further — closes
+      # that gap regardless of whether this run itself was reached via
+      # `push` or `workflow_dispatch`. This is deliberately NOT a
+      # `workflow_dispatch` call against pages-deploy.yml directly: that
+      # workflow's own `workflow_dispatch` trigger is intentionally kept
+      # non-publishing (see its header comment) so a manual "Run workflow"
+      # click there can never masquerade as a real release/push publish —
+      # a distinct trigger type is what lets pages-deploy.yml tell the two
+      # apart.
+      - name: Notify Pages to mirror this release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${{ github.repository }}/dispatches" \
+            -f event_type=release-published
