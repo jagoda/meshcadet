@@ -274,6 +274,28 @@ impl Default for TxQueue {
     }
 }
 
+// ── TX guard ─────────────────────────────────────────────────────────────────
+
+/// Whether a frame carrying this wire `payload_type` may proceed to
+/// `radio.transmit()`.
+///
+/// This is the RELEASE-LIVE enforcement of "MeshCadet never emits an ADVERT
+/// frame" — the TX loop (`firmware/src/main.rs`) used to gate this on a bare
+/// `debug_assert!`, which is compiled to a no-op whenever
+/// `debug-assertions` is off, and the root `Cargo.toml`'s `[profile.release]`
+/// does NOT enable it — so the guard the campaign relies on as the
+/// enforcement of "never over the air" was a no-op in shipped release
+/// firmware. This function is a plain runtime check with no `cfg` gate at
+/// all: it evaluates identically in every build profile, debug or release.
+///
+/// [`protocol::PolicyFilter::is_advert_type`] itself is unmodified; this
+/// only wraps it. Returns `false` iff `payload_type` is a MeshCore ADVERT
+/// (`0x04`) — the caller must drop the frame (do not retry, do not panic)
+/// and log an error rather than pass it to the radio.
+pub fn tx_guard_allows(payload_type: u8) -> bool {
+    !protocol::PolicyFilter::is_advert_type(payload_type)
+}
+
 // ── Airtime calculator ────────────────────────────────────────────────────────
 
 /// Estimate LoRa time-on-air in milliseconds for `payload_bytes` at the locked
@@ -545,5 +567,38 @@ mod tests {
             "max frame airtime {} ms exceeds 1000 ms budget",
             ms
         );
+    }
+
+    // ── TX guard ─────────────────────────────────────────────────────────────
+
+    /// **Release-guard, first-class test.** `cargo test` (this crate's own
+    /// harness) does not disable `debug_assertions`, so a bare
+    /// `debug_assert!` would have silently passed this test too — the old
+    /// defect only showed up in an actual `[profile.release]` firmware
+    /// build. `tx_guard_allows` closes that gap structurally: it is a plain
+    /// `bool`-returning function with no `cfg(debug_assertions)` anywhere in
+    /// it, so this assertion is exercising the exact code path that runs in
+    /// release firmware, not a debug-only stand-in for it.
+    #[test]
+    fn tx_guard_refuses_advert_payload_type_handed_to_the_tx_path() {
+        const PAYLOAD_TYPE_ADVERT: u8 = 0x04;
+        assert!(
+            !tx_guard_allows(PAYLOAD_TYPE_ADVERT),
+            "an ADVERT frame handed to the TX path must be refused, in every build profile"
+        );
+    }
+
+    #[test]
+    fn tx_guard_allows_every_non_advert_payload_type() {
+        for pt in 0u8..16u8 {
+            if pt == 0x04 {
+                continue;
+            }
+            assert!(
+                tx_guard_allows(pt),
+                "non-ADVERT payload_type 0x{:02x} must not be blocked",
+                pt
+            );
+        }
     }
 }

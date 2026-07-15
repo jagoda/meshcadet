@@ -30,6 +30,7 @@
 //! | `FRAME_COMMIT_PROVISIONING`| host→device | re-persist live config, reply `RSP_OK` (no reboot) |
 //! | `FRAME_EXPORT_HISTORY`  | host→device | stream all history entries, then send DONE |
 //! | `FRAME_CLEAR_HISTORY`   | host→device | erase ALL persisted conversation history (every DM + channel, both directions), reply `RSP_OK` / `RSP_ERROR` — flash effect immediate, UI in-memory state needs a reboot to reflect it (see handler doc comment) |
+//! | `FRAME_QUERY_ADVERT`    | host→device | build + sign this device's self-advert card, reply `RSP_ADVERT` with the raw card bytes — written straight to this serial reply, **never** enqueued onto `txq`/the radio dispatcher (see handler doc comment) |
 //!
 //! `QUERY_STATUS` is the host CLI's connect-and-verify command (`meshcadet
 //! status` / `identity`).  The unprovisioned [`provisioning_server`] answers it
@@ -70,19 +71,20 @@ use esp_idf_svc::nvs::{EspNvsPartition, NvsDefault};
 use protocol::channel_hash_var;
 use protocol::provisioning::{
     FRAME_ADD_CHANNEL, FRAME_ADD_CONTACT, FRAME_CLEAR_HISTORY, FRAME_COMMIT_PROVISIONING,
-    FRAME_DEL_CHANNEL, FRAME_DEL_CONTACT, FRAME_EXPORT_HISTORY, FRAME_QUERY_CHANNELS,
-    FRAME_QUERY_CONTACTS, FRAME_QUERY_STATUS, FRAME_RSP_CHANNEL, FRAME_RSP_CHANNELS_DONE,
-    FRAME_RSP_CONTACT, FRAME_RSP_CONTACTS_DONE, FRAME_RSP_ERROR, FRAME_RSP_HISTORY_DONE,
-    FRAME_RSP_HISTORY_ENTRY, FRAME_RSP_IDENTITY, FRAME_RSP_OK, FRAME_RSP_STATUS,
-    FRAME_SET_DEVICE_NAME, FRAME_SET_NOTIF_DEFAULTS,
+    FRAME_DEL_CHANNEL, FRAME_DEL_CONTACT, FRAME_EXPORT_HISTORY, FRAME_QUERY_ADVERT,
+    FRAME_QUERY_CHANNELS, FRAME_QUERY_CONTACTS, FRAME_QUERY_STATUS, FRAME_RSP_ADVERT,
+    FRAME_RSP_CHANNEL, FRAME_RSP_CHANNELS_DONE, FRAME_RSP_CONTACT, FRAME_RSP_CONTACTS_DONE,
+    FRAME_RSP_ERROR, FRAME_RSP_HISTORY_DONE, FRAME_RSP_HISTORY_ENTRY, FRAME_RSP_IDENTITY,
+    FRAME_RSP_OK, FRAME_RSP_STATUS, FRAME_SET_DEVICE_NAME, FRAME_SET_NOTIF_DEFAULTS,
     FRAME_SET_PIN, FRAME_OVERHEAD, MAX_NAME_LEN, PROV_MAGIC, ProvError, RspStatusPayload,
     decode_add_channel, decode_add_contact, decode_del_channel, decode_del_contact, decode_frame,
     decode_set_device_name, decode_set_notif_defaults, decode_set_pin,
     encode_frame, encode_rsp_channel, encode_rsp_contact, encode_rsp_error, encode_rsp_identity,
     encode_rsp_status,
 };
-use protocol::{encode_rsp_history_entry, MAX_RSP_HISTORY_ENTRY_PAYLOAD};
+use protocol::{encode_rsp_history_entry, Identity, MAX_ADVERT_CARD_LEN, MAX_RSP_HISTORY_ENTRY_PAYLOAD};
 
+use crate::advert_ts_store;
 use crate::config_store::{
     Channel, ChannelListFull, ChannelUpsert, Contact, ContactListFull, ContactUpsert,
     NotifDefaults, ProvisionedConfig,
@@ -118,8 +120,13 @@ mod err {
 /// `history` must be the shared global `HISTORY` mutex so that export reads
 /// are mutually excluded with main-thread appends (module-level mutex discipline).
 ///
-/// `identity_pubkey` is the device's own Ed25519 public key, returned in the
-/// `QUERY_STATUS` / `RSP_IDENTITY` replies.
+/// `identity` is the device's own Ed25519 identity (public key, returned in
+/// the `QUERY_STATUS` / `RSP_IDENTITY` replies; the seed, used to sign the
+/// `QUERY_ADVERT` self-advert card — this thread needs the whole `Identity`,
+/// not just the pubkey, for that reason). It is a `Clone` of the one
+/// `main.rs` holds; the seed staying in two in-memory copies is no wider an
+/// exposure than the existing single-thread copy (never leaves the device
+/// over any interface — see `identity_store.rs`'s doc).
 ///
 /// `config` is the provisioned config loaded at boot — the single mutable
 /// source of truth for the `QUERY_*` replies and the `ADD_*` / `DEL_*` edits.
@@ -140,7 +147,7 @@ pub fn run(
     history: &'static std::sync::Mutex<Option<HistoryStore>>,
     gps_status: &'static std::sync::Mutex<crate::gps::GpsStatus>,
     battery_status: &'static std::sync::Mutex<crate::battery::BatteryStatus>,
-    identity_pubkey: [u8; 32],
+    identity: Identity,
     mut config: ProvisionedConfig,
     nvs_partition: EspNvsPartition<NvsDefault>,
 ) {
@@ -210,7 +217,7 @@ pub fn run(
                     history,
                     gps_status,
                     battery_status,
-                    &identity_pubkey,
+                    &identity,
                     &mut config,
                     &nvs_partition,
                     &mut device_name,
@@ -242,7 +249,7 @@ fn handle_frame(
     history: &std::sync::Mutex<Option<HistoryStore>>,
     gps_status: &std::sync::Mutex<crate::gps::GpsStatus>,
     battery_status: &std::sync::Mutex<crate::battery::BatteryStatus>,
-    identity_pubkey: &[u8; 32],
+    identity: &Identity,
     config: &mut ProvisionedConfig,
     nvs_partition: &EspNvsPartition<NvsDefault>,
     device_name: &mut [u8; MAX_NAME_LEN],
@@ -272,7 +279,7 @@ fn handle_frame(
             let battery = battery_status.lock().map(|b| *b).unwrap_or_else(|e| *e.into_inner());
             let status = RspStatusPayload {
                 provisioned: true,
-                pubkey: *identity_pubkey,
+                pubkey: identity.pubkey,
                 contact_count: config.contact_count,
                 channel_count: config.channel_count,
                 gps_has_fix: gps.has_fix,
@@ -292,11 +299,64 @@ fn handle_frame(
 
             let mut ibuf = [0u8; 64];
             let ilen = encode_rsp_identity(
-                identity_pubkey,
+                &identity.pubkey,
                 &device_name[..*device_name_len as usize],
                 &mut ibuf,
             );
             send_frame(out, FRAME_RSP_IDENTITY, &ibuf[..ilen])?;
+        }
+        // ── QUERY_ADVERT ─────────────────────────────────────────────────────
+        // Build + sign this device's self-advert "biz card" and reply
+        // RSP_ADVERT with the raw card bytes — the host/browser-side
+        // provisioner UI's "share my card" action.
+        //
+        // GUARD (non-negotiable, campaign-wide): the card is built by
+        // `firmware_core::advert::handle_query_advert`, a pure function whose
+        // signature has no `TxQueue` / dispatcher / radio parameter anywhere
+        // in its call graph, and its result goes straight into `send_frame`
+        // below (the provisioning serial writer) — this handler never
+        // touches `txq`, the dispatcher, or any radio path, structurally,
+        // not just by convention.
+        //
+        // Timestamp: MeshCadet has no RTC, so `identity`'s card cannot use
+        // `main.rs`'s `tx_epoch_base` (a per-boot `esp_random()` value —
+        // useless here, see `firmware_core::advert` module docs: MeshCore's
+        // replay guard on the RECEIVING peer drops a re-imported advert when
+        // `timestamp <= last_advert_timestamp` already on file for that
+        // contact). `advert_ts_store` persists a durable, strictly
+        // increasing counter across reboots instead; the NVS write happens
+        // BEFORE the reply is sent (see `advert_ts_store::save_last_advert_ts`'s
+        // doc) so a crash between the two cannot regress it.
+        //
+        // Name: the configured device name, or (if unset) a pub_hash-derived
+        // `MeshCadet-<HH>` label — an advert with an empty name is silently
+        // dropped by every receiver, so this never emits one.
+        FRAME_QUERY_ADVERT => {
+            let name_str =
+                std::str::from_utf8(&device_name[..*device_name_len as usize]).unwrap_or("");
+            let nvs_last = advert_ts_store::load_last_advert_ts(nvs_partition.clone());
+            let mut card_buf = [0u8; MAX_ADVERT_CARD_LEN];
+            match firmware_core::advert::handle_query_advert(
+                identity,
+                payload,
+                nvs_last,
+                name_str,
+                &mut card_buf,
+            ) {
+                Ok((n, new_ts)) => {
+                    // Persist BEFORE replying (see doc comment above).
+                    advert_ts_store::save_last_advert_ts(nvs_partition.clone(), new_ts);
+                    log::info!(
+                        "admin_server: QUERY_ADVERT — {} byte card, timestamp={}",
+                        n, new_ts
+                    );
+                    send_frame(out, FRAME_RSP_ADVERT, &card_buf[..n])?;
+                }
+                Err(e) => {
+                    log::warn!("admin_server: QUERY_ADVERT decode: {:?}", e);
+                    return send_error(out, err::DECODE_ERROR, b"query_advert decode error");
+                }
+            }
         }
         // ── QUERY_CONTACTS ───────────────────────────────────────────────────
         // Stream every provisioned contact (index-ordered) as RSP_CONTACT

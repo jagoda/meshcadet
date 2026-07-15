@@ -30,6 +30,7 @@
 //!
 //! | This crate       | Firmware hardware/Slint half (stays in `firmware/src/`)        |
 //! |-------------------|----------------------------------------------------------------|
+//! | [`advert`]        | `admin_server.rs`'s `FRAME_QUERY_ADVERT` handler (NVS read/write of the last-issued timestamp, the serial write); `advert_ts_store.rs` (the NVS store itself) |
 //! | [`dispatcher`]    | *(none — this module is already 100% pure)*                    |
 //! | [`pin_menu`]      | *(none — this module is already 100% pure)*                    |
 //! | [`notification`]  | `ui::BuzzerDriver` (I2S tone playback)                          |
@@ -56,6 +57,7 @@
 //! moving more of `firmware`'s pure logic out from behind the detached
 //! workspace boundary.
 
+pub mod advert;
 pub mod battery;
 pub mod dispatcher;
 pub mod gps;
