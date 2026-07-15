@@ -6,7 +6,15 @@
 //! than an async LoRa-phy stack, matching the single-task polling model of
 //! the MeshCore dispatcher loop.
 //!
-//! # Locked preset (MeshCore v1.15 interop)
+//! # Locked preset (MeshCore v1.15 + v1.16 interop)
+//!
+//! No version detection or negotiation is required: the v1.15→v1.16 wire
+//! packet format is unchanged, and MeshCadet's ACK codec is prefix-compatible
+//! with both versions (see `compute_ack_hash` in `protocol/src/codec.rs`).
+//! One exception is under active verification, not yet resolved by
+//! inspection: v1.16 changed its OWN default LoRa preamble length (see the
+//! `Preamble` row and [`PREAMBLE_LEN`]'s doc comment); MeshCadet has not
+//! adopted that change pending an on-air bench measurement.
 //! | Parameter | Value |
 //! |-----------|-------|
 //! | Frequency | 910.525 MHz |
@@ -88,6 +96,15 @@ pub const CR_CODE: u8 = 0x01;
 pub const LDRO_CODE: u8 = 0x00;
 
 /// Preamble length (symbols).
+///
+/// 8 matches v1.15 stock nodes, which never call `setPreambleLength` and so
+/// inherit RadioLib's SX1262 default of 8. v1.16's `RadioLibWrappers::begin()`
+/// changed ITS OWN default to `preambleLengthForSF(sf) = sf<=8 ? 32 : 16`
+/// (32 at MeshCadet's locked SF7) — undocumented outside that radio wrapper,
+/// present in no spec doc. Whether 8 and 32 are mutually receivable is a
+/// physical-layer question this constant cannot answer by inspection; it is
+/// pinned at 8 pending an on-air bench measurement against stock v1.15 *and*
+/// v1.16 nodes. Do not change this value without recording that measurement.
 pub const PREAMBLE_LEN: u16 = 8;
 /// LoRa private-network sync word, hi/lo register bytes.
 ///

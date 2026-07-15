@@ -1773,7 +1773,9 @@ fn build_test_dm(
     Some((payload_off + dm_len, expected_ack))
 }
 
-/// Build a v1.15 ACK frame: `[header(0x0D)] [path_len(0x40)] [ack_hash(4)]`.
+/// Build an ACK frame: `[header(0x0D)] [path_len(0x40)] [ack_hash(4)]`.
+/// The 4-byte hash is accepted by both v1.15 and v1.16 stock nodes (see
+/// `compute_ack_hash`'s doc comment in `protocol/src/codec.rs`).
 fn build_ack_frame(ack_hash: &[u8; 4], out: &mut [u8]) -> usize {
     let header = Header::new(RouteType::Flood, PayloadType::Ack);
     out[0] = header.0;
@@ -2106,10 +2108,13 @@ fn on_receive(
 ///
 /// # ACK invariant (unchanged from M1)
 ///
-/// A v1.15 ACK is emitted for every successfully decrypted DM from a known
+/// An ACK is emitted for every successfully decrypted DM from a known
 /// contact, regardless of whether the text is a telemetry request or a plain
 /// text message.  ACK is computed on the decrypted timestamp + type + text and
-/// keyed on the originator's public key (MeshCore v1.15 §7.1).
+/// keyed on the originator's public key (MeshCore v1.15 §7.1 — unchanged in
+/// v1.16). This is dual-compat with no version detection or negotiation:
+/// MeshCadet's 4-byte ACK is accepted by both stock v1.15 and v1.16 nodes
+/// (see `compute_ack_hash`'s doc comment in `protocol/src/codec.rs`).
 
 /// Append one entry to the shared rotating `HISTORY` store (production builds
 /// only — `HISTORY`/`HistoryStore` don't exist under `hil`).
@@ -2721,6 +2726,27 @@ mod tests {
 
         assert!(pending.is_none());
         assert!(ui_events.is_empty(), "an unexpected ack must not raise a UI event");
+    }
+
+    /// Forward-compat regression: a v1.16 node emits a 6-byte ACK payload
+    /// (`ack_hash[0..4]` + extended-attempt byte + random byte). `handle_ack`
+    /// must accept it and prefix-match on the first 4 bytes only, exactly as
+    /// it does for a v1.15 4-byte payload.
+    #[test]
+    fn handle_ack_accepts_and_prefix_matches_a_6_byte_v1_16_ack() {
+        let mut pending = Some(PendingAck { hash: [1, 2, 3, 4], to_hash: 0x42 });
+        let mut ui_events: Vec<ui::UiEvent> = Vec::new();
+
+        // [ack_hash(4)] [extended-attempt byte] [random byte]
+        let payload_6_byte = [1u8, 2, 3, 4, 0x07, 0xFE];
+        handle_ack(&payload_6_byte, &mut pending, &mut ui_events);
+
+        assert!(pending.is_none(), "a prefix-matched 6-byte ack must clear pending_ack");
+        assert_eq!(ui_events.len(), 1, "a prefix-matched 6-byte ack must raise exactly one UI event");
+        match &ui_events[0] {
+            ui::UiEvent::DmAcked { to_hash } => assert_eq!(*to_hash, 0x42),
+            other => panic!("expected DmAcked, got {:?}", other),
+        }
     }
 
     // Regression guard for the channel counterpart: a heard repeat of our own

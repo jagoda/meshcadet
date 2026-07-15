@@ -196,8 +196,10 @@ fn grp_txt_frame_on_air_contract() {
 }
 
 /// Flood ACK: the round-trip-with-ACK acceptance criterion depends on this exact
-/// 6-byte frame — header 0x0D, path_len 0x40, then the 4-byte v1.15 ack hash at
-/// offset 2, recovered by the receiver's parse path.
+/// 6-byte frame — header 0x0D, path_len 0x40, then the 4-byte ack hash at
+/// offset 2, recovered by the receiver's parse path. 4-byte emission is
+/// accepted by both v1.15 and v1.16 stock nodes (see `compute_ack_hash`'s
+/// doc comment in `protocol/src/codec.rs`).
 #[test]
 fn ack_frame_on_air_contract() {
     let sender = Identity::from_seed([0x11u8; 32]);
@@ -222,7 +224,11 @@ fn ack_frame_on_air_contract() {
         PayloadType::Ack as u8,
         "parsed payload type must be ACK"
     );
-    assert_eq!(payload.len(), 4, "v1.15 ACK payload is exactly 4 bytes");
+    assert_eq!(
+        payload.len(),
+        4,
+        "MeshCadet's emitted ACK payload is exactly 4 bytes"
+    );
     assert_eq!(
         payload, &ack_hash,
         "ACK hash recovered intact from the composed frame"

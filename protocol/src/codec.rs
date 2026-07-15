@@ -14,8 +14,8 @@
 //!   TXT_MSG plaintext:
 //!     [timestamp_le(4)] [txt_type_attempt(1)] [text...]
 //!
-//!   ACK payload (v1.15):
-//!     [ack_hash(4)]
+//!   ACK payload (v1.15 and v1.16 — see note on [`compute_ack_hash`]):
+//!     [ack_hash(4)] (+ 2 more bytes on v1.16, ignored by both versions' receivers)
 //!     where ack_hash = SHA256(timestamp_le(4) || txt_type_attempt(1) || text || sender_pub_key(32))[0:4]
 //!
 //!   GRP_TXT payload:
@@ -137,14 +137,26 @@ pub fn decode_txt_msg_plaintext(
     Ok((timestamp, txt_type, attempt, 5))
 }
 
-// ── ACK hash (v1.15) ─────────────────────────────────────────────────────────
+// ── ACK hash (v1.15 and v1.16) ────────────────────────────────────────────────
 
-/// Compute the 4-byte ACK hash (v1.15).
+/// Compute the 4-byte ACK hash.
 ///
 /// `ack_hash = SHA256(timestamp_le(4) || txt_type_attempt(1) || text || sender_pub_key(32))[0:4]`
 ///
-/// Source: `BaseChatMesh.cpp` line 221–222 @ dee3e26a.
-/// ⚠ v1.16 changed this to 6 bytes; build against dee3e26 for 4-byte behaviour.
+/// Source: `BaseChatMesh.cpp` line 230–231 @ `repeater-v1.16.0`.
+///
+/// v1.16 emits 6 bytes instead of 4 (`ack_hash[4]` = extended-attempt byte,
+/// `ack_hash[5]` = random — `BaseChatMesh.cpp:232-234`), but `ack_hash[0..4]`
+/// is the *identical* SHA256 as v1.15; the two extra bytes exist only to
+/// perturb the packet hash after `SimpleMeshTables.h` dropped its
+/// value-keyed `_acks[]` table and moved ACK dedup onto packet-hash dedup
+/// (a deterministic 4-byte ACK would otherwise self-suppress as a dup).
+/// No receiver on either version reads bytes 4-5: `Mesh.cpp`'s
+/// `PAYLOAD_TYPE_ACK` handling (lines 79-85 and 114-122 @
+/// `repeater-v1.16.0`) always `memcpy`s exactly 4 bytes and gates on
+/// `payload_len >= 4` — a minimum, not an equality. 4-byte emission is
+/// therefore accepted by stock v1.15 *and* v1.16 nodes, permanently: this
+/// is not a version shim to revisit later.
 pub fn compute_ack_hash(
     timestamp: u32,
     txt_type_attempt: u8,
@@ -457,10 +469,11 @@ mod tests {
     }
 
     #[test]
-    fn ack_hash_is_4_bytes_v1_15() {
-        // Regression: v1.15 ACK is 4 bytes, NOT 6 (that's v1.16)
+    fn ack_hash_is_4_bytes() {
+        // compute_ack_hash always returns 4 bytes: this is the prefix both
+        // v1.15 and v1.16 receivers key on (see compute_ack_hash doc comment).
         let hash = compute_ack_hash(0xDEAD_BEEF, 0x05, b"test", &[0xAAu8; 32]);
-        assert_eq!(hash.len(), 4, "ACK hash must be exactly 4 bytes (v1.15)");
+        assert_eq!(hash.len(), 4, "ACK hash must be exactly 4 bytes");
     }
 
     #[test]
@@ -827,6 +840,36 @@ mod tests {
         assert_eq!(rp.path_byte_count, 4);
         assert_eq!(&rp.path[..4], &[0xAA, 0xBB, 0xCC, 0xDD]);
         assert_eq!(rp.extra, PathExtra::Ack([1, 2, 3, 4]));
+    }
+
+    /// Forward-compat regression: a v1.16 node bundles a 6-byte ACK (4-byte
+    /// hash + extended-attempt byte + random byte) into the PATH-return
+    /// extra. `decode_path_return_plaintext` must accept the longer payload
+    /// (its length check is `>= extra_offset + 1 + 4`, a minimum) and
+    /// prefix-match on the first 4 bytes, ignoring the trailing two.
+    #[test]
+    fn path_return_decode_with_6_byte_v1_16_ack_bundle() {
+        let mut pt = [0u8; 64];
+        pt[0] = 0x42; // path_len: 2B hash, 2 hops
+        pt[1] = 0xAA;
+        pt[2] = 0xBB; // hop 0 hash
+        pt[3] = 0xCC;
+        pt[4] = 0xDD; // hop 1 hash
+        pt[5] = 0x03; // extra_type = ACK
+        pt[6] = 0x01;
+        pt[7] = 0x02;
+        pt[8] = 0x03;
+        pt[9] = 0x04; // ack_hash[0..4]
+        pt[10] = 0x07; // extended-attempt byte (v1.16-only)
+        pt[11] = 0xFE; // random byte (v1.16-only)
+
+        let rp = decode_path_return_plaintext(&pt, 12).unwrap();
+        assert_eq!(rp.path_byte_count, 4);
+        assert_eq!(
+            rp.extra,
+            PathExtra::Ack([1, 2, 3, 4]),
+            "must prefix-match on the first 4 bytes, ignoring the extended-attempt/random tail"
+        );
     }
 
     #[test]
