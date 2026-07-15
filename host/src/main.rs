@@ -62,7 +62,7 @@ enum Cmd {
     ///   self-advert ("biz card") fetched fresh over serial (`FRAME_QUERY_ADVERT`
     ///   / `FRAME_RSP_ADVERT`) — this device is the only source, since the
     ///   signature requires its Ed25519 private key, which never leaves it.
-    ///   This is the format `meshcore-cli import-contact` expects.
+    ///   This is the format `meshcore-cli import_contact` (alias `ic`) expects.
     Identity {
         /// Display name to embed in the contact URI for THIS invocation only
         /// (does not persist). Defaults to the device's persisted name (see
@@ -80,7 +80,7 @@ enum Cmd {
         /// Print ONLY Format B's bare `meshcore://<hex>` card URI to stdout —
         /// no label, no Format A, no QR, no trailing commentary — so it can
         /// be piped directly, e.g.
-        /// `meshcore-cli import-contact "$(meshcadet ... identity --raw)"`.
+        /// `meshcore-cli import_contact "$(meshcadet ... identity --raw)"`.
         #[arg(long, action = ArgAction::SetTrue)]
         raw: bool,
     },
@@ -326,7 +326,7 @@ fn main() -> anyhow::Result<()> {
             // Format B: the device's own signed self-advert "card", fetched
             // fresh over serial — the host cannot synthesize this (the
             // signature needs the device's Ed25519 private key, which never
-            // leaves it). This is the format `meshcore-cli import-contact`
+            // leaves it). This is the format `meshcore-cli import_contact`
             // expects.
             //
             // In `--raw` mode this is the command's ENTIRE job, so a failure
@@ -348,11 +348,11 @@ fn main() -> anyhow::Result<()> {
                     if raw {
                         // Bare URI only — no label, no trailing prose — so
                         // this is safe to capture verbatim, e.g.
-                        // `meshcore-cli import-contact "$(meshcadet ... identity --raw)"`.
+                        // `meshcore-cli import_contact "$(meshcadet ... identity --raw)"`.
                         println!("{}", card_uri);
                     } else {
                         println!(
-                            "Card URI (paste verbatim into `meshcore-cli import-contact <URI>`):\n{}",
+                            "Card URI (paste verbatim into `meshcore-cli import_contact <URI>`):\n{}",
                             card_uri
                         );
                     }
@@ -906,7 +906,7 @@ mod tests {
     /// Format B's bare card URI (as printed under `--raw`) must be exactly
     /// the `meshcore://<hex>` string `protocol::card_to_uri` renders — no
     /// leading/trailing whitespace, no label, nothing else — so a caller can
-    /// pipe it verbatim into `meshcore-cli import-contact`.
+    /// pipe it verbatim into `meshcore-cli import_contact`.
     #[test]
     fn card_uri_is_bare_meshcore_scheme_with_no_stray_whitespace() {
         let card = [0x11u8, 0x22, 0x33, 0xAA, 0xBB];
