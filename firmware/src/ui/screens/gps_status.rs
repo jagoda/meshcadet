@@ -16,11 +16,18 @@
 //!    it is (the driver never discards a stale fix; staleness is surfaced,
 //!    not hidden — mirrors `gps::GpsDriver::get_fix_and_age`'s doc contract).
 //! 4. Time-sync state — when synced, the actual GPS-synced wall-clock
-//!    date+time plus how long ago the sync happened (`"2026-07-15 14:32:10
-//!    UTC (synced 5s ago)"`); `"Not synced"` if the system clock has never
-//!    been set from a valid GPS date+time sentence since boot (the T-Deck
-//!    Plus has no battery-backed RTC, so this resets to "not synced" every
-//!    power-off — see `gps::GpsDriver`'s module doc's "Clock sync" section).
+//!    date+time on its own row (`"2026-07-15 14:32:10 UTC"`) plus how long
+//!    ago the sync happened on a second row underneath (`"synced 5s ago"`);
+//!    `"Not synced"` (no second row) if the system clock has never been set
+//!    from a valid GPS date+time sentence since boot (the T-Deck Plus has no
+//!    battery-backed RTC, so this resets to "not synced" every power-off —
+//!    see `gps::GpsDriver`'s module doc's "Clock sync" section). Two rows,
+//!    not one: a single line wide enough to hold both the absolute date+time
+//!    and the relative age overflowed off the T-Deck's 320px-wide display
+//!    (see git history for the one-line version this replaced). The full
+//!    date INCLUDING YEAR on row one is load-bearing — see
+//!    `firmware_core::ui::gps_status::format_time_sync_date`'s doc for why
+//!    it must never be trimmed.
 //!
 //! All display strings are formatted Rust-side (`firmware_core::ui::
 //! gps_status::format_*`, imported below) and passed to Slint as plain text —
@@ -50,7 +57,7 @@
 //! — same self-contained deferred-write mechanism as `compose.rs`'s
 //! `EmojiPickerGrid` reveal. Live status updates (`set_status`, called every
 //! dispatcher-loop tick while this screen is open — see that method's doc)
-//! only ever touch the four `*_text` string properties, never
+//! only ever touch the five `*_text` string properties, never
 //! `reveal_opacity`, so the tick-driven age refreshes never re-fire this
 //! transition.
 //!
@@ -80,8 +87,18 @@
 //! before this change) rather than forking a second row component; the two
 //! themed rows above set it to `"planet"`/`"comet"` to pick which shared
 //! motif fills their icon column. It is a plain `string` property consumed
-//! entirely inside the `slint!{}` block below — the Rust-side
-//! `GpsStatusScreen` wrapper and `set_status` are untouched.
+//! entirely inside the `slint!{}` block below.
+//!
+//! `StatusRow` also grew two more optional properties for the Time-sync
+//! row's overflow fix (see the "Time-sync state" item above):
+//! `value2` (default `""`, hidden when empty) renders a second, smaller,
+//! secondary-styled line under `value` — every OTHER row leaves it unset
+//! and renders byte-identical to before; and `row-height` (default `48px`,
+//! matching the previous hardcoded literal) lets the one row that needs a
+//! third line claim more vertical space without changing anyone else's.
+//! Both are plain properties consumed entirely inside the `slint!{}` block
+//! below — the Rust-side `GpsStatusScreen` wrapper and `set_status` gained
+//! one new field push (`time_sync_age_text`) but are otherwise untouched.
 
 slint::slint! {
     import { Theme } from "../theme.slint";
@@ -91,14 +108,22 @@ slint::slint! {
     component StatusRow {
         in property <string> label;
         in property <string> value;
+        // Optional second value line — see module doc's `StatusRow`
+        // paragraph. "" (the default) renders NO second line at all, so
+        // rows that don't opt in keep their prior layout exactly.
+        in property <string> value2: "";
         // Optional per-row motif badge — see module doc's "Outer-space
         // theme" section. Selects which shared `ui/motifs.slint` component
         // (if any) fills the icon column; "none" (the default) reserves NO
         // icon column, so rows that don't opt in keep their prior
         // layout exactly.
         in property <string> icon-kind: "none"; // "none" | "planet" | "comet"
+        // Row height override — see module doc's `StatusRow` paragraph.
+        // 48px (the default) is the previous hardcoded literal, unchanged
+        // for every row that doesn't opt into a taller `value2` line.
+        in property <length> row-height: 48px;
 
-        height: 48px;
+        height: row-height;
 
         Rectangle {
             background: transparent;
@@ -138,7 +163,15 @@ slint::slint! {
 
                 VerticalLayout {
                     horizontal-stretch: 1.0;
-                    spacing: 2px;
+                    // 1px (was 2px): frees just enough vertical room for the
+                    // Time-sync row's third (`value2`) line to fit inside
+                    // this screen's fixed 240px height without pushing
+                    // anything below it off-screen — see `row-height`'s doc.
+                    // Harmless for every other row: measured against the
+                    // real theme/fonts via `ui_sim::gps_status_rows`, this
+                    // only ever *adds* headroom to their existing (already
+                    // comfortable) margins.
+                    spacing: 1px;
 
                     Text {
                         text: label;
@@ -157,6 +190,19 @@ slint::slint! {
                         font-size: Theme.size-subtitle; // 15px
                         color: Theme.text-primary;
                     }
+
+                    // Second value line — see `value2`'s doc above. Styled
+                    // like a secondary caption (smaller, dimmer) rather than
+                    // matching `value`'s primary styling: it's supplementary
+                    // ("how long ago"), the row above it is the fact that
+                    // matters ("what the wall clock actually reads"). Same
+                    // size/color pairing `message_view.rs` uses for its own
+                    // timestamp caption.
+                    if value2 != "" : Text {
+                        text: value2;
+                        font-size: Theme.size-caption; // 9px
+                        color: Theme.text-secondary;
+                    }
                 }
             }
         }
@@ -170,7 +216,15 @@ slint::slint! {
         in property <string> fix_state_text: "No signal";
         in property <string> sat_count_text: "0 satellites";
         in property <string> coords_text: "\u{2014}";
+        // Row 1 of the Time-sync row: the absolute wall clock (full
+        // date+time incl. year, e.g. "2026-07-15 14:32:10 UTC") or
+        // "Not synced". See module doc's "Time-sync state" item for why
+        // this is now two rows instead of one over-wide line.
         in property <string> time_sync_text: "Not synced";
+        // Row 2 of the Time-sync row: the relative age ("synced 5s ago"), or
+        // "" (renders no second row at all) when never synced — mirrors
+        // `time_sync_text`'s "Not synced"/populated pairing 1:1.
+        in property <string> time_sync_age_text: "";
         // Repeater signal-meter reading (ADR-0010): 0 = direct-only,
         // 1..=5 = bars. Pushed by `GpsStatusScreen::set_signal_level`
         // (`UiRuntime::set_signal_level` in `ui/mod.rs`); see
@@ -281,6 +335,16 @@ slint::slint! {
             StatusRow {
                 label: "Time sync";
                 value: time_sync_text;
+                value2: time_sync_age_text;
+                // 60px (was the 48px default): the only row wide enough in
+                // content to need it — three lines (label / absolute
+                // date+time / relative age) instead of two. Exactly the
+                // remaining budget on this 240px-tall, 36px-header screen
+                // (36 + 48*3 + 60 == 240) — measured against the real
+                // theme/fonts via `ui_sim::gps_status_rows` before landing;
+                // see that module's doc for the render this claim is proven
+                // against.
+                row-height: 60px;
             }
 
             Rectangle { vertical-stretch: 1.0; }
@@ -289,13 +353,16 @@ slint::slint! {
 }
 
 // Display-string formatting (`format_fix_state`/`format_sat_count`/
-// `format_coords`/`format_time_sync`) is pure Rust with no Slint dependency —
-// it now lives in `firmware_core::ui::gps_status` so its tests execute under
-// `cargo test --workspace` (this crate is a detached, cross-compiled
-// workspace — see `Cargo.toml`'s doc comment — so a `#[cfg(test)]` block
-// written here would type-check but never run). Only this Slint-backed view
-// wrapper stays. See `docs/adr/0005-firmware-core-extraction.md`.
-use firmware_core::ui::gps_status::{format_coords, format_fix_state, format_sat_count, format_time_sync};
+// `format_coords`/`format_time_sync_date`/`format_time_sync_age`) is pure
+// Rust with no Slint dependency — it now lives in `firmware_core::ui::
+// gps_status` so its tests execute under `cargo test --workspace` (this
+// crate is a detached, cross-compiled workspace — see `Cargo.toml`'s doc
+// comment — so a `#[cfg(test)]` block written here would type-check but
+// never run). Only this Slint-backed view wrapper stays. See
+// `docs/adr/0005-firmware-core-extraction.md`.
+use firmware_core::ui::gps_status::{
+    format_coords, format_fix_state, format_sat_count, format_time_sync_age, format_time_sync_date,
+};
 
 /// Rust-side wrapper.
 pub struct GpsStatusScreen {
@@ -311,7 +378,7 @@ impl GpsStatusScreen {
         Ok(GpsStatusScreen { component })
     }
 
-    /// Push a fresh GPS status snapshot into the three display rows. Safe to
+    /// Push a fresh GPS status snapshot into the four display rows. Safe to
     /// call repeatedly while the screen is open (e.g. every `step()`) so the
     /// fix/sync ages tick upward live rather than freezing at nav-open time.
     pub fn set_status(&self, status: &crate::gps::GpsStatus) {
@@ -320,8 +387,10 @@ impl GpsStatusScreen {
         self.component.set_coords_text(
             format_coords(status.has_fix, status.lat_e7, status.lon_e7, status.fix_age_secs).into(),
         );
-        self.component.set_time_sync_text(
-            format_time_sync(status.clock_unix_secs, status.clock_sync_age_secs).into(),
+        self.component
+            .set_time_sync_text(format_time_sync_date(status.clock_unix_secs).into());
+        self.component.set_time_sync_age_text(
+            format_time_sync_age(status.clock_unix_secs, status.clock_sync_age_secs).into(),
         );
     }
 

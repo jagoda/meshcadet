@@ -2,9 +2,10 @@
 //! `cargo run -p ui_sim --bin gps_status_rows_render` — regenerates the
 //! GPS status screen's theme host-sim render deliverable.
 //!
-//! Writes `docs/renders/gps-status-space-host-sim.png`: the three-row
+//! Writes `docs/renders/gps-status-space-host-sim.png`: the four-row
 //! stack (`Fix` w/ comet, `Satellites` w/ no icon, `Coordinates` w/ ringed
-//! planet) in its one static (no animation/trigger) frame. See
+//! planet, `Time sync` w/ no icon + a second `value2` line) in its one
+//! static (no animation/trigger) frame. See
 //! `ui_sim/src/gps_status_rows.rs`'s module doc for the full design; the
 //! same render pipeline is asserted on (non-visually) by
 //! `cargo test -p ui_sim --test gps_status_rows`.
