@@ -6,7 +6,7 @@
 //!
 //! Frame format reference: `docs/adr/0002-provisioning-wire-format.md`.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 
@@ -25,6 +25,7 @@ use protocol::provisioning::{
     encode_del_channel,
     encode_del_contact,
     encode_frame,
+    encode_query_advert,
     encode_set_device_name,
     encode_set_notif_defaults,
     encode_set_pin,
@@ -40,9 +41,11 @@ use protocol::provisioning::{
     FRAME_DEL_CHANNEL,
     FRAME_DEL_CONTACT,
     FRAME_EXPORT_HISTORY,
+    FRAME_QUERY_ADVERT,
     FRAME_QUERY_CHANNELS,
     FRAME_QUERY_CONTACTS,
     FRAME_QUERY_STATUS,
+    FRAME_RSP_ADVERT,
     FRAME_RSP_CHANNEL,
     FRAME_RSP_CHANNELS_DONE,
     FRAME_RSP_CONTACT,
@@ -59,8 +62,24 @@ use protocol::provisioning::{
     // frame synchronisation
     PROV_MAGIC,
 };
+use protocol::MAX_ADVERT_CARD_LEN;
 
 use crate::transport::Transport;
+
+/// Upper bound on any legitimate provisioning frame payload — used only by
+/// `Session::recv_frame`'s false-`PROV_MAGIC`-in-log-noise guard to tell a
+/// genuine frame header apart from ASCII log traffic that happens to contain
+/// the two magic bytes. Must track the single largest payload any frame type
+/// can carry. `FRAME_RSP_ADVERT`'s self-advert card (up to
+/// `MAX_ADVERT_CARD_LEN` = 134 bytes) is currently the largest, ahead of
+/// `FRAME_RSP_HISTORY_ENTRY` (`MAX_RSP_HISTORY_ENTRY_PAYLOAD` = 72 bytes) —
+/// a plen guard hardcoded to the smaller of the two would misclassify every
+/// genuine advert-card frame as noise and byte-drain it into a timeout.
+const MAX_VALID_FRAME_PAYLOAD_LEN: usize = if MAX_RSP_HISTORY_ENTRY_PAYLOAD > MAX_ADVERT_CARD_LEN {
+    MAX_RSP_HISTORY_ENTRY_PAYLOAD
+} else {
+    MAX_ADVERT_CARD_LEN
+};
 
 // ── Session ───────────────────────────────────────────────────────────────────
 
@@ -200,11 +219,11 @@ impl<T: Transport> Session<T> {
             if self.acc_buf.len() >= 5 {
                 let plen = (self.acc_buf[3] as usize) | ((self.acc_buf[4] as usize) << 8);
                 // Guard against false PROV_MAGIC in log traffic.  All valid
-                // protocol payloads fit within MAX_RSP_HISTORY_ENTRY_PAYLOAD
-                // (72 bytes); a larger plen means the "MC" at acc_buf[0..2]
-                // was ASCII log noise, not a real frame header.  Advance 1
-                // byte so find_magic_start can re-scan on the next iteration.
-                if plen > MAX_RSP_HISTORY_ENTRY_PAYLOAD {
+                // protocol payloads fit within MAX_VALID_FRAME_PAYLOAD_LEN;
+                // a larger plen means the "MC" at acc_buf[0..2] was ASCII log
+                // noise, not a real frame header.  Advance 1 byte so
+                // find_magic_start can re-scan on the next iteration.
+                if plen > MAX_VALID_FRAME_PAYLOAD_LEN {
                     self.acc_buf.drain(..1);
                     continue;
                 }
@@ -369,6 +388,70 @@ impl<T: Transport> Session<T> {
     /// has not yet been called this session.
     pub fn last_device_name(&self) -> Option<&str> {
         self.last_device_name.as_deref()
+    }
+
+    /// Ask the device to build and return its signed self-advert "biz card"
+    /// (see `protocol::advert::build_self_advert_card`).
+    ///
+    /// Sends `FRAME_QUERY_ADVERT` carrying the host's current unix time — the
+    /// device has no RTC of its own and stamps the card with this value —
+    /// and returns the raw card bytes from `FRAME_RSP_ADVERT` verbatim.
+    ///
+    /// The host cannot build this card itself: the signature requires the
+    /// device's Ed25519 private key, which never leaves the device (campaign
+    /// guard, `meshcadet-advert-card-host-cli` mission notes). This call is
+    /// the only legitimate source of a card.
+    pub fn query_advert(&mut self) -> anyhow::Result<Vec<u8>> {
+        let host_unix_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0);
+        let mut payload_buf = [0u8; 4];
+        let plen = encode_query_advert(host_unix_time, &mut payload_buf);
+        let (ft, payload) = self.send_recv_with_retry(FRAME_QUERY_ADVERT, &payload_buf[..plen])?;
+        match ft {
+            FRAME_RSP_ADVERT => {
+                // Structural sanity check before trusting the payload: header
+                // (1) + path_len (1) + pubkey (32) + timestamp (4) +
+                // signature (64) = 102 bytes is the fixed prefix every
+                // self-advert card carries ahead of its variable-length
+                // appdata (see `protocol::advert`'s wire-format doc comment).
+                // Anything shorter, or with the wrong header byte, cannot be
+                // a genuine card — fail loudly here with an actionable error
+                // rather than silently handing the CLI a garbage
+                // `meshcore://<hex>` URI to display or pipe.
+                const MIN_ADVERT_CARD_LEN: usize = 102;
+                const ADVERT_HEADER_BYTE: u8 = 0x11;
+                if payload.len() < MIN_ADVERT_CARD_LEN {
+                    anyhow::bail!(
+                        "RSP_ADVERT payload too short ({} bytes; need at least {} for a \
+                         structurally valid card)",
+                        payload.len(),
+                        MIN_ADVERT_CARD_LEN,
+                    );
+                }
+                if payload[0] != ADVERT_HEADER_BYTE {
+                    anyhow::bail!(
+                        "RSP_ADVERT card has unexpected header byte 0x{:02X} (expected 0x{:02X})",
+                        payload[0],
+                        ADVERT_HEADER_BYTE,
+                    );
+                }
+                Ok(payload)
+            }
+            FRAME_RSP_ERROR => {
+                let e = decode_rsp_error(&payload)
+                    .map_err(|de| anyhow::anyhow!("decode RSP_ERROR payload: {:?}", de))?;
+                let msg =
+                    std::str::from_utf8(&e.msg[..e.msg_len as usize]).unwrap_or("<invalid utf-8>");
+                anyhow::bail!("device error {}: {}", e.error_code, msg)
+            }
+            _ => anyhow::bail!(
+                "unexpected response 0x{:02X} to QUERY_ADVERT (expected RSP_ADVERT 0x{:02X})",
+                ft,
+                FRAME_RSP_ADVERT,
+            ),
+        }
     }
 
     /// Enumerate the device's configured contacts.

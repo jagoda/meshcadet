@@ -50,10 +50,19 @@ enum Cmd {
     /// Query device provisioning status and identity.
     Status,
 
-    /// Read device identity and print a scannable MeshCore contact QR code.
+    /// Read device identity and print a scannable MeshCore contact QR code,
+    /// plus the device's signed self-advert "card".
     ///
-    /// The QR encodes a `meshcore://contact/add?...` URI that a real MeshCore
-    /// companion app accepts to add this node as a chat contact.
+    /// Prints TWO contact formats, sourced differently and meant for
+    /// different consumers:
+    /// - Format A: `meshcore://contact/add?name=...&public_key=...&type=1` +
+    ///   its QR code. This is what the official MeshCore companion app
+    ///   scans; built locally from the identity readout.
+    /// - Format B: `meshcore://<hex-encoded card>`, the device's own signed
+    ///   self-advert ("biz card") fetched fresh over serial (`FRAME_QUERY_ADVERT`
+    ///   / `FRAME_RSP_ADVERT`) — this device is the only source, since the
+    ///   signature requires its Ed25519 private key, which never leaves it.
+    ///   This is the format `meshcore-cli import-contact` expects.
     Identity {
         /// Display name to embed in the contact URI for THIS invocation only
         /// (does not persist). Defaults to the device's persisted name (see
@@ -67,6 +76,13 @@ enum Cmd {
         /// name.
         #[arg(long = "set-name")]
         set_name: Option<String>,
+
+        /// Print ONLY Format B's bare `meshcore://<hex>` card URI to stdout —
+        /// no label, no Format A, no QR, no trailing commentary — so it can
+        /// be piped directly, e.g.
+        /// `meshcore-cli import-contact "$(meshcadet ... identity --raw)"`.
+        #[arg(long, action = ArgAction::SetTrue)]
+        raw: bool,
     },
 
     /// List the device's configured contacts (name + pubkey + telemetry flag).
@@ -218,12 +234,18 @@ fn main() -> anyhow::Result<()> {
             println!("battery held raw : {}", format_battery_held_raw_mv(&s));
         }
 
-        Cmd::Identity { name, set_name } => {
+        Cmd::Identity {
+            name,
+            set_name,
+            raw,
+        } => {
             // SET (optional): persist a new device display name to the
             // identity store before reading it back. Additive to the
             // pre-existing read-only behavior below — with `set_name` absent
             // (the common case), nothing here runs and the read/QR output is
-            // unchanged from before this command existed.
+            // unchanged from before this command existed. In `--raw` mode
+            // the confirmation is routed to stderr rather than stdout, so a
+            // `--raw --set-name` invocation still pipes cleanly.
             if let Some(new_name) = &set_name {
                 if new_name.len() > protocol::provisioning::MAX_NAME_LEN {
                     anyhow::bail!(
@@ -233,26 +255,34 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
                 session.set_device_name(new_name.as_bytes())?;
-                if new_name.is_empty() {
-                    println!("device name cleared");
+                let msg = if new_name.is_empty() {
+                    "device name cleared".to_string()
                 } else {
-                    println!("device name set: \"{}\"", new_name);
+                    format!("device name set: \"{}\"", new_name)
+                };
+                if raw {
+                    eprintln!("{}", msg);
+                } else {
+                    println!("{}", msg);
                 }
             }
 
             let s = session.query_status()?;
             let pubkey_hex = hex::encode(s.pubkey);
-            println!("pubkey   : {}", pubkey_hex);
-            println!(
-                "pub_hash : 0x{:02X}  (routing hash = pubkey[0])",
-                s.pubkey[0]
-            );
-            println!(
-                "name     : {}",
-                session.last_device_name().unwrap_or("(unnamed)")
-            );
+            if !raw {
+                println!("pubkey   : {}", pubkey_hex);
+                println!(
+                    "pub_hash : 0x{:02X}  (routing hash = pubkey[0])",
+                    s.pubkey[0]
+                );
+                println!(
+                    "name     : {}",
+                    session.last_device_name().unwrap_or("(unnamed)")
+                );
+            }
 
-            // Build the MeshCore companion contact-add URI.
+            // Format A: the MeshCore companion contact-add URI, built locally
+            // from the identity readout above.
             // Format (meshcore-dev/MeshCore docs/faq.md §7.5, companion-v1.16.0):
             //   meshcore://contact/add?name=<name>&public_key=<hex>&type=<type>
             //   type: chat=1, repeater=2, room=3, sensor=4 — MeshCadet is a chat node.
@@ -264,29 +294,76 @@ fn main() -> anyhow::Result<()> {
             let node_name = name
                 .or_else(|| session.last_device_name().map(str::to_string))
                 .unwrap_or_else(|| format!("MeshCadet-{:02X}", s.pubkey[0]));
-            let uri = format!(
-                "meshcore://contact/add?name={}&public_key={}&type=1",
-                url_encode(&node_name),
-                pubkey_hex,
-            );
-            println!("\nMeshCore contact URI (chat node):\n{}\n", uri);
+            let uri = build_contact_add_uri(&node_name, &pubkey_hex);
 
-            // Render the URI as a terminal QR code.  Dense1x2 packs two QR rows
-            // per text line (Unicode half-blocks) so the code stays compact and
-            // square in a normal terminal; the quiet zone is required for
-            // reliable scanning.
-            match qrcode::QrCode::new(uri.as_bytes()) {
-                Ok(code) => {
-                    let rendered = code
-                        .render::<qrcode::render::unicode::Dense1x2>()
-                        .quiet_zone(true)
-                        .build();
-                    println!("{}", rendered);
-                    println!("Scan with a MeshCore companion app to add this node as a contact.");
+            if !raw {
+                println!("\nMeshCore contact URI (chat node):\n{}\n", uri);
+
+                // Render the URI as a terminal QR code.  Dense1x2 packs two QR rows
+                // per text line (Unicode half-blocks) so the code stays compact and
+                // square in a normal terminal; the quiet zone is required for
+                // reliable scanning.
+                match qrcode::QrCode::new(uri.as_bytes()) {
+                    Ok(code) => {
+                        let rendered = code
+                            .render::<qrcode::render::unicode::Dense1x2>()
+                            .quiet_zone(true)
+                            .build();
+                        println!("{}", rendered);
+                        println!(
+                            "Scan with a MeshCore companion app to add this node as a contact."
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "warning: could not render QR code ({}); use the URI above.",
+                            e
+                        );
+                    }
                 }
+            }
+
+            // Format B: the device's own signed self-advert "card", fetched
+            // fresh over serial — the host cannot synthesize this (the
+            // signature needs the device's Ed25519 private key, which never
+            // leaves it). This is the format `meshcore-cli import-contact`
+            // expects.
+            //
+            // In `--raw` mode this is the command's ENTIRE job, so a failure
+            // here (e.g. older firmware that predates `FRAME_QUERY_ADVERT`)
+            // propagates and the command exits non-zero — there is nothing
+            // sensible to print instead. In normal mode Format A above has
+            // already fully succeeded and been printed; treat a Format B
+            // fetch failure as non-fatal (mirrors the QR-render-failure
+            // fallback above) so `identity` degrades to "Format A only"
+            // rather than losing output the user already had before this
+            // command grew a second, independent device round-trip.
+            match session.query_advert() {
+                Ok(card) => {
+                    let mut uri_buf = [0u8; protocol::MAX_CARD_URI_LEN];
+                    let n = protocol::card_to_uri(&card, &mut uri_buf);
+                    let card_uri = std::str::from_utf8(&uri_buf[..n]).expect(
+                        "card_to_uri always emits ASCII (meshcore:// scheme + lowercase hex)",
+                    );
+                    if raw {
+                        // Bare URI only — no label, no trailing prose — so
+                        // this is safe to capture verbatim, e.g.
+                        // `meshcore-cli import-contact "$(meshcadet ... identity --raw)"`.
+                        println!("{}", card_uri);
+                    } else {
+                        println!(
+                            "Card URI (paste verbatim into `meshcore-cli import-contact <URI>`):\n{}",
+                            card_uri
+                        );
+                    }
+                }
+                Err(e) if raw => return Err(e),
                 Err(e) => {
                     eprintln!(
-                        "warning: could not render QR code ({}); use the URI above.",
+                        "warning: could not fetch the device's self-advert card ({}); \
+                         Format A above is still valid, but Format B is unavailable this run \
+                         (older firmware without FRAME_QUERY_ADVERT support, or a transient \
+                         serial error).",
                         e
                     );
                 }
@@ -500,6 +577,23 @@ fn hex_short(b: &[u8; 32]) -> String {
     format!("{}…", hex::encode(&b[..4]))
 }
 
+/// Build the MeshCore companion contact-add URI ("Format A") from a display
+/// name and a hex-encoded pubkey.
+///
+/// `meshcore://contact/add?name=<name>&public_key=<hex>&type=<type>`
+/// (meshcore-dev/MeshCore docs/faq.md §7.5, companion-v1.16.0). `type=1`
+/// (chat) is hardcoded — MeshCadet is always a chat node.
+///
+/// Extracted verbatim from the pre-existing inline `format!` call so its
+/// byte output is unchanged; see `identity_uri_format_is_byte_identical_to_pre_mission`.
+fn build_contact_add_uri(name: &str, pubkey_hex: &str) -> String {
+    format!(
+        "meshcore://contact/add?name={}&public_key={}&type=1",
+        url_encode(name),
+        pubkey_hex,
+    )
+}
+
 /// Percent-encode a string for use as a URI query-component value (RFC 3986).
 ///
 /// Leaves the "unreserved" set (`A-Z a-z 0-9 - _ . ~`) intact and percent-encodes
@@ -608,8 +702,8 @@ fn format_battery_held_raw_mv(s: &protocol::provisioning::RspStatusPayload) -> S
 mod tests {
     use super::url_encode;
     use super::{
-        format_battery, format_battery_held_raw_mv, format_battery_raw_mv, format_gps_clock,
-        format_gps_coords, format_gps_fix,
+        build_contact_add_uri, format_battery, format_battery_held_raw_mv, format_battery_raw_mv,
+        format_gps_clock, format_gps_coords, format_gps_fix,
     };
     use protocol::provisioning::RspStatusPayload;
 
@@ -792,5 +886,55 @@ mod tests {
         assert!(!uri.contains(' '), "URI must not contain raw spaces");
         // Must encode as a QR code (byte mode); the companion app scans this.
         qrcode::QrCode::new(uri.as_bytes()).expect("identity URI must encode as a QR code");
+    }
+
+    /// Regression anchor: `build_contact_add_uri` ("Format A") must emit
+    /// byte-for-byte the same string the inline `format!` call produced
+    /// before this mission added Format B alongside it. Any future change to
+    /// this literal is a deliberate, reviewed edit — the official MeshCore
+    /// companion app depends on this exact query-string shape.
+    #[test]
+    fn identity_uri_format_is_byte_identical_to_pre_mission() {
+        let pubkey_hex = hex::encode([0xABu8; 32]);
+        let uri = build_contact_add_uri("Mom & Dad's T-Deck", &pubkey_hex);
+        assert_eq!(
+            uri,
+            "meshcore://contact/add?name=Mom%20%26%20Dad%27s%20T-Deck&public_key=abababababababababababababababababababababababababababababababab&type=1"
+        );
+    }
+
+    /// Format B's bare card URI (as printed under `--raw`) must be exactly
+    /// the `meshcore://<hex>` string `protocol::card_to_uri` renders — no
+    /// leading/trailing whitespace, no label, nothing else — so a caller can
+    /// pipe it verbatim into `meshcore-cli import-contact`.
+    #[test]
+    fn card_uri_is_bare_meshcore_scheme_with_no_stray_whitespace() {
+        let card = [0x11u8, 0x22, 0x33, 0xAA, 0xBB];
+        let mut buf = [0u8; protocol::MAX_CARD_URI_LEN];
+        let n = protocol::card_to_uri(&card, &mut buf);
+        let uri = std::str::from_utf8(&buf[..n]).unwrap();
+
+        assert_eq!(uri, "meshcore://112233aabb");
+        assert_eq!(uri.trim(), uri, "must carry no leading/trailing whitespace");
+        assert!(!uri.contains('\n'), "must be a single line");
+    }
+
+    /// Format A and Format B must be unambiguously distinguishable to a user
+    /// who is copy-pasting: Format A always carries the `contact/add?`
+    /// path + query string; Format B is the bare `meshcore://<hex>` scheme
+    /// with nothing else after the `//`.
+    #[test]
+    fn format_a_and_format_b_uris_are_distinguishable() {
+        let pubkey_hex = hex::encode([0xCDu8; 32]);
+        let format_a = build_contact_add_uri("Cadet", &pubkey_hex);
+
+        let card = [0xCDu8; 4];
+        let mut buf = [0u8; protocol::MAX_CARD_URI_LEN];
+        let n = protocol::card_to_uri(&card, &mut buf);
+        let format_b = std::str::from_utf8(&buf[..n]).unwrap();
+
+        assert!(format_a.contains("contact/add?"));
+        assert!(!format_b.contains("contact/add?"));
+        assert_ne!(format_a, format_b);
     }
 }
