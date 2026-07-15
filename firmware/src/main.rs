@@ -922,7 +922,13 @@ fn run() -> anyhow::Result<()> {
     );
 
     // Per-boot random base for outbound message timestamps (anti-replay).
-    let tx_epoch_base: u32 = unsafe { esp_idf_svc::sys::esp_random() };
+    // MUTABLE: the dispatcher loop below rebases this to the real GPS-synced
+    // wall clock the moment (and every tick after) `gps` first syncs — see
+    // the "tx timestamp base" rebase right after `gps.poll` for why this
+    // alone is sufficient to make every `tx_epoch_base.wrapping_add((now_ms
+    // / 1000) as u32)` call site below (DM/GRP_TXT/telemetry-reply
+    // timestamps) read real time post-sync with no other code change.
+    let mut tx_epoch_base: u32 = unsafe { esp_idf_svc::sys::esp_random() };
     log::info!("tx timestamp base seeded (per-boot anti-replay)");
 
     // 5b. Initialise SX1262 radio (pins per LilyGo utilities.h).
@@ -1234,6 +1240,25 @@ fn run() -> anyhow::Result<()> {
 
         // ── GPS poll (duty-cycle NMEA read + fix cache refresh) ──────────────
         gps.poll(now);
+
+        // ── Rebase the tx timestamp origin onto GPS-synced wall-clock time ───
+        // Runs unconditionally (both `hil` and production — `gps` and its
+        // clock-sync tracking exist in both) every iteration, not just once
+        // on the sync transition: rebasing every tick self-corrects for any
+        // GPS-vs-uptime-clock drift the same way a fresh `settimeofday` call
+        // would, and is a cheap no-op (`synced_wall_clock_secs` returns
+        // `None`, `tx_epoch_base` untouched) before the first fix ever syncs.
+        // The `wrapping_sub` is the exact inverse of every call site below's
+        // `tx_epoch_base.wrapping_add((now_ms / 1000) as u32)`, so from this
+        // point on that SAME formula evaluates to real Unix time — no other
+        // call site needs to change. Pre-sync, `tx_epoch_base` stays the
+        // original per-boot `esp_random()` value: fine for DM/GRP_TXT
+        // anti-replay (only ever compared against itself — see
+        // `firmware/src/advert_ts_store.rs`'s doc), just not a real clock
+        // reading yet.
+        if let Some(unix_secs) = gps.synced_wall_clock_secs(now) {
+            tx_epoch_base = unix_secs.wrapping_sub((now / 1000) as u32);
+        }
 
         // ── Battery poll (throttled ADC read + charging-trend refresh) ───────
         battery.poll(now);

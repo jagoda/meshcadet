@@ -9,17 +9,24 @@
 //!
 //! # Anti-replay timestamp policy
 //!
-//! MeshCadet has no RTC: `tx_epoch_base` (`firmware/src/main.rs`) is seeded
-//! from `esp_random()` once per boot and is fine for the existing DM/channel
-//! traffic (only ever compared against itself, never persisted), but it is
-//! useless for an advert's `timestamp` field — MeshCore's own replay guard
-//! drops a re-imported advert when `timestamp <= from->last_advert_timestamp`
-//! already on file for that contact (`BaseChatMesh.cpp:124`). A fresh random
-//! value on every boot would make a re-share (e.g. after a device rename)
-//! silently fail to update the receiving peer's contact. [`next_advert_timestamp`]
+//! MeshCadet has no RTC: `tx_epoch_base` (`firmware/src/main.rs`) starts each
+//! boot seeded from `esp_random()` and is later rebased onto real GPS
+//! wall-clock time once the system clock GPS-syncs — fine either way for the
+//! existing DM/channel traffic (only ever compared against itself, never
+//! persisted), but useless as-is for an advert's `timestamp` field, because
+//! it is never itself persisted across a reboot: even the GPS-synced case
+//! carries no memory of the highest timestamp this device has EVER issued a
+//! card with. MeshCore's own replay guard drops a re-imported advert when
+//! `timestamp <= from->last_advert_timestamp` already on file for that
+//! contact (`BaseChatMesh.cpp:124`). A value that can regress across a
+//! reboot (a random reseed, or a device power-on before GPS has re-synced)
+//! would make a re-share (e.g. after a device rename) silently fail to
+//! update the receiving peer's contact. [`next_advert_timestamp`]
 //! is the fix: `max(host_ts, nvs_last + 1)`, strictly increasing as long as
 //! the caller persists the result before generating the next card (including
-//! across a reboot).
+//! across a reboot) — independent of `tx_epoch_base`/GPS sync entirely,
+//! since advert generation is a USB-only, host-driven path with its own
+//! (typically more available, network-synced) time source (`host_ts`).
 //!
 //! # Name fallback
 //!

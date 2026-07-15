@@ -47,12 +47,31 @@ pub fn format_coords(has_fix: bool, lat_e7: i32, lon_e7: i32, fix_age_secs: u32)
     format!("{:.6}, {:.6} (age {}s)", lat_deg, lon_deg, fix_age_secs)
 }
 
-/// Format the time-sync row: `"Synced (age <n>s)"` or `"Not synced"`.
-pub fn format_time_sync(clock_synced: bool, clock_sync_age_secs: u32) -> String {
-    if clock_synced {
-        format!("Synced (age {}s)", clock_sync_age_secs)
-    } else {
-        "Not synced".to_string()
+/// Format the time-sync row: the actual GPS-synced wall-clock date+time plus
+/// how long ago the sync happened — `"2026-07-15 14:32:10 UTC (synced 5s
+/// ago)"` — or `"Not synced"` when the system clock has never been set from
+/// a GPS fix since boot (this device has no battery-backed RTC; see
+/// `firmware::gps`'s module doc).
+///
+/// `clock_unix_secs` is the CURRENT synced wall-clock time (ticks forward
+/// every call as long as sync holds — see
+/// [`crate::gps::synced_wall_clock_secs`]), not the time sync last occurred;
+/// `clock_sync_age_secs` is how many seconds ago that sync happened. Passing
+/// `None` for `clock_unix_secs` always renders "Not synced", regardless of
+/// `clock_sync_age_secs` — the two must agree (both `None`/`0` or both
+/// populated), which is exactly what `GpsStatus`'s single `clock_synced`
+/// flag already guarantees for both fields.
+pub fn format_time_sync(clock_unix_secs: Option<u32>, clock_sync_age_secs: u32) -> String {
+    match clock_unix_secs {
+        Some(unix_secs) => {
+            let (year, month, day, hour, minute, second) =
+                crate::gps::civil_from_unix(unix_secs as i64);
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC (synced {}s ago)",
+                year, month, day, hour, minute, second, clock_sync_age_secs
+            )
+        }
+        None => "Not synced".to_string(),
     }
 }
 
@@ -118,11 +137,17 @@ mod tests {
 
     #[test]
     fn time_sync_not_synced() {
-        assert_eq!(format_time_sync(false, 0), "Not synced");
+        assert_eq!(format_time_sync(None, 0), "Not synced");
     }
 
     #[test]
-    fn time_sync_synced_shows_age() {
-        assert_eq!(format_time_sync(true, 300), "Synced (age 300s)");
+    fn time_sync_synced_shows_wall_clock_and_age() {
+        // 2026-07-15T14:32:10Z (known-answer instant shared with
+        // `crate::gps::civil_from_unix_time_of_day_decodes`).
+        let unix_secs = crate::gps::unix_timestamp(2026, 7, 15, 14, 32, 10) as u32;
+        assert_eq!(
+            format_time_sync(Some(unix_secs), 300),
+            "2026-07-15 14:32:10 UTC (synced 300s ago)"
+        );
     }
 }
