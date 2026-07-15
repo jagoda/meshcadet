@@ -1731,6 +1731,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "ed25519-dalek",
  "hex",
  "protocol",
  "qrcode",

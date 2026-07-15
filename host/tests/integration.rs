@@ -28,10 +28,11 @@ use protocol::provisioning::{
     encode_rsp_channel, encode_rsp_contact, encode_rsp_error, encode_rsp_identity,
     encode_rsp_status, RspStatusPayload, FRAME_ADD_CHANNEL, FRAME_ADD_CONTACT, FRAME_CLEAR_HISTORY,
     FRAME_COMMIT_PROVISIONING, FRAME_DEL_CHANNEL, FRAME_DEL_CONTACT, FRAME_EXPORT_HISTORY,
-    FRAME_QUERY_CHANNELS, FRAME_QUERY_CONTACTS, FRAME_QUERY_STATUS, FRAME_RSP_CHANNEL,
-    FRAME_RSP_CHANNELS_DONE, FRAME_RSP_CONTACT, FRAME_RSP_CONTACTS_DONE, FRAME_RSP_ERROR,
-    FRAME_RSP_HISTORY_DONE, FRAME_RSP_HISTORY_ENTRY, FRAME_RSP_IDENTITY, FRAME_RSP_OK,
-    FRAME_RSP_STATUS, FRAME_SET_DEVICE_NAME, FRAME_SET_NOTIF_DEFAULTS, FRAME_SET_PIN,
+    FRAME_QUERY_ADVERT, FRAME_QUERY_CHANNELS, FRAME_QUERY_CONTACTS, FRAME_QUERY_STATUS,
+    FRAME_RSP_ADVERT, FRAME_RSP_CHANNEL, FRAME_RSP_CHANNELS_DONE, FRAME_RSP_CONTACT,
+    FRAME_RSP_CONTACTS_DONE, FRAME_RSP_ERROR, FRAME_RSP_HISTORY_DONE, FRAME_RSP_HISTORY_ENTRY,
+    FRAME_RSP_IDENTITY, FRAME_RSP_OK, FRAME_RSP_STATUS, FRAME_SET_DEVICE_NAME,
+    FRAME_SET_NOTIF_DEFAULTS, FRAME_SET_PIN,
 };
 
 // Pull in the host crate's public types.
@@ -89,6 +90,13 @@ struct MockDevice {
     /// across reboots" in these host-side tests (see `docs/adr` HIL note:
     /// real reboot persistence is verified on hardware).
     device_name: Vec<u8>,
+    /// Ed25519 identity used to sign `FRAME_RSP_ADVERT` cards, derived from
+    /// `pubkey` as an Ed25519 seed. Deliberately independent of the `pubkey`
+    /// field's role elsewhere (it is asserted verbatim as the *raw* device
+    /// identity bytes in `RSP_STATUS`/`RSP_IDENTITY` by unrelated tests) —
+    /// only the advert tests care that this identity's own `.pubkey` is the
+    /// one embedded and signed in the card.
+    advert_identity: protocol::Identity,
 }
 
 impl MockDevice {
@@ -105,6 +113,7 @@ impl MockDevice {
             last_channel_name: None,
             mock_history: Vec::new(),
             device_name: Vec::new(),
+            advert_identity: protocol::Identity::from_seed(pubkey),
         }
     }
 
@@ -152,6 +161,27 @@ impl MockDevice {
                 let in_ = encode_frame(FRAME_RSP_IDENTITY, &ibuf[..ilen], &mut iframebuf);
                 response.extend_from_slice(&iframebuf[..in_]);
                 response
+            }
+
+            FRAME_QUERY_ADVERT => {
+                let host_unix_time = protocol::provisioning::decode_query_advert(payload)
+                    .expect("QUERY_ADVERT payload must decode (4-byte host unix time)");
+
+                let name = if self.device_name.is_empty() {
+                    format!("MeshCadet-{:02X}", self.advert_identity.pubkey[0])
+                } else {
+                    String::from_utf8_lossy(&self.device_name).into_owned()
+                };
+                let mut card_buf = [0u8; protocol::MAX_ADVERT_CARD_LEN];
+                let card_len = protocol::build_self_advert_card(
+                    &self.advert_identity,
+                    host_unix_time,
+                    &name,
+                    &mut card_buf,
+                );
+                let mut fbuf = [0u8; protocol::MAX_ADVERT_CARD_LEN + 16];
+                let n = encode_frame(FRAME_RSP_ADVERT, &card_buf[..card_len], &mut fbuf);
+                fbuf[..n].to_vec()
             }
 
             FRAME_ADD_CONTACT => match decode_add_contact(payload) {
@@ -1805,6 +1835,194 @@ fn test_add_contact_retries_on_dropped_frame() {
         .expect("add_contact must succeed after 1 dropped frame via retry");
 }
 
+// ── Advert card (Format B) ───────────────────────────────────────────────────
+
+/// Acceptance: `Session::query_advert()` round-trips against the mock;
+/// returns a card whose signature verifies and whose header is `0x11`.
+#[test]
+fn test_query_advert_round_trips_and_verifies() {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    let seed = [0x77_u8; 32];
+    let mut session = make_session_v2(seed);
+    let identity = protocol::Identity::from_seed(seed);
+
+    let card = session
+        .query_advert()
+        .expect("query_advert must round-trip against the mock");
+
+    assert_eq!(card[0], 0x11, "header: VER0 | ADVERT<<2 | FLOOD");
+    assert_eq!(card[1], 0x00, "path_len: no hops on a freshly-built card");
+    assert_eq!(&card[2..34], &identity.pubkey, "pubkey field");
+
+    let signature_bytes: [u8; 64] = card[38..102].try_into().unwrap();
+    let appdata = &card[102..];
+
+    // Signed message = pubkey || timestamp_le || appdata (never header/path_len).
+    let mut msg = Vec::new();
+    msg.extend_from_slice(&identity.pubkey);
+    msg.extend_from_slice(&card[34..38]);
+    msg.extend_from_slice(appdata);
+
+    let verifying_key = VerifyingKey::from_bytes(&identity.pubkey).unwrap();
+    let signature = Signature::from_bytes(&signature_bytes);
+    assert!(
+        verifying_key.verify(&msg, &signature).is_ok(),
+        "card signature must verify against the device's own pubkey"
+    );
+}
+
+/// Acceptance: the `QUERY_ADVERT` payload carries the host's real unix time,
+/// not a placeholder — proven by decoding the timestamp the mock stamped
+/// into the returned card (bytes 34..38) and checking it lands within a
+/// generous window of `SystemTime::now()` at call time.
+#[test]
+fn test_query_advert_sends_real_host_unix_time() {
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32;
+
+    let mut session = make_session_v2([0x99_u8; 32]);
+    let card = session
+        .query_advert()
+        .expect("query_advert must round-trip against the mock");
+
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32;
+
+    let stamped = u32::from_le_bytes(card[34..38].try_into().unwrap());
+    assert!(
+        (before..=after).contains(&stamped),
+        "stamped timestamp {stamped} must fall within [{before}, {after}] \
+         (the host's real clock at call time), not a placeholder value"
+    );
+}
+
+/// Acceptance: the card's embedded name falls back to the same
+/// `MeshCadet-<hash>` label the CLI's Format A URI uses when no device name
+/// is persisted — consistent with `build_self_advert_card`'s hard
+/// requirement that the name never be empty (peers drop nameless adverts).
+#[test]
+fn test_query_advert_uses_pub_hash_label_when_unnamed() {
+    let seed = [0x42_u8; 32];
+    let mut session = make_session_v2(seed);
+    let identity = protocol::Identity::from_seed(seed);
+
+    let card = session.query_advert().expect("query_advert must succeed");
+    let appdata = &card[102..];
+    let name = std::str::from_utf8(&appdata[1..]).unwrap();
+    assert_eq!(name, format!("MeshCadet-{:02X}", identity.pubkey[0]));
+}
+
+/// Acceptance: `query_advert()` after a persisted device name embeds that
+/// name in the card, mirroring `RSP_IDENTITY`'s existing name handling.
+#[test]
+fn test_query_advert_uses_persisted_device_name() {
+    let seed = [0x51_u8; 32];
+    let mut session = make_session_v2(seed);
+    session
+        .set_device_name(b"Field Node")
+        .expect("set_device_name should succeed");
+
+    let card = session.query_advert().expect("query_advert must succeed");
+    let appdata = &card[102..];
+    let name = std::str::from_utf8(&appdata[1..]).unwrap();
+    assert_eq!(name, "Field Node");
+}
+
+/// Regression: `Session::query_advert()` must not perturb the
+/// stray-leading-`RSP_STATUS`/`RSP_IDENTITY` resync handshake that
+/// `test_export_history_tolerates_stray_leading_status_and_identity_frames`
+/// guards — introducing `FRAME_QUERY_ADVERT`/`FRAME_RSP_ADVERT` must not
+/// change how any *other* command's frame-type matching behaves. Runs
+/// `query_status()` then `query_advert()` then `list_contacts()` back to
+/// back against a single mock/session (mirrors a real CLI session issuing
+/// unrelated commands in sequence) to prove the new command composes
+/// cleanly with the existing ones.
+#[test]
+fn test_query_advert_does_not_desync_subsequent_commands() {
+    let mut session = make_session_v2([0x88_u8; 32]);
+
+    session.query_status().expect("query_status must succeed");
+    session.query_advert().expect("query_advert must succeed");
+    let contacts = session
+        .list_contacts()
+        .expect("list_contacts after query_advert must not desync");
+    assert!(contacts.is_empty());
+
+    // And the reverse order.
+    session
+        .query_advert()
+        .expect("query_advert after list_contacts must not desync");
+}
+
+/// Regression: a structurally-too-short `RSP_ADVERT` payload (shorter than
+/// the 102-byte fixed prefix every genuine card carries: header + path_len +
+/// pubkey + timestamp + signature) must be rejected with an actionable
+/// error, not silently handed to the CLI as a garbage `meshcore://<hex>` URI.
+#[test]
+fn test_query_advert_rejects_truncated_card_payload() {
+    let short_payload = [0x11u8; 50]; // well under the 102-byte minimum
+    let mut fbuf = [0u8; 128];
+    let n = encode_frame(FRAME_RSP_ADVERT, &short_payload, &mut fbuf);
+    let transport = PreloadTransport::with_data(fbuf[..n].to_vec());
+    let mut session = Session::with_timeout(transport, 1);
+
+    let err = session
+        .query_advert()
+        .expect_err("a truncated RSP_ADVERT payload must be rejected, not accepted");
+    assert!(
+        err.to_string().contains("too short"),
+        "error must explain the payload was too short: {err}"
+    );
+}
+
+/// Acceptance: a device-side `RSP_ERROR` in answer to `QUERY_ADVERT` (e.g.
+/// the device declines to build a card) must surface as a descriptive
+/// `Err`, not be silently treated as a malformed/empty card.
+#[test]
+fn test_query_advert_device_error_surfaces_to_caller() {
+    let mut pbuf = [0u8; 80];
+    let plen = encode_rsp_error(9, b"advert build failed", &mut pbuf);
+    let mut fbuf = [0u8; 128];
+    let n = encode_frame(FRAME_RSP_ERROR, &pbuf[..plen], &mut fbuf);
+    let transport = PreloadTransport::with_data(fbuf[..n].to_vec());
+    let mut session = Session::with_timeout(transport, 1);
+
+    let err = session
+        .query_advert()
+        .expect_err("a device RSP_ERROR must surface as an Err, not a bogus card");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("advert build failed") && msg.contains('9'),
+        "error must carry the device's error code and message: {msg}"
+    );
+}
+
+/// Regression: an `RSP_ADVERT` payload with the wrong header byte (not
+/// `0x11` = `VER0 | ADVERT<<2 | FLOOD`) must be rejected — it cannot be a
+/// genuine self-advert card even if it happens to be long enough.
+#[test]
+fn test_query_advert_rejects_wrong_header_byte() {
+    let mut bad_payload = [0u8; 110];
+    bad_payload[0] = 0x99; // wrong header byte
+    let mut fbuf = [0u8; 128];
+    let n = encode_frame(FRAME_RSP_ADVERT, &bad_payload, &mut fbuf);
+    let transport = PreloadTransport::with_data(fbuf[..n].to_vec());
+    let mut session = Session::with_timeout(transport, 1);
+
+    let err = session
+        .query_advert()
+        .expect_err("an RSP_ADVERT payload with the wrong header byte must be rejected");
+    assert!(
+        err.to_string().contains("header byte"),
+        "error must explain the header byte was wrong: {err}"
+    );
+}
+
 // ── CLI surface ────────────────────────────────────────────────────────────────
 
 /// Acceptance: `meshcadet --help` must list `clear-history` as a subcommand —
@@ -1837,5 +2055,25 @@ fn test_cli_clear_history_subcommand_help() {
     assert!(
         output.status.success(),
         "clear-history --help must exit successfully"
+    );
+}
+
+/// Acceptance: `meshcadet identity --help` must list the `--raw` flag — the
+/// host CLI's contract for exposing Format B's machine-readable/piping form.
+#[test]
+fn test_cli_identity_help_lists_raw_flag() {
+    let exe = env!("CARGO_BIN_EXE_meshcadet");
+    let output = std::process::Command::new(exe)
+        .args(["--port", "/dev/null", "identity", "--help"])
+        .output()
+        .expect("meshcadet identity --help must run");
+    assert!(
+        output.status.success(),
+        "identity --help must exit successfully"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--raw"),
+        "identity --help output must list the --raw flag:\n{stdout}"
     );
 }

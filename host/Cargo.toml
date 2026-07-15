@@ -26,3 +26,8 @@ qrcode = { version = "0.14", default-features = false }
 # Local-time rendering for export-history timestamps (std alone can't resolve
 # the local timezone offset).
 chrono = "0.4"
+
+[dev-dependencies]
+# Signature verification for the advert-card integration tests (mirrors
+# `protocol`'s own use of this crate for its golden-vector/round-trip tests).
+ed25519-dalek = { version = "2", default-features = false, features = ["rand_core"] }
