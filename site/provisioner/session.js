@@ -96,6 +96,35 @@ const FRAME_TIMEOUT_MS = 5_000;
 const MAX_VALID_FRAME_PAYLOAD_LEN = Math.max(MAX_RSP_HISTORY_ENTRY_PAYLOAD, MAX_ADVERT_CARD_LEN);
 
 /**
+ * Every provisioning response frame type this protocol defines. Used by
+ * `#recvUntilExpected` (and `exportHistory`'s own stream loop) to tell a
+ * genuine-but-late reply to an EARLIER command (any OTHER type from this
+ * set) apart from truly unrecognized/corrupted wire garbage — see
+ * `#recvUntilExpected`'s doc comment for why that distinction matters.
+ */
+const ALL_RSP_FRAME_TYPES = new Set([
+  FRAME_RSP_OK,
+  FRAME_RSP_ERROR,
+  FRAME_RSP_STATUS,
+  FRAME_RSP_IDENTITY,
+  FRAME_RSP_HISTORY_ENTRY,
+  FRAME_RSP_HISTORY_DONE,
+  FRAME_RSP_CONTACT,
+  FRAME_RSP_CONTACTS_DONE,
+  FRAME_RSP_CHANNEL,
+  FRAME_RSP_CHANNELS_DONE,
+  FRAME_RSP_ADVERT,
+]);
+
+/**
+ * Bound on stray leftover-frame tolerance, shared by every read path that
+ * tolerates them (`#recvUntilExpected`, `exportHistory`) — a genuinely
+ * stuck device or corrupted stream must still surface as an error rather
+ * than spin silently.
+ */
+const MAX_STRAY_FRAMES = 64;
+
+/**
  * Thrown when the device answers a command with `RSP_ERROR`.
  * Mirrors the `anyhow::bail!("device error {}: {}", ...)` sites in
  * `host/src/session.rs`.
@@ -228,7 +257,12 @@ export class ProvisionerSession {
    */
   async queryStatus() {
     return this.#exclusive(async () => {
-      const first = await this.#sendRecvWithRetry(FRAME_QUERY_STATUS, new Uint8Array(0));
+      const first = await this.#sendRecvWithRetry(
+        FRAME_QUERY_STATUS,
+        new Uint8Array(0),
+        (ft) => ft === FRAME_RSP_STATUS,
+        "QUERY_STATUS's RSP_STATUS"
+      );
       let status;
       if (first.frameType === FRAME_RSP_STATUS) {
         status = decodeRspStatus(first.payload);
@@ -272,7 +306,9 @@ export class ProvisionerSession {
       const hostUnixTime = Math.floor(Date.now() / 1000);
       const { frameType, payload } = await this.#sendRecvWithRetry(
         FRAME_QUERY_ADVERT,
-        encodeQueryAdvert(hostUnixTime)
+        encodeQueryAdvert(hostUnixTime),
+        (ft) => ft === FRAME_RSP_ADVERT,
+        "QUERY_ADVERT's RSP_ADVERT"
       );
       if (frameType === FRAME_RSP_ADVERT) {
         return decodeRspAdvert(payload);
@@ -451,7 +487,6 @@ export class ProvisionerSession {
 
     const entries = [];
     let strayFrames = 0;
-    const MAX_STRAY_FRAMES = 64;
 
     while (true) {
       if (frameType === FRAME_RSP_HISTORY_ENTRY) {
@@ -464,18 +499,14 @@ export class ProvisionerSession {
         break;
       } else if (frameType === FRAME_RSP_ERROR) {
         throw deviceErrorFrom(payload);
-      } else if (
-        frameType === FRAME_RSP_STATUS ||
-        frameType === FRAME_RSP_IDENTITY ||
-        frameType === FRAME_RSP_OK ||
-        frameType === FRAME_RSP_CONTACT ||
-        frameType === FRAME_RSP_CONTACTS_DONE ||
-        frameType === FRAME_RSP_CHANNEL ||
-        frameType === FRAME_RSP_CHANNELS_DONE
-      ) {
+      } else if (ALL_RSP_FRAME_TYPES.has(frameType)) {
         // A leftover well-formed reply to an earlier command still draining
         // over USB — tolerate a bounded number rather than mistaking it for a
-        // corrupted stream (mirrors export_history's stray-frame handling).
+        // corrupted stream. Checked against the FULL recognized-response set
+        // (not a hand-maintained list) so a newly added frame type — like
+        // FRAME_RSP_ADVERT, added after this tolerance list was first
+        // written — is covered automatically instead of silently falling
+        // through to the hard-fail branch below.
         strayFrames += 1;
         if (strayFrames > MAX_STRAY_FRAMES) {
           throw new Error(
@@ -525,7 +556,12 @@ export class ProvisionerSession {
    * unexpected response frame.
    */
   async #sendAndExpectOk(frameType, payload) {
-    const { frameType: ft, payload: rspPayload } = await this.#sendRecvWithRetry(frameType, payload);
+    const { frameType: ft, payload: rspPayload } = await this.#sendRecvWithRetry(
+      frameType,
+      payload,
+      (t) => t === FRAME_RSP_OK,
+      "RSP_OK"
+    );
     if (ft === FRAME_RSP_OK) {
       return;
     }
@@ -543,7 +579,12 @@ export class ProvisionerSession {
    * (`host/src/session.rs`).
    */
   async #streamUntilDone(queryFrameType, entryFrameType, doneFrameType, decodeEntry, label) {
-    let { frameType, payload } = await this.#sendRecvWithRetry(queryFrameType, new Uint8Array(0));
+    let { frameType, payload } = await this.#sendRecvWithRetry(
+      queryFrameType,
+      new Uint8Array(0),
+      (ft) => ft === entryFrameType || ft === doneFrameType,
+      `${label} enumeration`
+    );
     const entries = [];
     while (true) {
       if (frameType === entryFrameType) {
@@ -587,14 +628,37 @@ export class ProvisionerSession {
    * across many commands, so it must discard that residue itself before
    * starting a new exchange, or the next command reads someone else's
    * response and misreports it as "unexpected frame".
+   *
+   * THIS GUARD ALONE IS NOT SUFFICIENT, and its gap is exactly what let the
+   * cross-command desync regress (`meshcadet-provisioner-advert-frame-
+   * desync-regression` mission): it only discards residue that has already
+   * fully arrived by the time THIS call starts. It does nothing about a
+   * stray reply that arrives *during* this call's own wait — which is
+   * precisely what happens when the command about to run (e.g.
+   * `queryAdvert`, whose device-side signing + NVS write takes noticeably
+   * longer than a plain status/contact/channel query) is slower than the
+   * leftover reply still in flight from an earlier command. Passing
+   * `isExpected`/`label` through to `#recvUntilExpected` below closes that
+   * remaining gap: a frame that doesn't match what THIS command asked for,
+   * but is still a recognized provisioning response type, is treated as
+   * that leftover and discarded so the real answer is not orphaned to
+   * become the *next* command's residue in turn (the one-command-behind
+   * cascade: QUERY_ADVERT reads a trailing RSP_STATUS, then QUERY_CONTACTS
+   * reads the RSP_ADVERT that QUERY_ADVERT never waited for, then
+   * QUERY_CHANNELS reads the first RSP_CONTACT that QUERY_CONTACTS never
+   * waited for).
+   *
+   * `isExpected`/`label` default to accepting whatever arrives (matching
+   * the old, non-tolerant behavior) for callers — `exportHistory` — that
+   * already implement their own bounded stray-frame tolerance downstream.
    */
-  async #sendRecvWithRetry(frameType, payload) {
+  async #sendRecvWithRetry(frameType, payload, isExpected = () => true, label = "response") {
     this.#accBuf = new Uint8Array(0);
     const overallDeadline = Date.now() + RETRY_TOTAL_MS;
     while (true) {
       await this.#sendFrame(frameType, payload);
       try {
-        return await this.#recvFrame(RETRY_ATTEMPT_MS);
+        return await this.#recvUntilExpected(RETRY_ATTEMPT_MS, isExpected, label);
       } catch (err) {
         if (Date.now() >= overallDeadline) {
           throw err;
@@ -605,6 +669,56 @@ export class ProvisionerSession {
         // loop → send again.
         this.#accBuf = new Uint8Array(0);
       }
+    }
+  }
+
+  /**
+   * Wait for a frame whose type satisfies `isExpected`, silently discarding
+   * any OTHER *recognized* provisioning response frame (`ALL_RSP_FRAME_TYPES`)
+   * along the way instead of returning it to the caller as a desync.
+   *
+   * WHY THIS EXISTS: `#exclusive` guarantees only one command is ever
+   * mid-exchange, so a frame that doesn't match what the CURRENT command
+   * asked for cannot legitimately belong to it — it can only be the
+   * genuine (correctly formed, just late) reply to an EARLIER command
+   * whose own read already gave up (timed out, or itself hit a stray frame
+   * and threw) before the device's real answer made it back over USB.
+   * Discarding those strays HERE — rather than only at the top of
+   * `#sendRecvWithRetry`, which catches just the residue that has already
+   * fully arrived before the next command starts — is what stops that
+   * residue from cascading onto whatever command runs after this one.
+   *
+   * An UNRECOGNIZED byte (not in `ALL_RSP_FRAME_TYPES`) is never tolerated:
+   * that is genuine corruption or a protocol mismatch, not residue, and
+   * must still surface immediately. `RSP_ERROR` is always accepted too, so
+   * callers keep handling device errors themselves. Bounded by
+   * `MAX_STRAY_FRAMES` so a truly stuck device or corrupted stream still
+   * surfaces as an error instead of spinning silently until timeout.
+   */
+  async #recvUntilExpected(timeoutMs, isExpected, label) {
+    const deadline = Date.now() + timeoutMs;
+    let strayFrames = 0;
+    while (true) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new Error(`timeout waiting for response frame (accumulated ${this.#accBuf.length} bytes)`);
+      }
+      const frame = await this.#recvFrame(remaining);
+      if (frame.frameType === FRAME_RSP_ERROR || isExpected(frame.frameType)) {
+        return frame;
+      }
+      if (ALL_RSP_FRAME_TYPES.has(frame.frameType)) {
+        strayFrames += 1;
+        if (strayFrames > MAX_STRAY_FRAMES) {
+          throw new Error(
+            `too many stray frames (last: 0x${hex2(frame.frameType)}) waiting for ${label}`
+          );
+        }
+        // Leftover reply to an earlier command, still draining — discard
+        // and keep waiting for the real answer.
+        continue;
+      }
+      throw new Error(`unexpected frame 0x${hex2(frame.frameType)} (waiting for ${label})`);
     }
   }
 
