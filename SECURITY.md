@@ -60,8 +60,9 @@ what this reporting channel is and is not:
   cryptography (Ed25519 identity, ECDH-derived shared secrets, AES-128 +
   HMAC-SHA256) plus MeshCadet's allowlist policy for protection. See
   [ADR-0001 §1](docs/adr/0001-charter.md) for the exact primitives, which are
-  fixed by the need for byte-exact interop with MeshCore v1.15 — this project
-  cannot unilaterally change them without breaking interop.
+  fixed by the need for byte-exact interop with MeshCore (v1.15, with the
+  v1.16 target adopted 2026-07-25 — see ADR-0001 §1) — this project cannot
+  unilaterally change them without breaking interop.
 - **Non-allowlisted traffic is silently dropped**, by design: DMs and
   telemetry requests from unknown senders get no ACK and no reply, so a
   scanning adversary cannot distinguish "device offline" from "you're not on
@@ -96,8 +97,9 @@ auditing this codebase:
   against timing side-channels) but does not rate-limit or lock out repeated
   incorrect attempts. Brute-forcing a short PIN via the on-screen keypad is
   slow but not formally prevented.
-- **Inherited protocol-level limitation: AES-128-ECB.** MeshCore v1.15 (which
-  MeshCadet ports byte-exact for interop) encrypts DM/channel payloads with
+- **Inherited protocol-level limitation: AES-128-ECB.** MeshCore (v1.15,
+  byte-exact-ported; v1.16, the current target, is unchanged here — see
+  ADR-0001 §1) encrypts DM/channel payloads with
   AES-128 in **ECB mode**, not a mode with a per-message nonce/IV (see
   [ADR-0001 §1](docs/adr/0001-charter.md), "Discrepancy on record"). ECB
   leaks whether two ciphertext blocks encode identical plaintext. This is a
