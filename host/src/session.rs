@@ -18,12 +18,15 @@ use protocol::provisioning::{
     decode_rsp_contact,
     decode_rsp_error,
     decode_rsp_identity,
+    decode_rsp_room,
     decode_rsp_status,
     // encode helpers
     encode_add_channel,
     encode_add_contact,
+    encode_add_room,
     encode_del_channel,
     encode_del_contact,
+    encode_del_room,
     encode_frame,
     encode_query_advert,
     encode_set_device_name,
@@ -32,18 +35,22 @@ use protocol::provisioning::{
     ProvError,
     RspChannelPayload,
     RspContactPayload,
+    RspRoomPayload,
     RspStatusPayload,
     // frame-type constants
     FRAME_ADD_CHANNEL,
     FRAME_ADD_CONTACT,
+    FRAME_ADD_ROOM,
     FRAME_CLEAR_HISTORY,
     FRAME_COMMIT_PROVISIONING,
     FRAME_DEL_CHANNEL,
     FRAME_DEL_CONTACT,
+    FRAME_DEL_ROOM,
     FRAME_EXPORT_HISTORY,
     FRAME_QUERY_ADVERT,
     FRAME_QUERY_CHANNELS,
     FRAME_QUERY_CONTACTS,
+    FRAME_QUERY_ROOMS,
     FRAME_QUERY_STATUS,
     FRAME_RSP_ADVERT,
     FRAME_RSP_CHANNEL,
@@ -55,6 +62,8 @@ use protocol::provisioning::{
     FRAME_RSP_HISTORY_ENTRY,
     FRAME_RSP_IDENTITY,
     FRAME_RSP_OK,
+    FRAME_RSP_ROOM,
+    FRAME_RSP_ROOMS_DONE,
     FRAME_RSP_STATUS,
     FRAME_SET_DEVICE_NAME,
     FRAME_SET_NOTIF_DEFAULTS,
@@ -524,6 +533,38 @@ impl<T: Transport> Session<T> {
         Ok(entries)
     }
 
+    /// Enumerate the device's configured room-server contacts.
+    ///
+    /// Sends `FRAME_QUERY_ROOMS`, then receives a stream of `FRAME_RSP_ROOM`
+    /// frames terminated by `FRAME_RSP_ROOMS_DONE`. Returns the entries in
+    /// device-index order. The guest password is never present in the
+    /// response (see `FRAME_RSP_ROOM`'s doc comment in
+    /// `protocol::provisioning`) — there is nothing for this method to leak.
+    pub fn list_rooms(&mut self) -> anyhow::Result<Vec<RspRoomPayload>> {
+        let (mut ft, mut payload) = self.send_recv_with_retry(FRAME_QUERY_ROOMS, &[])?;
+        let mut entries: Vec<RspRoomPayload> = Vec::new();
+        loop {
+            match ft {
+                FRAME_RSP_ROOM => {
+                    let r = decode_rsp_room(&payload)
+                        .map_err(|e| anyhow::anyhow!("decode RSP_ROOM: {:?}", e))?;
+                    entries.push(r);
+                }
+                FRAME_RSP_ROOMS_DONE => break,
+                FRAME_RSP_ERROR => {
+                    let e = decode_rsp_error(&payload)
+                        .map_err(|de| anyhow::anyhow!("decode RSP_ERROR: {:?}", de))?;
+                    let msg = std::str::from_utf8(&e.msg[..e.msg_len as usize])
+                        .unwrap_or("<invalid utf-8>");
+                    anyhow::bail!("device error {}: {}", e.error_code, msg)
+                }
+                other => anyhow::bail!("unexpected frame 0x{:02X} during room enumeration", other),
+            }
+            (ft, payload) = self.recv_frame()?;
+        }
+        Ok(entries)
+    }
+
     /// Add a contact.  `name` is a UTF-8 display name (empty = use pub_hash as label).
     pub fn add_contact(
         &mut self,
@@ -566,6 +607,30 @@ impl<T: Transport> Session<T> {
         let mut buf = [0u8; 32];
         let plen = encode_del_channel(secret, &mut buf);
         self.send_and_expect_ok(FRAME_DEL_CHANNEL, &buf[..plen])
+    }
+
+    /// Add (or replace) a room-server contact.
+    ///
+    /// `guest_password` crosses the USB link in the clear (ADR-0001 §4 — the
+    /// cable is the authentication); it is encoded straight into the frame
+    /// payload and never logged, echoed, or embedded in an error message by
+    /// this method or `send_and_expect_ok`.
+    pub fn add_room(
+        &mut self,
+        pubkey: &[u8; 32],
+        guest_password: &[u8],
+        name: &[u8],
+    ) -> anyhow::Result<()> {
+        let mut buf = [0u8; 96];
+        let plen = encode_add_room(pubkey, guest_password, name, &mut buf);
+        self.send_and_expect_ok(FRAME_ADD_ROOM, &buf[..plen])
+    }
+
+    /// Delete a room-server contact by its Ed25519 public key.
+    pub fn del_room(&mut self, pubkey: &[u8; 32]) -> anyhow::Result<()> {
+        let mut buf = [0u8; 32];
+        let plen = encode_del_room(pubkey, &mut buf);
+        self.send_and_expect_ok(FRAME_DEL_ROOM, &buf[..plen])
     }
 
     /// Set notification defaults.
