@@ -87,7 +87,7 @@ use protocol::{encode_rsp_history_entry, Identity, MAX_ADVERT_CARD_LEN, MAX_RSP_
 use crate::advert_ts_store;
 use crate::config_store::{
     Channel, ChannelListFull, ChannelUpsert, Contact, ContactListFull, ContactUpsert,
-    NotifDefaults, ProvisionedConfig,
+    NotifDefaults, ProvisionedConfig, ROLE_CHAT,
 };
 use crate::history_store::HistoryStore;
 
@@ -424,6 +424,7 @@ fn handle_frame(
                     let new_contact = Contact {
                         pubkey:           c.pubkey,
                         telemetry_enable: c.telemetry_enable,
+                        role:             ROLE_CHAT,
                         display_name:     c.display_name,
                         display_name_len: c.display_name_len,
                     };
