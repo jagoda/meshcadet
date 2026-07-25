@@ -12,6 +12,8 @@
 //! meshcadet --port /dev/ttyUSB0 identity --set-name "Alex's MeshCadet"
 //! meshcadet --port /dev/ttyUSB0 add-contact --pubkey <HEX64> --name "Alice" --telemetry
 //! meshcadet --port /dev/ttyUSB0 add-channel --secret <HEX64> --name "family" --primary
+//! meshcadet --port /dev/ttyUSB0 add-room --pubkey <HEX64> --name "Lobby" --password-stdin
+//! meshcadet --port /dev/ttyUSB0 list-rooms
 //! meshcadet --port /dev/ttyUSB0 set-notif-defaults --visual --audible
 //! meshcadet --port /dev/ttyUSB0 set-pin --pin 1234
 //! meshcadet --port /dev/ttyUSB0 commit
@@ -19,6 +21,10 @@
 //! meshcadet --port /dev/ttyUSB0 clear-history
 //! ```
 
+use std::io::Write;
+use std::path::PathBuf;
+
+use anyhow::Context;
 use clap::{ArgAction, Parser, Subcommand};
 use host::session::Session;
 use host::transport::SerialTransport;
@@ -137,6 +143,67 @@ enum Cmd {
         /// must match exactly what was passed to add-channel.
         #[arg(long)]
         secret: String,
+    },
+
+    /// List the device's configured room-server contacts (pubkey + name +
+    /// sync/permission state).
+    ///
+    /// A room is stored as a contact with `role = room` (see
+    /// `docs/adr/0002-provisioning-wire-format.md` §7); this listing is
+    /// scoped to rooms only, so it never has to be filtered client-side. It
+    /// never includes the guest password — the device does not echo it back.
+    ListRooms,
+
+    /// Add (or replace) a room-server contact: pubkey, display name, and a
+    /// guest password.
+    ///
+    /// The guest password crosses the USB link in the clear — correct and
+    /// intentional, the cable is the authentication (see ADR-0001 §4) — but
+    /// it must not leak anywhere else: not in shell history, not in `ps`,
+    /// not in `--help`, not in an echoed confirmation or error message.
+    /// Supply it via `--password-file`, `--password-env`, or
+    /// `--password-stdin` where practical; `--password` exists for
+    /// scriptability but is recorded in shell history (and briefly visible
+    /// in process listings on most OSes). Omit all four to be prompted.
+    AddRoom {
+        /// Room server Ed25519 public key — 64 hex characters (32 bytes).
+        #[arg(long)]
+        pubkey: String,
+
+        /// Display name shown on screen (optional; defaults to routing hash if absent).
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Guest password, given directly on the command line. Exposed in
+        /// shell history; prefer one of the other --password-* sources.
+        /// Mutually exclusive with them.
+        #[arg(long)]
+        password: Option<String>,
+
+        /// Read the guest password from a file (its trailing newline, if
+        /// any, is stripped). Mutually exclusive with the other
+        /// --password-* sources.
+        #[arg(long = "password-file", value_name = "PATH")]
+        password_file: Option<PathBuf>,
+
+        /// Read the guest password from the named environment variable.
+        /// Mutually exclusive with the other --password-* sources.
+        #[arg(long = "password-env", value_name = "VAR")]
+        password_env: Option<String>,
+
+        /// Read the guest password as one line from stdin (trailing newline
+        /// stripped) — e.g. `echo -n "$PW" | meshcadet ... add-room
+        /// --password-stdin ...`. Mutually exclusive with the other
+        /// --password-* sources.
+        #[arg(long = "password-stdin", action = ArgAction::SetTrue)]
+        password_stdin: bool,
+    },
+
+    /// Remove a room-server contact from the device.
+    DelRoom {
+        /// Room server Ed25519 public key — 64 hex characters (32 bytes).
+        #[arg(long)]
+        pubkey: String,
     },
 
     /// Set notification defaults (what happens on message receipt before the user changes them).
@@ -469,6 +536,97 @@ fn main() -> anyhow::Result<()> {
             println!("channel removed: {}", hex_short(&sec));
         }
 
+        Cmd::ListRooms => {
+            let rooms = session.list_rooms()?;
+            if rooms.is_empty() {
+                println!("no rooms configured");
+            } else {
+                println!("idx\tpubkey                                                           \tsync_since\tperms\tname");
+                for r in &rooms {
+                    let name = std::str::from_utf8(&r.name[..r.name_len as usize])
+                        .unwrap_or("<invalid utf-8>");
+                    println!(
+                        "{}\t{}\t{}\t0x{:02X}\t{}",
+                        r.index,
+                        hex::encode(r.pubkey),
+                        r.sync_since,
+                        r.permissions,
+                        name,
+                    );
+                }
+                println!("{} room(s)", rooms.len());
+            }
+        }
+
+        Cmd::AddRoom {
+            pubkey,
+            name,
+            password,
+            password_file,
+            password_env,
+            password_stdin,
+        } => {
+            let pk = parse_32bytes_hex(&pubkey, "pubkey")?;
+            let guest_password = resolve_guest_password(
+                password.as_deref(),
+                password_file.as_deref(),
+                password_env.as_deref(),
+                password_stdin,
+            )?;
+            // Warn (length only — never the value) if the device will
+            // silently truncate the password, rather than let a mismatch
+            // surface later as an inexplicable login failure.
+            if let Some(warning) = password_truncation_warning(guest_password.len()) {
+                eprintln!("{warning}");
+            }
+            let name_bytes = name.as_deref().unwrap_or("").as_bytes().to_vec();
+            session.add_room(&pk, guest_password.as_bytes(), &name_bytes)?;
+            println!(
+                "room added: {}{}",
+                hex_short(&pk),
+                name.as_deref()
+                    .map(|n| format!(", name=\"{}\"", n))
+                    .unwrap_or_default()
+            );
+            // Same boot-time gate as add-contact: the live allowlist is
+            // populated from the provisioned contact list at boot (see
+            // firmware-core's `config_store` module docs), and a room is a
+            // contact under the hood.
+            println!(
+                "  note: reboot the device to apply this to the live mesh (allowlist is loaded at boot)."
+            );
+
+            let display_name = name.unwrap_or_else(|| format!("Room-{:02X}", pk[0]));
+            let uri = build_room_add_uri(&display_name, &hex::encode(pk));
+            println!("\nMeshCore room URI:\n{}\n", uri);
+            match qrcode::QrCode::new(uri.as_bytes()) {
+                Ok(code) => {
+                    let rendered = code
+                        .render::<qrcode::render::unicode::Dense1x2>()
+                        .quiet_zone(true)
+                        .build();
+                    println!("{}", rendered);
+                    println!(
+                        "Scan with a MeshCore companion app to add this room as a contact. \
+                         The guest password is NOT encoded in this QR (see ADR-0002 §7) — \
+                         communicate it separately."
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "warning: could not render QR code ({}); use the URI above.",
+                        e
+                    );
+                }
+            }
+        }
+
+        Cmd::DelRoom { pubkey } => {
+            let pk = parse_32bytes_hex(&pubkey, "pubkey")?;
+            session.del_room(&pk)?;
+            println!("room removed: {}", hex_short(&pk));
+        }
+
         Cmd::SetNotifDefaults { visual, audible } => {
             session.set_notif_defaults(visual, audible)?;
             println!(
@@ -577,6 +735,82 @@ fn hex_short(b: &[u8; 32]) -> String {
     format!("{}…", hex::encode(&b[..4]))
 }
 
+/// Resolve `add-room`'s guest password from exactly one of its four
+/// mutually-exclusive sources, or prompt for it interactively if none were
+/// given.
+///
+/// Precedence is irrelevant by construction — at most one of `password`,
+/// `password_file`, `password_env`, `password_stdin` may be set; more than
+/// one is a user error, rejected up front. Never logs, echoes, or embeds the
+/// resolved password in an error message (a file-read or env-lookup error
+/// names the *path*/*variable*, never the secret).
+fn resolve_guest_password(
+    password: Option<&str>,
+    password_file: Option<&std::path::Path>,
+    password_env: Option<&str>,
+    password_stdin: bool,
+) -> anyhow::Result<String> {
+    let sources_given = password.is_some() as u8
+        + password_file.is_some() as u8
+        + password_env.is_some() as u8
+        + password_stdin as u8;
+    if sources_given > 1 {
+        anyhow::bail!(
+            "specify at most one of --password, --password-file, --password-env, --password-stdin"
+        );
+    }
+
+    if let Some(p) = password {
+        return Ok(p.to_string());
+    }
+    if let Some(path) = password_file {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading --password-file {}", path.display()))?;
+        return Ok(raw.trim_end_matches(['\r', '\n']).to_string());
+    }
+    if let Some(var) = password_env {
+        let raw = std::env::var(var)
+            .map_err(|_| anyhow::anyhow!("environment variable {var} is not set"))?;
+        return Ok(raw);
+    }
+    if password_stdin {
+        let mut raw = String::new();
+        std::io::stdin()
+            .read_line(&mut raw)
+            .context("reading guest password from stdin")?;
+        return Ok(raw.trim_end_matches(['\r', '\n']).to_string());
+    }
+
+    // No source given: prompt interactively on stderr (so `--raw`-style
+    // piping of stdout is never polluted). MeshCadet carries no
+    // hidden-input dependency today, so this echoes to the terminal like
+    // any other `read_line` prompt — still strictly better than
+    // `--password` landing in shell history.
+    eprint!("guest password (leave empty for none): ");
+    std::io::stderr().flush().ok();
+    let mut raw = String::new();
+    std::io::stdin()
+        .read_line(&mut raw)
+        .context("reading guest password from stdin prompt")?;
+    Ok(raw.trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// Build the "your guest password will be truncated" warning for `add-room`,
+/// or `None` if `password_len` fits under the device's limit. Reports only
+/// the byte counts — never the password itself — so the caller can print it
+/// straight to stderr without risking a leak.
+fn password_truncation_warning(password_len: usize) -> Option<String> {
+    let limit = protocol::provisioning::MAX_ROOM_PASSWORD_LEN;
+    if password_len > limit {
+        Some(format!(
+            "warning: guest password is {password_len} bytes; the device accepts at most \
+             {limit} and will truncate it."
+        ))
+    } else {
+        None
+    }
+}
+
 /// Build the MeshCore companion contact-add URI ("Format A") from a display
 /// name and a hex-encoded pubkey.
 ///
@@ -598,7 +832,6 @@ fn build_contact_add_uri(name: &str, pubkey_hex: &str) -> String {
 /// appears in a `meshcore://contact/add?...&type=<n>` URI's `type` field.
 /// (Chat's `type=1` stays a literal in [`build_contact_add_uri`] — see that
 /// function's regression-anchor comment.)
-#[allow(dead_code)]
 const URI_NODE_TYPE_ROOM: u8 = 3;
 
 /// Build the MeshCore companion room-add URI from a display name and a
@@ -626,12 +859,8 @@ const URI_NODE_TYPE_ROOM: u8 = 3;
 /// whatever later UI implements the actual room-login flow (out of scope
 /// here).
 ///
-/// No CLI verb wires this in yet — this mission lands the wire format and
-/// the storage contract only; a room-provisioning CLI command (and its
-/// `FRAME_ADD_ROOM` round trip) is a later child's job. Kept `#[allow(dead_code)]`
-/// as the primitive that command will call, same precedent as
-/// `config_store::clear_provisioned_flag`.
-#[allow(dead_code)]
+/// Called by `add-room` to print the room's contact-add URI/QR alongside the
+/// provisioning round trip; see [`Cmd::AddRoom`].
 fn build_room_add_uri(name: &str, pubkey_hex: &str) -> String {
     format!(
         "meshcore://contact/add?name={}&public_key={}&type={}",
@@ -824,7 +1053,7 @@ mod tests {
     use super::{
         build_contact_add_uri, build_room_add_uri, format_battery, format_battery_held_raw_mv,
         format_battery_raw_mv, format_gps_clock, format_gps_coords, format_gps_fix,
-        parse_contact_uri,
+        parse_contact_uri, password_truncation_warning, resolve_guest_password,
     };
     use protocol::provisioning::RspStatusPayload;
 
@@ -1122,5 +1351,73 @@ mod tests {
     #[test]
     fn parse_contact_uri_rejects_missing_required_param() {
         assert!(parse_contact_uri("meshcore://contact/add?name=x&type=1").is_err());
+    }
+
+    // ── Guest-password resolution (add-room) ──────────────────────────────────
+
+    #[test]
+    fn resolve_guest_password_direct_flag() {
+        let pw = resolve_guest_password(Some("hunter2"), None, None, false).unwrap();
+        assert_eq!(pw, "hunter2");
+    }
+
+    #[test]
+    fn resolve_guest_password_from_file_strips_trailing_newline() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("meshcadet-test-pw-{}.txt", std::process::id()));
+        std::fs::write(&path, "s3cret\n").unwrap();
+        let pw = resolve_guest_password(None, Some(path.as_path()), None, false).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(pw, "s3cret");
+    }
+
+    #[test]
+    fn resolve_guest_password_from_env_var() {
+        let var = format!("MESHCADET_TEST_PW_{}", std::process::id());
+        std::env::set_var(&var, "envpass");
+        let pw = resolve_guest_password(None, None, Some(var.as_str()), false).unwrap();
+        std::env::remove_var(&var);
+        assert_eq!(pw, "envpass");
+    }
+
+    #[test]
+    fn resolve_guest_password_missing_env_var_errors() {
+        let var = format!("MESHCADET_TEST_PW_MISSING_{}", std::process::id());
+        std::env::remove_var(&var);
+        let err = resolve_guest_password(None, None, Some(var.as_str()), false).unwrap_err();
+        assert!(err.to_string().contains(&var));
+    }
+
+    #[test]
+    fn resolve_guest_password_rejects_multiple_sources() {
+        let err =
+            resolve_guest_password(Some("supersecretvalue12345"), None, Some("SOME_VAR"), false)
+                .unwrap_err();
+        assert!(err.to_string().contains("at most one"));
+        // The error message must name the flags, never a candidate value.
+        assert!(!err.to_string().contains("supersecretvalue12345"));
+    }
+
+    #[test]
+    fn resolve_guest_password_file_not_found_error_names_path_not_content() {
+        let missing = std::path::Path::new("/nonexistent/meshcadet-test-pw-does-not-exist");
+        let err = resolve_guest_password(None, Some(missing), None, false).unwrap_err();
+        assert!(err.to_string().contains("password-file"));
+    }
+
+    #[test]
+    fn password_truncation_warning_none_when_within_limit() {
+        let limit = protocol::provisioning::MAX_ROOM_PASSWORD_LEN;
+        assert_eq!(password_truncation_warning(limit), None);
+        assert_eq!(password_truncation_warning(0), None);
+    }
+
+    #[test]
+    fn password_truncation_warning_fires_over_limit_without_leaking_the_value() {
+        let limit = protocol::provisioning::MAX_ROOM_PASSWORD_LEN;
+        let warning = password_truncation_warning(limit + 5).expect("must warn over the limit");
+        assert!(warning.contains(&(limit + 5).to_string()));
+        assert!(warning.contains(&limit.to_string()));
+        assert!(warning.contains("truncat"));
     }
 }

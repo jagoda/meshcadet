@@ -23,15 +23,17 @@ use protocol::history::{
     MAX_RSP_HISTORY_ENTRY_PAYLOAD,
 };
 use protocol::provisioning::{
-    decode_add_channel, decode_add_contact, decode_del_channel, decode_del_contact, decode_frame,
-    decode_set_device_name, decode_set_notif_defaults, decode_set_pin, encode_frame,
-    encode_rsp_channel, encode_rsp_contact, encode_rsp_error, encode_rsp_identity,
-    encode_rsp_status, RspStatusPayload, FRAME_ADD_CHANNEL, FRAME_ADD_CONTACT, FRAME_CLEAR_HISTORY,
-    FRAME_COMMIT_PROVISIONING, FRAME_DEL_CHANNEL, FRAME_DEL_CONTACT, FRAME_EXPORT_HISTORY,
-    FRAME_QUERY_ADVERT, FRAME_QUERY_CHANNELS, FRAME_QUERY_CONTACTS, FRAME_QUERY_STATUS,
-    FRAME_RSP_ADVERT, FRAME_RSP_CHANNEL, FRAME_RSP_CHANNELS_DONE, FRAME_RSP_CONTACT,
-    FRAME_RSP_CONTACTS_DONE, FRAME_RSP_ERROR, FRAME_RSP_HISTORY_DONE, FRAME_RSP_HISTORY_ENTRY,
-    FRAME_RSP_IDENTITY, FRAME_RSP_OK, FRAME_RSP_STATUS, FRAME_SET_DEVICE_NAME,
+    decode_add_channel, decode_add_contact, decode_add_room, decode_del_channel,
+    decode_del_contact, decode_del_room, decode_frame, decode_set_device_name,
+    decode_set_notif_defaults, decode_set_pin, encode_frame, encode_rsp_channel,
+    encode_rsp_contact, encode_rsp_error, encode_rsp_identity, encode_rsp_room, encode_rsp_status,
+    RspStatusPayload, FRAME_ADD_CHANNEL, FRAME_ADD_CONTACT, FRAME_ADD_ROOM, FRAME_CLEAR_HISTORY,
+    FRAME_COMMIT_PROVISIONING, FRAME_DEL_CHANNEL, FRAME_DEL_CONTACT, FRAME_DEL_ROOM,
+    FRAME_EXPORT_HISTORY, FRAME_QUERY_ADVERT, FRAME_QUERY_CHANNELS, FRAME_QUERY_CONTACTS,
+    FRAME_QUERY_ROOMS, FRAME_QUERY_STATUS, FRAME_RSP_ADVERT, FRAME_RSP_CHANNEL,
+    FRAME_RSP_CHANNELS_DONE, FRAME_RSP_CONTACT, FRAME_RSP_CONTACTS_DONE, FRAME_RSP_ERROR,
+    FRAME_RSP_HISTORY_DONE, FRAME_RSP_HISTORY_ENTRY, FRAME_RSP_IDENTITY, FRAME_RSP_OK,
+    FRAME_RSP_ROOM, FRAME_RSP_ROOMS_DONE, FRAME_RSP_STATUS, FRAME_SET_DEVICE_NAME,
     FRAME_SET_NOTIF_DEFAULTS, FRAME_SET_PIN,
 };
 
@@ -61,6 +63,16 @@ struct ChannelRec {
     name: Vec<u8>,
 }
 
+/// A staged room-server entry stored by the mock device. `guest_password` is
+/// kept only so a test can assert it was received correctly — it is never
+/// echoed back over the wire (mirrors `RspRoomPayload` not carrying it).
+#[derive(Clone)]
+struct RoomRec {
+    pubkey: [u8; 32],
+    guest_password: Vec<u8>,
+    name: Vec<u8>,
+}
+
 struct MockDevice {
     /// Ed25519 pubkey the mock reports as its identity.
     pubkey: [u8; 32],
@@ -70,6 +82,10 @@ struct MockDevice {
     contacts: Vec<ContactRec>,
     /// Staged channels.
     channels: Vec<ChannelRec>,
+    /// Staged rooms (mirrors firmware room storage — a room is also a
+    /// contact under the hood, but kept in its own Vec here for simplicity
+    /// since the mock doesn't model `role`/contact unification).
+    rooms: Vec<RoomRec>,
     /// Last PIN received (for verification in tests).
     last_pin: Option<Vec<u8>>,
     /// Whether the most recent AddContact had telemetry enabled.
@@ -106,6 +122,7 @@ impl MockDevice {
             provisioned: false,
             contacts: Vec::new(),
             channels: Vec::new(),
+            rooms: Vec::new(),
             last_pin: None,
             last_contact_telemetry: None,
             last_contact_name: None,
@@ -241,6 +258,53 @@ impl MockDevice {
                 },
                 Err(e) => error_frame(1, &format!("{:?}", e)),
             },
+
+            FRAME_ADD_ROOM => match decode_add_room(payload) {
+                Ok(r) => {
+                    let name = r.name[..r.name_len as usize].to_vec();
+                    let guest_password = r.guest_password[..r.guest_password_len as usize].to_vec();
+                    // "Add or replace" — mirrors FRAME_ADD_CHANNEL's replace
+                    // semantics on a repeat pubkey rather than duplicating.
+                    self.rooms.retain(|room| room.pubkey != r.pubkey);
+                    self.rooms.push(RoomRec {
+                        pubkey: r.pubkey,
+                        guest_password,
+                        name,
+                    });
+                    ok_frame()
+                }
+                Err(e) => error_frame(1, &format!("{:?}", e)),
+            },
+
+            FRAME_DEL_ROOM => match decode_del_room(payload) {
+                Ok(d) => match self.rooms.iter().position(|r| r.pubkey == d.pubkey) {
+                    Some(idx) => {
+                        self.rooms.remove(idx);
+                        ok_frame()
+                    }
+                    None => error_frame(5, "room not found"),
+                },
+                Err(e) => error_frame(1, &format!("{:?}", e)),
+            },
+
+            FRAME_QUERY_ROOMS => {
+                let mut response: Vec<u8> = Vec::new();
+                for (idx, r) in self.rooms.iter().enumerate() {
+                    let mut pbuf = [0u8; 160];
+                    // sync_since/permissions/out_path are runtime-learned
+                    // state, not host-supplied (ADR-0002 §7) — the mock
+                    // reports them as never-yet-synced, matching a freshly
+                    // provisioned room.
+                    let plen = encode_rsp_room(idx as u8, &r.pubkey, 0, 0, &[], &r.name, &mut pbuf);
+                    let mut fbuf = [0u8; 192];
+                    let n = encode_frame(FRAME_RSP_ROOM, &pbuf[..plen], &mut fbuf);
+                    response.extend_from_slice(&fbuf[..n]);
+                }
+                let mut done = [0u8; 16];
+                let n = encode_frame(FRAME_RSP_ROOMS_DONE, &[], &mut done);
+                response.extend_from_slice(&done[..n]);
+                response
+            }
 
             FRAME_QUERY_CONTACTS => {
                 let mut response: Vec<u8> = Vec::new();
@@ -800,6 +864,107 @@ fn test_del_channel() {
 
     let status = session.query_status().expect("status after del");
     assert_eq!(status.channel_count, 0);
+}
+
+// ── Room-server provisioning (ADR-0002 §7) ──────────────────────────────────
+
+/// Acceptance: add-room provisions a room server end to end — the guest
+/// password crosses the wire and reaches the device, and the room is then
+/// enumerable via list-rooms with its name and pubkey intact. The guest
+/// password is never present in the RSP_ROOM enumeration payload.
+#[test]
+fn test_add_room() {
+    let mut session = make_session_v2([0x55_u8; 32]);
+
+    let room_pubkey = [0x77_u8; 32];
+    session
+        .add_room(&room_pubkey, b"letmein", b"Lobby")
+        .expect("add_room should succeed");
+
+    let rooms = session.list_rooms().expect("list_rooms after add_room");
+    assert_eq!(rooms.len(), 1);
+    let r = &rooms[0];
+    assert_eq!(r.pubkey, room_pubkey);
+    assert_eq!(&r.name[..r.name_len as usize], b"Lobby");
+    // RspRoomPayload has no password field at all — the type system, not
+    // just this assertion, guarantees it can't leak through this path.
+}
+
+/// Verify the guest password actually crosses the wire intact — asserted
+/// against the mock device's staged record (never against anything the
+/// session/CLI surfaces back to the host, which must stay password-blind).
+#[test]
+fn test_add_room_delivers_guest_password_to_device() {
+    let mut transport = MockTransport::new(MockDevice::new([0xCC_u8; 32]));
+    let room_pubkey = [0x99_u8; 32];
+    let mut buf = [0u8; 96];
+    let plen =
+        protocol::provisioning::encode_add_room(&room_pubkey, b"swordfish1234", b"Lobby", &mut buf);
+    let mut fbuf = [0u8; 128];
+    let n = encode_frame(FRAME_ADD_ROOM, &buf[..plen], &mut fbuf);
+    let response = transport
+        .device
+        .handle(FRAME_ADD_ROOM, decode_frame(&fbuf[..n]).unwrap().1);
+    assert_eq!(&response, &ok_frame());
+    assert_eq!(transport.device.rooms.len(), 1);
+    assert_eq!(transport.device.rooms[0].guest_password, b"swordfish1234");
+}
+
+/// Verify that del_room removes a previously added room by pubkey.
+#[test]
+fn test_del_room() {
+    let mut session = make_session_v2([0x66_u8; 32]);
+
+    let room_pubkey = [0x88_u8; 32];
+    session
+        .add_room(&room_pubkey, b"guestpw", b"Study")
+        .expect("add room");
+    session.del_room(&room_pubkey).expect("del room");
+
+    let rooms = session.list_rooms().expect("list_rooms after del_room");
+    assert!(rooms.is_empty(), "room should be gone after del_room");
+}
+
+/// Acceptance: list-rooms enumerates multiple rooms in device-index order.
+#[test]
+fn test_list_rooms_multiple() {
+    let mut session = make_session_v2([0x99_u8; 32]);
+
+    let first = [0x11_u8; 32];
+    let second = [0x22_u8; 32];
+    session
+        .add_room(&first, b"pw1", b"Lobby")
+        .expect("add first room");
+    session
+        .add_room(&second, b"pw2", b"Study")
+        .expect("add second room");
+
+    let rooms = session.list_rooms().expect("list_rooms");
+    assert_eq!(rooms.len(), 2);
+    assert_eq!(rooms[0].pubkey, first);
+    assert_eq!(&rooms[0].name[..rooms[0].name_len as usize], b"Lobby");
+    assert_eq!(rooms[1].pubkey, second);
+    assert_eq!(&rooms[1].name[..rooms[1].name_len as usize], b"Study");
+}
+
+/// Acceptance: deleting an unknown room pubkey surfaces the device's error
+/// rather than silently succeeding.
+#[test]
+fn test_del_room_not_found_surfaces_device_error() {
+    let mut session = make_session_v2([0xAA_u8; 32]);
+    let err = session
+        .del_room(&[0xEE_u8; 32])
+        .expect_err("deleting an unknown room must fail");
+    assert!(err.to_string().contains("room not found"));
+}
+
+/// Acceptance: an empty device reports no rooms configured, matching the
+/// existing list-contacts / list-channels empty-state precedent.
+#[test]
+fn test_list_rooms_empty() {
+    let mut session = make_session_v2([0xBB_u8; 32]);
+    let rooms = session.list_rooms().expect("list_rooms on empty device");
+    assert!(rooms.is_empty());
 }
 
 // ── Contact / channel enumeration ─────────────────────────────────────────────
@@ -2103,5 +2268,100 @@ fn test_cli_identity_help_names_the_real_meshcore_cli_import_command() {
     assert!(
         !stdout.contains("import-contact"),
         "identity --help must not use the hyphenated `import-contact`, which meshcore-cli does not dispatch:\n{stdout}"
+    );
+}
+
+// ── Room verbs: --help surface (ADR-0002 §7) ────────────────────────────────
+
+/// Acceptance: top-level `--help` lists the three room verbs, named
+/// consistently with the existing channel verbs (`add-room`/`del-room`/
+/// `list-rooms` mirroring `add-channel`/`del-channel`/`list-channels`).
+#[test]
+fn test_cli_help_lists_room_verbs() {
+    let exe = env!("CARGO_BIN_EXE_meshcadet");
+    let output = std::process::Command::new(exe)
+        .arg("--help")
+        .output()
+        .expect("meshcadet --help must run");
+    assert!(output.status.success(), "--help must exit successfully");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for verb in ["add-room", "del-room", "list-rooms"] {
+        assert!(
+            stdout.contains(verb),
+            "--help output must list the {verb} subcommand:\n{stdout}"
+        );
+    }
+}
+
+/// Acceptance: every room subcommand's own `--help` runs cleanly (valid
+/// argument wiring) and, together with the top-level `--help`, contains no
+/// real or example guest password anywhere in the combined help text.
+#[test]
+fn test_cli_room_subcommands_help_has_no_example_password() {
+    let exe = env!("CARGO_BIN_EXE_meshcadet");
+    let mut combined = String::new();
+
+    let top = std::process::Command::new(exe)
+        .arg("--help")
+        .output()
+        .expect("meshcadet --help must run");
+    assert!(top.status.success());
+    combined.push_str(&String::from_utf8_lossy(&top.stdout));
+
+    for args in [
+        vec!["--port", "/dev/null", "add-room", "--help"],
+        vec!["--port", "/dev/null", "del-room", "--help"],
+        vec!["--port", "/dev/null", "list-rooms", "--help"],
+    ] {
+        let output = std::process::Command::new(exe)
+            .args(&args)
+            .output()
+            .unwrap_or_else(|e| panic!("meshcadet {args:?} must run: {e}"));
+        assert!(
+            output.status.success(),
+            "{args:?} must exit successfully:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        combined.push_str(&String::from_utf8_lossy(&output.stdout));
+    }
+
+    // No literal example password value anywhere in the combined help text.
+    // (The word "password" itself is fine and expected — it's a value that
+    // must never appear.)
+    for forbidden in ["hunter2", "letmein", "guestpw", "s3cret", "correcthorse"] {
+        assert!(
+            !combined.contains(forbidden),
+            "--help text must not contain an example guest password ({forbidden}):\n{combined}"
+        );
+    }
+}
+
+/// Acceptance: `add-room --help` documents all four password sources
+/// (`--password`, `--password-file`, `--password-env`, `--password-stdin`)
+/// and flags that the direct-value flag lands in shell history.
+#[test]
+fn test_cli_add_room_help_documents_password_sources() {
+    let exe = env!("CARGO_BIN_EXE_meshcadet");
+    let output = std::process::Command::new(exe)
+        .args(["--port", "/dev/null", "add-room", "--help"])
+        .output()
+        .expect("meshcadet add-room --help must run");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for flag in [
+        "--password",
+        "--password-file",
+        "--password-env",
+        "--password-stdin",
+    ] {
+        assert!(
+            stdout.contains(flag),
+            "add-room --help must document {flag}:\n{stdout}"
+        );
+    }
+    assert!(
+        stdout.to_lowercase().contains("shell history")
+            || stdout.to_lowercase().contains("history"),
+        "add-room --help must warn that --password is recorded in shell history:\n{stdout}"
     );
 }
