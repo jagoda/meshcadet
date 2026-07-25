@@ -92,7 +92,14 @@ use protocol::{
     parse_telemetry_req, is_telemetry_req, encode_telemetry_response_lpp,
     MAX_TELEMETRY_RESPONSE_LEN,
     packet_dedup_key,
+    MAX_LOGIN_PASSWORD_LEN,
 };
+// Only referenced from `handle_path_return`'s room-login arm, which is
+// itself `#[cfg(not(feature = "hil"))]` — a separate `use` (rather than
+// folding into the block above) keeps a `hil` build warning-free instead of
+// importing a name that build never references.
+#[cfg(not(feature = "hil"))]
+use protocol::decode_login_response;
 
 #[cfg(not(feature = "hil"))]
 use esp_idf_hal::i2c::{I2cDriver, config::Config as I2cConfig};
@@ -121,6 +128,14 @@ mod provisioning_server;
 #[cfg(not(feature = "hil"))]
 mod history_store;
 mod radio;
+// Room-server client session — the pure decode/ACK/dedup state machine lives
+// in `firmware_core::room_session` (re-exported); this file additionally
+// keeps a small dedicated NVS store for session-learned state. Compiled in
+// ALL builds (like `gps_baud_store`) — HIL simply never populates a room
+// contact, so the store's functions are never called there, but nothing
+// about them is NVS-role-restricted the way `config_store`'s provisioning
+// blob is.
+mod room_session;
 mod signal_tracker;
 mod ui;
 // PIN-menu — pure Rust, no ESP-IDF deps; compiled in ALL builds so that
@@ -239,6 +254,67 @@ struct PendingChannelAck {
     hash: [u8; 4],
     channel_hash: u8,
 }
+
+// ── Room contact runtime state ────────────────────────────────────────────────
+
+/// In-memory runtime state for one provisioned room contact — built once at
+/// boot from the loaded `ProvisionedConfig` (production builds only; see
+/// `run()`'s provisioning-gate arm) and owned by the main dispatcher loop for
+/// the rest of `run()`.
+///
+/// This is deliberately NOT feature-gated (unlike `config_store`/`RoomExtra`
+/// themselves): `on_receive`/`handle_path_return` reference this type
+/// unconditionally so their signatures don't fork between `hil` and
+/// production builds — a `hil` build simply never populates the `Vec`, so
+/// every loop over it is a no-op there, exactly like `gps_baud_store`'s
+/// "compiled everywhere, meaningfully used only in production" shape.
+struct RoomRuntime {
+    /// The room server's full Ed25519 public key (ECDH partner for every
+    /// login/push/ACK exchange).
+    pubkey: [u8; 32],
+    /// The room's 1-byte routing hash (`pubkey[0]`) — this session's
+    /// conversation key into `HISTORY`/the UI's `messages` map, matching
+    /// every other DM/channel conversation's own hash-keying convention.
+    hash: u8,
+    /// This boot's guest password, from the provisioning-time `RoomExtra`
+    /// seed — not re-read from `config_store` afterward (see
+    /// `room_session.rs`'s module doc for why the main thread has no safe
+    /// handle back into the moved `ProvisionedConfig`).
+    guest_password: [u8; MAX_LOGIN_PASSWORD_LEN],
+    guest_password_len: u8,
+    /// Session-learned state — persisted permission/out_path/sync_since, and
+    /// the boot-time resume point [`room_session::load_room_session`] loaded
+    /// (falling back to the provisioning-time `RoomExtra` seed if nothing had
+    /// been persisted yet).
+    session: room_session::PersistedRoomSession,
+    /// Whether this boot has already enqueued the initial flood login for
+    /// this room — a login is sent at most once per boot; M1 has no
+    /// keep-alive/re-login scheduler (milestone 2).
+    login_sent: bool,
+    /// A small in-memory tail of this room's already-known conversation
+    /// entries — the content-dedup input
+    /// `firmware_core::room_session::handle_room_push` compares an inbound
+    /// push against (see that function's doc: a room-server retry changes
+    /// the wire frame's ciphertext but not the logical post, so dedup must
+    /// be content-level, not the radio's frame-level dedup ring). Seeded
+    /// from flash at boot (history hydrate, alongside `ui.seed_conversation`)
+    /// and appended to live, capped at [`ROOM_RECENT_CAP`].
+    ///
+    /// Every reader/writer of this field lives behind
+    /// `#[cfg(not(feature = "hil"))]` (there are no rooms under `hil`), so a
+    /// `hil` build never touches it at all — `allow(dead_code)` there is
+    /// genuinely dead in that profile, not a mistake.
+    #[cfg_attr(feature = "hil", allow(dead_code))]
+    recent: Vec<protocol::history::HistoryEntry>,
+}
+
+/// Cap on [`RoomRuntime::recent`]'s length — a room server's own cyclic push
+/// queue (`protocol::MAX_UNSYNCED_POSTS`, 32) is the deepest a retry could
+/// ever reach back into, but M1's dedup only needs to catch a retry of the
+/// single most-recently-unacked post, so a much smaller cap keeps this
+/// bounded without ever meaningfully weakening the dedup.
+#[cfg(not(feature = "hil"))]
+const ROOM_RECENT_CAP: usize = 8;
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -605,6 +681,16 @@ fn run() -> anyhow::Result<()> {
     #[cfg(not(feature = "hil"))]
     let mut provisioned_config = config_store::ProvisionedConfig::empty();
 
+    // Room contacts' runtime state (login/session tracking) — see
+    // `RoomRuntime`'s doc for why this is a separate, main-thread-owned
+    // snapshot rather than a handle back into `provisioned_config` above
+    // (which is moved into the `admin_server` thread further down). Built
+    // from `provisioned_config`'s room contacts in the provisioning-gate arm
+    // below, BEFORE that move happens. Always declared (even under `hil`,
+    // where it stays empty) so `on_receive`/`handle_path_return` keep one
+    // signature across both build profiles.
+    let mut room_runtime: Vec<RoomRuntime> = Vec::new();
+
     // 2.6. First-boot provisioning gate + policy population (production only)
     #[cfg(not(feature = "hil"))]
     {
@@ -717,32 +803,81 @@ fn run() -> anyhow::Result<()> {
                         // secret stays on-device: the server only ever encodes the
                         // on-air channel_hash into RSP_CHANNEL.
                         let n = cfg.contact_count as usize;
+                        // Room entries built alongside the contact loop below
+                        // (Contacts-tab filter: `is_room()` is the one-field
+                        // predicate that routes a room OUT of the Contacts tab
+                        // and INTO the Channels tab — see this mission's
+                        // Objective, "render room entries read-only in the
+                        // EXISTING Channels tab", and `RoomExtra`'s own doc on
+                        // why storing rooms in the one contacts store makes
+                        // this filter/union a one-field affair for both this
+                        // child and the later Groups-tab union).
+                        let mut room_channel_items: Vec<ui::screens::contact_list::ChannelItem> =
+                            Vec::new();
                         for i in 0..n {
                             policy.add_contact(
                                 &cfg.contacts[i].pubkey,
                                 cfg.contacts[i].telemetry_enable,
                             );
-                            // BUG FIX: wire contact names into the UI runtime so the
-                            // contact list screen shows the provisioned contacts (§B).
-                            // register_contact() was defined but never called from main.rs.
-                            if let Some(ref mut ui) = ui_opt {
-                                let hash = cfg.contacts[i].pub_hash();
-                                let name = if cfg.contacts[i].display_name_len > 0 {
-                                    let len = cfg.contacts[i].display_name_len as usize;
-                                    String::from_utf8_lossy(
-                                        &cfg.contacts[i].display_name[..len]
-                                    ).into_owned()
-                                } else {
-                                    format!("0x{:02x}", hash)
-                                };
+                            let hash = cfg.contacts[i].pub_hash();
+                            let name = if cfg.contacts[i].display_name_len > 0 {
+                                let len = cfg.contacts[i].display_name_len as usize;
+                                String::from_utf8_lossy(
+                                    &cfg.contacts[i].display_name[..len]
+                                ).into_owned()
+                            } else {
+                                format!("0x{:02x}", hash)
+                            };
+
+                            if cfg.contacts[i].is_room() {
+                                if let Some(extra) = cfg.room_extra(&cfg.contacts[i].pubkey) {
+                                    // Resume point: prefer this room's dedicated
+                                    // session store (what a PRIOR live session
+                                    // learned) over the provisioning-time seed,
+                                    // so a reboot mid-sync doesn't re-drain the
+                                    // server's whole backlog.
+                                    let seed =
+                                        room_session::PersistedRoomSession::from_room_extra(extra);
+                                    let session =
+                                        room_session::load_room_session(nvs_partition.clone(), hash)
+                                            .unwrap_or(seed);
+                                    room_runtime.push(RoomRuntime {
+                                        pubkey: cfg.contacts[i].pubkey,
+                                        hash,
+                                        guest_password: extra.guest_password,
+                                        guest_password_len: extra.guest_password_len,
+                                        session,
+                                        login_sent: false,
+                                        // Seeded from flash below, at the
+                                        // history-hydrate step (this room's
+                                        // provisioned-config entry is
+                                        // constructed before that step runs).
+                                        recent: Vec::new(),
+                                    });
+                                }
+                                room_channel_items.push(ui::screens::contact_list::ChannelItem {
+                                    name,
+                                    preview: String::new(),
+                                    time_str: String::new(),
+                                    unread: 0,
+                                    hash,
+                                });
+                            } else if let Some(ref mut ui) = ui_opt {
+                                // BUG FIX: wire contact names into the UI runtime so the
+                                // contact list screen shows the provisioned contacts (§B).
+                                // register_contact() was defined but never called from main.rs.
                                 ui.register_contact(hash, name);
                             }
                         }
+                        log::info!(
+                            "room: {} room contact(s) loaded from provisioned config",
+                            room_runtime.len(),
+                        );
                         // BUG FIX: push channel list into the UI so the Channels tab
                         // shows the provisioned channel(s) (§B channels-tab acceptance).
                         if let Some(ref mut ui) = ui_opt {
                             let ch_count = cfg.channel_count as usize;
-                            let channel_items: Vec<ui::screens::contact_list::ChannelItem> =
+                            let mut channel_items: Vec<ui::screens::contact_list::ChannelItem> =
                                 cfg.channels[..ch_count].iter().map(|ch| {
                                     // key_len-aware channel hash (matches the
                                     // on-air hash and admin_server RSP_CHANNEL):
@@ -763,6 +898,10 @@ fn run() -> anyhow::Result<()> {
                                         hash: ch_hash,
                                     }
                                 }).collect();
+                            // Rooms render read-only in this SAME, existing
+                            // Channels tab — no new tab, no visual distinction
+                            // (M1 scope; see this mission's Objective).
+                            channel_items.append(&mut room_channel_items);
                             ui.set_channels(&channel_items);
                         }
                         // Wire the provisioned PIN into the UI runtime so the
@@ -1032,6 +1171,21 @@ fn run() -> anyhow::Result<()> {
                 Ok(conversations) => {
                     for (kind, conv_hash, entries) in conversations {
                         let is_channel = kind == protocol::history::HistoryMsgType::GrpTxt;
+                        // Seed this room's content-dedup tail from flash
+                        // (`RoomRuntime::recent`'s doc) BEFORE `entries` is
+                        // consumed below — a room's pushed posts are stored
+                        // as ordinary `HistoryMsgType::Dm` entries keyed by
+                        // the room's own hash (see `handle_room_push_frame`),
+                        // so this is exactly the same lookup a true DM
+                        // contact would no-op on.
+                        if !is_channel {
+                            if let Some(room) = room_runtime.iter_mut().find(|r| r.hash == conv_hash) {
+                                room.recent = entries
+                                    .iter()
+                                    .map(|(entry, _is_ours, _acked)| *entry)
+                                    .collect();
+                            }
+                        }
                         let records: Vec<ui::MessageRecord> = entries
                             .into_iter()
                             .map(|(entry, is_ours, acked)| {
@@ -1209,6 +1363,45 @@ fn run() -> anyhow::Result<()> {
             log::warn!(
                 "dispatcher: esp_task_wdt_add failed (0x{:08x}) — loop not WDT-covered",
                 ret,
+            );
+        }
+    }
+
+    // ── Room logins: flood ANON_REQ once per provisioned room ────────────────
+    //
+    // Always flood-routed (`room_session::encode_room_login_frame` hardcodes
+    // `RouteType::Flood`) — first contact has no learned mesh route to the
+    // room server, so a direct send isn't an option yet (see that function's
+    // doc). `sync_since` is each room's RESUMED watermark (session store if
+    // one exists, else the provisioning-time seed), so a reboot mid-sync
+    // does not re-drain the server's whole backlog. `room_runtime` is empty
+    // under `hil` (no rooms there), so this loop is a no-op in that build.
+    {
+        let boot_ts = tx_epoch_base.wrapping_add((uptime_ms() / 1000) as u32);
+        for room in room_runtime.iter_mut() {
+            // Defensive: this loop runs exactly once per boot today (no
+            // keep-alive/re-login scheduler until milestone 2), but guard on
+            // the flag anyway rather than relying on that being the only
+            // caller forever.
+            if room.login_sent {
+                continue;
+            }
+            let shared = identity.ecdh_shared_secret(&room.pubkey);
+            let mut frame = [0u8; room_session::MAX_LOGIN_FRAME_LEN];
+            let n = room_session::encode_room_login_frame(
+                &shared,
+                room.hash,
+                &identity.pubkey,
+                boot_ts,
+                room.session.sync_since,
+                &room.guest_password[..room.guest_password_len as usize],
+                &mut frame,
+            );
+            txq.enqueue(&frame[..n]);
+            room.login_sent = true;
+            log::info!(
+                "room: queued flood login for 0x{:02x} (sync_since={})",
+                room.hash, room.session.sync_since,
             );
         }
     }
@@ -1557,6 +1750,8 @@ fn run() -> anyhow::Result<()> {
                             now,
                             tx_epoch_base,
                             &mut ui_events,
+                            &mut room_runtime,
+                            nvs_partition.clone(),
                         );
                         // Persist any DM ack flip to flash so it survives a
                         // power-cycle — before this fix, `match_pending_ack`
@@ -2085,6 +2280,8 @@ fn on_receive(
     now_ms: u64,
     tx_epoch_base: u32,
     ui_events: &mut Vec<ui::UiEvent>,
+    room_runtime: &mut [RoomRuntime],
+    nvs_partition: EspDefaultNvsPartition,
 ) {
     if frame.len() < 2 {
         rx_diag!("RX: frame too short ({} bytes)", frame.len());
@@ -2111,14 +2308,41 @@ fn on_receive(
 
     match payload_type {
         x if x == PayloadType::TxtMsg as u8 => {
+            // A room contact's pushed posts arrive as ordinary TXT_MSG DMs
+            // (`TXT_TYPE_SIGNED_PLAIN`, not `TXT_TYPE_PLAIN`) — route by
+            // src_hash to the room-push handler instead of `handle_dm`,
+            // which assumes the plain-DM flag layout and would mis-parse a
+            // push's leading author-pubkey prefix as text.
+            #[cfg(not(feature = "hil"))]
+            let raw_src = payload.get(1).copied().unwrap_or(0);
+            #[cfg(not(feature = "hil"))]
+            if let Some(room) = room_runtime.iter_mut().find(|r| r.hash == raw_src) {
+                handle_room_push_frame(payload, our_id, room, txq, ui_events, nvs_partition.clone());
+                return;
+            }
             handle_dm(payload, our_id, policy, txq, gps_snapshot, now_ms, tx_epoch_base, ui_events)
         }
         x if x == PayloadType::Req as u8 => {
             handle_req(payload, our_id, policy, txq, gps_snapshot, battery_snapshot)
         }
         x if x == PayloadType::Ack as u8 => handle_ack(payload, pending_ack, ui_events),
+        x if x == PayloadType::Response as u8 => {
+            // A direct RESPONSE datagram: the non-flood room-login-reply leg
+            // (see `handle_room_login_response`'s doc). No other payload
+            // type reaches this arm — a stock companion's telemetry
+            // RESPONSE is unsolicited-request-only and MeshCadet never
+            // sends `PAYLOAD_TYPE_REQ` itself, so nothing legitimate besides
+            // a room login reply is expected here.
+            #[cfg(not(feature = "hil"))]
+            handle_room_login_response(payload, our_id, room_runtime, nvs_partition.clone());
+            #[cfg(feature = "hil")]
+            {
+                let _ = (room_runtime, nvs_partition);
+                rx_diag!("RX RESPONSE: ignored under hil (no rooms)");
+            }
+        }
         x if x == PayloadType::Path as u8 => {
-            handle_path_return(payload, our_id, policy, pending_ack, ui_events)
+            handle_path_return(payload, our_id, policy, pending_ack, ui_events, room_runtime, nvs_partition)
         }
         x if x == PayloadType::GrpTxt as u8 => handle_grp_txt(payload, channel_secret, ui_events),
         other => {
@@ -2549,6 +2773,157 @@ fn match_pending_channel_ack(
     }
 }
 
+// ── Room-server client handlers ───────────────────────────────────────────────
+//
+// MILESTONE-1 WALKING SKELETON for `meshcadet-room-server-support`: log in to
+// a provisioned room server and read its posts, end to end, on the thinnest
+// path through every layer. The pure decode/ACK/dedup decisions live in
+// `firmware_core::room_session` (host-tested against
+// `protocol::room::RoomServerDouble`); everything here is the hardware glue
+// — radio TX enqueue, `HISTORY`/`RoomRuntime`/NVS-session-store persistence,
+// and the `ui::UiEvent` bridge — mirroring `handle_dm`'s own shape as closely
+// as possible so the two RX paths stay easy to compare.
+//
+// Posting, permission-gated compose, the keep-alive scheduler, and
+// notification-suppression parity are milestone 2 (`meshcadet-room-firmware-post-and-notify`)
+// — out of scope here.
+
+/// Apply a decoded room login outcome to `room`'s in-memory session state and
+/// persist it to this room's dedicated NVS session store. Shared by both
+/// login-reply forms (`handle_room_login_response`'s direct datagram and
+/// `handle_path_return`'s bundled `PathExtra::Response`).
+#[cfg(not(feature = "hil"))]
+fn apply_room_login_outcome(
+    room: &mut RoomRuntime,
+    outcome: &room_session::RoomLoginOutcome,
+    nvs_partition: EspDefaultNvsPartition,
+) {
+    room.session.apply_login_outcome(outcome);
+    room_session::save_room_session(nvs_partition, room.hash, &room.session);
+    log::info!(
+        "room: login complete for 0x{:02x}: permissions={:?}{}",
+        room.hash,
+        room.session.permission(),
+        if outcome.out_path.is_some() {
+            " (learned out_path)"
+        } else {
+            ""
+        },
+    );
+}
+
+/// Handle a direct `RESPONSE` datagram (`PayloadType::Response`) login
+/// reply. Decoded for completeness (both login-reply forms must decode — see
+/// this mission's Acceptance), even though on M1 hardware a room's first
+/// login is always the flood/PATH-return leg
+/// (`room_session::encode_room_login_frame`'s doc: no learned route yet) —
+/// this is the leg a later re-login (milestone 2's keep-alive scheduler)
+/// would exercise once `out_path` is known.
+#[cfg(not(feature = "hil"))]
+fn handle_room_login_response(
+    payload: &[u8],
+    our_id: &Identity,
+    room_runtime: &mut [RoomRuntime],
+    nvs_partition: EspDefaultNvsPartition,
+) {
+    let raw_src = payload.get(1).copied().unwrap_or(0);
+    let Some(room) = room_runtime.iter_mut().find(|r| r.hash == raw_src) else {
+        rx_diag!(
+            "RX RESPONSE: no provisioned room matches src_hash 0x{:02x}",
+            raw_src,
+        );
+        return;
+    };
+    let shared = our_id.ecdh_shared_secret(&room.pubkey);
+    match room_session::decode_login_response_datagram(&shared, payload) {
+        Ok(outcome) => apply_room_login_outcome(room, &outcome, nvs_partition),
+        Err(e) => log::warn!(
+            "RX room login (direct RESPONSE) from 0x{:02x}: decode error: {:?}",
+            raw_src, e,
+        ),
+    }
+}
+
+/// Handle an inbound room push (`TXT_MSG`, `TXT_TYPE_SIGNED_PLAIN`) from a
+/// known room contact: decode, ACK (non-negotiable — see
+/// `firmware_core::room_session::handle_room_push`'s doc), content-dedup
+/// against `room.recent`, append to the shared rotating history exactly like
+/// `handle_dm` does for an ordinary DM (same conversation-hash keying, so the
+/// Channels-tab row and the message view Just Work — see this mission's
+/// Objective), and persist the advanced `sync_since` watermark.
+#[cfg(not(feature = "hil"))]
+fn handle_room_push_frame(
+    payload: &[u8],
+    our_id: &Identity,
+    room: &mut RoomRuntime,
+    txq: &mut TxQueue,
+    ui_events: &mut Vec<ui::UiEvent>,
+    nvs_partition: EspDefaultNvsPartition,
+) {
+    let shared = our_id.ecdh_shared_secret(&room.pubkey);
+    match room_session::handle_room_push(
+        &shared,
+        payload,
+        &our_id.pubkey,
+        room.hash,
+        &room.recent,
+    ) {
+        Ok(outcome) => {
+            // ACK is non-negotiable: transmitted unconditionally, even for a
+            // push `handle_room_push` recognises as an already-seen
+            // duplicate (`outcome.entry: None`) — see that function's doc.
+            let mut ack_frame = [0u8; 8];
+            let n = build_ack_frame(&outcome.ack_hash, &mut ack_frame);
+            txq.enqueue(&ack_frame[..n]);
+            log::info!(
+                "TX room-push ACK queued for 0x{:02x}: ack_hash={}",
+                room.hash,
+                hex4(&outcome.ack_hash),
+            );
+
+            if let Some(entry) = outcome.entry {
+                let text_len = (entry.text_len as usize).min(entry.text.len());
+                let text = &entry.text[..text_len];
+                let text_str = core::str::from_utf8(text).unwrap_or("<invalid utf8>");
+                log::info!(
+                    "RX room push from 0x{:02x} ts={}: \"{}\"",
+                    room.hash, entry.timestamp, text_str,
+                );
+                append_history(
+                    room.hash,
+                    protocol::history::HistoryMsgType::Dm,
+                    entry.timestamp,
+                    text,
+                    false,
+                    true,
+                );
+                if room.recent.len() >= ROOM_RECENT_CAP {
+                    room.recent.remove(0);
+                }
+                room.recent.push(entry);
+                ui_events.push(ui::UiEvent::IncomingDm {
+                    from_hash: room.hash,
+                    from_name: format!("0x{:02x}", room.hash),
+                    text: text_str.to_owned(),
+                });
+            }
+
+            // Persist the advanced watermark now that the ACK is queued —
+            // mirrors `append_history`'s own "record what we observed, don't
+            // wait for on-air confirmation" convention (see that fn's doc on
+            // `acked` for inbound entries).
+            room.session.sync_since = outcome.post_ts;
+            room_session::save_room_session(nvs_partition, room.hash, &room.session);
+        }
+        Err(e) => {
+            log::warn!(
+                "RX room push from 0x{:02x}: decode error: {:?}",
+                room.hash, e,
+            );
+        }
+    }
+}
+
 /// Handle a PATH-return (0x08) — decrypt and extract bundled ACK.
 fn handle_path_return(
     payload: &[u8],
@@ -2556,6 +2931,8 @@ fn handle_path_return(
     policy: &PolicyFilter,
     pending_ack: &mut Option<PendingAck>,
     ui_events: &mut Vec<ui::UiEvent>,
+    room_runtime: &mut [RoomRuntime],
+    nvs_partition: EspDefaultNvsPartition,
 ) {
     let raw_src = payload.get(1).copied().unwrap_or(0);
 
@@ -2589,12 +2966,41 @@ fn handle_path_return(
                 PathExtra::None => {
                     rx_diag!("RX PATH: no bundled ACK (extra=None)");
                 }
-                PathExtra::Response(_) => {
+                PathExtra::Response(bundled) => {
                     // Bundled RESPONSE extra: the flood-login reply leg for a
-                    // room-server ANON_REQ login. Not reachable from this
-                    // allowlisted-contact DM path today; room-server login
-                    // wiring is a separate, later unit of work.
-                    rx_diag!("RX PATH: bundled RESPONSE extra (room-server login reply, unhandled here)");
+                    // room-server ANON_REQ login — the case that actually
+                    // happens on first contact (see
+                    // `room_session::encode_room_login_frame`'s doc). Reuses
+                    // the `rp`/`shared` this function already decoded rather
+                    // than re-decrypting via
+                    // `firmware_core::room_session::decode_login_path_return`.
+                    #[cfg(not(feature = "hil"))]
+                    {
+                        match room_runtime.iter_mut().find(|r| r.hash == raw_src) {
+                            Some(room) => match decode_login_response(&bundled) {
+                                Ok(resp) => {
+                                    let outcome = room_session::RoomLoginOutcome {
+                                        permissions: resp.permissions,
+                                        out_path: Some((rp.path, rp.path_byte_count)),
+                                    };
+                                    apply_room_login_outcome(room, &outcome, nvs_partition);
+                                }
+                                Err(e) => log::warn!(
+                                    "RX PATH room login from 0x{:02x}: decode error: {:?}",
+                                    raw_src, e,
+                                ),
+                            },
+                            None => rx_diag!(
+                                "RX PATH: bundled RESPONSE extra from unrecognised room 0x{:02x}",
+                                raw_src,
+                            ),
+                        }
+                    }
+                    #[cfg(feature = "hil")]
+                    {
+                        let _ = (room_runtime, nvs_partition, bundled);
+                        rx_diag!("RX PATH: bundled RESPONSE extra ignored under hil (no rooms)");
+                    }
                 }
             }
         }

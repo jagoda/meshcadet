@@ -208,6 +208,104 @@ pub fn apply_login_outcome(extra: &mut RoomExtra, outcome: &RoomLoginOutcome) {
     }
 }
 
+// ── Session-learned state: standalone persistence ───────────────────────────
+//
+// `main.rs::run()` hands the whole `ProvisionedConfig` (which owns `RoomExtra`)
+// off to the `admin_server` thread before the dispatcher loop that logs into
+// rooms and receives pushes ever runs — so that loop has no safe in-place
+// handle to `RoomExtra` to mutate. `PersistedRoomSession` is the same three
+// learned fields (`permissions`/`sync_since`/`out_path`), persisted instead
+// through a small, dedicated NVS store the dispatcher loop owns directly
+// (`firmware::room_session::{load,save}_room_session`, mirroring
+// `advert_ts_store.rs`'s "own small store" shape) — additive to, not a
+// replacement for, the provisioning-time `RoomExtra` seed.
+
+/// Bytes needed to encode a [`PersistedRoomSession`]:
+/// `permissions(1) + sync_since(4) + out_path_len(1) + out_path(MAX_PATH_SIZE)`.
+pub const PERSISTED_ROOM_SESSION_LEN: usize = 1 + 4 + 1 + MAX_PATH_SIZE;
+
+/// The session-learned subset of a room's [`RoomExtra`] fields — see the
+/// section doc above for why this is persisted through its own store rather
+/// than `RoomExtra` in place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PersistedRoomSession {
+    pub permissions: u8,
+    pub sync_since: u32,
+    pub out_path: [u8; MAX_PATH_SIZE],
+    pub out_path_len: u8,
+}
+
+impl PersistedRoomSession {
+    /// No session learned anything yet — the state a freshly provisioned
+    /// room (or one whose dedicated store has never been written) starts
+    /// from.
+    pub const EMPTY: Self = Self {
+        permissions: 0,
+        sync_since: 0,
+        out_path: [0u8; MAX_PATH_SIZE],
+        out_path_len: 0,
+    };
+
+    /// Snapshot the provisioning-time seed a `RoomExtra` carries (used as the
+    /// fallback when this room's dedicated store has nothing persisted yet —
+    /// e.g. the very first login attempt after provisioning).
+    pub fn from_room_extra(extra: &RoomExtra) -> Self {
+        Self {
+            permissions: extra.permissions,
+            sync_since: extra.sync_since,
+            out_path: extra.out_path,
+            out_path_len: extra.out_path_len,
+        }
+    }
+
+    /// The decoded permission role — mirrors [`RoomExtra::permission`].
+    pub fn permission(&self) -> RoomPermission {
+        RoomPermission::from_u8(self.permissions)
+    }
+
+    /// Apply a login outcome's learned fields — mirrors [`apply_login_outcome`]
+    /// for callers persisting through this standalone struct.
+    pub fn apply_login_outcome(&mut self, outcome: &RoomLoginOutcome) {
+        self.permissions = outcome.permissions as u8;
+        if let Some((path, path_byte_count)) = outcome.out_path {
+            self.out_path = path;
+            self.out_path_len = path_byte_count.min(u8::MAX as usize) as u8;
+        }
+    }
+}
+
+/// Encode a [`PersistedRoomSession`] into `out` (at least
+/// [`PERSISTED_ROOM_SESSION_LEN`] bytes). Returns the number of bytes written.
+pub fn encode_persisted_room_session(state: &PersistedRoomSession, out: &mut [u8]) -> usize {
+    out[0] = state.permissions;
+    out[1..5].copy_from_slice(&state.sync_since.to_le_bytes());
+    out[5] = state.out_path_len;
+    out[6..6 + MAX_PATH_SIZE].copy_from_slice(&state.out_path);
+    PERSISTED_ROOM_SESSION_LEN
+}
+
+/// Decode a [`PersistedRoomSession`] blob. `None` if truncated or if
+/// `out_path_len` exceeds [`MAX_PATH_SIZE`] (a corrupt/foreign blob).
+pub fn decode_persisted_room_session(blob: &[u8]) -> Option<PersistedRoomSession> {
+    if blob.len() < PERSISTED_ROOM_SESSION_LEN {
+        return None;
+    }
+    let permissions = blob[0];
+    let sync_since = u32::from_le_bytes(blob[1..5].try_into().ok()?);
+    let out_path_len = blob[5];
+    if out_path_len as usize > MAX_PATH_SIZE {
+        return None;
+    }
+    let mut out_path = [0u8; MAX_PATH_SIZE];
+    out_path.copy_from_slice(&blob[6..6 + MAX_PATH_SIZE]);
+    Some(PersistedRoomSession {
+        permissions,
+        sync_since,
+        out_path,
+        out_path_len,
+    })
+}
+
 // ── Inbound push: decode + ACK + dedup ──────────────────────────────────────
 
 /// Outcome of successfully decoding an inbound room push.
@@ -759,6 +857,66 @@ mod tests {
         assert_eq!(
             decode_login_response_datagram(&wrong_secret, &reply_wire[..reply_len]),
             Err(RoomSessionError::Codec(CodecError::MacMismatch))
+        );
+    }
+
+    // ── PersistedRoomSession: standalone codec round trip ───────────────────
+
+    #[test]
+    fn persisted_room_session_round_trips_through_encode_decode() {
+        let mut out_path = [0u8; MAX_PATH_SIZE];
+        out_path[0] = 0x11;
+        out_path[1] = 0x22;
+        let state = PersistedRoomSession {
+            permissions: RoomPermission::ReadWrite as u8,
+            sync_since: 0xDEAD_BEEF,
+            out_path,
+            out_path_len: 2,
+        };
+
+        let mut blob = [0u8; PERSISTED_ROOM_SESSION_LEN];
+        let n = encode_persisted_room_session(&state, &mut blob);
+        assert_eq!(n, PERSISTED_ROOM_SESSION_LEN);
+
+        let decoded = decode_persisted_room_session(&blob).unwrap();
+        assert_eq!(decoded, state);
+    }
+
+    #[test]
+    fn persisted_room_session_decode_rejects_truncated_blob() {
+        let short = [0u8; PERSISTED_ROOM_SESSION_LEN - 1];
+        assert_eq!(decode_persisted_room_session(&short), None);
+    }
+
+    #[test]
+    fn persisted_room_session_from_room_extra_snapshots_the_provisioning_seed() {
+        let mut extra = RoomExtra::EMPTY;
+        extra.permissions = RoomPermission::Guest as u8;
+        extra.sync_since = 7;
+
+        let state = PersistedRoomSession::from_room_extra(&extra);
+        assert_eq!(state.permission(), RoomPermission::Guest);
+        assert_eq!(state.sync_since, 7);
+    }
+
+    #[test]
+    fn persisted_room_session_apply_login_outcome_matches_room_extra_variant() {
+        let outcome = RoomLoginOutcome {
+            permissions: RoomPermission::Admin,
+            out_path: Some(([0xAAu8; MAX_PATH_SIZE], 3)),
+        };
+
+        let mut extra = RoomExtra::EMPTY;
+        apply_login_outcome(&mut extra, &outcome);
+
+        let mut state = PersistedRoomSession::EMPTY;
+        state.apply_login_outcome(&outcome);
+
+        assert_eq!(state.permissions, extra.permissions);
+        assert_eq!(state.out_path_len, extra.out_path_len);
+        assert_eq!(
+            &state.out_path[..state.out_path_len as usize],
+            &extra.out_path[..extra.out_path_len as usize]
         );
     }
 }
