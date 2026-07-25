@@ -31,3 +31,12 @@ chrono = "0.4"
 # Signature verification for the advert-card integration tests (mirrors
 # `protocol`'s own use of this crate for its golden-vector/round-trip tests).
 ed25519-dalek = { version = "2", default-features = false, features = ["rand_core"] }
+# Test-only: drives a host CLI `Session` against `firmware_core::room_admin`'s
+# actual dispatch functions (the ones `firmware/src/admin_server.rs`'s
+# `handle_frame` and `firmware/src/provisioning_server.rs`'s `process_frame`
+# call for FRAME_ADD_ROOM/FRAME_DEL_ROOM/FRAME_QUERY_ROOMS), rather than only
+# `tests/integration.rs`'s hand-rolled `MockDevice` — see
+# `tests/room_firmware_dispatch.rs`'s module doc for why this crate (not
+# `firmware` itself, which cannot run outside the cross-compiled esp toolchain)
+# is the real device peer for this purpose.
+firmware-core = { path = "../firmware-core" }

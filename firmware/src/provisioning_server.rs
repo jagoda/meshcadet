@@ -33,8 +33,9 @@ use anyhow::anyhow;
 use esp_idf_svc::nvs::{EspNvsPartition, NvsDefault};
 
 use protocol::provisioning::{
-    FRAME_ADD_CHANNEL, FRAME_ADD_CONTACT, FRAME_COMMIT_PROVISIONING, FRAME_DEL_CHANNEL,
-    FRAME_DEL_CONTACT, FRAME_QUERY_CHANNELS, FRAME_QUERY_CONTACTS, FRAME_QUERY_STATUS,
+    FRAME_ADD_CHANNEL, FRAME_ADD_CONTACT, FRAME_ADD_ROOM, FRAME_COMMIT_PROVISIONING,
+    FRAME_DEL_CHANNEL, FRAME_DEL_CONTACT, FRAME_DEL_ROOM, FRAME_QUERY_CHANNELS,
+    FRAME_QUERY_CONTACTS, FRAME_QUERY_ROOMS, FRAME_QUERY_STATUS,
     FRAME_RSP_CHANNEL, FRAME_RSP_CHANNELS_DONE, FRAME_RSP_CONTACT, FRAME_RSP_CONTACTS_DONE,
     FRAME_RSP_ERROR, FRAME_RSP_IDENTITY, FRAME_RSP_OK, FRAME_RSP_STATUS,
     FRAME_SET_DEVICE_NAME, FRAME_SET_NOTIF_DEFAULTS, FRAME_SET_PIN,
@@ -48,6 +49,8 @@ use protocol::provisioning::{
     RspStatusPayload,
 };
 use protocol::channel_hash_var;
+
+use firmware_core::room_admin::{self, AddRoomOutcome, DelRoomOutcome};
 
 use crate::config_store::{
     Channel, ChannelListFull, ChannelUpsert, Contact, NotifDefaults, ProvisionedConfig, RadioPreset,
@@ -444,6 +447,67 @@ fn process_frame(
                 Err(e) => {
                     log::warn!("prov_server: DEL_CHANNEL decode: {:?}", e);
                     return send_error(out, err::DECODE_ERROR, b"del_channel decode error");
+                }
+            }
+        }
+
+        // ── QUERY_ROOMS ──────────────────────────────────────────────────────
+        // Stream every staged room-server contact as RSP_ROOM frames,
+        // terminated by RSP_ROOMS_DONE — mirrors QUERY_CONTACTS/QUERY_CHANNELS.
+        // `room_admin::handle_query_rooms` (firmware-core, host-tested) builds
+        // the encoded (frame_type, payload) pairs from the live staging set.
+        FRAME_QUERY_ROOMS => {
+            log::info!("prov_server: QUERY_ROOMS — {} room(s)", staging.room_count);
+            for (frame_type, room_payload) in room_admin::handle_query_rooms(staging) {
+                send_frame(out, frame_type, &room_payload)?;
+            }
+        }
+
+        // ── ADD_ROOM ─────────────────────────────────────────────────────────
+        // Stage a room-server contact so a room can be provisioned in the
+        // first-provisioning flow, not only by a post-provisioning admin edit
+        // (`admin_server.rs`'s equivalent arm). Same shared
+        // `room_admin::handle_add_room` dispatch, same upsert-keyed-on-pubkey
+        // semantics; only committed to NVS on FRAME_COMMIT_PROVISIONING
+        // (staging model — see this file's module doc), unlike the runtime
+        // server's immediate persist.
+        FRAME_ADD_ROOM => {
+            match room_admin::handle_add_room(staging, payload) {
+                AddRoomOutcome::Added | AddRoomOutcome::Updated => {
+                    // payload[0] is the pubkey's first byte per AddRoomPayload's
+                    // wire layout — see admin_server.rs's equivalent arm.
+                    log::info!(
+                        "prov_server: ADD_ROOM pub_hash=0x{:02x}",
+                        payload.first().copied().unwrap_or(0)
+                    );
+                    send_ok(out)?;
+                }
+                AddRoomOutcome::ListFull => {
+                    return send_error(out, err::CONTACT_LIST_FULL, b"contact list full");
+                }
+                AddRoomOutcome::DecodeError => {
+                    log::warn!("prov_server: ADD_ROOM decode error");
+                    return send_error(out, err::DECODE_ERROR, b"add_room decode error");
+                }
+            }
+        }
+
+        // ── DEL_ROOM ─────────────────────────────────────────────────────────
+        FRAME_DEL_ROOM => {
+            match room_admin::handle_del_room(staging, payload) {
+                DelRoomOutcome::Removed => {
+                    log::info!(
+                        "prov_server: DEL_ROOM pub_hash=0x{:02x}",
+                        payload.first().copied().unwrap_or(0)
+                    );
+                    send_ok(out)?;
+                }
+                DelRoomOutcome::NotFound => {
+                    return send_error(out, err::CONTACT_NOT_FOUND, b"room not found");
+                }
+                DelRoomOutcome::DecodeError => {
+                    log::warn!("prov_server: DEL_ROOM decode error");
+                    return send_error(out, err::DECODE_ERROR, b"del_room decode error");
                 }
             }
         }

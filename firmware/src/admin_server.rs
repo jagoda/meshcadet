@@ -24,6 +24,9 @@
 //! | `FRAME_DEL_CONTACT`     | host→device | remove contact, persist to NVS, reply `RSP_OK` / `RSP_ERROR` |
 //! | `FRAME_ADD_CHANNEL`     | host→device | upsert channel by secret (known key updates in place, new key appends), persist to NVS, reply `RSP_OK` / `RSP_ERROR` |
 //! | `FRAME_DEL_CHANNEL`     | host→device | remove channel, persist to NVS, reply `RSP_OK` / `RSP_ERROR` |
+//! | `FRAME_QUERY_ROOMS`     | host→device | stream `RSP_ROOM` per configured room-server contact, then `RSP_ROOMS_DONE` |
+//! | `FRAME_ADD_ROOM`        | host→device | upsert a room-server contact (`role = ROLE_ROOM`) by pubkey plus its `RoomExtra` (guest password, fresh session state), persist to NVS, reply `RSP_OK` / `RSP_ERROR` |
+//! | `FRAME_DEL_ROOM`        | host→device | remove a room-server contact AND its `RoomExtra`, persist to NVS, reply `RSP_OK` / `RSP_ERROR` |
 //! | `FRAME_SET_NOTIF_DEFAULTS`| host→device | update notif defaults, persist to NVS, reply `RSP_OK` / `RSP_ERROR` |
 //! | `FRAME_SET_PIN`         | host→device | set/reset PIN, persist to NVS, reply `RSP_OK` / `RSP_ERROR` |
 //! | `FRAME_SET_DEVICE_NAME` | host→device | set device display name, persist to identity store, reply `RSP_OK` / `RSP_ERROR` |
@@ -70,12 +73,13 @@ use esp_idf_svc::nvs::{EspNvsPartition, NvsDefault};
 
 use protocol::channel_hash_var;
 use protocol::provisioning::{
-    FRAME_ADD_CHANNEL, FRAME_ADD_CONTACT, FRAME_CLEAR_HISTORY, FRAME_COMMIT_PROVISIONING,
-    FRAME_DEL_CHANNEL, FRAME_DEL_CONTACT, FRAME_EXPORT_HISTORY, FRAME_QUERY_ADVERT,
-    FRAME_QUERY_CHANNELS, FRAME_QUERY_CONTACTS, FRAME_QUERY_STATUS, FRAME_RSP_ADVERT,
-    FRAME_RSP_CHANNEL, FRAME_RSP_CHANNELS_DONE, FRAME_RSP_CONTACT, FRAME_RSP_CONTACTS_DONE,
-    FRAME_RSP_ERROR, FRAME_RSP_HISTORY_DONE, FRAME_RSP_HISTORY_ENTRY, FRAME_RSP_IDENTITY,
-    FRAME_RSP_OK, FRAME_RSP_STATUS, FRAME_SET_DEVICE_NAME, FRAME_SET_NOTIF_DEFAULTS,
+    FRAME_ADD_CHANNEL, FRAME_ADD_CONTACT, FRAME_ADD_ROOM, FRAME_CLEAR_HISTORY,
+    FRAME_COMMIT_PROVISIONING, FRAME_DEL_CHANNEL, FRAME_DEL_CONTACT, FRAME_DEL_ROOM,
+    FRAME_EXPORT_HISTORY, FRAME_QUERY_ADVERT, FRAME_QUERY_CHANNELS, FRAME_QUERY_CONTACTS,
+    FRAME_QUERY_ROOMS, FRAME_QUERY_STATUS, FRAME_RSP_ADVERT, FRAME_RSP_CHANNEL,
+    FRAME_RSP_CHANNELS_DONE, FRAME_RSP_CONTACT, FRAME_RSP_CONTACTS_DONE, FRAME_RSP_ERROR,
+    FRAME_RSP_HISTORY_DONE, FRAME_RSP_HISTORY_ENTRY, FRAME_RSP_IDENTITY, FRAME_RSP_OK,
+    FRAME_RSP_STATUS, FRAME_SET_DEVICE_NAME, FRAME_SET_NOTIF_DEFAULTS,
     FRAME_SET_PIN, FRAME_OVERHEAD, MAX_NAME_LEN, PROV_MAGIC, ProvError, RspStatusPayload,
     decode_add_channel, decode_add_contact, decode_del_channel, decode_del_contact, decode_frame,
     decode_set_device_name, decode_set_notif_defaults, decode_set_pin,
@@ -83,6 +87,8 @@ use protocol::provisioning::{
     encode_rsp_status,
 };
 use protocol::{encode_rsp_history_entry, Identity, MAX_ADVERT_CARD_LEN, MAX_RSP_HISTORY_ENTRY_PAYLOAD};
+
+use firmware_core::room_admin::{self, AddRoomOutcome, DelRoomOutcome};
 
 use crate::advert_ts_store;
 use crate::config_store::{
@@ -540,6 +546,84 @@ fn handle_frame(
                 }
             }
         }
+        // ── QUERY_ROOMS ──────────────────────────────────────────────────────
+        // Stream every configured room-server contact (index-ordered within the
+        // room list, not the overall contact list) as RSP_ROOM frames,
+        // terminated by RSP_ROOMS_DONE — mirrors QUERY_CONTACTS/QUERY_CHANNELS'
+        // streaming pattern. `room_admin::handle_query_rooms` (firmware-core,
+        // host-tested) builds the encoded (frame_type, payload) pairs; this
+        // arm only owns the serial write. The guest password never enters a
+        // response: `RspRoomPayload` has no password field by construction.
+        FRAME_QUERY_ROOMS => {
+            log::info!("admin_server: QUERY_ROOMS — {} room(s)", config.room_count);
+            for (frame_type, room_payload) in room_admin::handle_query_rooms(config) {
+                send_frame(out, frame_type, &room_payload)?;
+            }
+        }
+        // ── ADD_ROOM ─────────────────────────────────────────────────────────
+        // Upsert a room-server contact keyed on its pubkey: `room_admin::handle_add_room`
+        // (firmware-core, host-tested — see the M1 gap-fix doc there) decodes
+        // the payload and upserts both the `Contact` (forced to `ROLE_ROOM`)
+        // and its `RoomExtra` (guest password; fresh session state — a re-add
+        // always resets `sync_since`/`permissions`/`out_path`, matching the
+        // full-replace semantics ADD_CONTACT/ADD_CHANNEL already have for
+        // every other field). This is the path that previously fell through
+        // to the unknown-frame arm and left `meshcadet add-room` hanging to
+        // the host's retry limit with no reply at all — the M1 gate's finding.
+        //
+        // GUEST PASSWORD DISCIPLINE (ADR-0001 §4): the password crosses the
+        // USB link in the clear by design, but it is never logged, echoed, or
+        // placed in an error message here — the log line below deliberately
+        // omits it, matching every other credential-bearing frame in this file.
+        FRAME_ADD_ROOM => {
+            match room_admin::handle_add_room(config, payload) {
+                AddRoomOutcome::Added | AddRoomOutcome::Updated => {
+                    // payload[0] is the pubkey's first byte per AddRoomPayload's
+                    // wire layout (`pubkey(32) | ...`, protocol::provisioning
+                    // doc) — same pub_hash convention ADD_CONTACT/ADD_CHANNEL
+                    // log, just read directly off the raw bytes since this arm
+                    // never decodes the payload itself (that now lives in
+                    // room_admin::handle_add_room).
+                    log::info!(
+                        "admin_server: ADD_ROOM pub_hash=0x{:02x}",
+                        payload.first().copied().unwrap_or(0)
+                    );
+                    persist_or_rollback(config, nvs_partition, out, ConfigKind::Room)?;
+                }
+                AddRoomOutcome::ListFull => {
+                    return send_error(out, err::CONTACT_LIST_FULL, b"contact list full");
+                }
+                AddRoomOutcome::DecodeError => {
+                    log::warn!("admin_server: ADD_ROOM decode error");
+                    return send_error(out, err::DECODE_ERROR, b"add_room decode error");
+                }
+            }
+        }
+        // ── DEL_ROOM ─────────────────────────────────────────────────────────
+        // Remove a room-server contact: `room_admin::handle_del_room` deletes
+        // both the `Contact` entry AND its paired `RoomExtra`
+        // (`ProvisionedConfig::remove_room`), leaving every neighbouring
+        // contact/channel untouched.
+        FRAME_DEL_ROOM => {
+            match room_admin::handle_del_room(config, payload) {
+                DelRoomOutcome::Removed => {
+                    // payload[0] is the pubkey's first byte per DelRoomPayload's
+                    // wire layout (`pubkey(32)`) — see the ADD_ROOM arm's comment.
+                    log::info!(
+                        "admin_server: DEL_ROOM pub_hash=0x{:02x}",
+                        payload.first().copied().unwrap_or(0)
+                    );
+                    persist_or_rollback(config, nvs_partition, out, ConfigKind::Room)?;
+                }
+                DelRoomOutcome::NotFound => {
+                    return send_error(out, err::CONTACT_NOT_FOUND, b"room not found");
+                }
+                DelRoomOutcome::DecodeError => {
+                    log::warn!("admin_server: DEL_ROOM decode error");
+                    return send_error(out, err::DECODE_ERROR, b"del_room decode error");
+                }
+            }
+        }
         // ── SET_NOTIF_DEFAULTS / SET_PIN ──────────────────────────────────────
         // The host CLI's `set-notif-defaults` and `set-pin` / `reset-pin`
         // commands.  Like the edit frames above these used to fall through to
@@ -729,6 +813,17 @@ fn handle_frame(
 enum ConfigKind {
     Contact,
     Channel,
+    /// An `ADD_ROOM`/`DEL_ROOM` edit. A room is also a contact —
+    /// `ProvisionedConfig::upsert_room`/`remove_room` always move
+    /// `contact_count` AND `room_count` together, by exactly one each — so
+    /// unlike `Contact`/`Channel` this rollback decrements BOTH counters,
+    /// keeping the pair in lockstep. Leaving `room_count` untouched here
+    /// would strand a `RoomExtra` slot that `room_extra`'s pubkey lookup
+    /// could still find after its paired `Contact` was rolled back out of
+    /// `contact_count` (an add), or leave it one too high after a delete —
+    /// either way a phantom-room desync this mirrors-but-extends the
+    /// existing single-counter discipline to avoid.
+    Room,
 }
 
 /// Persist the whole config blob to NVS after an in-memory edit.
@@ -758,6 +853,10 @@ fn persist_or_rollback(
                 }
                 ConfigKind::Channel => {
                     config.channel_count = config.channel_count.saturating_sub(1);
+                }
+                ConfigKind::Room => {
+                    config.contact_count = config.contact_count.saturating_sub(1);
+                    config.room_count = config.room_count.saturating_sub(1);
                 }
             }
             send_error(out, err::STORAGE_ERROR, b"NVS save failed").map(|_| ())

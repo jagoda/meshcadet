@@ -1733,6 +1733,7 @@ dependencies = [
  "chrono",
  "clap",
  "ed25519-dalek",
+ "firmware-core",
  "hex",
  "protocol",
  "qrcode",
