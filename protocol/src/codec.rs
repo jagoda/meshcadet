@@ -26,8 +26,11 @@
 //!
 //!   PATH return payload (outer = same as DM):
 //!     inner plaintext: [path_len(1)] [path(N)] [extra_type(1)] [extra...]
-//!     extra_type 0x03 (ACK): [ack_hash(4)]
-//!     extra_type 0xFF:       [4 random bytes] (no bundled ack)
+//!     extra_type 0x03 (ACK):      [ack_hash(4)]
+//!     extra_type 0x01 (RESPONSE): [13-byte RESPONSE plaintext] — the flood-login
+//!                                 reply bundle (`room::decode_login_response` input);
+//!                                 see `Mesh.cpp::createPathReturn` @ MeshCore v1.16.0.
+//!     extra_type 0xFF:            [4 random bytes] (no bundled extra)
 
 use crate::crypto::{encrypt_then_mac_var, mac_then_decrypt_var, sha256, MacError};
 use sha2::{Digest, Sha256};
@@ -360,6 +363,12 @@ pub fn decode_grp_txt_var(
 pub enum PathExtra {
     /// A 4-byte ACK hash bundled with the returned path.
     Ack([u8; 4]),
+    /// A 13-byte RESPONSE plaintext bundled with the returned path — the
+    /// flood-login reply leg (a room-server ANON_REQ login that was flood-routed
+    /// returns its RESPONSE bundled here instead of as a standalone datagram).
+    /// See `Mesh.cpp::createPathReturn` @ MeshCore v1.16.0 and
+    /// `MyMesh.cpp:388-390` (`simple_room_server`).
+    Response([u8; 13]),
     /// No meaningful extra (extra_type = 0xFF, 4 random bytes).
     None,
 }
@@ -410,6 +419,15 @@ pub fn decode_path_return_plaintext(
         let mut ack = [0u8; 4];
         ack.copy_from_slice(&plaintext[extra_offset + 1..extra_offset + 5]);
         PathExtra::Ack(ack)
+    } else if extra_type == 0x01 {
+        // PAYLOAD_TYPE_RESPONSE: next 13 bytes are the login-response plaintext
+        // (the flood-login reply leg — MyMesh.cpp:388-390).
+        if pt_len < extra_offset + 1 + 13 {
+            return Err(CodecError::TruncatedPayload);
+        }
+        let mut resp = [0u8; 13];
+        resp.copy_from_slice(&plaintext[extra_offset + 1..extra_offset + 14]);
+        PathExtra::Response(resp)
     } else {
         // 0xFF or anything else: no meaningful extra
         PathExtra::None
