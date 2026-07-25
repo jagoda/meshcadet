@@ -31,6 +31,7 @@
 //! | This crate       | Firmware hardware/Slint half (stays in `firmware/src/`)        |
 //! |-------------------|----------------------------------------------------------------|
 //! | [`advert`]        | `admin_server.rs`'s `FRAME_QUERY_ADVERT` handler (NVS read/write of the last-issued timestamp, the serial write); `advert_ts_store.rs` (the NVS store itself) |
+//! | [`config_store`]  | `config_store::{is_provisioned, load_provisioned_config, save_provisioned_config, clear_provisioned_flag}` (`EspNvs` read/write) |
 //! | [`dispatcher`]    | *(none — this module is already 100% pure)*                    |
 //! | [`pin_menu`]      | *(none — this module is already 100% pure)*                    |
 //! | [`notification`]  | `ui::BuzzerDriver` (I2S tone playback)                          |
@@ -59,6 +60,7 @@
 
 pub mod advert;
 pub mod battery;
+pub mod config_store;
 pub mod dispatcher;
 pub mod gps;
 pub mod notification;
