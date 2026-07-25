@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! MeshCore v1.15 wire protocol — shared by MeshCadet firmware and the host CLI.
+//! MeshCore wire protocol — shared by MeshCadet firmware and the host CLI.
 //!
 //! This crate is the byte-exact port of the MeshCore v1.15.0 (`dee3e26a`) wire
 //! format: packet framing, header/route/payload-type fields, 2-byte path-hash
 //! encoding, the crypto/identity primitives (Ed25519 → X25519 ECDH, AES-128-ECB,
 //! 2-byte HMAC-SHA256 MAC), the DM + ACK codec, and symmetric channel encryption.
+//! It is also prefix-compatible with v1.16, the current protocol target (the
+//! ACK codec accepts and prefix-matches v1.16's widened 6-byte ACK; see
+//! [`codec::compute_ack_hash`]).
 //!
 //! The authoritative spec is the upstream MeshCore v1.15.0 firmware source
 //! (`dee3e26a`) this crate is ported from.

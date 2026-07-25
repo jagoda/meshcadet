@@ -80,8 +80,9 @@ posture is detailed in [`SECURITY.md`](SECURITY.md).
 
 ## What it does
 
-- Talks real MeshCore v1.15.0 over LoRa (SX1262): DMs, channel messages, ACKs,
-  and pull-only location telemetry.
+- Talks real MeshCore over LoRa (SX1262): DMs, channel messages, ACKs, and
+  pull-only location telemetry. Byte-exact against v1.15.0, targeting v1.16
+  with v1.15 back-compat (see [ADR-0001 §1](docs/adr/0001-charter.md)).
 - Touch-screen UI (Slint) for contacts, conversations, and composing messages
   with a curated `:shortcode:` emoji set.
 - Allowlist-only: an admin provisions every contact and channel over USB; the
@@ -122,7 +123,7 @@ DM / ACK / channel-message / pull-telemetry paths. Before relying on it:
 
 | Crate | Role | Builds with |
 |-------|------|-------------|
-| `protocol/` | MeshCore v1.15 wire port (framing, crypto, codec); shared | stable, host-native |
+| `protocol/` | MeshCore wire port (framing, crypto, codec); byte-exact v1.15, prefix-compatible v1.16; shared | stable, host-native |
 | `firmware-core/` | Decoupled, host-testable half of firmware logic (dispatcher, PIN-menu, notifications, GPS/battery/runtime-settings parsing+codecs) — no `esp-idf-*`/Slint dep; also a `path` dep of `firmware/` (see ADR-0005) | stable, host-native |
 | `firmware/` | T-Deck device app (radio, GPS, touch UI, storage, admin menu) | `esp` toolchain, `xtensa-esp32s3-espidf` |
 | `host/` | Admin CLI (`meshcadet`): USB provisioning, history export, PIN reset | stable, host-native |

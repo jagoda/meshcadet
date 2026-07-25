@@ -44,10 +44,12 @@ License:    MIT License (see below)
 `protocol/` is a byte-exact Rust port of the MeshCore v1.15.0 wire protocol
 (packet framing, header/route/payload-type fields, path-hash encoding, the
 Ed25519/X25519/AES-128-ECB/HMAC-SHA256 crypto and identity primitives, the
-DM/ACK codec, and symmetric channel encryption) — see `protocol/src/lib.rs`
-for the module map and interop rationale. MeshCadet exists to be a fully
-compliant MeshCore citizen on the air; this interop is a hard project
-requirement (see `docs/adr/0001-charter.md`).
+DM/ACK codec, and symmetric channel encryption), and is prefix-compatible
+with v1.16 (the two extra ACK bytes v1.16 adds are never read by either
+version's receiver) — see `protocol/src/lib.rs` for the module map and
+interop rationale. MeshCadet exists to be a fully compliant MeshCore citizen
+on the air; this interop is a hard project requirement, now targeting v1.16
+with v1.15 back-compat (see `docs/adr/0001-charter.md`).
 
 --------------------------------------------------------------------------
 RadioLib

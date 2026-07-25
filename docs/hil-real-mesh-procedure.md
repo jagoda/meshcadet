@@ -219,9 +219,17 @@ top to bottom; each step is cheaper to check than the one below it.
    demodulated as noise — no RxDone. (Earlier bug: BW code `0x04` = 125 kHz
    instead of `0x03` = 62.5 kHz.)
 
-2. **Peer firmware version / ACK format.** A v1.16 peer emits a 6-byte ACK;
-   MeshCadet's `compute_ack_hash` matches v1.15's 4-byte ACK. Version skew shows
-   up as DMs arriving but ACKs never matching — not total RX silence.
+2. **Peer firmware version — preamble length (open question).** A v1.16 peer
+   emits a 6-byte ACK, but MeshCadet's `compute_ack_hash` accepts and
+   prefix-matches it against its own 4-byte hash (`ack_hash[0..4]` is
+   identical across versions — see ADR-0001 §1), so ACK version skew is
+   **not** a live cause of RX trouble against v1.16 peers. What is NOT yet
+   bench-verified: v1.16 changed its own default LoRa preamble length (32
+   symbols at SF7, vs. v1.15's inherited RadioLib default of 8 that
+   MeshCadet uses — `radio.rs` `PREAMBLE_LEN`). A preamble mismatch is a
+   PHY-level total-silence cause, same class as the sync-word case below; if
+   RX is dead specifically against a v1.16 peer, this is the current top
+   suspect pending an on-air preamble sweep.
 
 3. **LoRa sync word.** This is the classic *total-silence* cause. The SX1262
    matches the LoRa sync word **in hardware during demod**; a mismatch drops the
