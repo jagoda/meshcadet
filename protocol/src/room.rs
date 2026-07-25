@@ -887,7 +887,7 @@ impl RoomServerDouble {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::{decode_dm_payload, decode_path_return_plaintext, PathExtra};
+    use crate::codec::{decode_dm_payload, decode_path_return_plaintext, CodecError, PathExtra};
     use crate::crypto::{mac_then_decrypt_var, sha256_2};
 
     fn make_pair() -> (Identity, Identity) {
@@ -1135,6 +1135,35 @@ mod tests {
         assert_eq!(
             decode_room_push(&shared, &wire[..n], &mut pt),
             Err(RoomCodecError::NotSignedPlain)
+        );
+    }
+
+    #[test]
+    fn decode_room_push_wrong_shared_secret_fails_mac() {
+        // Wrong ECDH secret (e.g. decoding with the wrong contact's key) must
+        // be rejected at the MAC layer, not silently mis-decrypted.
+        let (client, server) = make_pair();
+        let shared = server.ecdh_shared_secret(&client.pubkey);
+        let wrong_secret = [0xEEu8; 32];
+
+        let mut pt_in = [0u8; 9];
+        pt_in[0..4].copy_from_slice(&1u32.to_le_bytes());
+        pt_in[4] = TXT_TYPE_SIGNED_PLAIN << 2;
+        pt_in[5..9].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+
+        let mut wire = [0u8; 256];
+        let n = encode_dm_payload(
+            &shared,
+            client.pub_hash(),
+            server.pub_hash(),
+            &pt_in,
+            &mut wire,
+        );
+
+        let mut pt = [0u8; 256];
+        assert_eq!(
+            decode_room_push(&wrong_secret, &wire[..n], &mut pt),
+            Err(RoomCodecError::Codec(CodecError::MacMismatch))
         );
     }
 

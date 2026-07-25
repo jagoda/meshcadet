@@ -860,6 +860,21 @@ mod tests {
         assert_eq!(rp.extra, PathExtra::Ack([1, 2, 3, 4]));
     }
 
+    #[test]
+    fn path_return_decode_truncated_response_bundle_rejected() {
+        // extra_type = RESPONSE (0x01) but fewer than 13 bytes follow — must be
+        // rejected, not read out of bounds.
+        let mut pt = [0u8; 16];
+        pt[0] = 0x40; // 0 hops
+        pt[1] = 0x01; // extra_type = RESPONSE
+        pt[2..12].copy_from_slice(&[0u8; 10]); // only 10 of the required 13 bytes
+
+        assert_eq!(
+            decode_path_return_plaintext(&pt, 12).unwrap_err(),
+            CodecError::TruncatedPayload
+        );
+    }
+
     /// Forward-compat regression: a v1.16 node bundles a 6-byte ACK (4-byte
     /// hash + extended-attempt byte + random byte) into the PATH-return
     /// extra. `decode_path_return_plaintext` must accept the longer payload

@@ -2589,6 +2589,13 @@ fn handle_path_return(
                 PathExtra::None => {
                     rx_diag!("RX PATH: no bundled ACK (extra=None)");
                 }
+                PathExtra::Response(_) => {
+                    // Bundled RESPONSE extra: the flood-login reply leg for a
+                    // room-server ANON_REQ login. Not reachable from this
+                    // allowlisted-contact DM path today; room-server login
+                    // wiring is a separate, later unit of work.
+                    rx_diag!("RX PATH: bundled RESPONSE extra (room-server login reply, unhandled here)");
+                }
             }
         }
         Err(protocol::CodecError::MacMismatch) => {
