@@ -341,6 +341,42 @@ fn rsp_channel_vector(
     decode_vector(name, "rsp_channel", FRAME_RSP_CHANNEL, &buf[..plen], expect)
 }
 
+fn rsp_room_vector(
+    name: &'static str,
+    index: u8,
+    pubkey: [u8; 32],
+    sync_since: u32,
+    permissions: u8,
+    out_path: &[u8],
+    room_name: &[u8],
+) -> Vector {
+    let mut buf = [0u8; 160];
+    let plen = encode_rsp_room(
+        index,
+        &pubkey,
+        sync_since,
+        permissions,
+        out_path,
+        room_name,
+        &mut buf,
+    );
+    let d = decode_rsp_room(&buf[..plen]).expect("golden generator: rsp_room self-decode");
+    let expect = Json::Obj(vec![
+        ("index", n(d.index as i64)),
+        ("pubkey", hexj(&d.pubkey)),
+        ("sync_since", n(d.sync_since as i64)),
+        ("permissions", n(d.permissions as i64)),
+        ("out_path", hexj(&d.out_path[..d.out_path_len as usize])),
+        ("out_path_len", n(d.out_path_len as i64)),
+        (
+            "name",
+            s(std::str::from_utf8(&d.name[..d.name_len as usize]).unwrap()),
+        ),
+        ("name_len", n(d.name_len as i64)),
+    ]);
+    decode_vector(name, "rsp_room", FRAME_RSP_ROOM, &buf[..plen], expect)
+}
+
 fn rsp_error_vector(name: &'static str, error_code: u8, msg: &[u8]) -> Vector {
     let mut buf = [0u8; 128];
     let plen = encode_rsp_error(error_code, msg, &mut buf);
@@ -431,6 +467,12 @@ fn rsp_advert_vector(
 
 // ── The vector set ───────────────────────────────────────────────────────────
 
+// The leading run of `v.push(encode_vector(..))` calls right after `Vec::new()`
+// trips `vec_init_then_push`, but the full vector set below is not a single
+// mechanical literal — most entries are built from scoped `{ .. }` blocks with
+// their own local bindings (encode buffers, decoded structs), so a `vec![]`
+// rewrite isn't a clean, mechanical translation.
+#[allow(clippy::vec_init_then_push)]
 fn build_vectors() -> Vec<Vector> {
     let mut v = Vec::new();
 
@@ -454,6 +496,13 @@ fn build_vectors() -> Vec<Vector> {
         "query_channels",
         "query_channels",
         FRAME_QUERY_CHANNELS,
+        &[],
+        Json::Obj(vec![]),
+    ));
+    v.push(encode_vector(
+        "query_rooms",
+        "query_rooms",
+        FRAME_QUERY_ROOMS,
         &[],
         Json::Obj(vec![]),
     ));
@@ -566,6 +615,52 @@ fn build_vectors() -> Vec<Vector> {
             FRAME_DEL_CHANNEL,
             &buf[..plen],
             Json::Obj(vec![("secret", hexj(&secret))]),
+        ));
+    }
+    {
+        let pubkey = [0x5Au8; 32];
+        let password = b"hunter2";
+        let name = b"Lobby";
+        let mut buf = [0u8; 64];
+        let plen = encode_add_room(&pubkey, password, name, &mut buf);
+        v.push(encode_vector(
+            "add_room_with_password_and_name",
+            "add_room",
+            FRAME_ADD_ROOM,
+            &buf[..plen],
+            Json::Obj(vec![
+                ("pubkey", hexj(&pubkey)),
+                ("guest_password", s(std::str::from_utf8(password).unwrap())),
+                ("name", s(std::str::from_utf8(name).unwrap())),
+            ]),
+        ));
+    }
+    {
+        let pubkey = [0x5Bu8; 32];
+        let mut buf = [0u8; 64];
+        let plen = encode_add_room(&pubkey, &[], &[], &mut buf);
+        v.push(encode_vector(
+            "add_room_no_password_no_name",
+            "add_room",
+            FRAME_ADD_ROOM,
+            &buf[..plen],
+            Json::Obj(vec![
+                ("pubkey", hexj(&pubkey)),
+                ("guest_password", s("")),
+                ("name", s("")),
+            ]),
+        ));
+    }
+    {
+        let pubkey = [0x5Du8; 32];
+        let mut buf = [0u8; 32];
+        let plen = encode_del_room(&pubkey, &mut buf);
+        v.push(encode_vector(
+            "del_room",
+            "del_room",
+            FRAME_DEL_ROOM,
+            &buf[..plen],
+            Json::Obj(vec![("pubkey", hexj(&pubkey))]),
         ));
     }
     {
@@ -770,6 +865,26 @@ fn build_vectors() -> Vec<Vector> {
         "rsp_channels_done",
         FRAME_RSP_CHANNELS_DONE,
     ));
+
+    v.push(rsp_room_vector(
+        "rsp_room_with_path",
+        0,
+        [0x5Eu8; 32],
+        0xDEAD_BEEF,
+        2,
+        &[0x11, 0x22, 0x33],
+        b"Lobby",
+    ));
+    v.push(rsp_room_vector(
+        "rsp_room_no_path_yet",
+        1,
+        [0x5Fu8; 32],
+        0,
+        0,
+        &[],
+        b"New Room",
+    ));
+    v.push(frame_only_vector("rsp_rooms_done", FRAME_RSP_ROOMS_DONE));
 
     v.push(rsp_advert_vector(
         "rsp_advert",

@@ -1,12 +1,16 @@
 # ADR-0002 — Provisioning Wire Format
 
 - **Status:** Accepted (2026-06-13); amended 2026-06-15 (ADD_CHANNEL key_len + blob v0x02);
-  amended 2026-07-03 (retired `SET_RADIO_PRESET`/`SET_LOCKS` — see §3 note)
+  amended 2026-07-03 (retired `SET_RADIO_PRESET`/`SET_LOCKS` — see §3 note);
+  amended 2026-07-25 (room-server contacts: `ADD_ROOM`/`DEL_ROOM`/`QUERY_ROOMS`,
+  blob v0x03, room URI — see §7)
 - **Deciders:** Maintainer design review
 - **Supersedes:** —
 - **Implements:** ADR-0001 §4 (admin configuration interface via USB-serial)
-- **Code:** `protocol/src/provisioning.rs` (shared codec), `firmware/src/config_store.rs`,
-  `firmware/src/provisioning_server.rs`
+- **Code:** `protocol/src/provisioning.rs` (shared codec), `firmware-core/src/config_store.rs`
+  (blob codec + structs — see ADR-0005), `firmware/src/config_store.rs` (NVS I/O),
+  `firmware/src/provisioning_server.rs`, `host/src/main.rs` (room URI),
+  `site/provisioner/codec.js` (JS mirror)
 
 ## Context
 
@@ -165,12 +169,15 @@ The config is stored in the ESP-IDF NVS default partition under namespace
 The flag is written last (after the blob) so a power-failure during commit
 leaves the device unprovisioned rather than half-configured.
 
-Binary blob layout: version byte (current: `0x02`), counts, flags,
-per-contact entries (66 bytes each), per-channel entries (67 bytes each —
-the `key_len` byte was added in v0x02 to support 128-bit channel secrets).
-A blob with version `0x01` triggers reprovisioning (safe: device is treated as
-unprovisioned).  Max blob size: 1 623 bytes (well within the 24 KB NVS
-partition).
+Binary blob layout: version byte (current: `0x03`), counts, flags,
+per-contact entries (67 bytes each — the `role` byte was added in v0x03,
+§7), per-channel entries (67 bytes each — the `key_len` byte was added in
+v0x02 to support 128-bit channel secrets), and (v0x03+) per-room-extras
+entries (119 bytes each, §7). A blob with version `0x01` triggers
+reprovisioning (safe: device is treated as unprovisioned); a `v0x02` blob
+instead migrates losslessly forward to `v0x03` (§7 — the one exception to
+"unrecognized version ⇒ reprovision"). Max blob size: 3 544 bytes (well
+within the 24 KB NVS partition).
 
 The device display name (§3 `SET_DEVICE_NAME` amendment) does NOT live in this
 blob — it is a separate key (`name`) in the identity namespace (`mc_id`),
@@ -215,6 +222,121 @@ only reach the live radio/UI state after a reboot); the host CLI's
 `clear-history` output states the reboot requirement explicitly rather than
 implying an instant on-screen clear.
 
+### 7. Room-server contacts (2026-07-25 amendment)
+
+A room server is provisioned like a chat contact plus one extra secret (the
+guest password) and some runtime-learned state (`sync_since`, `permissions`,
+`out_path`). This amendment covers the storage layout, the new frame types,
+and the room URI/QR decision. It does **not** cover the actual room-login
+session logic, host-CLI verbs, or browser UI — those are later work; this
+amendment lands the contract they build against.
+
+**Storage: `role` byte + parallel room-extras list, not a separate contact
+type.** `ProvisionedConfig::contacts` gained a `role: u8` field (`ROLE_CHAT =
+0`, `ROLE_ROOM = 3` — the latter reused directly from MeshCore's own advert
+node-type nibble, `0=none, 1=chat, 2=repeater, 3=room server, 4=sensor`, so
+it can be passed straight through as a URI `type=` value with no
+translation; `ROLE_CHAT` is `0`, NOT upstream's `1`, specifically so a
+pre-this-amendment blob — which has no `role` byte at all — migrates every
+existing contact to "chat" for free by zero-fill). A room's password,
+`sync_since`, `permissions`, and `out_path` live in a separate
+`room_extras` list (`firmware-core/src/config_store.rs::RoomExtra`), keyed by
+pubkey rather than positional index, so the existing `DEL_CONTACT`
+compaction-shift can never desync it from its owning contact. Keeping rooms
+in the one contacts store (rather than a wholly separate table) makes a
+Contacts-tab filter and a Groups-tab union each a one-field predicate on
+`role`.
+
+**Blob version `0x02` → `0x03`.** New header byte `room_count`; contact
+entries grow from 66 to 67 bytes (`+role`); a new room-extras section
+(119 bytes/entry) follows the channel section. `MAX_BLOB_LEN` is rebudgeted
+to `32 + 16×67 + 8×67 + 16×119` = **3544 bytes** (room count is
+capacity-bounded by `MAX_CONTACTS`, since every room is also a contact —
+there is no separate `MAX_ROOMS`), still well within the 24 KB NVS
+partition. **The migration is mandatory and lossless**: a `v0x02` blob loads
+under `v0x03` with every contact and channel intact, every contact's `role`
+defaulted to `ROLE_CHAT`, and zero rooms — a device in the field is never
+bricked, wiped, or silently reset to unprovisioned by this firmware upgrade.
+The very next config save persists it forward as a full `v0x03` blob. See
+`firmware-core/src/config_store.rs`'s module doc for the byte-level layout
+and `v2_blob_migrates_losslessly_*`/`v2_blob_then_resave_upgrades_to_v3_*`
+for the executable proof.
+
+**New frame types**, numbered to continue the existing per-entity add/del/query
+sequences rather than reusing `ADD_CONTACT`/`RSP_CONTACT` (a room's
+provisioning-time payload — a guest password — has no chat-contact
+equivalent):
+
+| Frame type | Direction | Key payload fields |
+|------------|-----------|--------------------|
+| `QUERY_ROOMS (0x05)` | host→device | (empty) |
+| `ADD_ROOM (0x22)` | host→device | `pubkey(32) \| guest_password_len(1) \| guest_password(N) \| name_len(1) \| name(M)` |
+| `DEL_ROOM (0x23)` | host→device | `pubkey(32)` |
+| `RSP_ROOM (0x8B)` | device→host | `index(1) \| pubkey(32) \| sync_since(4 LE) \| permissions(1) \| out_path_len(1) \| out_path(P) \| name_len(1) \| name(M)` |
+| `RSP_ROOMS_DONE (0x8C)` | device→host | (empty) |
+
+`RSP_ROOM` deliberately does **not** echo the guest password back — same
+precedent as `RSP_CHANNEL` not echoing the channel secret. This keeps "the
+password appears in no log, echo, or error line" a mechanical property of
+the wire format rather than a call-site discipline the firmware has to get
+right every time. The guest password crosses the USB link in the clear —
+that is correct and intentional per §4/ADR-0001 §4: the cable is the
+authentication. No transport crypto is added for this frame family either.
+
+**Room URI/QR decision: reuse `type=3` as-is, carry the guest password
+out-of-band.** A room server is upstream MeshCore node type 3
+(`meshcore-dev/MeshCore` docs/faq.md §7.5 documents
+`meshcore://contact/add?name=<n>&public_key=<hex>&type=<type>` with
+`type`: chat=1, repeater=2, room=3, sensor=4) — but that scheme has **no
+slot for a password at any `type` value**. Two options were weighed:
+
+1. Extend the URI with a non-standard `password=` parameter.
+2. Reuse `type=3` unchanged and communicate the guest password out-of-band.
+
+**Compatibility investigation.** The FAQ text itself is silent on how the
+companion app's query-string parser handles an unrecognized parameter
+(ignored vs. hard-fail). A search for a public source repository for the
+companion app's URI/deep-link parser (to inspect its behavior directly,
+per this amendment's own requirement not to assert it) turned up nothing
+under the `meshcore-dev` GitHub org — the mobile companion app does not
+appear to have public source to read. Absent that, option 1's actual
+compatibility cost is **unknown and unverifiable from here**: a
+`password=` param might be silently ignored by every companion-app version
+(fine) or hard-fail the parse on some version, present or future (breaks
+the QR scan entirely, an unacceptable failure mode for a physical-QR
+handoff with no error channel back to the admin).
+
+**Decision: option 2.** The room URI is byte-identical in shape to the
+`type=1` contact URI, only `type=3` differs:
+
+```
+meshcore://contact/add?name=<name>&public_key=<hex>&type=3
+```
+
+This has **zero compatibility risk** — it is not a deviation from the
+upstream scheme at all, just the value upstream already reserves for this
+exact case. The cost is UX, not compatibility: the guest password must be
+communicated by some channel other than the QR itself (spoken, written
+alongside, printed separately by the host CLI) and entered by whichever
+later UI implements the actual room-login flow. Given the room-login
+session itself is already a separate step from the identity/contact-add
+scan (a `RESPONSE`/`ANON_REQ` round trip over the mesh, not something a
+QR scan alone can complete), this costs no additional step in practice — it
+only means the password isn't riding along in the same QR payload.
+
+`host/src/main.rs::build_room_add_uri` builds this URI;
+`host/src/main.rs::parse_contact_uri` is the round-trip parser proving it
+(and the existing `type=1` contact URI, unchanged byte-for-byte) decode
+back to their exact inputs — see that file's `room_uri_golden_string`,
+`contact_uri_byte_output_unchanged_by_room_uri_addition`, and
+`*_round_trips_through_the_host_cli_parser` tests.
+
+**JS codec mirror.** `site/provisioner/codec.js` gained
+`encodeAddRoom`/`encodeDelRoom`/`decodeRspRoom` and the new frame-type
+constants, extended via the same golden-vector conformance mechanism as
+every other frame (`xtask`'s `gen-prov-golden-vectors` +
+`codec.conformance.test.mjs`) — see `docs/adr/0007-provisioner-codec.md`.
+
 ## Alternatives Considered
 
 ### A. USB CDC/HID custom class
@@ -240,9 +362,13 @@ encoding names containing special characters).
 - The protocol is **not human-readable** — a host-side CLI or Python script is
   required to send provisioning frames.  This is intentional: the host CLI
   provides the user-facing tool.
-- The format is **versioned** (current: blob `v0x02`; was `v0x01` before
-  `key_len` was added to channels).  A version bump triggers a reprovisioning
-  request rather than a silent mismatch — safe failure mode.
+- The format is **versioned** (current: blob `v0x03`, adding room-server
+  contacts; was `v0x02` before that, and `v0x01` before `key_len` was added
+  to channels).  A version bump triggers a reprovisioning request rather
+  than a silent mismatch, EXCEPT `v0x02` → `v0x03`, which is a mandatory
+  lossless migration (§7) rather than a reprovisioning request — the first
+  version bump in this ADR's history that a device in the field must not be
+  reprovisioned over.
 - The CRC algorithm is **not authenticated** — eavesdroppers on the USB bus can
   inject frames.  Accepted risk under the physical-possession security model.
 - The **primary-channel flag** is enforced to be unique: `ADD_CHANNEL` with

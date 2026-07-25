@@ -51,7 +51,7 @@ use protocol::channel_hash_var;
 
 use crate::config_store::{
     Channel, ChannelListFull, ChannelUpsert, Contact, NotifDefaults, ProvisionedConfig, RadioPreset,
-    MAX_CHANNELS, MAX_CONTACTS, MAX_NAME_LEN, MAX_PIN_LEN,
+    RoomExtra, MAX_CHANNELS, MAX_CONTACTS, MAX_NAME_LEN, MAX_PIN_LEN, ROLE_CHAT,
 };
 
 /// Frame receive buffer.  Sized to hold the largest possible provisioning frame
@@ -88,6 +88,7 @@ pub fn run(
     let null_contact = Contact {
         pubkey: [0u8; 32],
         telemetry_enable: false,
+        role: ROLE_CHAT,
         display_name: [0u8; MAX_NAME_LEN],
         display_name_len: 0,
     };
@@ -104,6 +105,8 @@ pub fn run(
         contact_count:  0,
         channels:       [null_channel; MAX_CHANNELS],
         channel_count:  0,
+        room_extras:    [RoomExtra::EMPTY; MAX_CONTACTS],
+        room_count:     0,
         radio_preset:   RadioPreset::default(),
         notif_defaults: NotifDefaults::default(),
         pin:            [0u8; MAX_PIN_LEN],
@@ -342,6 +345,7 @@ fn process_frame(
                     staging.contacts[i] = Contact {
                         pubkey:            c.pubkey,
                         telemetry_enable:  c.telemetry_enable,
+                        role:              ROLE_CHAT,
                         display_name:      c.display_name,
                         display_name_len:  c.display_name_len,
                     };

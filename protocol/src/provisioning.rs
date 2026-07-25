@@ -31,6 +31,9 @@
 //! All payloads are encoded into/decoded from caller-supplied byte slices; no
 //! heap allocation is used.
 
+use crate::constants::MAX_PATH_SIZE;
+use crate::room::MAX_LOGIN_PASSWORD_LEN;
+
 // ── Constants ────────────────────────────────────────────────────────────────
 
 /// Frame synchronisation magic bytes ("MC").
@@ -47,6 +50,18 @@ pub const MAX_PIN_LEN: usize = 16;
 
 /// Maximum error message length in an RspError payload.
 pub const MAX_ERR_MSG_LEN: usize = 64;
+
+/// Maximum room guest-password length this codec will encode — reuses
+/// [`crate::room::MAX_LOGIN_PASSWORD_LEN`] (the `simple_room_server` login
+/// codec's own limit, NUL byte included) rather than redeclaring it, so the
+/// provisioning wire format and the room login wire format can never drift
+/// out of sync on this number.
+pub const MAX_ROOM_PASSWORD_LEN: usize = MAX_LOGIN_PASSWORD_LEN;
+
+/// Maximum learned mesh-route path length carried in an `RspRoom` payload —
+/// reuses [`crate::constants::MAX_PATH_SIZE`] (the wire path-field ceiling),
+/// again to keep a single source of truth.
+pub const MAX_ROOM_PATH_LEN: usize = MAX_PATH_SIZE;
 
 // ── Frame type constants ─────────────────────────────────────────────────────
 //
@@ -74,6 +89,17 @@ pub const FRAME_QUERY_CHANNELS: u8 = 0x03;
 /// this value.  The device replies [`FRAME_RSP_ADVERT`].
 pub const FRAME_QUERY_ADVERT: u8 = 0x04;
 
+/// Query the device's configured room-server contacts (streamed enumeration).
+/// Payload: empty.
+///
+/// The device replies with N × [`FRAME_RSP_ROOM`] then
+/// [`FRAME_RSP_ROOMS_DONE`], mirroring [`FRAME_QUERY_CONTACTS`] /
+/// [`FRAME_QUERY_CHANNELS`]'s streaming pattern. A room is also a contact
+/// (`role == ROLE_ROOM` — see `firmware_core::config_store`), but this query
+/// is scoped to rooms only so a room-management UI doesn't have to filter
+/// the full contact enumeration client-side.
+pub const FRAME_QUERY_ROOMS: u8 = 0x05;
+
 /// Add a contact entry.
 pub const FRAME_ADD_CONTACT: u8 = 0x10;
 /// Delete a contact entry by pubkey.
@@ -83,6 +109,17 @@ pub const FRAME_DEL_CONTACT: u8 = 0x11;
 pub const FRAME_ADD_CHANNEL: u8 = 0x20;
 /// Delete a channel entry by its full 32-byte secret.
 pub const FRAME_DEL_CHANNEL: u8 = 0x21;
+
+/// Add (or replace) a room-server contact: a contact entry with
+/// `role == ROLE_ROOM` plus its room-specific extras (guest password;
+/// `sync_since`/`permissions`/`out_path` are learned at runtime, not
+/// host-supplied — see ADR-0002 §7). Numbered to continue the `ADD_CHANNEL`/
+/// `DEL_CHANNEL` (`0x20`/`0x21`) add/del-entity sequence rather than
+/// reusing/aliasing `ADD_CONTACT`, since a room's provisioning-time payload
+/// (guest password) has no chat-contact equivalent.
+pub const FRAME_ADD_ROOM: u8 = 0x22;
+/// Delete a room-server contact (its contact entry AND room extras) by pubkey.
+pub const FRAME_DEL_ROOM: u8 = 0x23;
 
 // NOTE: 0x30 (formerly FRAME_SET_RADIO_PRESET) and 0x60 (formerly
 // FRAME_SET_LOCKS) are retired frame types, removed after an audit found
@@ -154,6 +191,16 @@ pub const FRAME_RSP_CHANNELS_DONE: u8 = 0x89;
 /// there is deliberately no inner length field — decode with
 /// [`decode_frame`] and treat the whole payload slice as the card.
 pub const FRAME_RSP_ADVERT: u8 = 0x8A;
+/// Response: one room-server contact in a streamed room enumeration
+/// (answer to [`FRAME_QUERY_ROOMS`]). The guest password is deliberately
+/// NOT echoed back — same precedent as [`FRAME_RSP_CHANNEL`] not echoing the
+/// channel secret: it is credential material the host already knows (it
+/// supplied it via [`FRAME_ADD_ROOM`]), and keeping it off every response
+/// keeps the "no log/echo/error line ever carries the password" invariant
+/// mechanical rather than call-site-discipline-dependent.
+pub const FRAME_RSP_ROOM: u8 = 0x8B;
+/// Response: terminal frame of a room enumeration stream (no payload).
+pub const FRAME_RSP_ROOMS_DONE: u8 = 0x8C;
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -172,6 +219,10 @@ pub enum ProvError {
     NameTooLong,
     /// The PIN exceeds `MAX_PIN_LEN`.
     PinTooLong,
+    /// A room guest password exceeds `MAX_ROOM_PASSWORD_LEN`.
+    PasswordTooLong,
+    /// A room `out_path` field exceeds `MAX_ROOM_PATH_LEN`.
+    PathTooLong,
 }
 
 // ── Payload structs ───────────────────────────────────────────────────────────
@@ -222,6 +273,33 @@ pub struct AddChannelPayload {
 pub struct DelChannelPayload {
     /// Full 32-byte channel secret identifying the channel to remove.
     pub secret: [u8; 32],
+}
+
+/// Payload for `FRAME_ADD_ROOM`.
+///
+/// Only the fields the host actually supplies at provisioning time: the
+/// room's identity (pubkey), its guest password, and a display name.
+/// `sync_since`, `permissions`, and `out_path` are runtime-learned state, not
+/// host-supplied — they have no place in this payload (see ADR-0002 §7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AddRoomPayload {
+    /// Ed25519 public key (32 bytes) — the room server's identity.
+    pub pubkey: [u8; 32],
+    /// UTF-8 guest password, padded with zeros to `MAX_ROOM_PASSWORD_LEN`.
+    pub guest_password: [u8; MAX_ROOM_PASSWORD_LEN],
+    /// Actual byte length of `guest_password`.
+    pub guest_password_len: u8,
+    /// UTF-8 display name, padded with zeros to `MAX_NAME_LEN`.
+    pub name: [u8; MAX_NAME_LEN],
+    /// Actual byte length of `name` (0 ⇒ use pub_hash as label).
+    pub name_len: u8,
+}
+
+/// Payload for `FRAME_DEL_ROOM`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DelRoomPayload {
+    /// Full Ed25519 public key of the room to remove.
+    pub pubkey: [u8; 32],
 }
 
 /// Payload for `FRAME_SET_NOTIF_DEFAULTS`.
@@ -365,6 +443,35 @@ pub struct RspChannelPayload {
     pub name_len: u8,
 }
 
+/// Payload for `FRAME_RSP_ROOM` (one entry in a room enumeration).
+///
+/// The guest password is intentionally **not** echoed back — see
+/// [`FRAME_RSP_ROOM`]'s doc comment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RspRoomPayload {
+    /// 0-based index of this room in the device's configured list.
+    pub index: u8,
+    /// Room server's Ed25519 public key (32 bytes) — the room identity.
+    pub pubkey: [u8; 32],
+    /// Persisted sync watermark: posts with `post_ts <= sync_since` have
+    /// already been delivered to this device (see `protocol::room`'s
+    /// `sync_since` docs).
+    pub sync_since: u32,
+    /// Raw `protocol::room::RoomPermission` byte last granted at login
+    /// (`RoomPermission::from_u8` decodes it).
+    pub permissions: u8,
+    /// Learned mesh-route path to the room server, zero-padded to
+    /// `MAX_ROOM_PATH_LEN`. Empty (`out_path_len == 0`) until a login or
+    /// keep-alive response has taught the device a path.
+    pub out_path: [u8; MAX_ROOM_PATH_LEN],
+    /// Actual byte length of `out_path` (0 ⇒ no path learned yet).
+    pub out_path_len: u8,
+    /// UTF-8 display name, zero-padded to `MAX_NAME_LEN`.
+    pub name: [u8; MAX_NAME_LEN],
+    /// Actual byte length of `name`.
+    pub name_len: u8,
+}
+
 /// Payload for `FRAME_RSP_ERROR`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RspErrorPayload {
@@ -494,6 +601,35 @@ pub fn encode_del_channel(secret: &[u8; 32], out: &mut [u8]) -> usize {
     32
 }
 
+/// Encode an `AddRoom` payload.  Returns bytes written.
+///
+/// Wire layout: `pubkey(32) | guest_password_len(1) | guest_password(N) |
+/// name_len(1) | name(M)`
+pub fn encode_add_room(
+    pubkey: &[u8; 32],
+    guest_password: &[u8],
+    name: &[u8],
+    out: &mut [u8],
+) -> usize {
+    let pw_len = guest_password.len().min(MAX_ROOM_PASSWORD_LEN);
+    let name_len = name.len().min(MAX_NAME_LEN);
+    out[0..32].copy_from_slice(pubkey);
+    out[32] = pw_len as u8;
+    out[33..33 + pw_len].copy_from_slice(&guest_password[..pw_len]);
+    let name_off = 33 + pw_len;
+    out[name_off] = name_len as u8;
+    out[name_off + 1..name_off + 1 + name_len].copy_from_slice(&name[..name_len]);
+    name_off + 1 + name_len
+}
+
+/// Encode a `DelRoom` payload.  Returns bytes written (always 32).
+///
+/// Wire layout: `pubkey(32)` — identical shape to [`encode_del_contact`],
+/// reused directly rather than re-implemented.
+pub fn encode_del_room(pubkey: &[u8; 32], out: &mut [u8]) -> usize {
+    encode_del_contact(pubkey, out)
+}
+
 /// Encode a `SetNotifDefaults` payload.  Returns bytes written (always 2).
 ///
 /// Wire layout: `visual(1) | audible(1)`
@@ -604,6 +740,36 @@ pub fn encode_rsp_channel(
     5 + name_len
 }
 
+/// Encode an `RspRoom` payload.  Returns bytes written.
+///
+/// Wire layout: `index(1) | pubkey(32) | sync_since(4 LE) | permissions(1) |
+/// out_path_len(1) | out_path(P) | name_len(1) | name(N)`
+///
+/// Maximum size: `40 + MAX_ROOM_PATH_LEN + MAX_NAME_LEN` (136 bytes).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_rsp_room(
+    index: u8,
+    pubkey: &[u8; 32],
+    sync_since: u32,
+    permissions: u8,
+    out_path: &[u8],
+    name: &[u8],
+    out: &mut [u8],
+) -> usize {
+    let out_path_len = out_path.len().min(MAX_ROOM_PATH_LEN);
+    let name_len = name.len().min(MAX_NAME_LEN);
+    out[0] = index;
+    out[1..33].copy_from_slice(pubkey);
+    out[33..37].copy_from_slice(&sync_since.to_le_bytes());
+    out[37] = permissions;
+    out[38] = out_path_len as u8;
+    out[39..39 + out_path_len].copy_from_slice(&out_path[..out_path_len]);
+    let name_off = 39 + out_path_len;
+    out[name_off] = name_len as u8;
+    out[name_off + 1..name_off + 1 + name_len].copy_from_slice(&name[..name_len]);
+    name_off + 1 + name_len
+}
+
 /// Encode an `RspError` payload.  Returns bytes written.
 ///
 /// Wire layout: `error_code(1) | msg_len(1) | msg(msg_len)`
@@ -697,6 +863,48 @@ pub fn decode_del_channel(payload: &[u8]) -> Result<DelChannelPayload, ProvError
     let mut secret = [0u8; 32];
     secret.copy_from_slice(&payload[0..32]);
     Ok(DelChannelPayload { secret })
+}
+
+/// Decode an `AddRoom` payload.
+pub fn decode_add_room(payload: &[u8]) -> Result<AddRoomPayload, ProvError> {
+    // Minimum: pubkey(32) + guest_password_len(1) + name_len(1) = 34 bytes
+    if payload.len() < 34 {
+        return Err(ProvError::TruncatedPayload);
+    }
+    let mut pubkey = [0u8; 32];
+    pubkey.copy_from_slice(&payload[0..32]);
+    let pw_len = payload[32] as usize;
+    if pw_len > MAX_ROOM_PASSWORD_LEN {
+        return Err(ProvError::PasswordTooLong);
+    }
+    if payload.len() < 33 + pw_len + 1 {
+        return Err(ProvError::TruncatedPayload);
+    }
+    let mut guest_password = [0u8; MAX_ROOM_PASSWORD_LEN];
+    guest_password[..pw_len].copy_from_slice(&payload[33..33 + pw_len]);
+    let name_off = 33 + pw_len;
+    let name_len = payload[name_off] as usize;
+    if name_len > MAX_NAME_LEN {
+        return Err(ProvError::NameTooLong);
+    }
+    if payload.len() < name_off + 1 + name_len {
+        return Err(ProvError::TruncatedPayload);
+    }
+    let mut name = [0u8; MAX_NAME_LEN];
+    name[..name_len].copy_from_slice(&payload[name_off + 1..name_off + 1 + name_len]);
+    Ok(AddRoomPayload {
+        pubkey,
+        guest_password,
+        guest_password_len: pw_len as u8,
+        name,
+        name_len: name_len as u8,
+    })
+}
+
+/// Decode a `DelRoom` payload.
+pub fn decode_del_room(payload: &[u8]) -> Result<DelRoomPayload, ProvError> {
+    let d = decode_del_contact(payload)?;
+    Ok(DelRoomPayload { pubkey: d.pubkey })
 }
 
 /// Decode a `SetNotifDefaults` payload.
@@ -881,6 +1089,52 @@ pub fn decode_rsp_channel(payload: &[u8]) -> Result<RspChannelPayload, ProvError
     })
 }
 
+/// Decode an `RspRoom` payload.
+pub fn decode_rsp_room(payload: &[u8]) -> Result<RspRoomPayload, ProvError> {
+    // Minimum: index(1) + pubkey(32) + sync_since(4) + permissions(1) +
+    // out_path_len(1) = 39 bytes
+    if payload.len() < 39 {
+        return Err(ProvError::TruncatedPayload);
+    }
+    let index = payload[0];
+    let mut pubkey = [0u8; 32];
+    pubkey.copy_from_slice(&payload[1..33]);
+    let sync_since = u32::from_le_bytes(payload[33..37].try_into().unwrap());
+    let permissions = payload[37];
+    let out_path_len = payload[38] as usize;
+    if out_path_len > MAX_ROOM_PATH_LEN {
+        return Err(ProvError::PathTooLong);
+    }
+    if payload.len() < 39 + out_path_len {
+        return Err(ProvError::TruncatedPayload);
+    }
+    let mut out_path = [0u8; MAX_ROOM_PATH_LEN];
+    out_path[..out_path_len].copy_from_slice(&payload[39..39 + out_path_len]);
+    let name_off = 39 + out_path_len;
+    if payload.len() < name_off + 1 {
+        return Err(ProvError::TruncatedPayload);
+    }
+    let name_len = payload[name_off] as usize;
+    if name_len > MAX_NAME_LEN {
+        return Err(ProvError::NameTooLong);
+    }
+    if payload.len() < name_off + 1 + name_len {
+        return Err(ProvError::TruncatedPayload);
+    }
+    let mut name = [0u8; MAX_NAME_LEN];
+    name[..name_len].copy_from_slice(&payload[name_off + 1..name_off + 1 + name_len]);
+    Ok(RspRoomPayload {
+        index,
+        pubkey,
+        sync_since,
+        permissions,
+        out_path,
+        out_path_len: out_path_len as u8,
+        name,
+        name_len: name_len as u8,
+    })
+}
+
 /// Decode an `RspError` payload.
 pub fn decode_rsp_error(payload: &[u8]) -> Result<RspErrorPayload, ProvError> {
     if payload.len() < 2 {
@@ -1050,6 +1304,129 @@ mod tests {
         assert!(!ch.primary);
         assert_eq!(ch.name_len, name.len() as u8);
         assert_eq!(&ch.name[..name.len()], name);
+    }
+
+    // ── AddRoom / DelRoom / RspRoom roundtrip (ADR-0002 §7) ──────────────────
+
+    #[test]
+    fn add_room_roundtrip_with_password_and_name() {
+        let pubkey = [0x5Au8; 32];
+        let password = b"hunter2";
+        let name = b"Lobby";
+        let mut payload_buf = [0u8; 64];
+        let plen = encode_add_room(&pubkey, password, name, &mut payload_buf);
+
+        let mut frame_buf = [0u8; 128];
+        let n = encode_frame(FRAME_ADD_ROOM, &payload_buf[..plen], &mut frame_buf);
+        let (ft, payload) = decode_frame(&frame_buf[..n]).unwrap();
+        assert_eq!(ft, FRAME_ADD_ROOM);
+
+        let room = decode_add_room(payload).unwrap();
+        assert_eq!(room.pubkey, pubkey);
+        assert_eq!(room.guest_password_len, password.len() as u8);
+        assert_eq!(&room.guest_password[..password.len()], password);
+        assert_eq!(room.name_len, name.len() as u8);
+        assert_eq!(&room.name[..name.len()], name);
+    }
+
+    #[test]
+    fn add_room_roundtrip_empty_password_and_name() {
+        let pubkey = [0x5Bu8; 32];
+        let mut payload_buf = [0u8; 64];
+        let plen = encode_add_room(&pubkey, &[], &[], &mut payload_buf);
+        let room = decode_add_room(&payload_buf[..plen]).unwrap();
+        assert_eq!(room.pubkey, pubkey);
+        assert_eq!(room.guest_password_len, 0);
+        assert_eq!(room.name_len, 0);
+    }
+
+    #[test]
+    fn add_room_password_truncates_to_capacity() {
+        let pubkey = [0x5Cu8; 32];
+        let long_password = [b'x'; 64];
+        let mut payload_buf = [0u8; 128];
+        let plen = encode_add_room(&pubkey, &long_password, b"Lobby", &mut payload_buf);
+        let room = decode_add_room(&payload_buf[..plen]).unwrap();
+        assert_eq!(room.guest_password_len as usize, MAX_ROOM_PASSWORD_LEN);
+    }
+
+    #[test]
+    fn decode_add_room_rejects_over_length_password() {
+        let mut payload = [0u8; 40];
+        payload[32] = (MAX_ROOM_PASSWORD_LEN + 1) as u8;
+        assert_eq!(decode_add_room(&payload), Err(ProvError::PasswordTooLong));
+    }
+
+    #[test]
+    fn del_room_roundtrip() {
+        let pubkey = [0x5Du8; 32];
+        let mut payload_buf = [0u8; 32];
+        let plen = encode_del_room(&pubkey, &mut payload_buf);
+
+        let mut frame_buf = [0u8; 64];
+        let n = encode_frame(FRAME_DEL_ROOM, &payload_buf[..plen], &mut frame_buf);
+        let (ft, payload) = decode_frame(&frame_buf[..n]).unwrap();
+        assert_eq!(ft, FRAME_DEL_ROOM);
+
+        let room = decode_del_room(payload).unwrap();
+        assert_eq!(room.pubkey, pubkey);
+    }
+
+    #[test]
+    fn rsp_room_roundtrip_with_path_and_name() {
+        let pubkey = [0x5Eu8; 32];
+        let out_path = [0x11u8, 0x22, 0x33];
+        let name = b"Lobby";
+        let mut payload_buf = [0u8; 160];
+        let plen = encode_rsp_room(
+            2,
+            &pubkey,
+            0xDEAD_BEEF,
+            2,
+            &out_path,
+            name,
+            &mut payload_buf,
+        );
+
+        let mut frame_buf = [0u8; 200];
+        let n = encode_frame(FRAME_RSP_ROOM, &payload_buf[..plen], &mut frame_buf);
+        let (ft, payload) = decode_frame(&frame_buf[..n]).unwrap();
+        assert_eq!(ft, FRAME_RSP_ROOM);
+
+        let room = decode_rsp_room(payload).unwrap();
+        assert_eq!(room.index, 2);
+        assert_eq!(room.pubkey, pubkey);
+        assert_eq!(room.sync_since, 0xDEAD_BEEF);
+        assert_eq!(room.permissions, 2);
+        assert_eq!(room.out_path_len as usize, out_path.len());
+        assert_eq!(&room.out_path[..out_path.len()], &out_path[..]);
+        assert_eq!(room.name_len, name.len() as u8);
+        assert_eq!(&room.name[..name.len()], name);
+    }
+
+    #[test]
+    fn rsp_room_roundtrip_no_path_yet() {
+        // A freshly-added room has no learned out_path until a login/keep-alive
+        // response has taught the device one (see RspRoomPayload::out_path_len doc).
+        let pubkey = [0x5Fu8; 32];
+        let mut payload_buf = [0u8; 160];
+        let plen = encode_rsp_room(0, &pubkey, 0, 0, &[], b"New Room", &mut payload_buf);
+        let room = decode_rsp_room(&payload_buf[..plen]).unwrap();
+        assert_eq!(room.out_path_len, 0);
+        assert_eq!(room.sync_since, 0);
+    }
+
+    #[test]
+    fn decode_rsp_room_rejects_over_length_out_path() {
+        let mut payload = [0u8; 40];
+        payload[38] = (MAX_ROOM_PATH_LEN + 1) as u8;
+        assert_eq!(decode_rsp_room(&payload), Err(ProvError::PathTooLong));
+    }
+
+    #[test]
+    fn decode_rsp_room_truncated_is_rejected() {
+        let payload = [0u8; 38]; // one byte short of the 39-byte minimum
+        assert_eq!(decode_rsp_room(&payload), Err(ProvError::TruncatedPayload));
     }
 
     // ── SetNotifDefaults roundtrip ───────────────────────────────────────────

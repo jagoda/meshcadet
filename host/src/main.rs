@@ -594,6 +594,53 @@ fn build_contact_add_uri(name: &str, pubkey_hex: &str) -> String {
     )
 }
 
+/// Room node type (`ROLE_ROOM` in `firmware_core::config_store`) as it
+/// appears in a `meshcore://contact/add?...&type=<n>` URI's `type` field.
+/// (Chat's `type=1` stays a literal in [`build_contact_add_uri`] — see that
+/// function's regression-anchor comment.)
+#[allow(dead_code)]
+const URI_NODE_TYPE_ROOM: u8 = 3;
+
+/// Build the MeshCore companion room-add URI from a display name and a
+/// hex-encoded room-server pubkey.
+///
+/// `meshcore://contact/add?name=<name>&public_key=<hex>&type=3`
+///
+/// Byte-identical in shape to [`build_contact_add_uri`] except `type=3`
+/// (room server) instead of `type=1` (chat) — no other parameter is added.
+///
+/// # Why no guest-password parameter (ADR-0002 §7)
+///
+/// The upstream `meshcore://contact/add` scheme (docs/faq.md §7.5) has no
+/// slot for a password at ANY `type=` value — a room server is provisioned
+/// there exactly like a chat contact, identity-only. A public source for the
+/// companion app's query-string parser could not be located to empirically
+/// verify whether it ignores or hard-fails on an unrecognized parameter (see
+/// ADR-0002 §7's investigation notes), so extending this URI with a
+/// non-standard `password=` param was rejected as an unverifiable
+/// compatibility risk. Reusing the upstream `type=3` value AS-IS costs
+/// nothing and guarantees this URI parses on every companion-app version,
+/// present and future, exactly as a chat contact URI does. The guest
+/// password is instead communicated out-of-band (spoken, written down,
+/// printed by the host CLI alongside — not inside — the QR) and entered by
+/// whatever later UI implements the actual room-login flow (out of scope
+/// here).
+///
+/// No CLI verb wires this in yet — this mission lands the wire format and
+/// the storage contract only; a room-provisioning CLI command (and its
+/// `FRAME_ADD_ROOM` round trip) is a later child's job. Kept `#[allow(dead_code)]`
+/// as the primitive that command will call, same precedent as
+/// `config_store::clear_provisioned_flag`.
+#[allow(dead_code)]
+fn build_room_add_uri(name: &str, pubkey_hex: &str) -> String {
+    format!(
+        "meshcore://contact/add?name={}&public_key={}&type={}",
+        url_encode(name),
+        pubkey_hex,
+        URI_NODE_TYPE_ROOM,
+    )
+}
+
 /// Percent-encode a string for use as a URI query-component value (RFC 3986).
 ///
 /// Leaves the "unreserved" set (`A-Z a-z 0-9 - _ . ~`) intact and percent-encodes
@@ -614,6 +661,79 @@ fn url_encode(s: &str) -> String {
         }
     }
     out
+}
+
+/// Percent-decode a URI query-component value — the inverse of [`url_encode`].
+#[allow(dead_code)]
+fn url_decode(s: &str) -> anyhow::Result<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = s
+                .get(i + 1..i + 3)
+                .ok_or_else(|| anyhow::anyhow!("url_decode: truncated percent-escape"))?;
+            let byte = u8::from_str_radix(hex, 16)
+                .map_err(|e| anyhow::anyhow!("url_decode: invalid percent-escape %{hex}: {e}"))?;
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out)
+        .map_err(|e| anyhow::anyhow!("url_decode: invalid UTF-8 after percent-decode: {e}"))
+}
+
+/// A decoded `meshcore://contact/add` URI — the round-trip counterpart to
+/// [`build_contact_add_uri`] / [`build_room_add_uri`].
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedContactUri {
+    name: String,
+    pubkey_hex: String,
+    node_type: u8,
+}
+
+/// Parse a `meshcore://contact/add?name=...&public_key=...&type=...` URI.
+///
+/// Query parameters may appear in any order. An unrecognized parameter is
+/// silently ignored rather than erroring — this parser's own tolerance
+/// policy, independent of (and not a stand-in for) the still-unverified
+/// upstream companion-app parser (see [`build_room_add_uri`]'s doc comment).
+#[allow(dead_code)]
+fn parse_contact_uri(uri: &str) -> anyhow::Result<ParsedContactUri> {
+    let rest = uri
+        .strip_prefix("meshcore://contact/add?")
+        .ok_or_else(|| anyhow::anyhow!("not a meshcore://contact/add URI: {uri}"))?;
+
+    let mut name = None;
+    let mut pubkey_hex = None;
+    let mut node_type = None;
+    for pair in rest.split('&') {
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("malformed query parameter: {pair}"))?;
+        match key {
+            "name" => name = Some(url_decode(value)?),
+            "public_key" => pubkey_hex = Some(value.to_string()),
+            "type" => {
+                node_type = Some(
+                    value
+                        .parse::<u8>()
+                        .map_err(|e| anyhow::anyhow!("invalid type value {value}: {e}"))?,
+                )
+            }
+            _ => {} // unrecognized parameter — ignored, not an error
+        }
+    }
+    Ok(ParsedContactUri {
+        name: name.ok_or_else(|| anyhow::anyhow!("missing name parameter"))?,
+        pubkey_hex: pubkey_hex.ok_or_else(|| anyhow::anyhow!("missing public_key parameter"))?,
+        node_type: node_type.ok_or_else(|| anyhow::anyhow!("missing type parameter"))?,
+    })
 }
 
 // ── GPS status formatting (host `status` command) ───────────────────────────
@@ -702,8 +822,9 @@ fn format_battery_held_raw_mv(s: &protocol::provisioning::RspStatusPayload) -> S
 mod tests {
     use super::url_encode;
     use super::{
-        build_contact_add_uri, format_battery, format_battery_held_raw_mv, format_battery_raw_mv,
-        format_gps_clock, format_gps_coords, format_gps_fix,
+        build_contact_add_uri, build_room_add_uri, format_battery, format_battery_held_raw_mv,
+        format_battery_raw_mv, format_gps_clock, format_gps_coords, format_gps_fix,
+        parse_contact_uri,
     };
     use protocol::provisioning::RspStatusPayload;
 
@@ -936,5 +1057,70 @@ mod tests {
         assert!(format_a.contains("contact/add?"));
         assert!(!format_b.contains("contact/add?"));
         assert_ne!(format_a, format_b);
+    }
+
+    // ── Room URI (ADR-0002 §7) ────────────────────────────────────────────────
+
+    /// Golden-string test pinning the room URI's exact byte output: same
+    /// shape as the `type=1` contact URI, only `type=3` differs.
+    #[test]
+    fn room_uri_golden_string() {
+        let pubkey_hex = hex::encode([0xABu8; 32]);
+        let uri = build_room_add_uri("Lobby", &pubkey_hex);
+        assert_eq!(
+            uri,
+            "meshcore://contact/add?name=Lobby&public_key=abababababababababababababababababababababababababababababababab&type=3"
+        );
+    }
+
+    /// Regression guard: adding the room URI must not change the existing
+    /// `type=1` contact URI's byte-for-byte output.
+    #[test]
+    fn contact_uri_byte_output_unchanged_by_room_uri_addition() {
+        let pubkey_hex = hex::encode([0xABu8; 32]);
+        let uri = build_contact_add_uri("Mom & Dad's T-Deck", &pubkey_hex);
+        assert_eq!(
+            uri,
+            "meshcore://contact/add?name=Mom%20%26%20Dad%27s%20T-Deck&public_key=abababababababababababababababababababababababababababababababab&type=1"
+        );
+    }
+
+    #[test]
+    fn room_uri_round_trips_through_the_host_cli_parser() {
+        let pubkey_hex = hex::encode([0xCDu8; 32]);
+        let uri = build_room_add_uri("Mom & Dad's Lobby", &pubkey_hex);
+        let parsed = parse_contact_uri(&uri).expect("room URI must parse");
+        assert_eq!(parsed.name, "Mom & Dad's Lobby");
+        assert_eq!(parsed.pubkey_hex, pubkey_hex);
+        assert_eq!(parsed.node_type, 3);
+    }
+
+    #[test]
+    fn contact_uri_round_trips_through_the_host_cli_parser() {
+        let pubkey_hex = hex::encode([0x11u8; 32]);
+        let uri = build_contact_add_uri("Alice", &pubkey_hex);
+        let parsed = parse_contact_uri(&uri).expect("contact URI must parse");
+        assert_eq!(parsed.name, "Alice");
+        assert_eq!(parsed.pubkey_hex, pubkey_hex);
+        assert_eq!(parsed.node_type, 1);
+    }
+
+    #[test]
+    fn parse_contact_uri_tolerates_query_param_order() {
+        let uri = "meshcore://contact/add?type=3&public_key=aabb&name=Z";
+        let parsed = parse_contact_uri(uri).unwrap();
+        assert_eq!(parsed.name, "Z");
+        assert_eq!(parsed.pubkey_hex, "aabb");
+        assert_eq!(parsed.node_type, 3);
+    }
+
+    #[test]
+    fn parse_contact_uri_rejects_non_contact_scheme() {
+        assert!(parse_contact_uri("meshcore://channel/add?name=x").is_err());
+    }
+
+    #[test]
+    fn parse_contact_uri_rejects_missing_required_param() {
+        assert!(parse_contact_uri("meshcore://contact/add?name=x&type=1").is_err());
     }
 }

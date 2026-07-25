@@ -127,6 +127,22 @@ check("decodeRspChannel rejects an over-length name_len", () => {
   );
 });
 
+check("decodeRspRoom rejects a payload shorter than the 39-byte floor", () => {
+  assert.throws(
+    () => codec.decodeRspRoom(new Uint8Array(38)),
+    (err) => err instanceof codec.ProvError && err.kind === "TruncatedPayload",
+  );
+});
+
+check("decodeRspRoom rejects an over-length out_path_len", () => {
+  const payload = new Uint8Array(40);
+  payload[38] = codec.MAX_ROOM_PATH_LEN + 1;
+  assert.throws(
+    () => codec.decodeRspRoom(payload),
+    (err) => err instanceof codec.ProvError && err.kind === "PathTooLong",
+  );
+});
+
 check("decodeRspStatus rejects a payload shorter than the legacy 55-byte floor", () => {
   assert.throws(
     () => codec.decodeRspStatus(new Uint8Array(54)),
@@ -185,6 +201,7 @@ const ENCODE_OPS = {
   query_status: () => new Uint8Array(0),
   query_contacts: () => new Uint8Array(0),
   query_channels: () => new Uint8Array(0),
+  query_rooms: () => new Uint8Array(0),
   query_advert: (p) => codec.encodeQueryAdvert(p.host_unix_time),
   commit_provisioning: () => new Uint8Array(0),
   export_history: () => new Uint8Array(0),
@@ -193,6 +210,8 @@ const ENCODE_OPS = {
   del_contact: (p) => codec.encodeDelContact(codec.hexToBytes(p.pubkey)),
   add_channel: (p) => codec.encodeAddChannel(codec.hexToBytes(p.secret), p.key_len, p.primary, p.name),
   del_channel: (p) => codec.encodeDelChannel(codec.hexToBytes(p.secret)),
+  add_room: (p) => codec.encodeAddRoom(codec.hexToBytes(p.pubkey), p.guest_password, p.name),
+  del_room: (p) => codec.encodeDelRoom(codec.hexToBytes(p.pubkey)),
   set_notif_defaults: (p) => codec.encodeSetNotifDefaults(p.visual, p.audible),
   set_pin: (p) => codec.encodeSetPin(p.pin),
   set_device_name: (p) => codec.encodeSetDeviceName(p.name),
@@ -204,6 +223,7 @@ const DECODE_OPS = {
   rsp_identity: codec.decodeRspIdentity,
   rsp_contact: codec.decodeRspContact,
   rsp_channel: codec.decodeRspChannel,
+  rsp_room: codec.decodeRspRoom,
   rsp_history_entry: codec.decodeRspHistoryEntry,
   rsp_advert: codec.decodeRspAdvert,
 };
