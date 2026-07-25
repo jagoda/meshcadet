@@ -1,6 +1,7 @@
 # ADR-0005 — `firmware-core` Extraction
 
-- **Status:** Accepted (2026-07-11)
+- **Status:** Accepted (2026-07-11); amended 2026-07-25 (`config_store.rs` joins
+  the pattern — see "Later legs" note in Consequences)
 - **Deciders:** Maintainer design review
 - **Supersedes:** —
 - **Implements:** —
@@ -9,8 +10,9 @@
   `diagnostics` feature forwarding), `firmware/src/dispatcher.rs`,
   `firmware/src/pin_menu.rs`, `firmware/src/ui/notification.rs`,
   `firmware/src/ui/screens/gps_status.rs`, `firmware/src/gps.rs`,
-  `firmware/src/battery.rs`, `firmware/src/runtime_settings_store.rs` (all
-  reduced to thin re-export shims over their hardware-owning remainder).
+  `firmware/src/battery.rs`, `firmware/src/runtime_settings_store.rs`,
+  `firmware/src/config_store.rs` (all reduced to thin re-export shims over
+  their hardware-owning remainder).
 
 ## Context
 
@@ -147,6 +149,16 @@ had never once been run.
   logic the same way. Later legs are scoped and landed independently; this
   ADR records the pattern each of them follows, not the full target end
   state.
+- **2026-07-25 — `config_store.rs` (leg 2).** The room-server-contacts
+  provisioning work (`docs/adr/0002-provisioning-wire-format.md` §7) needed
+  an executable "v0x02 blob migrates losslessly to v0x03" proof — exactly
+  the kind of pure byte-slice codec test this pattern exists for. The split
+  point mirrors `runtime_settings_store.rs`'s precedent exactly: the blob
+  codec (`serialize_config`/`deserialize_config`) and every
+  `Contact`/`Channel`/`RoomExtra`/`ProvisionedConfig` struct + upsert/lookup
+  helper moved to `firmware_core::config_store`; `is_provisioned`/
+  `load_provisioned_config`/`save_provisioned_config`/`clear_provisioned_flag`
+  (the `EspNvs` read/write half) stayed behind in `firmware::config_store`.
 
 ## Alternatives Considered
 
