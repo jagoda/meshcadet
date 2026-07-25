@@ -28,6 +28,7 @@
 //! | `telemetry`  | GPS telemetry: bespoke `?loc` text codec + MeshCore-native REQ/RESPONSE (companion-app) codec |
 //! | `history`    | Rotating history codec + in-memory ring buffer + wire export protocol |
 //! | `history_region` | Per-conversation flash region format: header, append/compaction ring, directory |
+//! | `room`       | `simple_room_server` client codec: ANON_REQ login, room push/post, keep-alive, + test double |
 
 #![cfg_attr(not(test), no_std)]
 
@@ -107,6 +108,7 @@ pub mod identity;
 pub mod mention;
 pub mod policy;
 pub mod provisioning;
+pub mod room;
 pub mod staging;
 pub mod telemetry;
 
@@ -142,6 +144,14 @@ pub use history_region::{
 pub use identity::Identity;
 pub use mention::{split_mentions, wrap_mentions, MentionRun, MentionRuns, MentionTier};
 pub use policy::PolicyFilter;
+pub use room::{
+    decode_keep_alive_ack, decode_login_response, decode_room_push, encode_anon_req_login,
+    encode_keep_alive, encode_room_post, keep_alive_ack_hash, room_post_ack_hash,
+    room_push_ack_hash, KeepAliveAck, LoginResponse, RoomCodecError, RoomPermission, RoomPush,
+    RoomServerDouble, MAX_LOGIN_PASSWORD_LEN, MAX_POST_TEXT_LEN, MAX_ROOM_CLIENTS,
+    MAX_UNSYNCED_POSTS, PERM_ACL_ROLE_MASK, REQ_TYPE_KEEP_ALIVE, RESP_SERVER_LOGIN_OK,
+    TXT_TYPE_CLI_DATA, TXT_TYPE_PLAIN, TXT_TYPE_SIGNED_PLAIN,
+};
 pub use telemetry::{
     decode_telemetry_response,
     decode_telemetry_response_lpp,
