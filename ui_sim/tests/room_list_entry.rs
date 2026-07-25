@@ -68,7 +68,19 @@ fn room_entry_renders_in_the_channels_tab() {
     // second stretch rect, so its badge center is offset by one tab-width
     // (125px) from the Messages tab's (115, 9).
     let badge_cx = 115u32 + 125u32;
-    let badge_cy = 9u32;
+    // NOT `9` (the disc's exact vertical center): the unread-count `Text` is
+    // layered on top of this badge `Rectangle` with `horizontal/vertical-
+    // alignment: center`, so by construction it straddles the disc's own
+    // center pixel. Slint 1.16's text stack resolves real system fonts
+    // (Parley/fontique/skrifa, not a bundled deterministic fallback), so
+    // the glyph's antialiased edge can land a pixel differently across
+    // environments — sampling the center row made this assertion flaky
+    // across machines (passed locally, failed in CI: a near-miss color
+    // blend, not a missing badge — see PR #64 CI log). `5` stays solidly
+    // inside the 14px disc (verified against the actual render) but sits
+    // above the glyph's vertical band, so it reads pure `brand_signal`
+    // regardless of which font resolves the "1".
+    let badge_cy = 5u32;
     assert_eq!(
         rgb8_at(&img, badge_cx, badge_cy),
         brand_signal,
