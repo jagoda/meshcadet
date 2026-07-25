@@ -47,12 +47,32 @@ export const FRAME_QUERY_CHANNELS = 0x03;
  * value. The device replies `FRAME_RSP_ADVERT`.
  */
 export const FRAME_QUERY_ADVERT = 0x04;
+/**
+ * Query the device's configured room-server contacts (streamed enumeration).
+ * The device replies with N x `FRAME_RSP_ROOM` then `FRAME_RSP_ROOMS_DONE`,
+ * mirroring `FRAME_QUERY_CONTACTS`/`FRAME_QUERY_CHANNELS`.
+ */
+export const FRAME_QUERY_ROOMS = 0x05;
 
 export const FRAME_ADD_CONTACT = 0x10;
 export const FRAME_DEL_CONTACT = 0x11;
 
 export const FRAME_ADD_CHANNEL = 0x20;
 export const FRAME_DEL_CHANNEL = 0x21;
+/**
+ * Add (or replace) a room-server contact: a contact entry with
+ * `role == ROLE_ROOM` plus its guest password. Numbered to continue the
+ * `ADD_CHANNEL`/`DEL_CHANNEL` add/del-entity sequence — see
+ * `protocol::provisioning::FRAME_ADD_ROOM`'s doc comment.
+ */
+export const FRAME_ADD_ROOM = 0x22;
+/** Delete a room-server contact (its contact entry AND room extras) by pubkey. */
+export const FRAME_DEL_ROOM = 0x23;
+
+/** Max room guest-password length this codec will encode (NUL byte included on the Rust side). */
+export const MAX_ROOM_PASSWORD_LEN = 16;
+/** Max learned mesh-route path length carried in an `RspRoom` payload. */
+export const MAX_ROOM_PATH_LEN = 64;
 
 export const FRAME_SET_NOTIF_DEFAULTS = 0x40;
 
@@ -81,6 +101,15 @@ export const FRAME_RSP_CHANNELS_DONE = 0x89;
  * `decodeRspAdvert`.
  */
 export const FRAME_RSP_ADVERT = 0x8a;
+/**
+ * Response: one room-server contact in a streamed room enumeration (answer
+ * to `FRAME_QUERY_ROOMS`). The guest password is deliberately NOT echoed
+ * back — same precedent as `FRAME_RSP_CHANNEL` not echoing the channel
+ * secret.
+ */
+export const FRAME_RSP_ROOM = 0x8b;
+/** Response: terminal frame of a room enumeration stream (no payload). */
+export const FRAME_RSP_ROOMS_DONE = 0x8c;
 
 // `protocol::history::HistoryMsgType`.
 export const HISTORY_MSG_TYPE_DM = 0;
@@ -298,6 +327,24 @@ export function encodeDelChannel(secret) {
   return secret.slice(0, 32);
 }
 
+/** Wire layout: `pubkey(32) | guest_password_len(1) | guest_password(N) | name_len(1) | name(M)` */
+export function encodeAddRoom(pubkey, guestPassword, name) {
+  const pwBytes = encodeUtf8(guestPassword).subarray(0, MAX_ROOM_PASSWORD_LEN);
+  const nameBytes = encodeUtf8(name).subarray(0, MAX_NAME_LEN);
+  const out = new Uint8Array(34 + pwBytes.length + nameBytes.length);
+  out.set(pubkey.subarray(0, 32), 0);
+  out[32] = pwBytes.length;
+  out.set(pwBytes, 33);
+  out[33 + pwBytes.length] = nameBytes.length;
+  out.set(nameBytes, 34 + pwBytes.length);
+  return out;
+}
+
+/** Wire layout: `pubkey(32)` — identical shape to `encodeDelContact`. */
+export function encodeDelRoom(pubkey) {
+  return encodeDelContact(pubkey);
+}
+
 /** Wire layout: `visual(1) | audible(1)` */
 export function encodeSetNotifDefaults(visual, audible) {
   return new Uint8Array([visual ? 1 : 0, audible ? 1 : 0]);
@@ -422,6 +469,39 @@ export function decodeRspChannel(payload) {
     key_len: payload[2],
     primary: payload[3] !== 0,
     name: decodeUtf8(payload.subarray(5, 5 + nameLen)),
+    name_len: nameLen,
+  };
+}
+
+/**
+ * Decode an `RspRoom` payload. Wire layout: `index(1) | pubkey(32) |
+ * sync_since(4 LE) | permissions(1) | out_path_len(1) | out_path(P) |
+ * name_len(1) | name(N)`. The guest password is never part of this payload —
+ * see `FRAME_RSP_ROOM`'s doc comment.
+ */
+export function decodeRspRoom(payload) {
+  requireLen(payload, 39);
+  const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+  const outPathLen = payload[38];
+  if (outPathLen > MAX_ROOM_PATH_LEN) {
+    throw new ProvError("PathTooLong");
+  }
+  requireLen(payload, 39 + outPathLen);
+  const nameOff = 39 + outPathLen;
+  requireLen(payload, nameOff + 1);
+  const nameLen = payload[nameOff];
+  if (nameLen > MAX_NAME_LEN) {
+    throw new ProvError("NameTooLong");
+  }
+  requireLen(payload, nameOff + 1 + nameLen);
+  return {
+    index: payload[0],
+    pubkey: payload.slice(1, 33),
+    sync_since: view.getUint32(33, true),
+    permissions: payload[37],
+    out_path: payload.slice(39, 39 + outPathLen),
+    out_path_len: outPathLen,
+    name: decodeUtf8(payload.subarray(nameOff + 1, nameOff + 1 + nameLen)),
     name_len: nameLen,
   };
 }
