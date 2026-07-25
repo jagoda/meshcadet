@@ -392,6 +392,19 @@ pub struct PromoContact {
     pub unread: i32,
 }
 
+/// One seeded Channels-tab row — also how a room-server contact is rendered
+/// (`meshcadet-room-firmware-login-read`'s M1 acceptance: a room appears,
+/// read-only, in this EXISTING tab; no new tab, no visual-distinction work,
+/// so this shares the identical `ChannelEntry`/`ContactRow` markup a true
+/// channel row uses).
+pub struct PromoChannel {
+    pub name: &'static str,
+    pub initial: &'static str,
+    pub preview: &'static str,
+    pub time_str: &'static str,
+    pub unread: i32,
+}
+
 struct ContactListPromoPlatform {
     window: Rc<MinimalSoftwareWindow>,
     start: Instant,
@@ -472,6 +485,43 @@ impl ContactListPromoFrame {
         self.ui
             .set_channels(ModelRc::new(VecModel::<ChannelEntry>::default()));
         self.ui.set_show_contacts(true);
+    }
+
+    /// Seed the Channels tab with `channels` and switch to it — mirrors
+    /// `set_contacts` above. A room-server contact renders here (see
+    /// [`PromoChannel`]'s doc): `meshcadet-room-firmware-login-read`'s M1
+    /// acceptance requires only that a room entry appears in this existing
+    /// tab, with no new visual distinction from a true channel row.
+    pub fn set_channels(&self, channels: &[PromoChannel]) {
+        let model: VecModel<ChannelEntry> = VecModel::default();
+        let mut total = 0;
+        for c in channels {
+            total += c.unread;
+            model.push(ChannelEntry {
+                name: c.name.into(),
+                initial: c.initial.into(),
+                preview: c.preview.into(),
+                time_str: c.time_str.into(),
+                unread: c.unread,
+                unread_str: if c.unread > 0 {
+                    c.unread.to_string().into()
+                } else {
+                    "".into()
+                },
+                hash: 0,
+            });
+        }
+        self.ui.set_channels(ModelRc::new(model));
+        self.ui.set_channels_unread_total(total);
+        self.ui.set_channels_unread_str(if total > 0 {
+            total.to_string().into()
+        } else {
+            "".into()
+        });
+        // Empty contacts model — the Channels tab is the one shown.
+        self.ui
+            .set_contacts(ModelRc::new(VecModel::<ContactEntry>::default()));
+        self.ui.set_show_contacts(false);
     }
 
     /// Advance Slint's animation clock and render one frame.
