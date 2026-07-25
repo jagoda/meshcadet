@@ -576,13 +576,8 @@ fn main() -> anyhow::Result<()> {
             // Warn (length only — never the value) if the device will
             // silently truncate the password, rather than let a mismatch
             // surface later as an inexplicable login failure.
-            if guest_password.len() > protocol::provisioning::MAX_ROOM_PASSWORD_LEN {
-                eprintln!(
-                    "warning: guest password is {} bytes; the device accepts at most {} \
-                     and will truncate it.",
-                    guest_password.len(),
-                    protocol::provisioning::MAX_ROOM_PASSWORD_LEN,
-                );
+            if let Some(warning) = password_truncation_warning(guest_password.len()) {
+                eprintln!("{warning}");
             }
             let name_bytes = name.as_deref().unwrap_or("").as_bytes().to_vec();
             session.add_room(&pk, guest_password.as_bytes(), &name_bytes)?;
@@ -798,6 +793,22 @@ fn resolve_guest_password(
         .read_line(&mut raw)
         .context("reading guest password from stdin prompt")?;
     Ok(raw.trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// Build the "your guest password will be truncated" warning for `add-room`,
+/// or `None` if `password_len` fits under the device's limit. Reports only
+/// the byte counts — never the password itself — so the caller can print it
+/// straight to stderr without risking a leak.
+fn password_truncation_warning(password_len: usize) -> Option<String> {
+    let limit = protocol::provisioning::MAX_ROOM_PASSWORD_LEN;
+    if password_len > limit {
+        Some(format!(
+            "warning: guest password is {password_len} bytes; the device accepts at most \
+             {limit} and will truncate it."
+        ))
+    } else {
+        None
+    }
 }
 
 /// Build the MeshCore companion contact-add URI ("Format A") from a display
@@ -1042,7 +1053,7 @@ mod tests {
     use super::{
         build_contact_add_uri, build_room_add_uri, format_battery, format_battery_held_raw_mv,
         format_battery_raw_mv, format_gps_clock, format_gps_coords, format_gps_fix,
-        parse_contact_uri, resolve_guest_password,
+        parse_contact_uri, password_truncation_warning, resolve_guest_password,
     };
     use protocol::provisioning::RspStatusPayload;
 
@@ -1392,5 +1403,21 @@ mod tests {
         let missing = std::path::Path::new("/nonexistent/meshcadet-test-pw-does-not-exist");
         let err = resolve_guest_password(None, Some(missing), None, false).unwrap_err();
         assert!(err.to_string().contains("password-file"));
+    }
+
+    #[test]
+    fn password_truncation_warning_none_when_within_limit() {
+        let limit = protocol::provisioning::MAX_ROOM_PASSWORD_LEN;
+        assert_eq!(password_truncation_warning(limit), None);
+        assert_eq!(password_truncation_warning(0), None);
+    }
+
+    #[test]
+    fn password_truncation_warning_fires_over_limit_without_leaking_the_value() {
+        let limit = protocol::provisioning::MAX_ROOM_PASSWORD_LEN;
+        let warning = password_truncation_warning(limit + 5).expect("must warn over the limit");
+        assert!(warning.contains(&(limit + 5).to_string()));
+        assert!(warning.contains(&limit.to_string()));
+        assert!(warning.contains("truncat"));
     }
 }
