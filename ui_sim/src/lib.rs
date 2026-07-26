@@ -84,6 +84,13 @@ pub mod motif_library;
 pub mod compose_send;
 
 /// Host-sim render rig —
+/// proves `meshcadet-room-firmware-post-and-notify` Phase B's read-only
+/// compose indicator (disabled Send button + banner) for a room a session
+/// can't post to. See that module's own doc for why it is a separate,
+/// narrower component/render path.
+pub mod compose_read_only_promo;
+
+/// Host-sim render rig —
 /// proves `gps_status.rs`'s `StatusRow.icon-kind` selector correctly
 /// switches between the `RingedPlanetCorner` ("location") and `Comet`
 /// ("signal") motifs. See that module's own doc for why it is a separate,
