@@ -83,16 +83,50 @@ posture is detailed in [`SECURITY.md`](SECURITY.md).
 - Talks real MeshCore over LoRa (SX1262): DMs, channel messages, ACKs, and
   pull-only location telemetry. Byte-exact against v1.15.0, targeting v1.16
   with v1.15 back-compat (see [ADR-0001 §1](docs/adr/0001-charter.md)).
-- Touch-screen UI (Slint) for contacts, conversations, and composing messages
-  with a curated `:shortcode:` emoji set.
-- Allowlist-only: an admin provisions every contact and channel over USB; the
-  device never auto-discovers or auto-adds anyone, and never advertises itself
-  on the mesh.
+- Touch-screen UI (Slint) with two tabs: **Contacts** (direct-message peers)
+  and **Groups** — a unified list of provisioned channels and room-server
+  connections, visually distinguished — plus a conversation view and a
+  composer with a curated `:shortcode:` emoji set.
+- Allowlist-only: an admin provisions every contact, channel, and room server
+  over USB; the device never auto-discovers or auto-adds anyone, and never
+  advertises itself on the mesh.
 - On-device PIN-gated admin menu for lightweight runtime toggles, plus a USB
   host CLI for provisioning, PIN reset, and history export.
 
 See [`docs/adr/0001-charter.md`](docs/adr/0001-charter.md) for the complete
 behavioral contract.
+
+## Room servers (read/post client only)
+
+MeshCadet can join a [MeshCore Room Server](https://github.com/meshcore-dev/MeshCore)
+as a **guest** — a shared, always-on channel-like space hosted by someone
+else's node — subject to the same allowlist discipline as every other
+contact:
+
+- **Acquisition is out-of-band only.** An admin provisions a room server as
+  an allowlisted contact — pubkey, display name, and guest password — over
+  USB, using the host CLI (`add-room`) or the browser provisioner's **Room
+  servers** panel, or by scanning the room's QR/link from a MeshCore
+  companion app. There is **no advert and no discovery**: MeshCadet never
+  learns about a room server except through one of these explicit,
+  admin-driven paths.
+- **Login, then sync.** The device logs in with the provisioned guest
+  password, drains the server's stored backlog — up to 32 posts — into local
+  history, and from then on reads and posts to the room live, the same as
+  any other Groups-tab entry.
+- **Visually unified, not a new surface.** A room server appears alongside
+  true channels in the existing Groups tab (Contacts stays DM-only), tinted
+  to distinguish it from a true channel at a glance — no new tab, no
+  separate app surface.
+
+**Non-goals.** MeshCadet is a room **client** only:
+
+- No remote administration of a room server — no promoting/demoting guests,
+  no server configuration, nothing beyond guest-level read/post.
+- No ACL management — permissions on a room are whatever the room server
+  itself grants a guest; MeshCadet neither reads nor writes ACL state.
+- MeshCadet is **never itself a room server** — it does not host, relay, or
+  serve a room to anyone else.
 
 ## Status and known limitations
 
@@ -208,17 +242,23 @@ USB" screen and accepts no messages until provisioned (see below).
 ### 3. Provisioning a device (the admin CLI)
 
 The `host` crate provides `meshcadet`, a USB-serial CLI an admin uses to set
-up a device — register contacts and channels, set notification defaults and a
-PIN, and later export history or reset a forgotten PIN. It's part of the
-host-native workspace, so it builds and runs from the repo root:
+up a device — register contacts, channels, and room servers, set notification
+defaults and a PIN, and later export history or reset a forgotten PIN. It's
+part of the host-native workspace, so it builds and runs from the repo root:
 
 ```sh
 cargo run -p host -- --port /dev/ttyACM0 status
 cargo run -p host -- --port /dev/ttyACM0 identity
 cargo run -p host -- --port /dev/ttyACM0 add-contact --pubkey <HEX64> --name "Alice" --telemetry
 cargo run -p host -- --port /dev/ttyACM0 add-channel --secret <HEX64> --name "family" --primary
+cargo run -p host -- --port /dev/ttyACM0 add-room --pubkey <HEX64> --name "Lobby" --password-stdin
 cargo run -p host -- --port /dev/ttyACM0 commit
 ```
+
+Flashing and provisioning can also be done straight from a browser, no
+toolchain install required — see [`site/README.md`](site/README.md) for the
+web flasher and the web provisioner (whose **Room servers** panel mirrors
+the CLI's `add-room`/`list-rooms`/`del-room`).
 
 Run `cargo run -p host -- --help` for the full command list. Physical USB
 possession of the device is the sole authentication factor for provisioning
