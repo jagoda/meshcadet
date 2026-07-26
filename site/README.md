@@ -91,7 +91,11 @@ building or publishing anything.
   Guarded against drift from the Rust codec by
   `provisioner/codec.conformance.test.mjs` + `xtask --bin
   gen-prov-golden-vectors`, run by `pages-check.yml`'s `codec-conformance` job
-  on every PR touching either side. See `docs/adr/0007-provisioner-codec.md`
+  on every PR touching either side. Locally, `node --test
+  site/provisioner/*.test.mjs` runs the whole provisioner suite including that
+  guard — the conformance script generates its own golden vectors (via
+  `cargo run -p xtask`) when it isn't handed a path, so it needs a Rust
+  toolchain on `PATH` and fails loudly without one. See `docs/adr/0007-provisioner-codec.md`
   for the full design (why pure JS instead of WASM, and the client-side
   security model the rest of the provisioner page must uphold).
 - `provisioner/session.js` — async Web Serial transport + session

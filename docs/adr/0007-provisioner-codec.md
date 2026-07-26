@@ -206,8 +206,12 @@ reviewer would look at:
   ADR-0002's revision history shows on the order of one amendment per
   quarter).
 - `site/provisioner/` has no `package.json`/`node_modules` — the conformance
-  test imports `codec.js` directly and uses only Node's built-in
-  `node:assert`/`node:fs`. `pages-check.yml`'s `codec-conformance` job needs a
+  test imports `codec.js` directly and uses only Node built-ins
+  (`node:assert`/`node:fs`, plus `node:child_process` for the
+  generate-my-own-vectors fallback it takes when run with no vectors path,
+  so that `node --test site/provisioner/*.test.mjs` works as a whole-suite
+  command; the fallback exits nonzero if `cargo` is unavailable rather than
+  passing vacuously). `pages-check.yml`'s `codec-conformance` job needs a
   Rust toolchain (to run the generator) in addition to Node, which
   `check`'s (relative-path) job does not — kept as two separate jobs so a
   Rust-toolchain hiccup doesn't block the fast relative-path check and vice
