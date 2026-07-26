@@ -109,6 +109,29 @@ jobs:
         # Rust module's own tests do. See the test file's own header.
         run: node site/provisioner/history-format.test.mjs
 
+      - name: guest-password-hygiene — the room guest password never reaches storage/console/URL and is cleared on disconnect
+        # meshcadet-room-web-provisioner's binding scope requirement: drives
+        # session.js's addRoom for real against hostile localStorage/
+        # sessionStorage traps + a console spy, then statically asserts
+        # provisioner.js/provisioner.html's source text upholds the rest
+        # (no URL/history manipulation, type="password" + autocomplete="off",
+        # the password field cleared on every handleAddRoom exit path and on
+        # disconnect). See the test file's own header for why it's split
+        # from session.smoke.test.mjs this way.
+        run: node site/provisioner/guest-password-hygiene.test.mjs
+
+      - name: admin-pin-hygiene — the admin PIN never reaches storage/console/URL and is cleared on every exit path
+        # Mirrors guest-password-hygiene.test.mjs for the other browser secret
+        # this page carries: drives session.js's setPin for real against
+        # hostile localStorage/sessionStorage traps + a console spy, then
+        # statically asserts provisioner.js/provisioner.html's source text
+        # upholds the rest (no URL/history manipulation, type="password" +
+        # autocomplete="off", the PIN field cleared on every handleSetPin
+        # exit path — success AND catch — and on disconnect). See the test
+        # file's own header for why it's split from session.smoke.test.mjs
+        # this way.
+        run: node site/provisioner/admin-pin-hygiene.test.mjs
+
   codec-conformance:
     name: site/provisioner/codec.js matches protocol::provisioning byte-for-byte
     runs-on: ubuntu-latest

@@ -1,8 +1,10 @@
 // provisioner.js — UI glue for provisioner.html: Web Serial connect ->
 // status/identity + MeshCore contact QR (M1), the M2 non-sensitive
 // provisioning **writes** (contact/channel list+add/remove, notification
-// defaults, device-name set, commit), and the M2 **sensitive-data** surface:
-// admin-PIN set/reset, history export (local download), and history clear.
+// defaults, device-name set, commit), the M2 **sensitive-data** surface:
+// admin-PIN set/reset, history export (local download), and history clear,
+// and (meshcadet-room-web-provisioner) room-server provisioning: room
+// list/add/remove plus its `type=3` QR/URI (see the "Rooms" section below).
 //
 // No build step (site/README.md convention): plain ES module, loaded
 // directly by the browser. The QR library is a major-version-pinned CDN
@@ -14,19 +16,26 @@
 // Client-side security model (docs/adr/0007-provisioner-codec.md): no
 // analytics/telemetry, nothing sent to a server (GitHub Pages is fully
 // static). Every secret this page touches — a generated channel secret, the
-// admin PIN, and exported private-message history — is created/handled only
-// in this page and either sent to the device over the already-open serial
-// connection or offered to the user as an explicit local download; it is
-// never logged, never placed in the URL, and never written to
-// `localStorage`/`sessionStorage`. Specifically: the PIN field is cleared the
-// instant it's sent (and `session.setPin` scrubs its own buffer), and history
-// text is written to disk only on an explicit "Download transcript" click,
-// never auto-downloaded and never console-logged.
+// admin PIN, a room's guest password (ADR-0002 §4/ADR-0001 §4), and exported
+// private-message history — is created/handled only in this page and either
+// sent to the device over the already-open serial connection or offered to
+// the user as an explicit local download; it is never logged, never placed
+// in the URL, and never written to `localStorage`/`sessionStorage`.
+// Specifically: the PIN and guest-password fields are cleared the instant
+// they're sent (and `session.setPin`/`session.addRoom` each scrub their own
+// buffer), and history text is written to disk only on an explicit "Download
+// transcript" click, never auto-downloaded and never console-logged.
 
 import { ProvisionerSession, DeviceError } from "./provisioner/session.js";
 import { bytesToHex } from "./provisioner/codec.js";
-import { buildContactUri, cardToUri } from "./provisioner/contact-uri.js";
-import { validatePubkeyHex, validateChannelSecretHex, validateDeviceName, validatePin } from "./provisioner/validation.js";
+import { buildContactUri, buildRoomUri, cardToUri } from "./provisioner/contact-uri.js";
+import {
+  validatePubkeyHex,
+  validateChannelSecretHex,
+  validateDeviceName,
+  validatePin,
+  validateRoomPassword,
+} from "./provisioner/validation.js";
 import { formatHistoryTranscript } from "./provisioner/history-format.js";
 import QRCode from "https://esm.sh/qrcode@1.5.3";
 
@@ -87,6 +96,18 @@ const delChannelSecret = document.getElementById("del-channel-secret");
 const delChannelButton = document.getElementById("del-channel-button");
 const delChannelStatus = document.getElementById("del-channel-status");
 
+const roomsPanel = document.getElementById("rooms-panel");
+const roomsTableBody = document.getElementById("rooms-table-body");
+const addRoomForm = document.getElementById("add-room-form");
+const addRoomPubkey = document.getElementById("add-room-pubkey");
+const addRoomName = document.getElementById("add-room-name");
+const addRoomPassword = document.getElementById("add-room-password");
+const addRoomButton = document.getElementById("add-room-button");
+const addRoomStatus = document.getElementById("add-room-status");
+const roomQrBlock = document.getElementById("room-qr-block");
+const roomQrCanvas = document.getElementById("room-qr-canvas");
+const roomQrUri = document.getElementById("room-qr-uri");
+
 const notifPanel = document.getElementById("notif-panel");
 const notifForm = document.getElementById("notif-form");
 const notifVisual = document.getElementById("notif-visual");
@@ -118,7 +139,16 @@ const clearHistoryConfirmButton = document.getElementById("clear-history-confirm
 const clearHistoryCancelButton = document.getElementById("clear-history-cancel-button");
 const clearHistoryStatus = document.getElementById("clear-history-status");
 
-const writePanels = [contactsPanel, channelsPanel, notifPanel, commitPanel, pinPanel, historyPanel, clearHistoryPanel];
+const writePanels = [
+  contactsPanel,
+  channelsPanel,
+  roomsPanel,
+  notifPanel,
+  commitPanel,
+  pinPanel,
+  historyPanel,
+  clearHistoryPanel,
+];
 
 // Transient hold for a just-read history transcript, awaiting an explicit
 // user "Download transcript" click. Contains private message text, so it is
@@ -167,6 +197,10 @@ if (!ProvisionerSession.isSupported() || !ProvisionerSession.isSecureContext()) 
   });
   genChannel128Button.addEventListener("click", () => handleGenerateChannelSecret(16));
   genChannel256Button.addEventListener("click", () => handleGenerateChannelSecret(32));
+  addRoomForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    handleAddRoom();
+  });
   notifForm.addEventListener("submit", (event) => {
     event.preventDefault();
     handleSetNotifDefaults();
@@ -273,6 +307,7 @@ function clearFormStatuses() {
   addContactStatus.textContent = "";
   addChannelStatus.textContent = "";
   delChannelStatus.textContent = "";
+  addRoomStatus.textContent = "";
   notifStatus.textContent = "";
   commitStatus.textContent = "";
   setPinStatus.textContent = "";
@@ -280,9 +315,16 @@ function clearFormStatuses() {
   clearHistoryStatus.textContent = "";
   cardUriStatus.textContent = "";
   cardUriEl.textContent = "—";
-  // Scrub sensitive UI state on teardown: drop any typed PIN, forget any
-  // read-but-not-downloaded transcript, and re-arm the clear-history gate.
+  // Scrub sensitive UI state on teardown: drop any typed PIN/guest password,
+  // forget any read-but-not-downloaded transcript, and re-arm the
+  // clear-history gate. The guest password (ADR-0002 §4/ADR-0001 §4) gets
+  // the exact same "gone from this page's memory the instant we disconnect"
+  // treatment as the admin PIN — see this mission's scope note on guest-
+  // password hygiene.
   setPinInput.value = "";
+  addRoomPassword.value = "";
+  roomQrBlock.hidden = true;
+  roomQrUri.textContent = "";
   pendingTranscript = null;
   historyDownloadButton.hidden = true;
   resetClearHistoryConfirm();
@@ -325,6 +367,13 @@ async function refreshLists() {
   } catch (err) {
     console.error("MeshCadet provisioner: list_channels failed", err);
     setTableMessage(channelsTableBody, 5, `Couldn't read channels: ${err.message || err}`);
+  }
+  try {
+    const rooms = await session.listRooms();
+    renderRooms(rooms);
+  } catch (err) {
+    console.error("MeshCadet provisioner: list_rooms failed", err);
+    setTableMessage(roomsTableBody, 6, `Couldn't read rooms: ${err.message || err}`);
   }
 }
 
@@ -614,6 +663,138 @@ async function handleDelChannel() {
   });
 }
 
+// ── Rooms (list-rooms / add-room / del-room) ──────────────────────────────
+//
+// Field selection mirrors the host CLI's `list-rooms`/`add-room` output
+// (host/src/main.rs) — idx, pubkey, sync_since, permissions, name. Rows are
+// built with `createElement`/`textContent` (never `innerHTML`), same
+// discipline as `renderContacts`/`renderChannels`.
+//
+// GUEST-PASSWORD HYGIENE (this mission's binding requirement — ADR-0002 §4 /
+// ADR-0001 §4): the password crosses the USB link in the clear BY DESIGN
+// (the cable is the authentication), but in this browser it must never be
+// persisted or leaked. Concretely, end to end through this file:
+//   - `add-room-password` (provisioner.html) is `type="password"` with
+//     `autocomplete="off"` on both the input and its enclosing form, so the
+//     browser never offers to save/autofill it.
+//   - `handleAddRoom` below reads it into a single local `password` const,
+//     passes it straight to `session.addRoom` (which itself scrubs its own
+//     transient payload buffer — see session.js's doc comment on
+//     `addRoom`), and clears the input field the instant the call resolves.
+//   - It is never interpolated into `addRoomStatus.textContent`, never
+//     `console.log`/`console.error`-ed (errors are reported the same
+//     `reportWriteError` way every other write command's are — the device
+//     error text, never the password), never assigned to `location`/a URL,
+//     and never written to `localStorage`/`sessionStorage` (this page uses
+//     neither, anywhere, for anything — see site/README.md's client-side
+//     security model).
+//   - `clearFormStatuses()` (called on disconnect) clears the field again,
+//     so a typed-but-not-yet-submitted password doesn't linger past
+//     teardown either.
+// See guest-password-hygiene.test.mjs for the executable checks backing
+// this comment (a static-source assertion this file and provisioner.html
+// uphold the above, since the QRCode CDN import means this file can't be
+// loaded standalone under plain `node` — see that test's own header).
+
+function renderRooms(rooms) {
+  roomsTableBody.replaceChildren();
+  if (rooms.length === 0) {
+    setTableMessage(roomsTableBody, 6, "No rooms configured.");
+    return;
+  }
+  for (const r of rooms) {
+    const tr = document.createElement("tr");
+    tr.appendChild(textCell(String(r.index)));
+    tr.appendChild(textCell(bytesToHex(r.pubkey), "mono"));
+    tr.appendChild(textCell(String(r.sync_since)));
+    tr.appendChild(textCell(`0x${r.permissions.toString(16).toUpperCase().padStart(2, "0")}`, "mono"));
+    tr.appendChild(textCell(r.name || "(unnamed)"));
+    const actionsTd = document.createElement("td");
+    const qrButton = document.createElement("button");
+    qrButton.type = "button";
+    qrButton.className = "btn btn-ghost";
+    qrButton.textContent = "QR";
+    qrButton.addEventListener("click", () => renderRoomQr(r.name, r.pubkey));
+    actionsTd.appendChild(qrButton);
+    const removeButton = document.createElement("button");
+    removeButton.type = "button";
+    removeButton.className = "btn btn-ghost";
+    removeButton.textContent = "Remove";
+    removeButton.addEventListener("click", () => handleDelRoom(r.pubkey, removeButton));
+    actionsTd.appendChild(removeButton);
+    tr.appendChild(actionsTd);
+    roomsTableBody.appendChild(tr);
+  }
+}
+
+/**
+ * Render a room's `meshcore://contact/add?...&type=3` URI/QR (Format A,
+ * `type=3` — see `contact-uri.js`'s `buildRoomUri`). Deliberately takes only
+ * `name`/`pubkey` — never the guest password, which has no slot in this URI
+ * at all (ADR-0002 §7) and must never be threaded through this function.
+ */
+async function renderRoomQr(name, pubkey) {
+  const uri = buildRoomUri(name, pubkey);
+  roomQrBlock.hidden = false;
+  roomQrUri.textContent = uri;
+  try {
+    await QRCode.toCanvas(roomQrCanvas, uri, {
+      width: 220,
+      margin: 2,
+      color: { dark: "#0d1117", light: "#ffffff" },
+    });
+    roomQrCanvas.hidden = false;
+  } catch (err) {
+    console.error("MeshCadet provisioner: room QR render failed", err);
+    roomQrCanvas.hidden = true;
+  }
+}
+
+async function handleAddRoom() {
+  const pubkeyResult = validatePubkeyHex(addRoomPubkey.value);
+  if (!pubkeyResult.ok) {
+    addRoomStatus.textContent = pubkeyResult.error;
+    return;
+  }
+  const passwordResult = validateRoomPassword(addRoomPassword.value);
+  const password = addRoomPassword.value ?? "";
+  const name = addRoomName.value;
+  await withButtonDisabled(addRoomButton, async () => {
+    addRoomStatus.textContent = "Adding room…";
+    try {
+      await session.addRoom(pubkeyResult.bytes, password, name);
+      // Clear the password field immediately on success — it has already
+      // been sent (and scrubbed from session.js's own buffer); nothing here
+      // should hold onto it a moment longer than necessary.
+      addRoomPassword.value = "";
+      addRoomStatus.textContent = passwordResult.truncationWarning
+        ? `Room added. Note: ${passwordResult.truncationWarning}.`
+        : "Room added. Note: reboot the device to apply this to the live mesh (allowlist is loaded at boot).";
+      addRoomPubkey.value = "";
+      addRoomName.value = "";
+      await refreshLists();
+      await renderRoomQr(name, pubkeyResult.bytes);
+    } catch (err) {
+      // Clear here too: a failed submit is not a reason to leave a secret
+      // sitting in the DOM any longer than the successful path would.
+      addRoomPassword.value = "";
+      reportWriteError(addRoomStatus, "add room", err);
+    }
+  });
+}
+
+async function handleDelRoom(pubkey, removeButton) {
+  await withButtonDisabled(removeButton, async () => {
+    try {
+      await session.delRoom(pubkey);
+      addRoomStatus.textContent = `Room removed: ${bytesToHex(pubkey).slice(0, 8)}…`;
+      await refreshLists();
+    } catch (err) {
+      reportWriteError(addRoomStatus, "remove room", err);
+    }
+  });
+}
+
 // ── Notification defaults (set-notif-defaults) ────────────────────────────
 //
 // Write-only, mirroring the CLI: there is no QUERY_STATUS field for the
@@ -685,10 +866,13 @@ function reportWriteError(statusEl, action, err) {
 //
 // The PIN is a secret (ADR-0007): it is validated for byte-length only,
 // passed straight to `session.setPin` (which sends it over serial and scrubs
-// its own buffer), and the input field is cleared the instant it's sent. It
-// is never logged, echoed into a status message, placed in the URL, or
-// written to storage. `validatePin` deliberately never returns the PIN, so
-// there is only ever the one `setPinInput.value` copy to drop.
+// its own buffer), and the input field is cleared on EVERY exit path —
+// success and the device-error/transport-failure catch branch alike (plus
+// `clearFormStatuses` on disconnect) — so a failed submit is never a reason
+// to leave the secret sitting in the DOM. It is never logged, echoed into a
+// status message, placed in the URL, or written to storage. `validatePin`
+// deliberately never returns the PIN, so there is only ever the one
+// `setPinInput.value` copy to drop.
 
 async function handleSetPin() {
   const pin = setPinInput.value;
@@ -705,6 +889,10 @@ async function handleSetPin() {
     setPinInput.value = "";
     setPinStatus.textContent = "PIN set. Physical USB possession remains the auth factor for resets.";
   } catch (err) {
+    // Clear here too: a failed submit is not a reason to leave a secret
+    // sitting in the DOM any longer than the successful path would (same
+    // discipline as handleAddRoom's catch branch).
+    setPinInput.value = "";
     // Note: never surface the PIN itself — reportWriteError logs only the
     // error (a device RSP_ERROR message or transport failure), not the PIN.
     reportWriteError(setPinStatus, "set PIN", err);
