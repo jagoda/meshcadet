@@ -872,12 +872,12 @@ fn run() -> anyhow::Result<()> {
                         // Room entries built alongside the contact loop below
                         // (Contacts-tab filter: `is_room()` is the one-field
                         // predicate that routes a room OUT of the Contacts tab
-                        // and INTO the Channels tab — see this mission's
-                        // Objective, "render room entries read-only in the
-                        // EXISTING Channels tab", and `RoomExtra`'s own doc on
-                        // why storing rooms in the one contacts store makes
-                        // this filter/union a one-field affair for both this
-                        // child and the later Groups-tab union).
+                        // and INTO the Groups tab — see `RoomExtra`'s own doc
+                        // on why storing rooms in the one contacts store makes
+                        // this filter/union a one-field affair, and
+                        // `contact_list::route_contact`'s doc for why the
+                        // actual routing decision below is a pure,
+                        // host-testable call rather than inline branching).
                         let mut room_channel_items: Vec<ui::screens::contact_list::ChannelItem> =
                             Vec::new();
                         for i in 0..n {
@@ -886,80 +886,94 @@ fn run() -> anyhow::Result<()> {
                                 cfg.contacts[i].telemetry_enable,
                             );
                             let hash = cfg.contacts[i].pub_hash();
-                            let name = if cfg.contacts[i].display_name_len > 0 {
+                            let display_name = if cfg.contacts[i].display_name_len > 0 {
                                 let len = cfg.contacts[i].display_name_len as usize;
                                 String::from_utf8_lossy(
                                     &cfg.contacts[i].display_name[..len]
                                 ).into_owned()
                             } else {
-                                format!("0x{:02x}", hash)
+                                String::new()
                             };
+                            // `route`'s variant is matched exhaustively below
+                            // (never re-tested against `is_room()` again) so a
+                            // future divergence between `route_contact`'s
+                            // routing and this loop's room-session branch
+                            // can't silently drop a contact into neither
+                            // list — the match is the single source of truth
+                            // for where this contact goes.
+                            let route = ui::screens::contact_list::route_contact(
+                                hash,
+                                cfg.contacts[i].is_room(),
+                                &display_name,
+                            );
 
-                            if cfg.contacts[i].is_room() {
-                                if let Some(extra) = cfg.room_extra(&cfg.contacts[i].pubkey) {
-                                    // Resume point: prefer this room's dedicated
-                                    // session store (what a PRIOR live session
-                                    // learned) over the provisioning-time seed,
-                                    // so a reboot mid-sync doesn't re-drain the
-                                    // server's whole backlog.
-                                    let seed =
-                                        room_session::PersistedRoomSession::from_room_extra(extra);
-                                    let session =
-                                        room_session::load_room_session(nvs_partition.clone(), hash)
-                                            .unwrap_or(seed);
-                                    // Phase B: never present a compose box
-                                    // for a message the server will swallow
-                                    // — register this room's CURRENT (resumed
-                                    // session, not just the provisioning-time
-                                    // seed) permission with the UI so
-                                    // `navigate_to_compose` can gate on it.
-                                    if let Some(ref mut ui) = ui_opt {
-                                        ui.register_room(hash, session.permission().can_post());
+                            match route {
+                                ui::screens::contact_list::ContactRoute::Room(item) => {
+                                    if let Some(extra) = cfg.room_extra(&cfg.contacts[i].pubkey) {
+                                        // Resume point: prefer this room's dedicated
+                                        // session store (what a PRIOR live session
+                                        // learned) over the provisioning-time seed,
+                                        // so a reboot mid-sync doesn't re-drain the
+                                        // server's whole backlog.
+                                        let seed = room_session::PersistedRoomSession::from_room_extra(
+                                            extra,
+                                        );
+                                        let session = room_session::load_room_session(
+                                            nvs_partition.clone(),
+                                            hash,
+                                        )
+                                        .unwrap_or(seed);
+                                        // Phase B: never present a compose box
+                                        // for a message the server will swallow
+                                        // — register this room's CURRENT (resumed
+                                        // session, not just the provisioning-time
+                                        // seed) permission with the UI so
+                                        // `navigate_to_compose` can gate on it.
+                                        if let Some(ref mut ui) = ui_opt {
+                                            ui.register_room(hash, session.permission().can_post());
+                                        }
+                                        room_runtime.push(RoomRuntime {
+                                            pubkey: cfg.contacts[i].pubkey,
+                                            hash,
+                                            guest_password: extra.guest_password,
+                                            guest_password_len: extra.guest_password_len,
+                                            session,
+                                            login_sent: false,
+                                            last_keep_alive_ms: 0,
+                                            sync_phase: room_session::RoomSyncPhase::new_after_login(),
+                                            pending_post_ack: None,
+                                            pending_keep_alive_ack: None,
+                                            keep_alive_stall: room_session::RoomKeepAliveStall::new(),
+                                            // The boot-time login below is itself
+                                            // a "fresh login" — its reply should
+                                            // drive the first post-login
+                                            // keep-alive's `force_since` too, so
+                                            // this starts true rather than false.
+                                            resync_pending: true,
+                                            // Seeded from flash below, at the
+                                            // history-hydrate step (this room's
+                                            // provisioned-config entry is
+                                            // constructed before that step runs).
+                                            recent: Vec::new(),
+                                        });
                                     }
-                                    room_runtime.push(RoomRuntime {
-                                        pubkey: cfg.contacts[i].pubkey,
-                                        hash,
-                                        guest_password: extra.guest_password,
-                                        guest_password_len: extra.guest_password_len,
-                                        session,
-                                        login_sent: false,
-                                        last_keep_alive_ms: 0,
-                                        sync_phase: room_session::RoomSyncPhase::new_after_login(),
-                                        pending_post_ack: None,
-                                        pending_keep_alive_ack: None,
-                                        keep_alive_stall: room_session::RoomKeepAliveStall::new(),
-                                        // The boot-time login below is itself
-                                        // a "fresh login" — its reply should
-                                        // drive the first post-login
-                                        // keep-alive's `force_since` too, so
-                                        // this starts true rather than false.
-                                        resync_pending: true,
-                                        // Seeded from flash below, at the
-                                        // history-hydrate step (this room's
-                                        // provisioned-config entry is
-                                        // constructed before that step runs).
-                                        recent: Vec::new(),
-                                    });
+                                    room_channel_items.push(item);
                                 }
-                                room_channel_items.push(ui::screens::contact_list::ChannelItem {
-                                    name,
-                                    preview: String::new(),
-                                    time_str: String::new(),
-                                    unread: 0,
-                                    hash,
-                                });
-                            } else if let Some(ref mut ui) = ui_opt {
-                                // BUG FIX: wire contact names into the UI runtime so the
-                                // contact list screen shows the provisioned contacts (§B).
-                                // register_contact() was defined but never called from main.rs.
-                                ui.register_contact(hash, name);
+                                ui::screens::contact_list::ContactRoute::Contact { hash, name } => {
+                                    // BUG FIX: wire contact names into the UI runtime so the
+                                    // contact list screen shows the provisioned contacts (§B).
+                                    // register_contact() was defined but never called from main.rs.
+                                    if let Some(ref mut ui) = ui_opt {
+                                        ui.register_contact(hash, name);
+                                    }
+                                }
                             }
                         }
                         log::info!(
                             "room: {} room contact(s) loaded from provisioned config",
                             room_runtime.len(),
                         );
-                        // BUG FIX: push channel list into the UI so the Channels tab
+                        // BUG FIX: push channel list into the UI so the Groups tab
                         // shows the provisioned channel(s) (§B channels-tab acceptance).
                         if let Some(ref mut ui) = ui_opt {
                             let ch_count = cfg.channel_count as usize;
@@ -982,11 +996,13 @@ fn run() -> anyhow::Result<()> {
                                         time_str: String::new(),
                                         unread: 0,
                                         hash: ch_hash,
+                                        is_room: false,
                                     }
                                 }).collect();
-                            // Rooms render read-only in this SAME, existing
-                            // Channels tab — no new tab, no visual distinction
-                            // (M1 scope; see this mission's Objective).
+                            // Rooms render read-only in this SAME, unified
+                            // Groups tab, unioned with the true channels above
+                            // — visually distinguished by `ChannelItem::is_room`
+                            // (see contact_list.rs's `ContactRow`/room styling).
                             channel_items.append(&mut room_channel_items);
                             ui.set_channels(&channel_items);
                         }
@@ -3205,8 +3221,8 @@ fn handle_room_login_response(
 /// `firmware_core::room_session::handle_room_push`'s doc), content-dedup
 /// against `room.recent`, append to the shared rotating history exactly like
 /// `handle_dm` does for an ordinary DM (same conversation-hash keying, so the
-/// Channels-tab row and the message view Just Work — see this mission's
-/// Objective), and persist the advanced `sync_since` watermark.
+/// Groups-tab row and the message view Just Work), and persist the advanced
+/// `sync_since` watermark.
 #[cfg(not(feature = "hil"))]
 fn handle_room_push_frame(
     payload: &[u8],

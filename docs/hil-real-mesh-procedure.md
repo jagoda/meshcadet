@@ -276,8 +276,8 @@ top to bottom; each step is cheaper to check than the one below it.
 
 1. Provision and reboot.
 2. **Expected:** Contact list screen visible; at least the provisioned contact appears.
-3. Tap "📡 Channels" tab — channel(s) should appear.
-4. Tap back to "📬 Messages" tab.
+3. Tap "Groups" tab — channel(s) should appear.
+4. Tap back to "Contacts" tab.
 
 ### C. Message view + incoming DM render
 
@@ -629,9 +629,9 @@ still shows stale previews after a clean reboot, suspect the boot-hydrate
 step running before the clear's flash writes are actually committed, or a
 separate in-memory cache this fix missed.
 
-### P. Channels-tab unread badge survives a sleep→wake cycle
+### P. Groups-tab unread badge survives a sleep→wake cycle
 
-Regression check for a REOPEN: HIL evidence showed the Channels-tab unread
+Regression check for a REOPEN: HIL evidence showed the Groups-tab unread
 badge appearing inconsistently after a sleep→wake cycle, while the DM-tab
 badge appeared consistently, even though a static code trace could not find a
 live defect on the sleep→wake boundary (`self.active_screen` does not change
@@ -650,23 +650,23 @@ lines from the failing run — they pin whether the guard saw the wrong
 `active_screen`, or `channel_items` was empty/stale at the moment.
 
 1. From the admin menu, confirm "💤 Screen sleep" is at `10s` (§H). Return to
-   the contact list; tap the "📬 Messages" tab so it (not "📡 Channels") is the
+   the contact list; tap the "Contacts" tab so it (not "Groups") is the
    visible tab.
 2. Let the screen sleep (§H, 10+ seconds untouched).
 3. While the screen is asleep, have the operator's node post a message to the
    shared channel. **Expected:** keyboard backlight blinks (§J) — confirms the
    event was received while asleep.
-4. Wake the device (tap anywhere, per §H). **Expected:** the "📡 Channels" tab
+4. Wake the device (tap anywhere, per §H). **Expected:** the "Groups" tab
    shows a nonzero unread badge immediately on wake — no extra tap/navigation
    needed to surface it.
-5. Tap the "📡 Channels" tab, then back to "📬 Messages" — **Expected:** the DM
+5. Tap the "Groups" tab, then back to "Contacts" — **Expected:** the DM
    tab's own badge state is unaffected by step 4 (still whatever it was before
    this run).
 6. Repeat steps 1–4 at least four more times in a row (same asleep-on-DM-tab
-   →channel-message→wake sequence). **Expected:** the Channels-tab badge
+   →channel-message→wake sequence). **Expected:** the Groups-tab badge
    appears on EVERY trial, not intermittently.
 7. Repeat once more, but this time send a DM instead of a channel message at
-   step 3. **Expected:** the "📬 Messages" tab badge appears reliably on wake
+   step 3. **Expected:** the "Contacts" tab badge appears reliably on wake
    too (regression check — the fix is symmetric across both tabs).
 
 ### Q. Battery gauge doesn't inflate to 100% while charging
