@@ -1271,7 +1271,10 @@ mod tests {
         let ack = double
             .handle_post(&client.pubkey, &out[2..n])
             .expect("ReadWrite client's post must be accepted by the double");
-        assert_eq!(ack, expected_ack, "double's ack must match this function's computed ack_hash");
+        assert_eq!(
+            ack, expected_ack,
+            "double's ack must match this function's computed ack_hash"
+        );
     }
 
     // ── Phase C: route-direct keep-alive framing ────────────────────────────
@@ -1322,7 +1325,10 @@ mod tests {
         let ack = double
             .handle_keep_alive(&client.pubkey, &out[4..n])
             .expect("keep-alive must be accepted");
-        assert_eq!(decode_keep_alive_ack(&ack).unwrap().ack_hash, keep_alive_ack_hash(5000, 0, &client.pubkey));
+        assert_eq!(
+            decode_keep_alive_ack(&ack).unwrap().ack_hash,
+            keep_alive_ack_hash(5000, 0, &client.pubkey)
+        );
     }
 
     #[test]
@@ -1375,7 +1381,11 @@ mod tests {
     #[test]
     fn live_post_after_drain_closes_gets_full_parity() {
         let mut phase = RoomSyncPhase::new_after_login();
-        assert_eq!(phase.on_keep_alive_ack(0), None, "nothing drained: no aggregate");
+        assert_eq!(
+            phase.on_keep_alive_ack(0),
+            None,
+            "nothing drained: no aggregate"
+        );
         assert!(!phase.is_draining());
 
         let outcome = RoomPushOutcome {
@@ -1413,7 +1423,10 @@ mod tests {
             }),
         };
         for _ in 0..40 {
-            assert_eq!(phase.on_push_outcome(&fresh_entry()), RoomNotification::None);
+            assert_eq!(
+                phase.on_push_outcome(&fresh_entry()),
+                RoomNotification::None
+            );
         }
         assert!(
             phase.is_draining(),
@@ -1445,7 +1458,11 @@ mod tests {
     #[test]
     fn keep_alive_ack_with_nonzero_unsynced_count_keeps_draining() {
         let mut phase = RoomSyncPhase::new_after_login();
-        assert_eq!(phase.on_keep_alive_ack(5), None, "still draining: not yet 0");
+        assert_eq!(
+            phase.on_keep_alive_ack(5),
+            None,
+            "still draining: not yet 0"
+        );
         assert!(phase.is_draining());
     }
 }
