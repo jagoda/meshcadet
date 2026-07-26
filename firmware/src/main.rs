@@ -315,6 +315,23 @@ struct RoomRuntime {
     /// if any. `None` when no keep-alive is outstanding.
     #[cfg_attr(feature = "hil", allow(dead_code))]
     pending_keep_alive_ack: Option<[u8; 4]>,
+    /// Reconnect-stall detector — see
+    /// `firmware_core::room_session::RoomKeepAliveStall`'s doc. Reset via
+    /// `.reset()` on any successful keep-alive ACK (`handle_ack`), an
+    /// inbound post (`handle_room_push_frame`), or a fresh login
+    /// (`apply_room_login_outcome`) — mirroring the server's own
+    /// `push_failures` reset conditions.
+    #[cfg_attr(feature = "hil", allow(dead_code))]
+    keep_alive_stall: room_session::RoomKeepAliveStall,
+    /// Set whenever a login reply (fresh boot login OR a stall-triggered
+    /// re-flood) applies a new session — consumed by the NEXT keep-alive
+    /// tick, which passes `session.sync_since` as that keep-alive's
+    /// `force_since` instead of the routine `0`, explicitly re-affirming the
+    /// server's view of this client's sync watermark rather than relying
+    /// solely on the login reply itself. Cleared once that keep-alive is
+    /// sent. See this mission's "resumed keep-alive" fix bullet.
+    #[cfg_attr(feature = "hil", allow(dead_code))]
+    resync_pending: bool,
     /// A small in-memory tail of this room's already-known conversation
     /// entries — the content-dedup input
     /// `firmware_core::room_session::handle_room_push` compares an inbound
@@ -910,6 +927,13 @@ fn run() -> anyhow::Result<()> {
                                         sync_phase: room_session::RoomSyncPhase::new_after_login(),
                                         pending_post_ack: None,
                                         pending_keep_alive_ack: None,
+                                        keep_alive_stall: room_session::RoomKeepAliveStall::new(),
+                                        // The boot-time login below is itself
+                                        // a "fresh login" — its reply should
+                                        // drive the first post-login
+                                        // keep-alive's `force_since` too, so
+                                        // this starts true rather than false.
+                                        resync_pending: true,
                                         // Seeded from flash below, at the
                                         // history-hydrate step (this room's
                                         // provisioned-config entry is
@@ -1602,6 +1626,16 @@ fn run() -> anyhow::Result<()> {
         // scheduler must never attempt one. `room_runtime` is empty under
         // `hil` (no rooms there), so this is a no-op in that build, exactly
         // like the boot-time login loop above.
+        //
+        // Reconnect-stall detector: BEFORE overwriting `pending_keep_alive_ack`
+        // below, a still-`Some` value left over from the PRIOR tick means that
+        // keep-alive was never ACKed — feed it to `RoomKeepAliveStall`, which
+        // counts consecutive misses and — once it decides the route is dead,
+        // not just one dropped frame — zeroes `out_path_len` itself so THIS
+        // SAME tick falls through to the re-flood-login branch below (clean
+        // relearn), rather than waiting a further interval. See
+        // `firmware_core::room_session::RoomKeepAliveStall`'s doc for the
+        // full "why N misses, why zero out_path" rationale.
         #[cfg(not(feature = "hil"))]
         for room in room_runtime.iter_mut() {
             if !room.login_sent {
@@ -1613,6 +1647,25 @@ fn run() -> anyhow::Result<()> {
             room.last_keep_alive_ms = now;
             let ts = tx_epoch_base.wrapping_add((now / 1000) as u32);
             let shared = identity.ecdh_shared_secret(&room.pubkey);
+
+            let ack_outstanding = room.pending_keep_alive_ack.is_some();
+            if ack_outstanding {
+                let invalidated = room.keep_alive_stall.on_tick(true, &mut room.session);
+                if invalidated {
+                    room.pending_keep_alive_ack = None;
+                    log::warn!(
+                        "room: 0x{:02x} exceeded {} consecutive missed keep-alive ACKs — \
+                         invalidating out_path to force a relearn",
+                        room.hash, room_session::KEEP_ALIVE_STALL_THRESHOLD,
+                    );
+                    room_session::save_room_session(nvs_partition.clone(), room.hash, &room.session);
+                } else {
+                    log::warn!(
+                        "room: 0x{:02x} missed keep-alive ACK ({}/{})",
+                        room.hash, room.keep_alive_stall.missed(), room_session::KEEP_ALIVE_STALL_THRESHOLD,
+                    );
+                }
+            }
 
             if room.session.out_path_len == 0 {
                 let mut frame = [0u8; room_session::MAX_LOGIN_FRAME_LEN];
@@ -1634,6 +1687,16 @@ fn run() -> anyhow::Result<()> {
                 continue;
             }
 
+            // Resumed keep-alive after a (re)login: force_since re-affirms
+            // `sync_since` explicitly rather than relying solely on the
+            // login reply — see `resync_pending`'s doc. Routine ticks pass 0
+            // (no override).
+            let force_since = if room.resync_pending {
+                room.session.sync_since
+            } else {
+                0
+            };
+
             let mut frame = [0u8; room_session::MAX_KEEP_ALIVE_FRAME_LEN];
             match room_session::encode_room_keep_alive_frame(
                 &shared,
@@ -1641,17 +1704,21 @@ fn run() -> anyhow::Result<()> {
                 identity.pub_hash(),
                 &room.session.out_path[..room.session.out_path_len as usize],
                 ts,
-                0, // force_since: no stall-recovery override needed on a routine tick
+                force_since,
                 &mut frame,
             ) {
                 Some(n) => {
                     txq.enqueue(&frame[..n]);
-                    room.pending_keep_alive_ack =
-                        Some(protocol::room::keep_alive_ack_hash(ts, 0, &identity.pubkey));
+                    room.pending_keep_alive_ack = Some(protocol::room::keep_alive_ack_hash(
+                        ts,
+                        force_since,
+                        &identity.pubkey,
+                    ));
                     room.session.record_sent_timestamp(ts);
+                    room.resync_pending = false;
                     log::info!(
-                        "room: TX route-direct keep-alive for 0x{:02x} (ts={})",
-                        room.hash, ts,
+                        "room: TX route-direct keep-alive for 0x{:02x} (ts={}, force_since={})",
+                        room.hash, ts, force_since,
                     );
                 }
                 None => {
@@ -2956,6 +3023,10 @@ fn handle_ack(
         }
         if room.pending_keep_alive_ack == Some(got) {
             room.pending_keep_alive_ack = None;
+            // A successful ACK proves the route is live — reset the
+            // reconnect-stall detector's miss counter (see
+            // `RoomKeepAliveStall`'s doc).
+            room.keep_alive_stall.reset();
             // Decode through the module's own validated decoder rather than
             // hand-indexing `payload[4]` — a payload truncated to exactly 4
             // bytes (no appended unsynced-count byte at all) must NOT be
@@ -3077,6 +3148,13 @@ fn apply_room_login_outcome(
     nvs_partition: EspDefaultNvsPartition,
 ) {
     room.session.apply_login_outcome(outcome);
+    // A fresh login (boot OR stall-triggered relearn) mirrors the server's
+    // own push_failures reset conditions — this session is presumed live
+    // again, so the missed-ACK counter must not carry a stale count into it.
+    room.keep_alive_stall.reset();
+    // The next keep-alive should re-affirm this login's `sync_since` via
+    // `force_since` rather than the routine `0` — see `resync_pending`'s doc.
+    room.resync_pending = true;
     room_session::save_room_session(nvs_partition, room.hash, &room.session);
     log::info!(
         "room: login complete for 0x{:02x}: permissions={:?}{}",
@@ -3147,6 +3225,12 @@ fn handle_room_push_frame(
         &room.recent,
     ) {
         Ok(outcome) => {
+            // An inbound post is proof `out_path`-direction traffic is
+            // flowing (the server routed a push down its own path and it
+            // reached us) — reset the stall detector's miss counter exactly
+            // like a successful keep-alive ACK would (see
+            // `RoomKeepAliveStall`'s doc).
+            room.keep_alive_stall.reset();
             // ACK is non-negotiable: transmitted unconditionally, even for a
             // push `handle_room_push` recognises as an already-seen
             // duplicate (`outcome.entry: None`) — see that function's doc.

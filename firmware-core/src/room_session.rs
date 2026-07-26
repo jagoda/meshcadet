@@ -557,6 +557,102 @@ pub fn encode_room_keep_alive_frame(
     Some(prefix_len + n)
 }
 
+// ── Keep-alive: reconnect-stall detector ────────────────────────────────────
+//
+// The gap this closes: `out_path` is only ever zeroed at init/decode — there
+// is no ACK-timeout handler and no failure counter anywhere upstream of this
+// module, so a repeater/topology change that leaves the persisted `out_path`
+// stale-but-nonzero keeps getting route-directed down a dead route forever.
+// The `out_path_len == 0` re-flood-login branch this scheduler already has
+// (`encode_room_login_frame`'s doc) never fires, and the session stalls
+// until reboot — corroborated by this module's own "a client that fails to
+// ACK stalls its own sync permanently" doc and the M1 checkpoint's "stalled
+// until reboot" finding. [`RoomKeepAliveStall`] is the missing failure
+// counter: `firmware::main`'s scheduler feeds it one bool per tick (was the
+// PRIOR tick's `pending_keep_alive_ack` still outstanding?) and it decides
+// when the session has had enough chances to recover on its own.
+
+/// Consecutive missed keep-alive ACKs [`RoomKeepAliveStall`] tolerates before
+/// concluding a client's `out_path` is dead — a topology/repeater change,
+/// not just one dropped frame on an otherwise-live route.
+///
+/// **N=2**: a single miss is exactly what ordinary LoRa frame loss looks
+/// like on a route that is otherwise fine — invalidating `out_path` on that
+/// alone would spuriously re-flood (costing every relaying node airtime,
+/// unlike a route-direct keep-alive) on routine link noise. A SECOND
+/// consecutive miss, a full `ROOM_KEEP_ALIVE_INTERVAL_MS` (5 minutes) later,
+/// is the discriminator: back-to-back failures that far apart are no longer
+/// explainable as one unlucky frame — the route itself stopped working. At
+/// that 5-minute cadence, N=2 costs ~10 minutes worst-case to
+/// detect-and-recover: still well inside the "human notices the room went
+/// quiet, hasn't yet reached for the power button" window
+/// `ROOM_KEEP_ALIVE_INTERVAL_MS`'s own doc (`firmware/src/main.rs`) argues
+/// for, and it adds no extra airtime at all — the flood re-login this
+/// triggers is the exact same frame the `out_path_len == 0` branch already
+/// sends; this constant only changes when that branch fires.
+pub const KEEP_ALIVE_STALL_THRESHOLD: u8 = 2;
+
+/// Reconnect-stall detector: counts consecutive keep-alive ticks whose PRIOR
+/// tick's ACK never arrived, and — once [`KEEP_ALIVE_STALL_THRESHOLD`] is
+/// reached — zeroes a session's `out_path_len` so the caller's very next
+/// tick falls onto the re-flood-login branch (clean relearn) instead of
+/// route-directing another keep-alive down the same dead path.
+///
+/// Reset conditions mirror the server's own `push_failures` reset
+/// conditions (see [`KEEP_ALIVE_STALL_THRESHOLD`]'s doc): a successful
+/// keep-alive ACK, an inbound post, or a fresh login should all call
+/// [`Self::reset`] — never let a miss streak from a stale interaction carry
+/// into a freshly-proven-live session.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RoomKeepAliveStall {
+    missed: u8,
+}
+
+impl RoomKeepAliveStall {
+    /// A fresh detector — no misses counted yet.
+    pub const fn new() -> Self {
+        Self { missed: 0 }
+    }
+
+    /// Current consecutive-miss count (test/diagnostic visibility only —
+    /// callers drive behaviour through [`Self::on_tick`]/[`Self::reset`],
+    /// never by inspecting this directly).
+    pub fn missed(&self) -> u8 {
+        self.missed
+    }
+
+    /// Clear the miss streak — call on any evidence the session is live
+    /// (see this type's doc for the three reset conditions).
+    pub fn reset(&mut self) {
+        self.missed = 0;
+    }
+
+    /// Record one keep-alive scheduler tick. `ack_outstanding` is whether
+    /// the PRIOR tick's `pending_keep_alive_ack` was still `Some` (i.e.
+    /// never ACKed) at the moment this tick fires; a tick with nothing
+    /// outstanding (the routine case — the prior keep-alive was ACKed
+    /// in time, or none had been sent yet) is a no-op that leaves the
+    /// counter untouched.
+    ///
+    /// Returns `true` the moment the miss streak reaches
+    /// [`KEEP_ALIVE_STALL_THRESHOLD`] — at which point `session.out_path_len`
+    /// has ALREADY been zeroed and the counter reset to 0 (a clean slate for
+    /// whatever session the relearn produces next) — `false` otherwise.
+    pub fn on_tick(&mut self, ack_outstanding: bool, session: &mut PersistedRoomSession) -> bool {
+        if !ack_outstanding {
+            return false;
+        }
+        self.missed = self.missed.saturating_add(1);
+        if self.missed >= KEEP_ALIVE_STALL_THRESHOLD {
+            session.out_path_len = 0;
+            self.missed = 0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 // ── Notification-suppression parity: Phase D ────────────────────────────────
 
 /// What a caller should do about one incoming room post, per
@@ -1431,6 +1527,240 @@ mod tests {
         assert!(
             double.push_next(&client.pubkey, &mut wire2).is_some(),
             "force_since must have made the already-delivered post re-eligible for push"
+        );
+    }
+
+    // ── Keep-alive: reconnect-stall detector ─────────────────────────────
+
+    #[test]
+    fn stall_detector_never_trips_while_acks_keep_arriving() {
+        let mut session = PersistedRoomSession::EMPTY;
+        session.out_path_len = 2;
+        let mut stall = RoomKeepAliveStall::new();
+        for _ in 0..(KEEP_ALIVE_STALL_THRESHOLD as u32 * 5) {
+            assert!(
+                !stall.on_tick(false, &mut session),
+                "an ACKed tick must never invalidate out_path"
+            );
+        }
+        assert_eq!(
+            session.out_path_len, 2,
+            "a session receiving ACKs normally must never spuriously re-flood"
+        );
+        assert_eq!(stall.missed(), 0);
+    }
+
+    #[test]
+    fn stall_detector_invalidates_out_path_exactly_at_the_threshold() {
+        let mut session = PersistedRoomSession::EMPTY;
+        session.out_path_len = 2;
+        let mut stall = RoomKeepAliveStall::new();
+        for i in 1..KEEP_ALIVE_STALL_THRESHOLD {
+            assert!(
+                !stall.on_tick(true, &mut session),
+                "miss {i}/{KEEP_ALIVE_STALL_THRESHOLD} must not yet invalidate out_path"
+            );
+            assert_eq!(
+                session.out_path_len, 2,
+                "out_path survives before the threshold"
+            );
+        }
+        assert!(
+            stall.on_tick(true, &mut session),
+            "the {KEEP_ALIVE_STALL_THRESHOLD}th consecutive miss must invalidate out_path"
+        );
+        assert_eq!(
+            session.out_path_len, 0,
+            "out_path must be zeroed on stall detection"
+        );
+        assert_eq!(
+            stall.missed(),
+            0,
+            "the counter itself resets once it fires, for the session the relearn produces"
+        );
+    }
+
+    #[test]
+    fn stall_detector_reset_clears_a_partial_miss_streak() {
+        // The miss-counter reset condition, isolated from any ACK/post/login
+        // plumbing: a streak that was interrupted must need a FULL fresh
+        // threshold's worth of misses to trip, not just one more.
+        let mut session = PersistedRoomSession::EMPTY;
+        session.out_path_len = 2;
+        let mut stall = RoomKeepAliveStall::new();
+        assert!(!stall.on_tick(true, &mut session)); // one miss
+        stall.reset();
+        for _ in 1..KEEP_ALIVE_STALL_THRESHOLD {
+            assert!(!stall.on_tick(true, &mut session));
+        }
+        assert_eq!(
+            session.out_path_len, 2,
+            "a reset streak needs a full fresh threshold to trip, not the pre-reset remainder"
+        );
+    }
+
+    #[test]
+    fn stall_then_relearn_recovers_backlog_without_reboot() {
+        // This mission's core acceptance bullet, end to end: a changed-path
+        // reconnect recovers WITHOUT reboot. `RoomKeepAliveStall` detects the
+        // stall and zeroes `out_path_len`; a re-flood login (modelled here
+        // via the double's `handle_login`, exactly like `login_direct`)
+        // relearns the session; and the resumed keep-alive's `force_since`
+        // re-affirms the watermark BEFORE any push retry, so the server's
+        // queue does not re-deliver a post the client already has (dedup
+        // stays intact) while still recovering the one it genuinely missed.
+        let (client, server) = make_pair();
+        let other_author = Identity::from_seed([0xB0u8; 32]);
+        let mut double = RoomServerDouble::new(server.clone(), b"admin-pw", b"guest-pw", false);
+
+        let outcome = login_direct(&mut double, &client, &server, b"guest-pw", 1000);
+        let mut session = PersistedRoomSession::EMPTY;
+        session.apply_login_outcome(&outcome);
+        // Simulate an earlier PATH-return having taught a route (the
+        // double's direct-RESPONSE login form never carries one — see
+        // `decode_login_path_return_records_permission_and_learns_out_path`
+        // for that leg's own coverage).
+        session.out_path[..2].copy_from_slice(&[0xAB, 0xCD]);
+        session.out_path_len = 2;
+        let mut stall = RoomKeepAliveStall::new();
+        let shared = client.ecdh_shared_secret(&server.pubkey);
+
+        // Drain one post normally, before anything goes wrong.
+        double.seed_post(&other_author.pubkey, 2000, b"already delivered");
+        let mut wire = [0u8; 256];
+        let n = double
+            .push_next(&client.pubkey, &mut wire)
+            .expect("the seeded post must be eligible");
+        let mut pt = [0u8; 256];
+        let (_dest, _src, push) = decode_room_push(&shared, &wire[..n], &mut pt).unwrap();
+        let ack = room_push_ack_hash(
+            push.post_ts,
+            push.attempt,
+            push.push_body(&pt),
+            &client.pubkey,
+        );
+        assert!(double.handle_ack(&client.pubkey, &ack));
+        session.sync_since = push.post_ts; // mirrors `handle_room_push_frame`'s watermark update
+        stall.reset(); // mirrors the inbound-post reset condition
+        assert_eq!(double.client_sync_since(&client.pubkey), Some(2000));
+
+        // A routine keep-alive succeeds — Case A / "no spurious re-flood".
+        let mut raw = [0u8; 64];
+        let ka_n = encode_keep_alive(
+            &shared,
+            server.pub_hash(),
+            client.pub_hash(),
+            2100,
+            0,
+            &mut raw,
+        );
+        let ka_ack = double
+            .handle_keep_alive(&client.pubkey, &raw[..ka_n])
+            .expect("routine keep-alive must be accepted");
+        assert_eq!(decode_keep_alive_ack(&ka_ack).unwrap().unsynced_count, 0);
+        assert!(!stall.on_tick(false, &mut session));
+        assert_eq!(
+            session.out_path_len, 2,
+            "a live route must survive a routine keep-alive"
+        );
+
+        // The path changes: the server attempts a push right as the route
+        // dies (it has no way to know), then every subsequent keep-alive
+        // vanishes — nothing reaches `double` at all, exactly what a dead
+        // `out_path` means on the wire.
+        double.seed_post(&other_author.pubkey, 3000, b"missed during the stall");
+        let mut stuck_wire = [0u8; 256];
+        assert!(
+            double.push_next(&client.pubkey, &mut stuck_wire).is_some(),
+            "the server attempts the push (it has no way to know the route just died)"
+        );
+
+        for i in 1..KEEP_ALIVE_STALL_THRESHOLD {
+            assert!(
+                !stall.on_tick(true, &mut session),
+                "miss {i}/{KEEP_ALIVE_STALL_THRESHOLD} must not yet invalidate out_path"
+            );
+            assert_eq!(session.out_path_len, 2);
+        }
+        assert!(
+            stall.on_tick(true, &mut session),
+            "the {KEEP_ALIVE_STALL_THRESHOLD}th consecutive miss must invalidate out_path"
+        );
+        assert_eq!(
+            session.out_path_len, 0,
+            "out_path must be zeroed on stall detection"
+        );
+        assert_eq!(stall.missed(), 0);
+
+        // Relearn: `out_path_len == 0` routes `firmware::main`'s scheduler
+        // to re-flood the login. The double's simplified login helper
+        // always claims `sync_since=0` in its ANON_REQ (unlike production
+        // firmware, which sends the real persisted watermark) —
+        // deliberately exercising the pessimistic case where the server's
+        // own view of `sync_since` regresses on relogin, which is exactly
+        // the case `force_since` exists to correct.
+        let relearn = login_direct(&mut double, &client, &server, b"guest-pw", 4000);
+        session.apply_login_outcome(&relearn);
+        session.out_path[..3].copy_from_slice(&[0x11, 0x22, 0x33]); // a NEW (changed) path
+        session.out_path_len = 3;
+        stall.reset();
+        assert_eq!(
+            double.client_sync_since(&client.pubkey),
+            Some(0),
+            "the double's login helper regresses sync_since to 0 on relogin"
+        );
+
+        // The resumed keep-alive carries `force_since = session.sync_since`
+        // (this mission's fix, not the routine `0`) — re-affirming the
+        // watermark BEFORE any push retry.
+        let mut raw2 = [0u8; 64];
+        let ka_n2 = encode_keep_alive(
+            &shared,
+            server.pub_hash(),
+            client.pub_hash(),
+            4100,
+            session.sync_since,
+            &mut raw2,
+        );
+        let ka_ack2 = double
+            .handle_keep_alive(&client.pubkey, &raw2[..ka_n2])
+            .expect("the resumed keep-alive must be accepted");
+        assert_eq!(
+            decode_keep_alive_ack(&ka_ack2).unwrap().unsynced_count,
+            1,
+            "only the genuinely-missed post is outstanding"
+        );
+        assert_eq!(
+            double.client_sync_since(&client.pubkey),
+            Some(2000),
+            "force_since corrected the server's regressed watermark"
+        );
+        assert!(!stall.on_tick(false, &mut session));
+
+        // The backlog drains: exactly the missed post, not a duplicate of
+        // the already-delivered one.
+        let mut retry_wire = [0u8; 256];
+        let retry_n = double
+            .push_next(&client.pubkey, &mut retry_wire)
+            .expect("the missed post must now be eligible");
+        let mut pt2 = [0u8; 256];
+        let (_dest2, _src2, push2) =
+            decode_room_push(&shared, &retry_wire[..retry_n], &mut pt2).unwrap();
+        assert_eq!(
+            push2.post_ts, 3000,
+            "the genuinely-missed post, not a re-delivery of the already-acked one"
+        );
+        let ack2 = room_push_ack_hash(
+            push2.post_ts,
+            push2.attempt,
+            push2.push_body(&pt2),
+            &client.pubkey,
+        );
+        assert!(double.handle_ack(&client.pubkey, &ack2));
+        assert_eq!(
+            double.client_sync_since(&client.pubkey),
+            Some(3000),
+            "sync_since advances past the recovered post — dedup/backlog intact"
         );
     }
 
