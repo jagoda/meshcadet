@@ -35,6 +35,7 @@
 //! | [`dispatcher`]    | *(none — this module is already 100% pure)*                    |
 //! | [`pin_menu`]      | *(none — this module is already 100% pure)*                    |
 //! | [`notification`]  | `ui::BuzzerDriver` (I2S tone playback)                          |
+//! | [`room_session`]  | `firmware/src/main.rs`'s room-contact RX/TX dispatch + a small dedicated NVS store for learned session state (radio TX enqueue, RX routing, flash I/O) |
 //! | [`ui::gps_status`]| `ui::screens::gps_status::GpsStatusScreen` (the `slint!{}` view) |
 //! | [`ui::contact_list`] | `ui::screens::contact_list::{ContactListScreen, ContactItem}` (the `slint!{}` view) |
 //! | [`ui::admin_menu`] | `ui::screens::admin_menu::AdminMenuScreen` (the `slint!{}` view) |
@@ -65,6 +66,7 @@ pub mod dispatcher;
 pub mod gps;
 pub mod notification;
 pub mod pin_menu;
+pub mod room_session;
 pub mod runtime_settings_store;
 pub mod signal_tracker;
 pub mod ui;
