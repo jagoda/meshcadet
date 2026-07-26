@@ -49,7 +49,10 @@
 use protocol::codec::{decode_dm_payload, decode_path_return, CodecError, PathExtra};
 use protocol::constants::MAX_PATH_SIZE;
 use protocol::history::{HistoryEntry, HistoryMsgType, MAX_HISTORY_TEXT_LEN};
-use protocol::room::{decode_login_response, decode_room_push, room_push_ack_hash};
+use protocol::room::{
+    decode_login_response, decode_room_push, encode_keep_alive, encode_room_post,
+    room_post_ack_hash, room_push_ack_hash, MAX_POST_TEXT_LEN,
+};
 pub use protocol::room::{LoginResponse, RoomCodecError, RoomPermission, RoomPush};
 use protocol::{Header, PathLen, PayloadType, RouteType};
 
@@ -221,8 +224,9 @@ pub fn apply_login_outcome(extra: &mut RoomExtra, outcome: &RoomLoginOutcome) {
 // replacement for, the provisioning-time `RoomExtra` seed.
 
 /// Bytes needed to encode a [`PersistedRoomSession`]:
-/// `permissions(1) + sync_since(4) + out_path_len(1) + out_path(MAX_PATH_SIZE)`.
-pub const PERSISTED_ROOM_SESSION_LEN: usize = 1 + 4 + 1 + MAX_PATH_SIZE;
+/// `permissions(1) + sync_since(4) + out_path_len(1) + out_path(MAX_PATH_SIZE)
+/// + last_room_ts(4)`.
+pub const PERSISTED_ROOM_SESSION_LEN: usize = 1 + 4 + 1 + MAX_PATH_SIZE + 4;
 
 /// The session-learned subset of a room's [`RoomExtra`] fields — see the
 /// section doc above for why this is persisted through its own store rather
@@ -233,6 +237,14 @@ pub struct PersistedRoomSession {
     pub sync_since: u32,
     pub out_path: [u8; MAX_PATH_SIZE],
     pub out_path_len: u8,
+    /// High-water mark of every wall-clock timestamp this room session has
+    /// ever sent the server (login, keep-alive, or a prior post — the
+    /// server tracks one `last_timestamp` counter per client across all
+    /// three, `MyMesh.cpp:435`). Persisted (not just kept in RAM) so a
+    /// reboot's fresh, not-yet-GPS-synced clock can never regress below a
+    /// value this room has already used — see [`RoomPostError`]'s doc for
+    /// why a regression here must be refused, not sent.
+    pub last_room_ts: u32,
 }
 
 impl PersistedRoomSession {
@@ -244,6 +256,7 @@ impl PersistedRoomSession {
         sync_since: 0,
         out_path: [0u8; MAX_PATH_SIZE],
         out_path_len: 0,
+        last_room_ts: 0,
     };
 
     /// Snapshot the provisioning-time seed a `RoomExtra` carries (used as the
@@ -255,6 +268,7 @@ impl PersistedRoomSession {
             sync_since: extra.sync_since,
             out_path: extra.out_path,
             out_path_len: extra.out_path_len,
+            last_room_ts: 0,
         }
     }
 
@@ -272,6 +286,17 @@ impl PersistedRoomSession {
             self.out_path_len = path_byte_count.min(u8::MAX as usize) as u8;
         }
     }
+
+    /// Record that this room session has just sent the server a frame
+    /// timestamped `ts` (login, keep-alive, or a post) — advances
+    /// `last_room_ts` to `ts` if it is a genuine increase. Never regresses:
+    /// callers that raced or retried with a smaller `ts` leave the
+    /// high-water mark untouched.
+    pub fn record_sent_timestamp(&mut self, ts: u32) {
+        if ts > self.last_room_ts {
+            self.last_room_ts = ts;
+        }
+    }
 }
 
 /// Encode a [`PersistedRoomSession`] into `out` (at least
@@ -281,6 +306,8 @@ pub fn encode_persisted_room_session(state: &PersistedRoomSession, out: &mut [u8
     out[1..5].copy_from_slice(&state.sync_since.to_le_bytes());
     out[5] = state.out_path_len;
     out[6..6 + MAX_PATH_SIZE].copy_from_slice(&state.out_path);
+    let ts_off = 6 + MAX_PATH_SIZE;
+    out[ts_off..ts_off + 4].copy_from_slice(&state.last_room_ts.to_le_bytes());
     PERSISTED_ROOM_SESSION_LEN
 }
 
@@ -298,11 +325,14 @@ pub fn decode_persisted_room_session(blob: &[u8]) -> Option<PersistedRoomSession
     }
     let mut out_path = [0u8; MAX_PATH_SIZE];
     out_path.copy_from_slice(&blob[6..6 + MAX_PATH_SIZE]);
+    let ts_off = 6 + MAX_PATH_SIZE;
+    let last_room_ts = u32::from_le_bytes(blob[ts_off..ts_off + 4].try_into().ok()?);
     Some(PersistedRoomSession {
         permissions,
         sync_since,
         out_path,
         out_path_len,
+        last_room_ts,
     })
 }
 
@@ -387,6 +417,246 @@ fn build_history_entry(conv_hash: u8, post_ts: u32, text: &[u8]) -> HistoryEntry
     }
 }
 
+// ── Outbound post: Phase A "post semantics" ─────────────────────────────────
+
+/// Errors from [`encode_room_post_checked`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoomPostError {
+    /// `candidate_ts` is not STRICTLY greater than `last_room_ts` — the
+    /// high-water mark of every timestamp this room session has already
+    /// sent the server (login, keep-alive, OR a prior post; the server
+    /// tracks one `last_timestamp` counter per client across all three,
+    /// `MyMesh.cpp:435`). Sending anyway risks exactly the trap this
+    /// campaign's Objective calls out: the server treats an EQUAL timestamp
+    /// as a retry (post silently discarded, still ACKed) and a LESSER one as
+    /// an outright replay (no ACK at all). Typically caused by the local
+    /// wall clock not yet being GPS-synced this boot (still on its per-boot
+    /// random seed) or having gone backwards relative to a value this room
+    /// has already used — the caller must surface this to the user rather
+    /// than transmit.
+    NonMonotonicTimestamp,
+}
+
+/// Generous upper bound on [`encode_room_post_checked`]'s output: outer
+/// `[header(1)][path_len(1)]` + `encode_room_post`'s own DM-envelope worst
+/// case (`2(dest/src hash) + 2(HMAC) + ceil_16(6 + MAX_POST_TEXT_LEN + 1)`).
+pub const MAX_POST_FRAME_LEN: usize = 2 + 2 + 2 + (((6 + MAX_POST_TEXT_LEN + 1) / 16) + 1) * 16;
+
+/// Checked, wire-ready encode of a room post (Phase A "post semantics"):
+/// `[header=Flood/TxtMsg][path_len=0-hop][DM envelope]` — the same "flood,
+/// addressed by dest_hash" shape [`encode_room_login_frame`] already uses,
+/// since a room contact worth posting to has necessarily already reached
+/// the server once (over flood or a learned direct route) and flood
+/// addressing reaches it either way.
+///
+/// Refuses to encode (returns `Err`, writes nothing) unless `candidate_ts`
+/// is STRICTLY greater than `last_room_ts` — see [`RoomPostError`]'s doc.
+/// `last_room_ts` must be this room session's full high-water mark (login /
+/// keep-alive / prior post), not just a prior call to this function.
+///
+/// On success returns `(frame_len, expected_ack_hash)`. The caller MUST:
+/// - remember `expected_ack_hash` to recognise the server's post-ACK
+///   (`room_post_ack_hash`'s doc: `sha256(post_plaintext || client_pubkey)[0..4]`);
+/// - advance its own high-water mark to `candidate_ts`
+///   ([`PersistedRoomSession::record_sent_timestamp`]) so the NEXT call's
+///   `last_room_ts` reflects this send, whether or not the ACK ever arrives
+///   (the monotonic guard is about what this client has SENT, not what it
+///   has had acknowledged).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_room_post_checked(
+    shared_secret: &[u8; 32],
+    dest_hash: u8,
+    src_hash: u8,
+    candidate_ts: u32,
+    last_room_ts: u32,
+    text: &[u8],
+    client_pubkey: &[u8; 32],
+    out: &mut [u8],
+) -> Result<(usize, [u8; 4]), RoomPostError> {
+    if candidate_ts <= last_room_ts {
+        return Err(RoomPostError::NonMonotonicTimestamp);
+    }
+    out[0] = Header::new(RouteType::Flood, PayloadType::TxtMsg).0;
+    out[1] = PathLen::new(2, 0).map(|p| p.0).unwrap_or(0x40);
+    let n = encode_room_post(
+        shared_secret,
+        dest_hash,
+        src_hash,
+        candidate_ts,
+        0,
+        text,
+        &mut out[2..],
+    );
+    let text_len = text.len().min(MAX_POST_TEXT_LEN);
+    let ack = room_post_ack_hash(candidate_ts, 0, &text[..text_len], client_pubkey);
+    Ok((2 + n, ack))
+}
+
+// ── Keep-alive: Phase C "keep-alive scheduler" ──────────────────────────────
+
+/// Build the outer `[header][path_len][path bytes...]` prefix for a frame
+/// this client sends straight to a room server over its learned `out_path` —
+/// the ONLY route a room server ever answers a `REQ_TYPE_KEEP_ALIVE` over
+/// (`MyMesh.cpp:536`, `packet->isRouteDirect()`). `out_path` is 1-byte-hash
+/// encoded (matches [`RoomLoginOutcome::out_path`]/[`RoomExtra::out_path`]'s
+/// own convention — the path a `decode_path_return` PATH-return taught this
+/// client). Returns `None` if `out_path` is empty (nothing learned yet — the
+/// caller must re-flood the `ANON_REQ` login to relearn it instead, per this
+/// module's `encode_room_login_frame`) or longer than 63 hops (`PathLen`'s
+/// own range).
+pub fn encode_room_direct_prefix(
+    payload_type: PayloadType,
+    out_path: &[u8],
+    out: &mut [u8],
+) -> Option<usize> {
+    if out_path.is_empty() {
+        return None;
+    }
+    let path_len = PathLen::new(1, u8::try_from(out_path.len()).ok()?)?;
+    out[0] = Header::new(RouteType::Direct, payload_type).0;
+    out[1] = path_len.0;
+    let n = path_len.hop_count() as usize;
+    out[2..2 + n].copy_from_slice(&out_path[..n]);
+    Some(2 + n)
+}
+
+/// Generous upper bound on [`encode_room_keep_alive_frame`]'s output: the
+/// direct-route prefix's worst case (`2 + MAX_PATH_SIZE`) plus the keep-alive
+/// DM envelope's own worst case (`2 + 2 + ceil_16(9)` = 20).
+pub const MAX_KEEP_ALIVE_FRAME_LEN: usize = 2 + MAX_PATH_SIZE + 20;
+
+/// Encode a full route-direct keep-alive frame — Phase C's periodic
+/// liveness/backlog-depth probe. Returns `None` (writes nothing) if
+/// `out_path` is empty: **route-direct is a hard prerequisite**
+/// (`encode_room_direct_prefix`'s doc) — a caller that gets `None` here must
+/// re-flood the login instead of ever attempting a flood-routed keep-alive
+/// (the server ignores one outright, `MyMesh.cpp:536`).
+///
+/// `force_since`, passed straight through to [`encode_keep_alive`], recovers
+/// a stalled sync by force-updating the server's view of this client's
+/// `sync_since`; pass `0` to leave it untouched.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_room_keep_alive_frame(
+    shared_secret: &[u8; 32],
+    dest_hash: u8,
+    src_hash: u8,
+    out_path: &[u8],
+    timestamp: u32,
+    force_since: u32,
+    out: &mut [u8],
+) -> Option<usize> {
+    let prefix_len = encode_room_direct_prefix(PayloadType::Req, out_path, out)?;
+    let n = encode_keep_alive(
+        shared_secret,
+        dest_hash,
+        src_hash,
+        timestamp,
+        force_since,
+        &mut out[prefix_len..],
+    );
+    Some(prefix_len + n)
+}
+
+// ── Notification-suppression parity: Phase D ────────────────────────────────
+
+/// What a caller should do about one incoming room post, per
+/// [`RoomSyncPhase`]'s classification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoomNotification {
+    /// Currently draining the post-login backlog: suppress any per-post
+    /// notification/badge increment. Silently folded into the eventual
+    /// [`RoomNotification::Aggregate`] the drain window's close will emit.
+    None,
+    /// The drain window just closed (a keep-alive ACK reported the unsynced
+    /// count reached 0): fire exactly ONE aggregate notification for the
+    /// whole backlog just absorbed. `count` is how many genuinely new posts
+    /// (post-dedup) were folded in — `0` never reaches the caller (see
+    /// [`RoomSyncPhase::on_keep_alive_ack`]'s doc: nothing drained, nothing
+    /// to announce).
+    Aggregate { count: u32 },
+    /// Not draining: this is a live post, full parity with the channel
+    /// notification path (fire it exactly like `IncomingGroupMsg`).
+    Live,
+}
+
+/// Per-room session-phase tracker driving Phase D's notification
+/// classification — **by session phase, not post count or a timer** (the
+/// Objective's own non-negotiable: a count/timer heuristic misclassifies a
+/// live post that arrives during a slow drain). A sync-drain window opens
+/// the moment a room session starts (a fresh boot always needs to reconfirm
+/// whether backlog remains) and closes only when a keep-alive ACK's
+/// unsynced-count byte reports `0` — never on a post count reaching some
+/// threshold, never on a wall-clock timer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoomSyncPhase {
+    draining: bool,
+    drained_count: u32,
+}
+
+impl RoomSyncPhase {
+    /// A fresh room session, right after login: the drain window starts
+    /// open — the client cannot yet know whether it has any backlog until a
+    /// keep-alive ACK confirms zero.
+    pub const fn new_after_login() -> Self {
+        Self {
+            draining: true,
+            drained_count: 0,
+        }
+    }
+
+    /// Whether the drain window is currently open.
+    pub fn is_draining(&self) -> bool {
+        self.draining
+    }
+
+    /// Classify one genuinely-new incoming post (a dedup HIT must never
+    /// reach this — see [`Self::on_push_outcome`], the call site this exists
+    /// to keep in lockstep with dedup).
+    fn on_post_received(&mut self) -> RoomNotification {
+        if self.draining {
+            self.drained_count += 1;
+            RoomNotification::None
+        } else {
+            RoomNotification::Live
+        }
+    }
+
+    /// The single call site a caller's push handler should use: feeds a
+    /// [`RoomPushOutcome`] straight in, so the dedup rule and the
+    /// notification-suppression rule can never drift apart. A duplicate
+    /// (`entry: None` — a room-server retry of a post already in history)
+    /// is not counted or classified at all: it must still be ACKed
+    /// unconditionally (`handle_room_push`'s doc), but it must never inflate
+    /// the drain aggregate's count or fire a live notification — a re-drain
+    /// after reboot must not duplicate history OR re-notify.
+    pub fn on_push_outcome(&mut self, outcome: &RoomPushOutcome) -> RoomNotification {
+        if outcome.entry.is_none() {
+            return RoomNotification::None;
+        }
+        self.on_post_received()
+    }
+
+    /// Feed a keep-alive ACK's unsynced-count byte in. If the drain window
+    /// was open and this count reports `0`, closes it and returns the
+    /// aggregate notification to fire — `None` if either the window was
+    /// already closed, the count is still nonzero (still draining, however
+    /// slowly), or the window closed with nothing actually drained (nothing
+    /// to announce).
+    pub fn on_keep_alive_ack(&mut self, unsynced_count: u8) -> Option<RoomNotification> {
+        if !self.draining || unsynced_count != 0 {
+            return None;
+        }
+        self.draining = false;
+        let count = self.drained_count;
+        self.drained_count = 0;
+        if count > 0 {
+            Some(RoomNotification::Aggregate { count })
+        } else {
+            None
+        }
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -394,7 +664,8 @@ mod tests {
     use super::*;
     use protocol::identity::Identity;
     use protocol::room::{
-        encode_anon_req_login, encode_room_post, room_post_ack_hash, RoomServerDouble,
+        decode_keep_alive_ack, encode_anon_req_login, encode_room_post, keep_alive_ack_hash,
+        room_post_ack_hash, RoomServerDouble,
     };
 
     fn make_pair() -> (Identity, Identity) {
@@ -872,6 +1143,7 @@ mod tests {
             sync_since: 0xDEAD_BEEF,
             out_path,
             out_path_len: 2,
+            last_room_ts: 0xC0FF_EE42,
         };
 
         let mut blob = [0u8; PERSISTED_ROOM_SESSION_LEN];
@@ -918,5 +1190,262 @@ mod tests {
             &state.out_path[..state.out_path_len as usize],
             &extra.out_path[..extra.out_path_len as usize]
         );
+    }
+
+    #[test]
+    fn record_sent_timestamp_never_regresses() {
+        let mut state = PersistedRoomSession::EMPTY;
+        state.record_sent_timestamp(100);
+        assert_eq!(state.last_room_ts, 100);
+        state.record_sent_timestamp(50); // smaller: ignored
+        assert_eq!(state.last_room_ts, 100);
+        state.record_sent_timestamp(101);
+        assert_eq!(state.last_room_ts, 101);
+    }
+
+    // ── Phase A: encode_room_post_checked's monotonic-timestamp guard ──────
+
+    #[test]
+    fn encode_room_post_checked_rejects_equal_and_lesser_timestamps() {
+        let (client, server) = make_pair();
+        let shared = client.ecdh_shared_secret(&server.pubkey);
+        let mut out = [0u8; MAX_POST_FRAME_LEN];
+
+        assert_eq!(
+            encode_room_post_checked(
+                &shared,
+                server.pub_hash(),
+                client.pub_hash(),
+                1000,
+                1000, // equal: the "silently discarded as a retry" trap
+                b"hi",
+                &client.pubkey,
+                &mut out,
+            ),
+            Err(RoomPostError::NonMonotonicTimestamp)
+        );
+        assert_eq!(
+            encode_room_post_checked(
+                &shared,
+                server.pub_hash(),
+                client.pub_hash(),
+                999,
+                1000, // lesser: outright replay
+                b"hi",
+                &client.pubkey,
+                &mut out,
+            ),
+            Err(RoomPostError::NonMonotonicTimestamp)
+        );
+    }
+
+    #[test]
+    fn encode_room_post_checked_accepts_strictly_greater_and_round_trips_through_double() {
+        let (client, server) = make_pair();
+        let mut double = RoomServerDouble::new(server.clone(), b"admin-pw", b"guest-pw", false);
+        login_direct(&mut double, &client, &server, b"guest-pw", 1000);
+
+        let shared = client.ecdh_shared_secret(&server.pubkey);
+        let mut out = [0u8; MAX_POST_FRAME_LEN];
+        let (n, expected_ack) = encode_room_post_checked(
+            &shared,
+            server.pub_hash(),
+            client.pub_hash(),
+            2000,
+            1000,
+            b"a genuinely new post",
+            &client.pubkey,
+            &mut out,
+        )
+        .expect("candidate_ts > last_room_ts must encode");
+
+        // The frame is a real, wire-valid flood TXT_MSG the double accepts —
+        // strip the 2-byte outer header/path_len this function prepends
+        // before handing the DM payload to the double, mirroring how
+        // `on_receive` peels the same prefix off in production.
+        assert_eq!(
+            out[0],
+            Header::new(RouteType::Flood, PayloadType::TxtMsg).0,
+            "post frame must be flood-routed, matching every other DM send"
+        );
+        let ack = double
+            .handle_post(&client.pubkey, &out[2..n])
+            .expect("ReadWrite client's post must be accepted by the double");
+        assert_eq!(ack, expected_ack, "double's ack must match this function's computed ack_hash");
+    }
+
+    // ── Phase C: route-direct keep-alive framing ────────────────────────────
+
+    #[test]
+    fn encode_room_direct_prefix_refuses_empty_out_path() {
+        let mut out = [0u8; 8];
+        assert_eq!(
+            encode_room_direct_prefix(PayloadType::Req, &[], &mut out),
+            None,
+            "no learned route: caller must re-flood the login instead"
+        );
+    }
+
+    #[test]
+    fn encode_room_keep_alive_frame_is_never_flood_routed() {
+        let (client, server) = make_pair();
+        let shared = client.ecdh_shared_secret(&server.pubkey);
+        let out_path = [0xABu8, 0xCD];
+
+        let mut out = [0u8; MAX_KEEP_ALIVE_FRAME_LEN];
+        let n = encode_room_keep_alive_frame(
+            &shared,
+            server.pub_hash(),
+            client.pub_hash(),
+            &out_path,
+            5000,
+            0,
+            &mut out,
+        )
+        .expect("a learned out_path must encode");
+
+        let header = Header(out[0]);
+        assert_eq!(
+            header.route_type(),
+            Some(RouteType::Direct),
+            "a room keep-alive must NEVER be flood-routed (MyMesh.cpp:536 ignores one)"
+        );
+        assert_eq!(header.payload_type(), Some(PayloadType::Req));
+        let path_len = PathLen(out[1]);
+        assert_eq!(path_len.hop_count(), 2);
+        assert_eq!(&out[2..4], &out_path);
+
+        // Round trip through the double: strip the same prefix production's
+        // `on_receive` would peel off before forwarding the DM payload.
+        let mut double = RoomServerDouble::new(server.clone(), b"admin-pw", b"guest-pw", false);
+        login_direct(&mut double, &client, &server, b"guest-pw", 1000);
+        let ack = double
+            .handle_keep_alive(&client.pubkey, &out[4..n])
+            .expect("keep-alive must be accepted");
+        assert_eq!(decode_keep_alive_ack(&ack).unwrap().ack_hash, keep_alive_ack_hash(5000, 0, &client.pubkey));
+    }
+
+    #[test]
+    fn encode_room_keep_alive_frame_none_without_a_learned_path() {
+        let (client, server) = make_pair();
+        let shared = client.ecdh_shared_secret(&server.pubkey);
+        let mut out = [0u8; MAX_KEEP_ALIVE_FRAME_LEN];
+        assert_eq!(
+            encode_room_keep_alive_frame(
+                &shared,
+                server.pub_hash(),
+                client.pub_hash(),
+                &[],
+                5000,
+                0,
+                &mut out,
+            ),
+            None
+        );
+    }
+
+    // ── Phase D: session-phase notification classification ─────────────────
+
+    #[test]
+    fn drain_of_32_posts_yields_exactly_one_aggregate_of_32() {
+        let mut phase = RoomSyncPhase::new_after_login();
+        for _ in 0..32 {
+            let outcome = RoomPushOutcome {
+                ack_hash: [0; 4],
+                post_ts: 0,
+                entry: Some(HistoryEntry {
+                    sender_hash: 0,
+                    msg_type: HistoryMsgType::Dm,
+                    timestamp: 0,
+                    text: [0; MAX_HISTORY_TEXT_LEN],
+                    text_len: 0,
+                }),
+            };
+            assert_eq!(phase.on_push_outcome(&outcome), RoomNotification::None);
+        }
+        assert_eq!(
+            phase.on_keep_alive_ack(0),
+            Some(RoomNotification::Aggregate { count: 32 })
+        );
+        // Idempotent: a second unsynced=0 report with nothing new drained
+        // fires nothing (the window is already closed).
+        assert_eq!(phase.on_keep_alive_ack(0), None);
+    }
+
+    #[test]
+    fn live_post_after_drain_closes_gets_full_parity() {
+        let mut phase = RoomSyncPhase::new_after_login();
+        assert_eq!(phase.on_keep_alive_ack(0), None, "nothing drained: no aggregate");
+        assert!(!phase.is_draining());
+
+        let outcome = RoomPushOutcome {
+            ack_hash: [0; 4],
+            post_ts: 0,
+            entry: Some(HistoryEntry {
+                sender_hash: 0,
+                msg_type: HistoryMsgType::Dm,
+                timestamp: 0,
+                text: [0; MAX_HISTORY_TEXT_LEN],
+                text_len: 0,
+            }),
+        };
+        assert_eq!(phase.on_push_outcome(&outcome), RoomNotification::Live);
+    }
+
+    #[test]
+    fn live_post_during_a_slow_drain_is_still_classified_as_draining() {
+        // The test that kills a naive count/timer heuristic: feed MORE than
+        // 32 posts (a count heuristic would have flipped to "live" well
+        // before this) while the drain window is still legitimately open
+        // (no keep-alive has yet reported unsynced=0) — every single one
+        // must still classify as None (folded into the eventual aggregate),
+        // never as a standalone Live notification.
+        let mut phase = RoomSyncPhase::new_after_login();
+        let fresh_entry = || RoomPushOutcome {
+            ack_hash: [0; 4],
+            post_ts: 0,
+            entry: Some(HistoryEntry {
+                sender_hash: 0,
+                msg_type: HistoryMsgType::Dm,
+                timestamp: 0,
+                text: [0; MAX_HISTORY_TEXT_LEN],
+                text_len: 0,
+            }),
+        };
+        for _ in 0..40 {
+            assert_eq!(phase.on_push_outcome(&fresh_entry()), RoomNotification::None);
+        }
+        assert!(
+            phase.is_draining(),
+            "40 posts in is still no reason to leave the drain phase — only a keep-alive ACK can"
+        );
+        assert_eq!(
+            phase.on_keep_alive_ack(0),
+            Some(RoomNotification::Aggregate { count: 40 })
+        );
+    }
+
+    #[test]
+    fn dedup_hit_is_neither_counted_nor_notified() {
+        // A replayed push (`entry: None`) must not inflate the drain
+        // aggregate's count, and must not itself fire a notification —
+        // a re-drain after reboot must not duplicate history OR re-notify.
+        let mut phase = RoomSyncPhase::new_after_login();
+        let dup = RoomPushOutcome {
+            ack_hash: [0; 4],
+            post_ts: 0,
+            entry: None,
+        };
+        assert_eq!(phase.on_push_outcome(&dup), RoomNotification::None);
+        // Nothing was actually drained — closing the window now fires no
+        // aggregate at all (count is 0).
+        assert_eq!(phase.on_keep_alive_ack(0), None);
+    }
+
+    #[test]
+    fn keep_alive_ack_with_nonzero_unsynced_count_keeps_draining() {
+        let mut phase = RoomSyncPhase::new_after_login();
+        assert_eq!(phase.on_keep_alive_ack(5), None, "still draining: not yet 0");
+        assert!(phase.is_draining());
     }
 }
