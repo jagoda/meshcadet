@@ -288,9 +288,33 @@ struct RoomRuntime {
     /// been persisted yet).
     session: room_session::PersistedRoomSession,
     /// Whether this boot has already enqueued the initial flood login for
-    /// this room — a login is sent at most once per boot; M1 has no
-    /// keep-alive/re-login scheduler (milestone 2).
+    /// this room. A re-login can still happen later (Phase C: the
+    /// keep-alive scheduler re-floods if `out_path` is ever lost), but the
+    /// one-shot BOOT login only ever fires once.
     login_sent: bool,
+    /// Wall-clock ms (`uptime_ms()`-scale, matching every other `last_*_ms`
+    /// scheduler in this loop) this room last sent a keep-alive — `0`
+    /// initially, so the very first scheduler tick after login fires
+    /// immediately rather than waiting a full interval. See
+    /// `ROOM_KEEP_ALIVE_INTERVAL_MS`'s doc for the chosen cadence and its
+    /// airtime/liveness justification.
+    #[cfg_attr(feature = "hil", allow(dead_code))]
+    last_keep_alive_ms: u64,
+    /// Phase D's session-phase notification classifier — see
+    /// `firmware_core::room_session::RoomSyncPhase`'s doc. Starts assuming a
+    /// drain is needed (every fresh boot does, until a keep-alive ACK proves
+    /// otherwise).
+    #[cfg_attr(feature = "hil", allow(dead_code))]
+    sync_phase: room_session::RoomSyncPhase,
+    /// The ACK hash expected back for this room's one in-flight POST, if
+    /// any — Phase A's "the post round-trips and its ACK is matched"
+    /// acceptance bullet. `None` when no post is outstanding.
+    #[cfg_attr(feature = "hil", allow(dead_code))]
+    pending_post_ack: Option<[u8; 4]>,
+    /// The ACK hash expected back for this room's one in-flight keep-alive,
+    /// if any. `None` when no keep-alive is outstanding.
+    #[cfg_attr(feature = "hil", allow(dead_code))]
+    pending_keep_alive_ack: Option<[u8; 4]>,
     /// A small in-memory tail of this room's already-known conversation
     /// entries — the content-dedup input
     /// `firmware_core::room_session::handle_room_push` compares an inbound
@@ -315,6 +339,31 @@ struct RoomRuntime {
 /// bounded without ever meaningfully weakening the dedup.
 #[cfg(not(feature = "hil"))]
 const ROOM_RECENT_CAP: usize = 8;
+
+/// Phase C keep-alive cadence: 5 minutes (300_000 ms).
+///
+/// **Airtime**: a keep-alive frame is tiny — a 9-byte plaintext wrapped in a
+/// DM envelope, well under 40 bytes on the wire — sent route-direct (one
+/// unicast hop-count, not a flood rebroadcast every node repeats). At 12
+/// sends/hour it is over an order of magnitude below this device's own
+/// `TX_INTERVAL_MS` (30 s advert cadence, a much larger flood frame) and
+/// negligible against any reasonable LoRa duty-cycle budget.
+///
+/// **Liveness**: `meshcadet-room-m1-checkpoint`'s Findings pin the failure
+/// mode this exists to catch — three consecutive push-ACK timeouts evict a
+/// client from the server's push list UNTIL REBOOT, and `push_failures`
+/// only resets on an ACK, an inbound post, an inbound REQ (this keep-alive),
+/// or a fresh login. A push timeout is 12 s (flood) or up to ~4+2×(hops+1) s
+/// (direct); three in a row is on the order of tens of seconds to a minute.
+/// 5 minutes is short enough that a silently-decayed `out_path` (this
+/// scheduler's OTHER job: re-flooding the login the moment `out_path_len`
+/// reads 0) or a wedged push list gets a recovery attempt well within the
+/// timescale a human would notice a room "went quiet" and long before
+/// they'd consider power-cycling the device, while staying far enough above
+/// the server's own per-push timeouts that this isn't just adding to the
+/// same airtime pressure that caused the stall in the first place.
+#[cfg(not(feature = "hil"))]
+const ROOM_KEEP_ALIVE_INTERVAL_MS: u64 = 300_000;
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -841,6 +890,15 @@ fn run() -> anyhow::Result<()> {
                                     let session =
                                         room_session::load_room_session(nvs_partition.clone(), hash)
                                             .unwrap_or(seed);
+                                    // Phase B: never present a compose box
+                                    // for a message the server will swallow
+                                    // — register this room's CURRENT (resumed
+                                    // session, not just the provisioning-time
+                                    // seed) permission with the UI so
+                                    // `navigate_to_compose` can gate on it.
+                                    if let Some(ref mut ui) = ui_opt {
+                                        ui.register_room(hash, session.permission().can_post());
+                                    }
                                     room_runtime.push(RoomRuntime {
                                         pubkey: cfg.contacts[i].pubkey,
                                         hash,
@@ -848,6 +906,10 @@ fn run() -> anyhow::Result<()> {
                                         guest_password_len: extra.guest_password_len,
                                         session,
                                         login_sent: false,
+                                        last_keep_alive_ms: 0,
+                                        sync_phase: room_session::RoomSyncPhase::new_after_login(),
+                                        pending_post_ack: None,
+                                        pending_keep_alive_ack: None,
                                         // Seeded from flash below, at the
                                         // history-hydrate step (this room's
                                         // provisioned-config entry is
@@ -1399,6 +1461,7 @@ fn run() -> anyhow::Result<()> {
             );
             txq.enqueue(&frame[..n]);
             room.login_sent = true;
+            room.session.record_sent_timestamp(boot_ts);
             log::info!(
                 "room: queued flood login for 0x{:02x} (sync_since={})",
                 room.hash, room.session.sync_since,
@@ -1526,6 +1589,81 @@ fn run() -> anyhow::Result<()> {
                 );
             }
             last_tx_ms = now;
+        }
+
+        // ── Room keep-alive scheduler (Phase C) ───────────────────────────────
+        //
+        // Every `ROOM_KEEP_ALIVE_INTERVAL_MS` per provisioned, logged-in room:
+        // send a route-direct keep-alive if a route is known (consuming the
+        // ACK's appended unsynced-count byte closes Phase D's drain window —
+        // see `handle_ack`), or re-flood the login to relearn one if it was
+        // ever lost (`out_path_len == 0`) — a flood-routed keep-alive is a
+        // no-op the server ignores outright (`MyMesh.cpp:536`), so this
+        // scheduler must never attempt one. `room_runtime` is empty under
+        // `hil` (no rooms there), so this is a no-op in that build, exactly
+        // like the boot-time login loop above.
+        #[cfg(not(feature = "hil"))]
+        for room in room_runtime.iter_mut() {
+            if !room.login_sent {
+                continue; // login not even queued yet this boot
+            }
+            if now.saturating_sub(room.last_keep_alive_ms) < ROOM_KEEP_ALIVE_INTERVAL_MS {
+                continue;
+            }
+            room.last_keep_alive_ms = now;
+            let ts = tx_epoch_base.wrapping_add((now / 1000) as u32);
+            let shared = identity.ecdh_shared_secret(&room.pubkey);
+
+            if room.session.out_path_len == 0 {
+                let mut frame = [0u8; room_session::MAX_LOGIN_FRAME_LEN];
+                let n = room_session::encode_room_login_frame(
+                    &shared,
+                    room.hash,
+                    &identity.pubkey,
+                    ts,
+                    room.session.sync_since,
+                    &room.guest_password[..room.guest_password_len as usize],
+                    &mut frame,
+                );
+                txq.enqueue(&frame[..n]);
+                room.session.record_sent_timestamp(ts);
+                log::info!(
+                    "room: 0x{:02x} has no learned out_path — re-flooding login",
+                    room.hash,
+                );
+                continue;
+            }
+
+            let mut frame = [0u8; room_session::MAX_KEEP_ALIVE_FRAME_LEN];
+            match room_session::encode_room_keep_alive_frame(
+                &shared,
+                room.hash,
+                identity.pub_hash(),
+                &room.session.out_path[..room.session.out_path_len as usize],
+                ts,
+                0, // force_since: no stall-recovery override needed on a routine tick
+                &mut frame,
+            ) {
+                Some(n) => {
+                    txq.enqueue(&frame[..n]);
+                    room.pending_keep_alive_ack =
+                        Some(protocol::room::keep_alive_ack_hash(ts, 0, &identity.pubkey));
+                    room.session.record_sent_timestamp(ts);
+                    log::info!(
+                        "room: TX route-direct keep-alive for 0x{:02x} (ts={})",
+                        room.hash, ts,
+                    );
+                }
+                None => {
+                    // Can only happen if out_path_len somehow exceeds 63
+                    // hops — defensive; out_path_len is bounded by
+                    // `apply_login_outcome`'s own `.min` clamp.
+                    log::warn!(
+                        "room: keep-alive encode failed for 0x{:02x} despite a learned out_path",
+                        room.hash,
+                    );
+                }
+            }
         }
 
         // ── CAD + TX ─────────────────────────────────────────────────────────
@@ -1974,6 +2112,88 @@ fn run() -> anyhow::Result<()> {
                             }
                         }
                     }
+                    ui::UiCommand::SendRoomPost { room_hash, text } => {
+                        // Phase A: post send. `room_session::encode_room_post_checked`
+                        // enforces the strictly-monotonic per-room timestamp
+                        // invariant (this mission's Objective) — a refusal
+                        // is surfaced (logged), never silently sent, since
+                        // the server would either treat an equal timestamp
+                        // as a retry (discarded, still ACKed) or a lesser
+                        // one as an outright replay (no ACK at all).
+                        #[cfg(not(feature = "hil"))]
+                        match room_runtime.iter_mut().find(|r| r.hash == room_hash) {
+                            None => log::warn!(
+                                "UI send room post: unknown room 0x{:02x}",
+                                room_hash,
+                            ),
+                            Some(room) => {
+                                // Defense in depth (Phase B): the UI should
+                                // already have refused to queue this for a
+                                // read-only session (`on_send_message`'s own
+                                // guard) — never trust a cross-module
+                                // invariant with no local check too.
+                                if !room.session.permission().can_post() {
+                                    log::warn!(
+                                        "UI send room post: room 0x{:02x} session is \
+                                         read-only — dropped",
+                                        room_hash,
+                                    );
+                                } else {
+                                    let candidate_ts =
+                                        tx_epoch_base.wrapping_add((now / 1000) as u32);
+                                    let shared = identity.ecdh_shared_secret(&room.pubkey);
+                                    match room_session::encode_room_post_checked(
+                                        &shared,
+                                        room.hash,
+                                        identity.pub_hash(),
+                                        candidate_ts,
+                                        room.session.last_room_ts,
+                                        text.as_bytes(),
+                                        &identity.pubkey,
+                                        &mut frame_buf,
+                                    ) {
+                                        Ok((n, ack)) => {
+                                            txq.enqueue(&frame_buf[..n]);
+                                            room.pending_post_ack = Some(ack);
+                                            room.session.record_sent_timestamp(candidate_ts);
+                                            log::info!(
+                                                "TX room post to 0x{:02x}: {:?} ({} bytes)",
+                                                room.hash, text, n,
+                                            );
+                                            // ── Persist to rotating history (outbound) ──
+                                            // Mirrors SendDm's append-on-send — a room's
+                                            // posts render through the exact same
+                                            // hash-keyed history region a DM's do.
+                                            append_history(
+                                                room.hash,
+                                                protocol::history::HistoryMsgType::Dm,
+                                                candidate_ts,
+                                                text.as_bytes(),
+                                                true,
+                                                false,
+                                            );
+                                        }
+                                        Err(e) => {
+                                            // Phase A's non-negotiable: never send a
+                                            // post the server's replay gate would
+                                            // silently discard — surface it (logged)
+                                            // rather than transmit.
+                                            log::warn!(
+                                                "UI send room post to 0x{:02x} refused: \
+                                                 {:?} — local clock has not advanced \
+                                                 past this room's last sent timestamp \
+                                                 (unsynced GPS clock, or a genuine \
+                                                 clock regression)",
+                                                room.hash, e,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        #[cfg(feature = "hil")]
+                        let _ = (room_hash, text);
+                    }
                 }
             }
         }
@@ -2325,7 +2545,9 @@ fn on_receive(
         x if x == PayloadType::Req as u8 => {
             handle_req(payload, our_id, policy, txq, gps_snapshot, battery_snapshot)
         }
-        x if x == PayloadType::Ack as u8 => handle_ack(payload, pending_ack, ui_events),
+        x if x == PayloadType::Ack as u8 => {
+            handle_ack(payload, pending_ack, room_runtime, ui_events)
+        }
         x if x == PayloadType::Response as u8 => {
             // A direct RESPONSE datagram: the non-flood room-login-reply leg
             // (see `handle_room_login_response`'s doc). No other payload
@@ -2701,14 +2923,70 @@ fn handle_req(
     }
 }
 
-/// Match an inbound ACK against the pending ACK for our last-sent DM.
-fn handle_ack(payload: &[u8], pending_ack: &mut Option<PendingAck>, ui_events: &mut Vec<ui::UiEvent>) {
+/// Match an inbound ACK against the pending ACK for our last-sent DM, OR —
+/// checked first, before falling through to the DM slot — a room's
+/// in-flight post or keep-alive ACK (Phase A/C). A room post ACK just clears
+/// the pending flag (mirrors `DmAcked`'s "flip the sent-message checkmark",
+/// reusing that same UiEvent since a room's posts render through the exact
+/// same hash-keyed message view a DM's do — see `room_message_view.rs`'s
+/// module doc). A room keep-alive ACK additionally carries the appended
+/// unsynced-count byte (`payload[4]`) that closes Phase D's drain window —
+/// see `firmware_core::room_session::RoomSyncPhase::on_keep_alive_ack`.
+#[cfg_attr(feature = "hil", allow(unused_variables))]
+fn handle_ack(
+    payload: &[u8],
+    pending_ack: &mut Option<PendingAck>,
+    room_runtime: &mut [RoomRuntime],
+    ui_events: &mut Vec<ui::UiEvent>,
+) {
     if payload.len() < 4 {
         log::warn!("RX ACK: truncated ({} bytes)", payload.len());
         return;
     }
     let mut got = [0u8; 4];
     got.copy_from_slice(&payload[..4]);
+
+    #[cfg(not(feature = "hil"))]
+    for room in room_runtime.iter_mut() {
+        if room.pending_post_ack == Some(got) {
+            room.pending_post_ack = None;
+            log::info!("RX room post ACK for 0x{:02x}: matched", room.hash);
+            ui_events.push(ui::UiEvent::DmAcked { to_hash: room.hash });
+            return;
+        }
+        if room.pending_keep_alive_ack == Some(got) {
+            room.pending_keep_alive_ack = None;
+            // Decode through the module's own validated decoder rather than
+            // hand-indexing `payload[4]` — a payload truncated to exactly 4
+            // bytes (no appended unsynced-count byte at all) must NOT be
+            // silently treated as "0 unsynced" (which would prematurely
+            // close Phase D's drain window); `Err` here just skips the
+            // drain-phase update for this ACK, matching "unable to determine
+            // backlog depth" rather than assuming the most optimistic case.
+            match protocol::room::decode_keep_alive_ack(payload) {
+                Ok(ack) => {
+                    log::info!(
+                        "RX room keep-alive ACK for 0x{:02x}: unsynced_count={}",
+                        room.hash, ack.unsynced_count,
+                    );
+                    if let Some(room_session::RoomNotification::Aggregate { count }) =
+                        room.sync_phase.on_keep_alive_ack(ack.unsynced_count)
+                    {
+                        ui_events.push(ui::UiEvent::RoomDrainComplete {
+                            room_hash: room.hash,
+                            count,
+                        });
+                    }
+                }
+                Err(e) => log::warn!(
+                    "RX room keep-alive ACK for 0x{:02x}: missing unsynced-count byte ({:?})",
+                    room.hash, e,
+                ),
+            }
+            return;
+        }
+    }
+
     match_pending_ack(got, pending_ack, ui_events);
 }
 
@@ -2881,6 +3159,14 @@ fn handle_room_push_frame(
                 hex4(&outcome.ack_hash),
             );
 
+            // Phase D: classify BEFORE the dedup-gated content append below,
+            // off the SAME `outcome` — `RoomSyncPhase::on_push_outcome`'s
+            // whole contract is that a dedup hit (`entry: None`) is neither
+            // counted nor notified, keeping the notification-suppression
+            // rule in lockstep with the content dedup a re-drain after
+            // reboot depends on.
+            let notification = room.sync_phase.on_push_outcome(&outcome);
+
             if let Some(entry) = outcome.entry {
                 let text_len = (entry.text_len as usize).min(entry.text.len());
                 let text = &entry.text[..text_len];
@@ -2901,11 +3187,33 @@ fn handle_room_push_frame(
                     room.recent.remove(0);
                 }
                 room.recent.push(entry);
-                ui_events.push(ui::UiEvent::IncomingDm {
-                    from_hash: room.hash,
-                    from_name: format!("0x{:02x}", room.hash),
-                    text: text_str.to_owned(),
-                });
+                // Session-phase notification classification (Phase D): a
+                // still-draining backlog post is appended silently (folded
+                // into the eventual aggregate); a live post gets full
+                // channel-path parity. `RoomNotification::None` is also
+                // reachable here in principle (can't from a fresh `Some`
+                // entry today, but matching exhaustively rather than
+                // wildcarding keeps this in lockstep if `RoomSyncPhase`'s
+                // classification ever grows a new suppressed case).
+                match notification {
+                    room_session::RoomNotification::None => {
+                        ui_events.push(ui::UiEvent::RoomPostDrained {
+                            room_hash: room.hash,
+                            text: text_str.to_owned(),
+                        });
+                    }
+                    room_session::RoomNotification::Live => {
+                        ui_events.push(ui::UiEvent::RoomPostLive {
+                            room_hash: room.hash,
+                            text: text_str.to_owned(),
+                        });
+                    }
+                    room_session::RoomNotification::Aggregate { .. } => {
+                        // Never produced by `on_push_outcome` — only
+                        // `on_keep_alive_ack` (see `handle_ack`) does.
+                        // Unreachable here; no event to raise.
+                    }
+                }
             }
 
             // Persist the advanced watermark now that the ACK is queued —
@@ -3201,7 +3509,7 @@ mod tests {
 
         // [ack_hash(4)] [extended-attempt byte] [random byte]
         let payload_6_byte = [1u8, 2, 3, 4, 0x07, 0xFE];
-        handle_ack(&payload_6_byte, &mut pending, &mut ui_events);
+        handle_ack(&payload_6_byte, &mut pending, &mut [], &mut ui_events);
 
         assert!(pending.is_none(), "a prefix-matched 6-byte ack must clear pending_ack");
         assert_eq!(ui_events.len(), 1, "a prefix-matched 6-byte ack must raise exactly one UI event");

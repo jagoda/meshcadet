@@ -180,6 +180,36 @@ pub enum UiEvent {
         lon_e7: i32,
         age_secs: u32,
     },
+    /// A room post that arrived while Phase D's sync-drain window was still
+    /// open (`firmware_core::room_session::RoomSyncPhase::is_draining`).
+    /// Content is appended (message view / list preview reflect it once the
+    /// user looks) but — deliberately, this is the whole point of Phase D —
+    /// NO per-post unread bump and NO `notif.fire`: a 32-post login backlog
+    /// must not emit 32 notifications or badge increments. Folded instead
+    /// into the single [`UiEvent::RoomDrainComplete`] the drain window's
+    /// close fires.
+    RoomPostDrained {
+        room_hash: u8,
+        text: String,
+    },
+    /// A room post that arrived AFTER Phase D's sync-drain window closed:
+    /// full parity with [`UiEvent::IncomingGroupMsg`] (append + unread bump
+    /// + `notif.fire` + list refresh) — a room's live posts must read
+    /// exactly like a channel's.
+    RoomPostLive {
+        room_hash: u8,
+        text: String,
+    },
+    /// Phase D's sync-drain window just closed with `count` genuinely-new
+    /// posts folded into it (dedup hits never count — see
+    /// `RoomSyncPhase::on_push_outcome`'s doc): fire exactly ONE aggregate
+    /// notification/badge bump for the whole backlog just absorbed. Never
+    /// raised with `count == 0` (nothing to announce — see
+    /// `RoomSyncPhase::on_keep_alive_ack`'s doc).
+    RoomDrainComplete {
+        room_hash: u8,
+        count: u32,
+    },
 }
 
 /// Commands from the UI layer to the radio dispatcher.
@@ -193,6 +223,17 @@ pub enum UiCommand {
     /// Send a group channel message.
     SendGroupMsg {
         channel_hash: u8,
+        text: String,
+    },
+    /// Send a room post (Phase A) — a DM-to-node `TXT_MSG` awaiting a 4-byte
+    /// ACK, distinct from both `SendDm` (no room permission gating) and
+    /// `SendGroupMsg` (unacknowledged flood) — see this mission's Objective.
+    /// Only ever emitted by `on_send_message` for a hash registered via
+    /// `register_room` with `can_post: true`; `main.rs` still re-checks the
+    /// room's live session permission before actually transmitting (defense
+    /// in depth — see `firmware/src/main.rs`'s handling of this command).
+    SendRoomPost {
+        room_hash: u8,
         text: String,
     },
 }
@@ -420,6 +461,14 @@ pub struct UiRuntime<'d> {
     self_name: String,
     /// Unread counts per contact.
     unread: std::collections::HashMap<u8, u32>,
+    /// Room hash → whether this room's CURRENT session permission can post
+    /// (`RoomPermission::can_post()`), registered once per provisioned room
+    /// at boot by `main.rs` (`register_room`). Phase B's gate: a hash
+    /// present here identifies a room conversation (as opposed to a plain
+    /// channel, which is absent) and its value decides `on_send_message`'s
+    /// routing AND `navigate_to_compose`'s read-only rendering. Never
+    /// present for a DM contact or a non-room channel.
+    room_permissions: std::collections::HashMap<u8, bool>,
     /// Channel items cache — re-used when navigating back from PinEntry.
     channel_items: Vec<screens::contact_list::ChannelItem>,
     /// Trackball-driven highlighted row index on the ContactList screen
@@ -870,6 +919,7 @@ impl<'d> UiRuntime<'d> {
             contact_names: std::collections::HashMap::new(),
             self_name: self_name.to_string(),
             unread: std::collections::HashMap::new(),
+            room_permissions: std::collections::HashMap::new(),
             channel_items: Vec::new(),
             contact_list_selected: -1,
             admin_menu_selected: -1,
@@ -929,6 +979,18 @@ impl<'d> UiRuntime<'d> {
             );
             screen.set_contacts(&contacts);
         }
+    }
+
+    /// Register a room's CURRENT session permission (called after
+    /// provisioned config is loaded, alongside `register_contact`/
+    /// `set_channels` — a room is rendered as a `ChannelItem`, see
+    /// `main.rs`'s room-loading loop). `can_post` should be
+    /// `RoomPermission::can_post()` off the room's RESUMED session (not just
+    /// the provisioning-time seed) — Phase B's gate: `on_send_message` and
+    /// `navigate_to_compose` both consult this to route sends correctly and
+    /// to render the read-only indicator.
+    pub fn register_room(&mut self, hash: u8, can_post: bool) {
+        self.room_permissions.insert(hash, can_post);
     }
 
     /// Push channel list into the contact list screen (called after provisioned
@@ -1893,6 +1955,65 @@ impl<'d> UiRuntime<'d> {
                 // Refresh the live MessageView if this channel conversation is currently open.
                 self.refresh_message_view_for(channel_hash, true);
             }
+            UiEvent::RoomPostDrained { room_hash, text } => {
+                // Silent append: content reaches the message view / list
+                // preview, but deliberately NO unread bump and NO
+                // `notif.fire` — see this variant's own doc. The eventual
+                // `RoomDrainComplete` fires the single aggregate instead.
+                self.messages
+                    .entry(room_hash)
+                    .or_default()
+                    .push(MessageRecord {
+                        text,
+                        is_ours: false,
+                        acked: false,
+                        ts_ms: now_ms,
+                    });
+                if let ActiveScreen::ContactList(ref screen) = self.active_screen {
+                    let channels = build_channel_items(
+                        &self.channel_items, &self.messages, &self.unread,
+                    );
+                    screen.set_channels(&channels);
+                }
+                self.refresh_message_view_for(room_hash, true);
+            }
+            UiEvent::RoomPostLive { room_hash, text } => {
+                // Full parity with IncomingGroupMsg — see this variant's doc.
+                self.messages
+                    .entry(room_hash)
+                    .or_default()
+                    .push(MessageRecord {
+                        text,
+                        is_ours: false,
+                        acked: false,
+                        ts_ms: now_ms,
+                    });
+                if incoming_message_is_unread(self.active_convo, room_hash, true) {
+                    *self.unread.entry(room_hash).or_insert(0) += 1;
+                }
+                self.notif.fire(NotifEvent::IncomingGroupMsg, now_ms, self.screen_asleep);
+                if let ActiveScreen::ContactList(ref screen) = self.active_screen {
+                    let channels = build_channel_items(
+                        &self.channel_items, &self.messages, &self.unread,
+                    );
+                    screen.set_channels(&channels);
+                }
+                self.refresh_message_view_for(room_hash, true);
+            }
+            UiEvent::RoomDrainComplete { room_hash, count } => {
+                // Exactly one aggregate notification/badge bump for the
+                // whole backlog just absorbed — never one per drained post.
+                if incoming_message_is_unread(self.active_convo, room_hash, true) {
+                    *self.unread.entry(room_hash).or_insert(0) += count;
+                }
+                self.notif.fire(NotifEvent::IncomingGroupMsg, now_ms, self.screen_asleep);
+                if let ActiveScreen::ContactList(ref screen) = self.active_screen {
+                    let channels = build_channel_items(
+                        &self.channel_items, &self.messages, &self.unread,
+                    );
+                    screen.set_channels(&channels);
+                }
+            }
             UiEvent::DmAcked { to_hash } => {
                 // Mark the last outbound message to this contact as acked.
                 mark_last_unacked_outbound(&mut self.messages, to_hash);
@@ -2078,6 +2199,27 @@ impl<'d> UiRuntime<'d> {
             return;
         }
 
+        // Phase B: a room hash routes to `SendRoomPost`, never the plain
+        // `SendGroupMsg` flood a channel row would otherwise get (rooms are
+        // rendered as `ChannelItem`s — `is_channel` is true for them too —
+        // so this check MUST come first, and MUST come before the optimistic
+        // "sent" record push below — a blocked send must leave no phantom
+        // bubble in the thread). Defense in depth: `can_post` is re-checked
+        // here even though the compose screen this draft came from should
+        // already have been read-only-disabled for a room this session
+        // can't post to (Phase B) — never present a compose box for a
+        // message the server will swallow, and never SEND one either if
+        // that guard was somehow bypassed.
+        if let Some(&can_post) = self.room_permissions.get(&hash) {
+            if !can_post {
+                log::warn!(
+                    "ui: compose send blocked — room 0x{:02x} is read-only for this session",
+                    hash,
+                );
+                return;
+            }
+        }
+
         self.messages
             .entry(hash)
             .or_default()
@@ -2087,7 +2229,10 @@ impl<'d> UiRuntime<'d> {
                 acked: false,
                 ts_ms: 0, // filled in by dispatcher
             });
-        if is_channel {
+        if self.room_permissions.contains_key(&hash) {
+            log::info!("ui: send room post room=0x{:02x} ({} bytes)", hash, text.len());
+            self.commands.push(UiCommand::SendRoomPost { room_hash: hash, text });
+        } else if is_channel {
             log::info!("ui: send GRP_TXT ch={:#04x} ({} bytes)", hash, text.len());
             self.commands.push(UiCommand::SendGroupMsg { channel_hash: hash, text });
         } else {
@@ -2696,6 +2841,18 @@ impl<'d> UiRuntime<'d> {
         // Seed the header's SignalMeter — see `navigate_to_contact_list`'s
         // identical seeding comment.
         screen.set_signal_level(level_to_bars(self.signal_level));
+        // Phase B: a room this session can't post to renders compose
+        // disabled with an explicit read-only indicator — never present a
+        // compose box for a message the server will silently swallow.
+        // `room_permissions` holds no entry at all for a non-room
+        // conversation (DM or plain channel), so `unwrap_or(false)` (not
+        // read-only) is the correct default there.
+        let read_only = self
+            .room_permissions
+            .get(&hash)
+            .map(|&can_post| !can_post)
+            .unwrap_or(false);
+        screen.set_read_only(read_only);
 
         // Pre-load the draft when this navigation was triggered by a
         // printable keypress in MessageView rather than the Write button

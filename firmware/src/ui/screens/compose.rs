@@ -316,6 +316,15 @@ slint::slint! {
         // `SignalMeter`'s embedding below.
         in property <int>               signal_level: 0;
 
+        // Phase B (`meshcadet-room-firmware-post-and-notify`): a room this
+        // session can't post to (GUEST/READ_ONLY permission) sets this and
+        // gets BOTH a disabled Send button AND a read-only draft area — the
+        // server silently drops a sub-ReadWrite post (no ACK, no error), so
+        // this screen must never let the user believe a tap here does
+        // anything. `false` for every non-room conversation (DM/channel),
+        // set by `ComposeScreen::set_read_only` from `navigate_to_compose`.
+        in property <bool>              read_only: false;
+
         // Drives the Send button's `RocketOnSend` one-shot (see module doc's
         // "Outer-space theme" section) — flipped `true` in the Send button's
         // own `clicked` handler below, and auto-reset back to `false` by the
@@ -473,6 +482,28 @@ slint::slint! {
                 // wrapper around the single child to take effect.
                 VerticalLayout {
                     padding: 8px;
+                    spacing: 4px;
+
+                    // Read-only indicator (Phase B) — a plain, always-in-
+                    // flow banner (not an overlay) so it never obscures the
+                    // draft/emoji-picker geometry below; `warn` is this
+                    // theme's own "caution / needs-attention state" token,
+                    // an exact fit for "you can look, you can't post here".
+                    // `size-preview` (11px), not `size-meta` (10px): 11px is
+                    // one of `gen_emoji_font.c`'s curated `EMOJI_SIZES`, so
+                    // the leading 🔒 glyph actually rasterises here — 10px is
+                    // NOT in that set, which would silently ship a BLANK lock
+                    // glyph on real hardware (the exact failure mode
+                    // `gen_emoji_font.c`'s own module doc calls out; the host
+                    // glyph-coverage harness can't catch a Theme-token
+                    // font-size indirection like this one, so this is a
+                    // by-inspection fix, not a harness-driven one).
+                    if read_only : Text {
+                        text: "🔒 Read-only — you can't post in this room";
+                        font-size: Theme.size-preview;
+                        color: Theme.warn;
+                        wrap: word-wrap;
+                    }
 
                     // `single-line: false` + `wrap: word-wrap` keep long typed text
                     // auto-wrapping across multiple visual lines, but this TextInput
@@ -484,12 +515,18 @@ slint::slint! {
                     // so Return-inserts-newline is superseded outright rather than
                     // left reachable through some other path). Nothing here needs
                     // to special-case Return; the interception happens upstream.
+                    //
+                    // `read-only: root.read_only` (Phase B) uses Slint's own
+                    // built-in `TextInput.read-only` property — a read-only
+                    // room's draft area rejects edits outright, on top of
+                    // the Send button's own `enabled` gate below.
                     draft_input := TextInput {
                         text <=> draft;
                         font-size: Theme.size-body-lg;
                         color: Theme.text-primary;
                         wrap: word-wrap;
                         single-line: false;
+                        read-only: root.read_only;
                         init => { self.focus(); }
                         edited => { root.draft_changed(self.text); }
                     }
@@ -538,16 +575,20 @@ slint::slint! {
                     Rectangle { horizontal-stretch: 1.0; }
 
                     // Send button — `star-gold` affordance + rocket-on-send
-                    // (see module doc's "Outer-space theme" section).
+                    // (see module doc's "Outer-space theme" section). Phase
+                    // B: `read_only` forces the idle (`surface-raised`)
+                    // look regardless of draft content — same visual as "no
+                    // draft yet", so a read-only room never shows the
+                    // "armed" affordance for a send that can't happen.
                     Rectangle {
                         width: 80px; height: 28px;
-                        background: draft != "" ? Theme.star-gold : Theme.surface-raised;
+                        background: (draft != "" && !read_only) ? Theme.star-gold : Theme.surface-raised;
                         animate background { duration: 120ms; easing: ease-out; }
                         border-radius: 14px;
                         Text {
                             text: "📤 Send";
                             font-size: Theme.size-body; font-weight: 600;
-                            color: draft != "" ? Theme.bg-space : Theme.text-secondary;
+                            color: (draft != "" && !read_only) ? Theme.bg-space : Theme.text-secondary;
                             animate color { duration: 120ms; easing: ease-out; }
                             horizontal-alignment: center;
                             vertical-alignment: center;
@@ -559,8 +600,10 @@ slint::slint! {
                             // this screen now outlives the send tap by the
                             // deferred nav window, so the button must stop
                             // reacting after the first tap or a second tap
-                            // would queue a duplicate send.
-                            enabled: draft != "" && !root.sent;
+                            // would queue a duplicate send. `!root.read_only`
+                            // is Phase B's gate — never send from a room the
+                            // server would silently drop the post from.
+                            enabled: draft != "" && !root.sent && !root.read_only;
                             clicked => {
                                 root.sent = true;
                                 root.send_pressed(draft);
@@ -642,6 +685,13 @@ impl ComposeScreen {
     /// identical doc for the `bars` contract.
     pub fn set_signal_level(&self, bars: i32) {
         self.component.set_signal_level(bars);
+    }
+
+    /// Phase B: render this screen read-only (disabled Send + banner) for a
+    /// room this session can't post to. `false` for every non-room
+    /// conversation. See the `read_only` property's doc in the markup above.
+    pub fn set_read_only(&self, read_only: bool) {
+        self.component.set_read_only(read_only);
     }
 
     pub fn get_draft(&self) -> String {
