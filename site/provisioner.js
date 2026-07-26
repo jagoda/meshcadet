@@ -866,10 +866,13 @@ function reportWriteError(statusEl, action, err) {
 //
 // The PIN is a secret (ADR-0007): it is validated for byte-length only,
 // passed straight to `session.setPin` (which sends it over serial and scrubs
-// its own buffer), and the input field is cleared the instant it's sent. It
-// is never logged, echoed into a status message, placed in the URL, or
-// written to storage. `validatePin` deliberately never returns the PIN, so
-// there is only ever the one `setPinInput.value` copy to drop.
+// its own buffer), and the input field is cleared on EVERY exit path —
+// success and the device-error/transport-failure catch branch alike (plus
+// `clearFormStatuses` on disconnect) — so a failed submit is never a reason
+// to leave the secret sitting in the DOM. It is never logged, echoed into a
+// status message, placed in the URL, or written to storage. `validatePin`
+// deliberately never returns the PIN, so there is only ever the one
+// `setPinInput.value` copy to drop.
 
 async function handleSetPin() {
   const pin = setPinInput.value;
@@ -886,6 +889,10 @@ async function handleSetPin() {
     setPinInput.value = "";
     setPinStatus.textContent = "PIN set. Physical USB possession remains the auth factor for resets.";
   } catch (err) {
+    // Clear here too: a failed submit is not a reason to leave a secret
+    // sitting in the DOM any longer than the successful path would (same
+    // discipline as handleAddRoom's catch branch).
+    setPinInput.value = "";
     // Note: never surface the PIN itself — reportWriteError logs only the
     // error (a device RSP_ERROR message or transport failure), not the PIN.
     reportWriteError(setPinStatus, "set PIN", err);
