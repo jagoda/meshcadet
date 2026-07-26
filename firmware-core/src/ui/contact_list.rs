@@ -1,7 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Contact / channel list screen — pure display-string formatting, the
-//! plain-data contact/channel-entry types, and the two list-builder
-//! functions that assemble them from `UiRuntime`'s data maps.
+//! Contacts / Groups list screen — pure display-string formatting, the
+//! plain-data contact/channel-entry types, and the list-builder /
+//! routing functions that assemble them from `UiRuntime`'s data maps.
+//!
+//! The Groups tab is a **union over two data stores** — provisioned
+//! `Channel`s and role=`room` `Contact`s (see `config_store::Contact::
+//! is_room`) — rendered as one Slint list of `ChannelEntry`/`ChannelItem`
+//! rows, each carrying [`ChannelItem::is_room`] so the view can paint a
+//! room row visually distinct from a true channel row. [`route_contact`]
+//! is the one seam that decides, for a single provisioned contact, whether
+//! it belongs in the Contacts tab or is unioned into the Groups tab — see
+//! its own doc for why this needs to be a pure, host-testable function
+//! rather than inline logic in `main.rs`.
 //!
 //! The `slint::slint!{}` view and the `ContactListScreen` Rust wrapper stay
 //! in `firmware/src/ui/screens/contact_list.rs` — they depend on Slint;
@@ -42,14 +52,22 @@ pub fn unread_total_increased(prev: Option<i32>, total: i32) -> bool {
     matches!(prev, Some(p) if total > p)
 }
 
-/// A channel entry.
-#[derive(Clone, Debug)]
+/// A Groups-tab entry — either a true channel or a room server, unioned
+/// into one list. `is_room` is the visual-distinction flag the Groups-tab
+/// view reads to paint the two kinds differently (see
+/// `firmware/src/ui/screens/contact_list.rs`'s `ContactRow`/room styling);
+/// it carries no wire meaning and is never round-tripped through any
+/// provisioning frame.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ChannelItem {
     pub name: String,
     pub preview: String,
     pub time_str: String,
     pub unread: i32,
     pub hash: u8,
+    /// `true` for a room server (`Contact::is_room()`), `false` for a true
+    /// channel. Purely a rendering hint for the unified Groups list.
+    pub is_room: bool,
 }
 
 /// A contact entry passed into the Slint model.
@@ -116,12 +134,59 @@ pub fn build_channel_items(
             time_str: String::new(),
             unread: *unread.get(&c.hash).unwrap_or(&0) as i32,
             hash: c.hash,
+            is_room: c.is_room,
         })
         .collect();
     // Sort by unread count (desc) then name (asc) — same ordering rule as
     // `build_contact_items`, for cross-tab consistency.
     items.sort_by(|a, b| b.unread.cmp(&a.unread).then(a.name.cmp(&b.name)));
     items
+}
+
+/// Where a single provisioned contact belongs once `main.rs`'s boot-time
+/// config-load loop has decoded it: the Contacts tab (`register_contact`
+/// wants a bare `(hash, name)` pair) or the Groups tab, unioned alongside
+/// true channels as a [`ChannelItem`] with [`ChannelItem::is_room`] set.
+/// The `Room` variant carries a full `ChannelItem` rather than a bare name
+/// so a call site cannot accidentally feed a room contact into
+/// `register_contact` — it only type-checks through the Groups path.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ContactRoute {
+    Contact { hash: u8, name: String },
+    Room(ChannelItem),
+}
+
+/// Route one provisioned contact to the Contacts tab or the Groups tab by
+/// `is_room` — the one-field `Contact::is_room()` predicate the
+/// provisioning contract's `role` byte was designed for (see
+/// `config_store::Contact::is_room`'s doc). `display_name` is the
+/// already-decoded UTF-8 label (empty ⇒ fall back to the `0x{hash:02x}`
+/// placeholder both tabs use).
+///
+/// Pulled out as a pure function so `main.rs`'s boot-time contact-loading
+/// loop — which only ever runs on-device (this crate's `firmware`
+/// consumer cross-compiles for `xtensa-esp32s3-espidf` with `harness =
+/// false`; see this module's doc) — has a host-testable seam proving a
+/// role=room contact routes OUT of Contacts and INTO Groups, rather than
+/// that routing being asserted only by reading the code.
+pub fn route_contact(hash: u8, is_room: bool, display_name: &str) -> ContactRoute {
+    let name = if display_name.is_empty() {
+        format!("0x{:02x}", hash)
+    } else {
+        display_name.to_string()
+    };
+    if is_room {
+        ContactRoute::Room(ChannelItem {
+            name,
+            preview: String::new(),
+            time_str: String::new(),
+            unread: 0,
+            hash,
+            is_room: true,
+        })
+    } else {
+        ContactRoute::Contact { hash, name }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -194,6 +259,7 @@ mod tests {
                 time_str: String::new(),
                 unread: 0, // catalog entries are always seeded at 0 — see set_channels
                 hash,
+                is_room: false,
             })
             .collect()
     }
@@ -311,5 +377,124 @@ mod tests {
         let items = build_contact_items(&contact_names, &messages, &unread);
         let dana = items.iter().find(|c| c.hash == 0x64).unwrap();
         assert_eq!(dana.preview, "welcome back");
+    }
+
+    #[test]
+    fn build_channel_items_carries_is_room_through() {
+        let mut channels = catalog(&[("General", 0x10)]);
+        channels.push(ChannelItem {
+            name: "Mission Ops Room".to_string(),
+            preview: String::new(),
+            time_str: String::new(),
+            unread: 0,
+            hash: 0x99,
+            is_room: true,
+        });
+        let messages: HashMap<u8, Vec<MessageRecord>> = HashMap::new();
+        let unread = HashMap::new();
+
+        let items = build_channel_items(&channels, &messages, &unread);
+        let general = items.iter().find(|c| c.hash == 0x10).unwrap();
+        assert!(
+            !general.is_room,
+            "a true channel must not be flagged is_room"
+        );
+        let room = items.iter().find(|c| c.hash == 0x99).unwrap();
+        assert!(
+            room.is_room,
+            "a room's is_room flag must survive the rebuild"
+        );
+    }
+
+    #[test]
+    fn unread_badge_parity_holds_for_room_and_channel_rows_and_tab_aggregate() {
+        // Regression guard for this mission's badge/notification-parity
+        // acceptance bullet: a room entry's unread count must flow through
+        // `build_channel_items` exactly like a true channel's — both at the
+        // per-row level (each entry's own `unread`) and the tab-aggregate
+        // level (the sum `set_channels` computes over the returned Vec,
+        // fed into `channels_unread_total`).
+        let mut channels = catalog(&[("General", 0x10)]);
+        channels.push(ChannelItem {
+            name: "Mission Ops Room".to_string(),
+            preview: String::new(),
+            time_str: String::new(),
+            unread: 0,
+            hash: 0x99,
+            is_room: true,
+        });
+        let messages: HashMap<u8, Vec<MessageRecord>> = HashMap::new();
+        let mut unread = HashMap::new();
+        unread.insert(0x10u8, 2u32); // channel: 2 unread
+        unread.insert(0x99u8, 5u32); // room: 5 unread
+
+        let items = build_channel_items(&channels, &messages, &unread);
+
+        // Row level: each entry carries its OWN unread count regardless of
+        // is_room.
+        let channel_row = items.iter().find(|c| c.hash == 0x10).unwrap();
+        assert_eq!(channel_row.unread, 2);
+        let room_row = items.iter().find(|c| c.hash == 0x99).unwrap();
+        assert_eq!(room_row.unread, 5);
+
+        // Tab-aggregate level: mirrors `ContactListScreen::set_channels`'s
+        // `total += ch.unread` loop — a room's unread must count toward the
+        // SAME Groups-tab aggregate badge a channel's does, not a separate
+        // or missing total.
+        let total: i32 = items.iter().map(|c| c.unread).sum();
+        assert_eq!(
+            total, 7,
+            "room and channel unread must sum into one Groups-tab aggregate"
+        );
+    }
+
+    // ── route_contact ────────────────────────────────────────────────────
+    //
+    // Regression guard for this mission's core acceptance bullet: a
+    // role=room contact must route OUT of the Contacts tab and INTO the
+    // Groups tab. `main.rs`'s boot-time loop can't run on host (see this
+    // module's doc), so this is the seam that proves it rather than the
+    // routing being asserted only by reading `main.rs`.
+
+    #[test]
+    fn route_contact_chat_goes_to_contacts() {
+        let route = route_contact(0x11, false, "Alice");
+        assert_eq!(
+            route,
+            ContactRoute::Contact {
+                hash: 0x11,
+                name: "Alice".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn route_contact_room_goes_to_groups_as_channel_item() {
+        let route = route_contact(0x22, true, "Lobby");
+        match route {
+            ContactRoute::Room(item) => {
+                assert_eq!(item.hash, 0x22);
+                assert_eq!(item.name, "Lobby");
+                assert!(item.is_room, "a routed room must carry is_room: true");
+            }
+            ContactRoute::Contact { .. } => {
+                panic!("a role=room contact must NOT route to the Contacts tab")
+            }
+        }
+    }
+
+    #[test]
+    fn route_contact_empty_name_falls_back_to_hex_hash_for_both_kinds() {
+        assert_eq!(
+            route_contact(0xab, false, ""),
+            ContactRoute::Contact {
+                hash: 0xab,
+                name: "0xab".to_string(),
+            }
+        );
+        match route_contact(0xcd, true, "") {
+            ContactRoute::Room(item) => assert_eq!(item.name, "0xcd"),
+            ContactRoute::Contact { .. } => panic!("room contact misrouted"),
+        }
     }
 }

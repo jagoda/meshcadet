@@ -6,8 +6,10 @@
  *   - Printable ASCII (U+0020..U+007E) from a Latin TTF (DejaVu Sans)
  *   - A small set of BMP symbols used by the UI (‹ › ✏ ✓ ✕ ⚙ ⌫ −) from the
  *     Latin font (with emoji-face fallback for any the Latin font lacks)
- *   - 40 curated picker emoji + 6 UI-chrome emoji (📤 😀 📬 📡 🔐 📍) from
- *     NotoEmoji-Regular.ttf
+ *   - 40 curated picker emoji + a curated set of UI-chrome emoji, including
+ *     📤 😀 🔐 📍, from NotoEmoji-Regular.ttf (see `UI_EXTRA_CPS` below for
+ *     the full, current list — this header enumerates examples, not an
+ *     exhaustive count)
  *
  * Why one combined font, registered globally, at every UI size:
  *   The Slint SoftwareRenderer resolves an entire text run to a SINGLE bitmap
@@ -77,8 +79,15 @@ static const unsigned long EMOJI_CPS[] = {
 static const unsigned long UI_EXTRA_CPS[] = {
     0x1F4E4,  /* 📤 outbox tray   — "📤 Send" button (compose.rs, 13px)        */
     0x1F600,  /* 😀 grinning face — picker toggle    (compose.rs, 18px)        */
-    0x1F4EC,  /* 📬 mailbox       — "📬 Messages" tab (contact_list.rs, 13px)  */
-    0x1F4E1,  /* 📡 satellite     — "📡 Channels" tab (contact_list.rs, 13px)  */
+    /* NOTE: 0x1F4EC (📬 mailbox) and 0x1F4E1 (📡 satellite) were the
+     * "📬 Messages"/"📡 Channels" tab-label glyphs in contact_list.rs. The
+     * Contacts/Groups rename dropped both plain-text tab labels back to
+     * bare "Contacts"/"Groups" (no leading glyph) — see contact_list.rs's
+     * module doc — so these two codepoints are no longer used anywhere in
+     * the UI and were removed from this table. Removing an UNUSED entry is
+     * always safe (the glyph-coverage harness only checks that USED
+     * codepoints are registered, never the reverse); if a future screen
+     * wants either glyph again, re-add it here. */
     0x1F510,  /* 🔐 lock+key      — PIN-entry icon    (pin_entry.rs, 20px)     */
     0x1F4CD,  /* 📍 round pin     — telemetry location in message body (13px);
                  * also the GPS-status header title (gps_status.rs, 14px)     */
@@ -105,7 +114,7 @@ static const unsigned long UI_EXTRA_CPS[] = {
                  * (compose.rs, size-preview/11px; ui_sim's read-only mirror
                  * uses the same glyph+size — M2 post-and-notify) */
 };
-#define N_UI_EXTRA 11
+#define N_UI_EXTRA 9
 
 /* BMP symbols used in the UI.  Preferred from the Latin font (DejaVu); a symbol
  * the Latin face lacks falls back to the emoji face (see render_glyph).  These

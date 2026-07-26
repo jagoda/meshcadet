@@ -54,6 +54,9 @@ slint::slint! {
         in property <int>     unread;
         in property <string>  unread_str;
         in property <bool>    selected;
+        // Mirrors `contact_list.rs`'s `ContactRow.is_room` — see this file's
+        // module doc for why a copy (not an import).
+        in property <bool>    is_room: false;
         callback clicked;
 
         height: 54px;
@@ -80,7 +83,7 @@ slint::slint! {
                     width: 36px;
                     height: 36px;
                     border-radius: 18px;
-                    background: Theme.select;
+                    background: is_room ? Theme.nebula-violet : Theme.select;
 
                     Text {
                         text: initial;
@@ -183,6 +186,7 @@ slint::slint! {
         unread:  int,
         unread_str: string,
         hash:    int,
+        is_room: bool,
     }
 
     export component ContactListPromoUi inherits Window {
@@ -239,7 +243,7 @@ slint::slint! {
                         background: show_contacts ? Theme.bg-space : transparent;
 
                         Text {
-                            text: "📬 Messages";
+                            text: "Contacts";
                             font-size: Theme.size-body;
                             color: show_contacts ? Theme.brand-signal : Theme.text-secondary;
                             horizontal-alignment: center;
@@ -274,7 +278,7 @@ slint::slint! {
                         background: !show_contacts ? Theme.bg-space : transparent;
 
                         Text {
-                            text: "📡 Channels";
+                            text: "Groups";
                             font-size: Theme.size-body;
                             color: !show_contacts ? Theme.brand-signal : Theme.text-secondary;
                             horizontal-alignment: center;
@@ -355,6 +359,7 @@ slint::slint! {
                             unread:     ch.unread;
                             unread_str: ch.unread_str;
                             selected:   i == root.selected_index;
+                            is_room:    ch.is_room;
                             clicked => { root.channel_selected(ch.hash); }
                         }
                     }
@@ -392,17 +397,18 @@ pub struct PromoContact {
     pub unread: i32,
 }
 
-/// One seeded Channels-tab row — also how a room-server contact is rendered
-/// (`meshcadet-room-firmware-login-read`'s M1 acceptance: a room appears,
-/// read-only, in this EXISTING tab; no new tab, no visual-distinction work,
-/// so this shares the identical `ChannelEntry`/`ContactRow` markup a true
-/// channel row uses).
+/// One seeded Groups-tab row — a true channel (`is_room: false`) or a
+/// room-server contact (`is_room: true`), unioned into the same list and
+/// rendered read-only for a room. `is_room` drives `ContactRow`'s
+/// avatar-circle color (see this file's copied markup) — the "two entry
+/// types visually distinct" acceptance bullet.
 pub struct PromoChannel {
     pub name: &'static str,
     pub initial: &'static str,
     pub preview: &'static str,
     pub time_str: &'static str,
     pub unread: i32,
+    pub is_room: bool,
 }
 
 struct ContactListPromoPlatform {
@@ -487,11 +493,10 @@ impl ContactListPromoFrame {
         self.ui.set_show_contacts(true);
     }
 
-    /// Seed the Channels tab with `channels` and switch to it — mirrors
-    /// `set_contacts` above. A room-server contact renders here (see
-    /// [`PromoChannel`]'s doc): `meshcadet-room-firmware-login-read`'s M1
-    /// acceptance requires only that a room entry appears in this existing
-    /// tab, with no new visual distinction from a true channel row.
+    /// Seed the Groups tab with `channels` and switch to it — mirrors
+    /// `set_contacts` above. A room-server contact renders here alongside
+    /// true channels, visually distinguished by `is_room` (see
+    /// [`PromoChannel`]'s doc).
     pub fn set_channels(&self, channels: &[PromoChannel]) {
         let model: VecModel<ChannelEntry> = VecModel::default();
         let mut total = 0;
@@ -509,6 +514,7 @@ impl ContactListPromoFrame {
                     "".into()
                 },
                 hash: 0,
+                is_room: c.is_room,
             });
         }
         self.ui.set_channels(ModelRc::new(model));
@@ -518,7 +524,7 @@ impl ContactListPromoFrame {
         } else {
             "".into()
         });
-        // Empty contacts model — the Channels tab is the one shown.
+        // Empty contacts model — the Groups tab is the one shown.
         self.ui
             .set_contacts(ModelRc::new(VecModel::<ContactEntry>::default()));
         self.ui.set_show_contacts(false);

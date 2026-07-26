@@ -1,16 +1,23 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Integration test: renders the contact-list promo rig
 //! (`ui_sim::contact_list_promo`, a verbatim copy of `contact_list.rs`'s full
-//! markup) with a room-server contact seeded into the Channels tab, and
-//! asserts the row actually paints — the `meshcadet-room-firmware-login-read`
-//! (M1) acceptance bullet "a `ui_sim` render shows a room entry in the list".
+//! markup) with a MIXED Groups list — one true channel and one room-server
+//! entry unioned together — and asserts:
 //!
-//! Per that mission's Objective, a room renders read-only in the EXISTING
-//! Channels tab with no new tab and no visual-distinction work — so this
-//! seeds a room the same way `contact_list_promo.rs`'s new `set_channels`
-//! seeds any other channel row, and reuses the exact avatar-circle assertion
-//! technique `contact_list_promo.rs`'s own Contacts-tab test already
-//! establishes (`tab_badge_paints_when_seeded_unread_is_nonzero_and_rows_are_visible`).
+//! 1. The Groups tab (formerly "Channels") actually shows both kinds, proven
+//!    the same indirect way `contact_list_promo.rs`'s own Contacts-tab test
+//!    proves its tab: the tab-bar aggregate badge painting when a seeded
+//!    entry has unread > 0.
+//! 2. A room row and a channel row are **visually distinguishable** — the
+//!    `meshcadet-groups-contacts-rename` mission's core acceptance bullet —
+//!    by asserting their avatar-circle fills render as two DIFFERENT solid
+//!    colors (`Theme.select` for a channel, `Theme.nebula-violet` for a
+//!    room; see `contact_list.rs`'s `ContactRow.is_room` styling).
+//!
+//! Per `meshcadet-room-firmware-login-read`'s (M1) original acceptance, a
+//! room already rendered read-only in this tab with no visual distinction;
+//! this test supersedes that M1-era assertion now that this mission adds
+//! the distinction M1 explicitly deferred.
 //!
 //! Lives under `tests/` (its own Cargo integration-test binary / process) —
 //! see `compose_send.rs`'s module doc for the full "why a second render
@@ -37,18 +44,30 @@ fn rgb8_at(img: &image::RgbImage, x: u32, y: u32) -> (u8, u8, u8) {
 /// Single test — see module doc: exactly one `ContactListPromoFrame` (and
 /// therefore exactly one Slint `Platform`) may be installed per process.
 #[test]
-fn room_entry_renders_in_the_channels_tab() {
+fn room_and_channel_entries_render_distinguishably_in_the_groups_tab() {
     let brand_signal = quantize565(0x00, 0xb4, 0xff);
     let select = quantize565(0x1e, 0x30, 0x50);
+    let nebula_violet = quantize565(0x7c, 0x5c, 0xff);
 
     let frame = ContactListPromoFrame::new();
-    frame.set_channels(&[PromoChannel {
-        name: "Mission Ops Room",
-        initial: "M",
-        preview: "welcome to the room",
-        time_str: "1m ago",
-        unread: 1,
-    }]);
+    frame.set_channels(&[
+        PromoChannel {
+            name: "Ops Net",
+            initial: "O",
+            preview: "channel chatter",
+            time_str: "2m ago",
+            unread: 0,
+            is_room: false,
+        },
+        PromoChannel {
+            name: "Mission Ops Room",
+            initial: "M",
+            preview: "welcome to the room",
+            time_str: "1m ago",
+            unread: 1,
+            is_room: true,
+        },
+    ]);
     // Same wall-clock fade-in note as `contact_list_promo_render.rs` — the
     // screen's `content_opacity` one-shot fade animates over 200ms of REAL
     // TIME from construction; sleep past it before capturing.
@@ -60,48 +79,53 @@ fn room_entry_renders_in_the_channels_tab() {
         ui_sim::contact_list_promo::HEIGHT,
     );
 
-    // Channels tab must be the active one (underline + active label color) —
-    // proven indirectly via its tab-bar aggregate badge, same technique
-    // `contact_list_promo.rs`'s own Contacts-tab test uses for its tab.
-    // Tab rect geometry: see `tab_badge_paints_...`'s comment in
-    // `ui_sim/tests/contact_list_promo.rs` — the Channels tab occupies the
-    // second stretch rect, so its badge center is offset by one tab-width
-    // (125px) from the Messages tab's (115, 9).
+    // Groups tab must be the active one — proven indirectly via its tab-bar
+    // aggregate badge, same technique `contact_list_promo.rs`'s own
+    // Contacts-tab test uses for its tab. Tab rect geometry: see
+    // `tab_badge_paints_...`'s comment in `ui_sim/tests/contact_list_promo.rs`
+    // — the Groups tab occupies the second stretch rect, so its badge
+    // center is offset by one tab-width (125px) from the Contacts tab's
+    // (115, 9).
     //
-    // `badge_cy` is deliberately NOT the disc's vertical center (9-10): the
-    // badge's own `channels_unread_str` glyph ("1") is centered on top of
-    // the solid fill by construction, and its anti-aliased stroke sits
-    // almost exactly on column 240 across rows 7-12 (checked empirically
-    // against this rig's framebuffer) — asserting there makes the pixel's
-    // exact color hostage to sub-pixel font-rasterization differences
-    // between environments (Slint 1.16 resolves real system fonts —
-    // fontique/skrifa/swash — not a bundled deterministic fallback, so a
-    // different font/version on a given CI runner shifts the glyph's edge
-    // by ~1px). This is what made the check red in CI while reliably green
-    // locally: a text-glyph-edge blend, not a settle-timing or
-    // handler-wiring bug — same root cause and same fix PR #64's identical
-    // `room_entry_renders_in_the_channels_tab` failure diagnosed
-    // independently (see that mission's Findings). `badge_cy = 5` matches
-    // that fix exactly (not just "a" safe row) to avoid two divergent
-    // resolutions of the same defect landing on sibling branches: it sits
-    // solidly inside the 14px disc across a wide x-range, clear of the
-    // glyph's vertical band (rows 7-12), so it still proves the badge
-    // painted without being sensitive to that glyph's exact pixels.
+    // `badge_cy` is deliberately NOT the disc's vertical center (9-10): see
+    // this same note preserved verbatim from the prior version of this test
+    // — a text-glyph-edge blend (not a settle-timing or handler-wiring bug)
+    // made a center-row assertion flaky across font/version differences.
+    // `badge_cy = 5` sits solidly inside the 14px disc, clear of the
+    // glyph's vertical band, so it still proves the badge painted.
     let badge_cx = 115u32 + 125u32;
     let badge_cy = 5u32;
     assert_eq!(
         rgb8_at(&img, badge_cx, badge_cy),
         brand_signal,
-        "Channels tab badge must render when the seeded room entry has unread > 0"
+        "Groups tab badge must render when a seeded room entry has unread > 0"
     );
 
-    // The room row's avatar circle (row 0, same geometry as the Contacts-tab
-    // test) must paint as a solid `Theme.select` fill — proof the row itself
-    // rendered, not just that the tab switched.
+    // Row 0 (the true channel, is_room: false): avatar circle is at
+    // (12..48, 44..80) — header (36px) + row padding-top (8px) — see
+    // `contact_list_promo.rs`'s copied markup; (30, 45) sits inside the
+    // circle's fill clear of the centered initial glyph.
+    let channel_avatar = rgb8_at(&img, 30, 45);
     assert_eq!(
-        rgb8_at(&img, 30, 45),
-        select,
-        "room entry's avatar circle did not render in the Channels tab list — \
+        channel_avatar, select,
+        "a true channel's avatar circle must render Theme.select — \
          did the content_opacity fade-in settle before capture?"
+    );
+
+    // Row 1 (the room entry, is_room: true): one more row height (54px)
+    // down — avatar circle center at (30, 45 + 54) = (30, 99).
+    let room_avatar = rgb8_at(&img, 30, 99);
+    assert_eq!(
+        room_avatar, nebula_violet,
+        "a room entry's avatar circle must render Theme.nebula-violet, \
+         not the plain-channel Theme.select fill"
+    );
+
+    // The core acceptance bullet: the two kinds must be visually
+    // DISTINGUISHABLE, not just individually correct.
+    assert_ne!(
+        channel_avatar, room_avatar,
+        "a room row and a channel row must not render identically in the \
+         unified Groups list"
     );
 }

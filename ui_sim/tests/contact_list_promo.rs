@@ -60,14 +60,14 @@ fn tab_badge_paints_when_seeded_unread_is_nonzero_and_rows_are_visible() {
         ui_sim::contact_list_promo::HEIGHT,
     );
 
-    // Tab badge box: header HorizontalLayout is [Messages tab: stretch]
-    // [Channels tab: stretch][SignalMeter slot: 26px fixed][gear button:
+    // Tab badge box: header HorizontalLayout is [Contacts tab: stretch]
+    // [Groups tab: stretch][SignalMeter slot: 26px fixed][gear button:
     // 44px fixed] across 320px (the ADR-0010 signal-meter slot — see
     // contact_list_promo.rs's copied markup — narrows each tab rect from
     // the original (320-44)/2 = 138px), so each tab rect is
     // (320-44-26)/2 = 125px wide; the badge sits at
     // `x: parent.width - 18px, y: 3px, width: 14px, height: 14px` inside the
-    // Messages tab rect. Center measured empirically against this rig at
+    // Contacts tab rect. Center measured empirically against this rig at
     // (115, 9) (not re-derived by hand — antialiasing on a 14px disc makes
     // the exact edge easy to get wrong).
     let badge_cx = 115u32;
