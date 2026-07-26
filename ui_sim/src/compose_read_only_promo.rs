@@ -73,9 +73,12 @@ slint::slint! {
             x: 8px; y: 8px;
             width: 200px; height: 16px;
             background: Theme.warn;
+            // Mirrors `compose.rs`'s `size-preview` (11px, an `EMOJI_SIZES`
+            // member) — NOT `size-meta` (10px), which is not in that curated
+            // set and would rasterise the leading 🔒 as a blank glyph.
             Text {
                 text: "🔒 Read-only — you can't post in this room";
-                font-size: Theme.size-meta;
+                font-size: Theme.size-preview;
                 color: Theme.bg-space;
                 vertical-alignment: center;
             }

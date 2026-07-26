@@ -489,9 +489,18 @@ slint::slint! {
                     // draft/emoji-picker geometry below; `warn` is this
                     // theme's own "caution / needs-attention state" token,
                     // an exact fit for "you can look, you can't post here".
+                    // `size-preview` (11px), not `size-meta` (10px): 11px is
+                    // one of `gen_emoji_font.c`'s curated `EMOJI_SIZES`, so
+                    // the leading 🔒 glyph actually rasterises here — 10px is
+                    // NOT in that set, which would silently ship a BLANK lock
+                    // glyph on real hardware (the exact failure mode
+                    // `gen_emoji_font.c`'s own module doc calls out; the host
+                    // glyph-coverage harness can't catch a Theme-token
+                    // font-size indirection like this one, so this is a
+                    // by-inspection fix, not a harness-driven one).
                     if read_only : Text {
                         text: "🔒 Read-only — you can't post in this room";
-                        font-size: Theme.size-meta;
+                        font-size: Theme.size-preview;
                         color: Theme.warn;
                         wrap: word-wrap;
                     }

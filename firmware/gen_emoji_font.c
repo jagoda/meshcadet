@@ -101,8 +101,11 @@ static const unsigned long UI_EXTRA_CPS[] = {
      * host glyph-coverage harness (`xtask`) while freezing the
      * full icon inventory, rather than by a future field report. */
     0x1F50B,  /* 🔋 battery — "🔋  Battery"                (admin_menu.rs, 14px) */
+    0x1F512,  /* 🔒 lock (no key) — "🔒 Read-only" compose banner
+                 * (compose.rs, size-preview/11px; ui_sim's read-only mirror
+                 * uses the same glyph+size — M2 post-and-notify) */
 };
-#define N_UI_EXTRA 10
+#define N_UI_EXTRA 11
 
 /* BMP symbols used in the UI.  Preferred from the Latin font (DejaVu); a symbol
  * the Latin face lacks falls back to the emoji face (see render_glyph).  These
