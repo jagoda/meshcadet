@@ -67,19 +67,27 @@ fn room_entry_renders_in_the_channels_tab() {
     // `ui_sim/tests/contact_list_promo.rs` — the Channels tab occupies the
     // second stretch rect, so its badge center is offset by one tab-width
     // (125px) from the Messages tab's (115, 9).
+    //
+    // `badge_cy` is deliberately NOT the disc's vertical center (9-10): the
+    // badge's own `channels_unread_str` glyph ("1") is centered on top of
+    // the solid fill by construction, and its anti-aliased stroke sits
+    // almost exactly on column 240 across rows 7-12 (checked empirically
+    // against this rig's framebuffer) — asserting there makes the pixel's
+    // exact color hostage to sub-pixel font-rasterization differences
+    // between environments (Slint 1.16 resolves real system fonts —
+    // fontique/skrifa/swash — not a bundled deterministic fallback, so a
+    // different font/version on a given CI runner shifts the glyph's edge
+    // by ~1px). This is what made the check red in CI while reliably green
+    // locally: a text-glyph-edge blend, not a settle-timing or
+    // handler-wiring bug — same root cause and same fix PR #64's identical
+    // `room_entry_renders_in_the_channels_tab` failure diagnosed
+    // independently (see that mission's Findings). `badge_cy = 5` matches
+    // that fix exactly (not just "a" safe row) to avoid two divergent
+    // resolutions of the same defect landing on sibling branches: it sits
+    // solidly inside the 14px disc across a wide x-range, clear of the
+    // glyph's vertical band (rows 7-12), so it still proves the badge
+    // painted without being sensitive to that glyph's exact pixels.
     let badge_cx = 115u32 + 125u32;
-    // NOT `9` (the disc's exact vertical center): the unread-count `Text` is
-    // layered on top of this badge `Rectangle` with `horizontal/vertical-
-    // alignment: center`, so by construction it straddles the disc's own
-    // center pixel. Slint 1.16's text stack resolves real system fonts
-    // (Parley/fontique/skrifa, not a bundled deterministic fallback), so
-    // the glyph's antialiased edge can land a pixel differently across
-    // environments — sampling the center row made this assertion flaky
-    // across machines (passed locally, failed in CI: a near-miss color
-    // blend, not a missing badge — see PR #64 CI log). `5` stays solidly
-    // inside the 14px disc (verified against the actual render) but sits
-    // above the glyph's vertical band, so it reads pure `brand_signal`
-    // regardless of which font resolves the "1".
     let badge_cy = 5u32;
     assert_eq!(
         rgb8_at(&img, badge_cx, badge_cy),
