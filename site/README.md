@@ -197,6 +197,19 @@ building or publishing anything.
   message text and is never auto-downloaded, transmitted, or logged); and a
   triple-gated **clear-history** (reveal → acknowledgement checkbox → native
   `confirm()` dialog) that surfaces the CLI's reboot-to-refresh note.
+  `meshcadet-room-web-provisioner` mirrors the room-server provisioning path
+  (already proven end-to-end through the host CLI) into a **Rooms** section:
+  list/add/remove a room-server contact (`session.js`'s `listRooms`/
+  `addRoom`/`delRoom`, against the room frames `codec.js` already carries)
+  and a per-room `meshcore://contact/add?...&type=3` QR/URI
+  (`contact-uri.js`'s `buildRoomUri`) — byte-identical in shape to the
+  identity QR's Format A except `type=3`, per ADR-0002 §7. The room's guest
+  password gets the same hygiene discipline as the admin PIN above (send,
+  then clear from the DOM immediately, never logged/stored/URL-embedded,
+  scrubbed again on disconnect) plus its own explicit test coverage
+  (`session.smoke.test.mjs`'s room scenarios; `guest-password-hygiene.test.mjs`
+  for the storage/console/URL/autofill invariants specifically) — see that
+  test file's own header for why it's split from `session.smoke.test.mjs`.
 - `styles.css` — one stylesheet, no build step. Color tokens at the top
   mirror `firmware/src/ui/theme.slint`'s `Theme` global 1:1, so the site and
   the on-device UI read as the same product. Keep them in sync if the

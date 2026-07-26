@@ -22,12 +22,16 @@ import {
   encodeFrame,
   decodeFrame,
   encodeAddContact,
+  encodeAddRoom,
   encodeSetPin,
   FRAME_QUERY_STATUS,
   FRAME_QUERY_CONTACTS,
   FRAME_QUERY_CHANNELS,
   FRAME_QUERY_ADVERT,
+  FRAME_QUERY_ROOMS,
   FRAME_ADD_CONTACT,
+  FRAME_ADD_ROOM,
+  FRAME_DEL_ROOM,
   FRAME_SET_PIN,
   FRAME_EXPORT_HISTORY,
   FRAME_CLEAR_HISTORY,
@@ -39,6 +43,8 @@ import {
   FRAME_RSP_CONTACTS_DONE,
   FRAME_RSP_CHANNEL,
   FRAME_RSP_CHANNELS_DONE,
+  FRAME_RSP_ROOM,
+  FRAME_RSP_ROOMS_DONE,
   FRAME_RSP_HISTORY_ENTRY,
   FRAME_RSP_HISTORY_DONE,
   FRAME_RSP_ADVERT,
@@ -991,6 +997,129 @@ async function strayFrameToleranceIsBounded() {
   await session.disconnect();
 }
 
+// ── Scenario 23: listRooms streams RSP_ROOM*N -> RSP_ROOMS_DONE ───────────
+
+/** Wire layout: index(1) | pubkey(32) | sync_since(4 LE) | permissions(1) | out_path_len(1) | out_path(P) | name_len(1) | name(N). */
+function buildRoomPayload(index, pubkeyByte, syncSince, permissions, outPath, name) {
+  const nameBytes = new TextEncoder().encode(name);
+  const buf = new Uint8Array(40 + outPath.length + nameBytes.length);
+  const view = new DataView(buf.buffer);
+  buf[0] = index;
+  buf.fill(pubkeyByte, 1, 33);
+  view.setUint32(33, syncSince, true);
+  buf[37] = permissions;
+  buf[38] = outPath.length;
+  buf.set(outPath, 39);
+  buf[39 + outPath.length] = nameBytes.length;
+  buf.set(nameBytes, 40 + outPath.length);
+  return buf;
+}
+
+async function listRoomsStreamsToDone() {
+  const { port, push } = makeFakePort(() => {
+    setTimeout(() => {
+      push(encodeFrame(FRAME_RSP_ROOM, buildRoomPayload(0, 0xaa, 1_700_000_000, 2, new Uint8Array(0), "Lobby")));
+      push(encodeFrame(FRAME_RSP_ROOMS_DONE, new Uint8Array(0)));
+    }, 5);
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  const rooms = await session.listRooms();
+  assert.equal(rooms.length, 1);
+  assert.equal(rooms[0].index, 0);
+  assert.equal(rooms[0].sync_since, 1_700_000_000);
+  assert.equal(rooms[0].permissions, 2);
+  assert.equal(rooms[0].name, "Lobby");
+  // The guest password is never part of RSP_ROOM's payload (ADR-0002 §7) —
+  // nothing to assert absent here beyond the shape decodeRspRoom already
+  // enforces (codec.conformance.test.mjs pins that byte layout).
+
+  await session.disconnect();
+}
+
+// ── Scenario 24: addRoom sends FRAME_ADD_ROOM with the correct payload ───
+
+async function addRoomSendsCorrectFrame() {
+  const written = [];
+  const { port, push } = makeFakePort((chunk) => {
+    written.push(chunk);
+    setTimeout(() => push(encodeFrame(FRAME_RSP_OK)), 5);
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  const pubkey = new Uint8Array(32).fill(0xdd);
+  await session.addRoom(pubkey, "hunter2", "Lobby");
+
+  assert.equal(written.length, 1);
+  const sent = decodeFrame(written[0]);
+  assert.equal(sent.frameType, FRAME_ADD_ROOM);
+  assert.deepEqual(Array.from(sent.payload), Array.from(encodeAddRoom(pubkey, "hunter2", "Lobby")));
+
+  await session.disconnect();
+}
+
+// ── Scenario 25: addRoom's RSP_ERROR surfaces as DeviceError (and never
+//    logs/embeds the guest password anywhere in that error) ──────────────
+
+async function addRoomDeviceError() {
+  const { port, push } = makeFakePort(() => {
+    const msg = new TextEncoder().encode("room slot full");
+    const payload = new Uint8Array(2 + msg.length);
+    payload[0] = 9;
+    payload[1] = msg.length;
+    payload.set(msg, 2);
+    setTimeout(() => push(encodeFrame(FRAME_RSP_ERROR, payload)), 5);
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  const guestPassword = "top-secret-guest-pw";
+  await assert.rejects(
+    () => session.addRoom(new Uint8Array(32).fill(0xee), guestPassword, "Annex"),
+    (err) => {
+      assert.ok(err instanceof DeviceError);
+      assert.equal(err.errorCode, 9);
+      assert.match(err.message, /room slot full/);
+      assert.ok(!err.message.includes(guestPassword), "DeviceError message must never embed the guest password");
+      return true;
+    }
+  );
+
+  await session.disconnect();
+}
+
+// ── Scenario 26: delRoom sends FRAME_DEL_ROOM with the pubkey-only payload ─
+
+async function delRoomSendsCorrectFrame() {
+  const written = [];
+  const { port, push } = makeFakePort((chunk) => {
+    written.push(chunk);
+    setTimeout(() => push(encodeFrame(FRAME_RSP_OK)), 5);
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  const pubkey = new Uint8Array(32).fill(0xff);
+  await session.delRoom(pubkey);
+
+  assert.equal(written.length, 1);
+  const sent = decodeFrame(written[0]);
+  assert.equal(sent.frameType, FRAME_DEL_ROOM);
+  assert.deepEqual(Array.from(sent.payload), Array.from(pubkey));
+
+  await session.disconnect();
+}
+
 // ── Run ────────────────────────────────────────────────────────────────────
 
 const scenarios = [
@@ -1017,6 +1146,10 @@ const scenarios = [
   ["a stray leftover frame ahead of QUERY_ADVERT's reply does not cascade through contacts/channels (one-behind desync regression)", advertResidueDoesNotCascadeThroughContactsAndChannels],
   ["a genuinely unrecognized frame type is not tolerated as stray residue", unrecognizedFrameTypeIsNotToleratedAsStray],
   ["stray-frame tolerance is bounded, not infinite", strayFrameToleranceIsBounded],
+  ["listRooms streams RSP_ROOM*N -> RSP_ROOMS_DONE", listRoomsStreamsToDone],
+  ["addRoom sends FRAME_ADD_ROOM with the correct payload", addRoomSendsCorrectFrame],
+  ["addRoom's RSP_ERROR surfaces as DeviceError without ever embedding the guest password", addRoomDeviceError],
+  ["delRoom sends FRAME_DEL_ROOM with the pubkey-only payload", delRoomSendsCorrectFrame],
 ];
 
 for (const [name, fn] of scenarios) {

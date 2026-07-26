@@ -8,7 +8,13 @@
 //   node site/provisioner/validation.test.mjs
 
 import assert from "node:assert/strict";
-import { validatePubkeyHex, validateChannelSecretHex, validateDeviceName, validatePin } from "./validation.js";
+import {
+  validatePubkeyHex,
+  validateChannelSecretHex,
+  validateDeviceName,
+  validatePin,
+  validateRoomPassword,
+} from "./validation.js";
 
 let checks = 0;
 function ok(cond, label) {
@@ -179,6 +185,52 @@ function eq(actual, expected, label) {
   // set one the user didn't intend).
   const result = validatePin("é".repeat(9));
   ok(!result.ok, "multi-byte UTF-8 PIN is measured in bytes, not characters");
+}
+
+// ── validateRoomPassword ─────────────────────────────────────────────────
+//
+// Mirrors resolve_guest_password/password_truncation_warning
+// (host/src/main.rs): unlike validatePin, empty is fine and over-length
+// warns rather than rejects (encodeAddRoom truncates, mirroring the device).
+
+{
+  const result = validateRoomPassword("hunter2");
+  ok(result.ok, "an ordinary guest password is valid");
+  eq(result.truncationWarning, null, "within-limit password has no truncation warning");
+  eq(Object.prototype.hasOwnProperty.call(result, "password"), false, "result never echoes the password back (it's a secret)");
+}
+
+{
+  const result = validateRoomPassword("");
+  ok(result.ok, "an empty guest password is valid (\"leave empty for none\", mirroring the CLI prompt)");
+  eq(result.truncationWarning, null);
+}
+
+{
+  const result = validateRoomPassword(null);
+  ok(result.ok, "a null/undefined guest password is treated as empty, not rejected");
+}
+
+{
+  const result = validateRoomPassword("a".repeat(16));
+  ok(result.ok, "exactly 16 ASCII bytes is valid with no truncation warning (the boundary)");
+  eq(result.truncationWarning, null);
+}
+
+{
+  const result = validateRoomPassword("a".repeat(17));
+  ok(result.ok, "over-length password is still accepted (truncated on the wire, not rejected)");
+  ok(result.truncationWarning !== null, "17 ASCII bytes over MAX_ROOM_PASSWORD_LEN (16) warns");
+  ok(/16/.test(result.truncationWarning), `warning names the device's limit: ${result.truncationWarning}`);
+  ok(!/a{17}/.test(result.truncationWarning), "warning never embeds the password value itself");
+}
+
+{
+  // "é" is 2 UTF-8 bytes; 9 of them is 18 bytes — over the 16-byte ceiling
+  // despite being only 9 *characters* — the check must count bytes.
+  const result = validateRoomPassword("é".repeat(9));
+  ok(result.ok, "over-length is still accepted");
+  ok(result.truncationWarning !== null, "multi-byte UTF-8 password is measured in bytes, not characters");
 }
 
 console.log(`validation.test: OK — ${checks} check(s) passed.`);

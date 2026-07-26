@@ -55,6 +55,34 @@ export function buildContactUri(identity) {
   return `meshcore://contact/add?name=${urlEncode(name)}&public_key=${bytesToHex(identity.pubkey)}&type=1`;
 }
 
+// Room node type (`ROLE_ROOM` in `firmware_core::config_store`) as it
+// appears in a `meshcore://contact/add?...&type=<n>` URI's `type` field.
+// Mirrors `URI_NODE_TYPE_ROOM` (`host/src/main.rs`) — chat's `type=1` stays a
+// literal in `buildContactUri` above, unaffected by this constant.
+const URI_NODE_TYPE_ROOM = 3;
+
+/**
+ * Build the MeshCore companion room-add URI from a display name and a
+ * room-server's 32-byte Ed25519 public key. A byte-for-byte hand port of
+ * `build_room_add_uri` (`host/src/main.rs`) — see ADR-0002 §7 "Room URI/QR
+ * decision" for why this is byte-identical in shape to `buildContactUri`
+ * (Format A) except `type=3` instead of `type=1`, with NO password
+ * parameter: the guest password crosses only over the already-open USB
+ * serial link (ADR-0001 §4, "the cable is the authentication") and must be
+ * communicated out-of-band from this URI/QR, never embedded in it.
+ *
+ * Unlike `buildContactUri` (which reads its display name off a device-
+ * reported `RspIdentity`), a room-server contact has no device-reported name
+ * of its own from this page's perspective — the caller supplies whatever
+ * name the admin entered, falling back to `Room-<hex pubkey[0]>` exactly as
+ * `Cmd::AddRoom`'s `display_name` does (`host/src/main.rs`) when the admin
+ * left the name blank.
+ */
+export function buildRoomUri(name, pubkey) {
+  const displayName = name && name.length > 0 ? name : `Room-${pubkey[0].toString(16).toUpperCase().padStart(2, "0")}`;
+  return `meshcore://contact/add?name=${urlEncode(displayName)}&public_key=${bytesToHex(pubkey)}&type=${URI_NODE_TYPE_ROOM}`;
+}
+
 // URI scheme prefix mirroring `protocol::advert::CARD_URI_SCHEME`
 // (`Serial.print("meshcore://")` in the upstream MeshCore `card` REPL
 // command, and the `import`/QR-scan side that consumes it). Format A above

@@ -21,6 +21,15 @@
 // exported history (which surfaces private message text) is returned to the
 // caller only — this module never persists, transmits, or logs it.
 //
+// This mission (meshcadet-room-web-provisioner) mirrors the room-server
+// provisioning verbs already proven end-to-end through the host CLI
+// (`meshcadet-room-host-cli`) into this session layer: `listRooms`,
+// `addRoom`, `delRoom`, against the room frames `meshcadet-room-provisioning-
+// contract`/child 3 already added to `codec.js`. `addRoom` follows `setPin`'s
+// scrub-after-send discipline for the guest password (ADR-0002 §4/ADR-0001
+// §4: the password crosses USB in the clear by design, but must never
+// linger in this module's own state, be logged, or be persisted).
+//
 // No build step: plain ES module, loaded directly by the browser.
 
 import {
@@ -32,12 +41,15 @@ import {
   decodeRspError,
   decodeRspContact,
   decodeRspChannel,
+  decodeRspRoom,
   decodeRspHistoryEntry,
   decodeRspAdvert,
   encodeAddContact,
   encodeDelContact,
   encodeAddChannel,
   encodeDelChannel,
+  encodeAddRoom,
+  encodeDelRoom,
   encodeSetNotifDefaults,
   encodeSetDeviceName,
   encodeSetPin,
@@ -47,10 +59,13 @@ import {
   FRAME_QUERY_CONTACTS,
   FRAME_QUERY_CHANNELS,
   FRAME_QUERY_ADVERT,
+  FRAME_QUERY_ROOMS,
   FRAME_ADD_CONTACT,
   FRAME_DEL_CONTACT,
   FRAME_ADD_CHANNEL,
   FRAME_DEL_CHANNEL,
+  FRAME_ADD_ROOM,
+  FRAME_DEL_ROOM,
   FRAME_SET_NOTIF_DEFAULTS,
   FRAME_SET_PIN,
   FRAME_SET_DEVICE_NAME,
@@ -65,6 +80,8 @@ import {
   FRAME_RSP_CONTACTS_DONE,
   FRAME_RSP_CHANNEL,
   FRAME_RSP_CHANNELS_DONE,
+  FRAME_RSP_ROOM,
+  FRAME_RSP_ROOMS_DONE,
   FRAME_RSP_HISTORY_ENTRY,
   FRAME_RSP_HISTORY_DONE,
   FRAME_RSP_ADVERT,
@@ -113,6 +130,8 @@ const ALL_RSP_FRAME_TYPES = new Set([
   FRAME_RSP_CONTACTS_DONE,
   FRAME_RSP_CHANNEL,
   FRAME_RSP_CHANNELS_DONE,
+  FRAME_RSP_ROOM,
+  FRAME_RSP_ROOMS_DONE,
   FRAME_RSP_ADVERT,
 ]);
 
@@ -383,6 +402,73 @@ export class ProvisionerSession {
    */
   async delChannel(secret) {
     await this.#exclusive(() => this.#sendAndExpectOk(FRAME_DEL_CHANNEL, encodeDelChannel(secret)));
+  }
+
+  /**
+   * Enumerate the device's configured room-server contacts. Sends
+   * `FRAME_QUERY_ROOMS`, then consumes the streamed `FRAME_RSP_ROOM` frames
+   * terminated by `FRAME_RSP_ROOMS_DONE`. Mirrors `Session::list_rooms`
+   * (`host/src/session.rs`). Returns entries in device-index order.
+   *
+   * The guest password is never part of a room's `RspRoom` payload (see
+   * `codec.js`'s `decodeRspRoom` doc comment) — there is nothing to scrub
+   * here, unlike `addRoom` below.
+   */
+  async listRooms() {
+    return this.#exclusive(() =>
+      this.#streamUntilDone(FRAME_QUERY_ROOMS, FRAME_RSP_ROOM, FRAME_RSP_ROOMS_DONE, decodeRspRoom, "room")
+    );
+  }
+
+  /**
+   * Add (or replace) a room-server contact: a contact entry plus its guest
+   * password. `pubkey` is a 32-byte `Uint8Array` (Ed25519 public key);
+   * `guestPassword` is a UTF-8 string, silently truncated to
+   * `MAX_ROOM_PASSWORD_LEN` (16) bytes by `encodeAddRoom` — validate/warn
+   * upstream with `provisioner/validation.js`'s `validateRoomPassword` if you
+   * need to flag that rather than silently truncate. `name` is a UTF-8
+   * display name (empty = device falls back to a routing-hash-derived
+   * label, same as `addContact`). Mirrors `Session::add_room`
+   * (`host/src/session.rs`).
+   *
+   * ADR-0002 §4/ADR-0001 §4 security model: the guest password crosses the
+   * USB serial link in the clear BY DESIGN (the cable is the authentication)
+   * — that is correct here and is not this method's concern. What IS this
+   * method's concern, mirroring `setPin`'s discipline exactly: the password
+   * is held only in this transient `payload` buffer for the duration of the
+   * send, then scrubbed (`.fill(0)`) once the retry loop can no longer
+   * reference it — never stored on the instance, logged, placed in the URL,
+   * or written to `localStorage`/`sessionStorage`. (The caller owns the
+   * `guestPassword` string itself; JS strings are immutable and cannot be
+   * scrubbed, so the caller — see `provisioner.js`'s `handleAddRoom` — must
+   * also drop its reference and clear the password input field once this
+   * resolves or rejects.)
+   *
+   * Unlike `setPin`/`clearHistory` (which bypass `#exclusive` — see that
+   * method's doc comment), this routes through `#exclusive` like every other
+   * non-sensitive write command (`addContact`, `addChannel`, ...): a room is
+   * just another provisioned entity, not a per-session secret update, so it
+   * gets the same serialization guarantee against a concurrent command
+   * racing its write.
+   */
+  async addRoom(pubkey, guestPassword, name) {
+    const payload = encodeAddRoom(pubkey, guestPassword, name);
+    try {
+      await this.#exclusive(() => this.#sendAndExpectOk(FRAME_ADD_ROOM, payload));
+    } finally {
+      // Scrub the guest-password bytes from our buffer now that no retry can
+      // re-send it.
+      payload.fill(0);
+    }
+  }
+
+  /**
+   * Delete a room-server contact (its contact entry AND room extras) by its
+   * 32-byte Ed25519 public key. Mirrors `Session::del_room`
+   * (`host/src/session.rs`).
+   */
+  async delRoom(pubkey) {
+    await this.#exclusive(() => this.#sendAndExpectOk(FRAME_DEL_ROOM, encodeDelRoom(pubkey)));
   }
 
   /** Set notification defaults (visual/audible). Mirrors `Session::set_notif_defaults`. */

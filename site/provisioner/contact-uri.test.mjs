@@ -12,7 +12,7 @@
 //   node site/provisioner/contact-uri.test.mjs
 
 import assert from "node:assert/strict";
-import { urlEncode, buildContactUri, cardToUri } from "./contact-uri.js";
+import { urlEncode, buildContactUri, buildRoomUri, cardToUri } from "./contact-uri.js";
 
 let checks = 0;
 function eq(actual, expected, label) {
@@ -57,6 +57,67 @@ eq(urlEncode("é"), "%C3%A9", "UTF-8 multibyte escaped byte-for-byte");
   pubkey[0] = 0x0a;
   const uri = buildContactUri({ pubkey, device_name: "" });
   ok(uri.includes("name=MeshCadet-0A"), `expected fallback name in ${uri}`);
+}
+
+// ── buildRoomUri (room-server "type=3" URI, ADR-0002 §7) ─────────────────
+//
+// Mirrors host/src/main.rs's own #[cfg(test)] fixtures byte-for-byte:
+// `room_uri_golden_string` and `room_uri_round_trips_through_the_host_cli_
+// parser` — this IS child 5's golden string (0xAB * 32 pubkey, name
+// "Lobby"), cross-checked here against the exact same expected byte output
+// the host CLI parser round-trips.
+
+{
+  const pubkey = new Uint8Array(32).fill(0xab);
+  const uri = buildRoomUri("Lobby", pubkey);
+  eq(
+    uri,
+    `meshcore://contact/add?name=Lobby&public_key=${"ab".repeat(32)}&type=3`,
+    "byte-identical to host_cli's room_uri_golden_string"
+  );
+}
+
+{
+  // Mirrors room_uri_round_trips_through_the_host_cli_parser's fixture
+  // (0xCD * 32 pubkey, name "Mom & Dad's Lobby") — same URI shape, only the
+  // encoded name/pubkey differ. pubkey_hex built from "cd".repeat(32) rather
+  // than hand-transcribed, so this can't drift from an off-by-one typo.
+  const pubkey = new Uint8Array(32).fill(0xcd);
+  const uri = buildRoomUri("Mom & Dad's Lobby", pubkey);
+  eq(
+    uri,
+    `meshcore://contact/add?name=Mom%20%26%20Dad%27s%20Lobby&public_key=${"cd".repeat(32)}&type=3`,
+    "byte-identical to host_cli's room_uri_round_trips_through_the_host_cli_parser fixture"
+  );
+}
+
+// No password parameter anywhere in the URI — ADR-0002 §7's decision that
+// the guest password is communicated out-of-band, never embedded in the QR.
+{
+  const pubkey = new Uint8Array(32).fill(0x11);
+  const uri = buildRoomUri("Lobby", pubkey);
+  ok(!uri.includes("password"), "room URI never carries a password parameter");
+}
+
+// Name fallback: an empty/absent name falls back to "Room-<hex pubkey[0]>",
+// mirroring Cmd::AddRoom's `display_name` fallback (host/src/main.rs).
+{
+  const pubkey = new Uint8Array(32);
+  pubkey[0] = 0x0a;
+  const uri = buildRoomUri("", pubkey);
+  ok(uri.includes("name=Room-0A"), `expected room-name fallback in ${uri}`);
+}
+
+// Shape parity with buildContactUri: same prefix/param order, only type differs.
+{
+  const pubkey = new Uint8Array(32).fill(0x22);
+  const contactUri = buildContactUri({ pubkey, device_name: "Sameshape" });
+  const roomUri = buildRoomUri("Sameshape", pubkey);
+  eq(
+    roomUri,
+    contactUri.replace("&type=1", "&type=3"),
+    "room URI is byte-identical in shape to the contact URI except type=3"
+  );
 }
 
 // ── cardToUri (Format B) ──────────────────────────────────────────────────

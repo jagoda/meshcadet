@@ -15,7 +15,7 @@
 // No build step: plain ES module, loaded directly by the browser or by
 // `node` for the test.
 
-import { hexToBytes, MAX_NAME_LEN, MAX_PIN_LEN } from "./codec.js";
+import { hexToBytes, MAX_NAME_LEN, MAX_PIN_LEN, MAX_ROOM_PASSWORD_LEN } from "./codec.js";
 
 const HEX_ONLY_RE = /^[0-9a-fA-F]*$/;
 
@@ -117,4 +117,34 @@ export function validatePin(input) {
     return { ok: false, error: `PIN must be at most ${MAX_PIN_LEN} bytes (UTF-8); got ${byteLen} bytes` };
   }
   return { ok: true };
+}
+
+/**
+ * Validate a room-server guest password.
+ * Mirrors `resolve_guest_password`/`password_truncation_warning`
+ * (`host/src/main.rs`): unlike `validatePin`, an EMPTY password is valid
+ * ("leave empty for none" — the CLI's own interactive-prompt copy), and an
+ * over-length password is not rejected outright, only flagged — `encodeAddRoom`
+ * silently truncates to `MAX_ROOM_PASSWORD_LEN` (16) bytes exactly as the
+ * device does, so a longer password still round-trips (truncated) rather
+ * than blocking the submit.
+ *
+ * Deliberately does NOT return or echo the password in the result (it's a
+ * secret, same discipline as `validatePin`): on success it returns only
+ * `{ ok: true, truncationWarning }`, leaving the caller's own `password`
+ * reference as the single copy to send and then drop. `truncationWarning`
+ * names only the byte counts, never the password value — same guarantee
+ * `password_truncation_warning`'s doc comment makes.
+ *
+ * Returns `{ ok: true, truncationWarning: string | null }` (never `{ ok: false }`
+ * — there is no rejectable input here, matching the CLI's own permissiveness).
+ */
+export function validateRoomPassword(input) {
+  const password = input ?? "";
+  const byteLen = new TextEncoder().encode(password).length;
+  const truncationWarning =
+    byteLen > MAX_ROOM_PASSWORD_LEN
+      ? `guest password is ${byteLen} bytes; the device accepts at most ${MAX_ROOM_PASSWORD_LEN} and will truncate it`
+      : null;
+  return { ok: true, truncationWarning };
 }
