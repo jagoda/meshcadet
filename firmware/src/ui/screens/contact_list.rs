@@ -1,12 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Contact / channel list screen.
+//! Contacts / Groups list screen.
 //!
 //! The primary home screen after provisioning.  Shows two tabs:
 //! - **Contacts** — direct message peers (admin-provisioned, sorted by
-//!   last-message recency)
-//! - **Channels** — group channels (admin-provisioned)
+//!   last-message recency). A role=`room` contact is filtered OUT of this
+//!   tab — see [`firmware_core::ui::contact_list::route_contact`].
+//! - **Groups** — a UNION of two data stores: provisioned `Channel`s and
+//!   role=`room` contacts, rendered as one list. The two kinds are visually
+//!   distinct (see `ContactRow`'s `is_room` styling below) but share
+//!   identical unread-badge / new-message notification semantics —
+//!   [`ChannelItem::is_room`] is a rendering hint only, never a wire or
+//!   provisioning-API identifier.
 //!
-//! Tapping a contact or channel navigates to [`MessageViewScreen`].
+//! Tapping a contact, channel, or room navigates to [`MessageViewScreen`].
 //!
 //! Each contact row shows:
 //! - Contact display name (provisioned)
@@ -32,7 +38,7 @@ slint::slint! {
     import { Starfield, CometOnNotify, SpaceBackdrop } from "../motifs.slint";
     import { SignalMeter } from "../signal_meter.slint";
 
-    // A single row in the contact list.
+    // A single row in the Contacts or Groups list.
     component ContactRow {
         in property <string>  name;
         in property <string>  initial;
@@ -41,6 +47,12 @@ slint::slint! {
         in property <int>     unread;
         in property <string>  unread_str;
         in property <bool>    selected;
+        // Groups-tab visual-distinction flag: `true` for a room-server
+        // entry, `false` for a true channel (always `false` on the
+        // Contacts tab). Only tints the avatar circle — no new glyph, so
+        // no `gen_emoji_font.c` registration is needed (see this file's
+        // module doc).
+        in property <bool>    is_room: false;
         callback clicked;
 
         height: 54px;
@@ -69,12 +81,16 @@ slint::slint! {
                 padding-bottom: 8px;
                 spacing: 8px;
 
-                // Avatar circle (first letter of name)
+                // Avatar circle (first letter of name). A room-server entry
+                // in the Groups tab fills with `Theme.nebula-violet` instead
+                // of the standard `Theme.select` — the "two entry types
+                // visually distinct in the list" requirement, done with an
+                // existing color token rather than a new font glyph.
                 Rectangle {
                     width: 36px;
                     height: 36px;
                     border-radius: 18px;
-                    background: Theme.select;
+                    background: is_room ? Theme.nebula-violet : Theme.select;
 
                     Text {
                         text: initial;
@@ -176,6 +192,9 @@ slint::slint! {
         hash:    int,  // pub_hash (u8) stored as int
     }
 
+    // A Groups-tab entry — either a true channel or a room server unioned
+    // into the same list; `is_room` is the visual-distinction flag (see
+    // `ContactRow.is_room`'s doc above).
     struct ChannelEntry {
         name:    string,
         initial: string,
@@ -184,6 +203,7 @@ slint::slint! {
         unread:  int,
         unread_str: string,
         hash:    int,
+        is_room: bool,
     }
 
     // ── Root screen component ─────────────────────────────────────────────────
@@ -224,7 +244,7 @@ slint::slint! {
 
         in property <[ContactEntry]>  contacts;
         in property <[ChannelEntry]>  channels;
-        in-out property <bool>        show_contacts: true;  // true=DMs, false=channels
+        in-out property <bool>        show_contacts: true;  // true=Contacts (DMs), false=Groups
 
         // Aggregate unread badges for the tab bar — sum of the per-row `unread`
         // values in `contacts`/`channels` respectively, computed Rust-side in
@@ -317,7 +337,7 @@ slint::slint! {
                         background: show_contacts ? Theme.bg-space : transparent;
 
                         Text {
-                            text: "📬 Messages";
+                            text: "Contacts";
                             font-size: Theme.size-body;
                             color: show_contacts ? Theme.brand-signal : Theme.text-secondary;
                             horizontal-alignment: center;
@@ -356,13 +376,13 @@ slint::slint! {
                         background: !show_contacts ? Theme.bg-space : transparent;
 
                         Text {
-                            text: "📡 Channels";
+                            text: "Groups";
                             font-size: Theme.size-body;
                             color: !show_contacts ? Theme.brand-signal : Theme.text-secondary;
                             horizontal-alignment: center;
                             vertical-alignment: center;
                         }
-                        // Tab-level unread badge — see the Messages tab above.
+                        // Tab-level unread badge — see the Contacts tab above.
                         if channels_unread_total > 0 : Rectangle {
                             x: parent.width - 18px;
                             y: 3px;
@@ -398,13 +418,13 @@ slint::slint! {
                     // trailing spacer to nest into (unlike `gps_status.rs`/
                     // `message_view.rs`). Declared AFTER the gear button (it
                     // previously sat before it, which read as part of the
-                    // "📡 Channels" tab beside it) so it now renders as the
+                    // "Groups" tab beside it) so it now renders as the
                     // rightmost header element, clear of the gear's touch
                     // target. A small new flow child reserves its own
                     // non-overlapping slot — the two tabs' `horizontal-
                     // stretch: 1.0` simply divide the slightly-reduced
                     // remaining width evenly (each still comfortably wider
-                    // than its "📬 Messages"/"📡 Channels" label), so neither
+                    // than its "Contacts"/"Groups" label), so neither
                     // tab's touch target, badge, or underline position is
                     // disturbed beyond that width recompute — nothing here
                     // is repositioned relative to its own parent.
@@ -432,7 +452,7 @@ slint::slint! {
                 }
             }
 
-            // ── Contact / channel list ──────────────────────────────────────────
+            // ── Contacts / Groups list ────────────────────────────────────────
             // One shared Flickable (named so `scroll_selected_into_view` can
             // drive it) with the two row sets as mutually-exclusive conditional
             // children — only one is ever instantiated at a time, same runtime
@@ -461,6 +481,7 @@ slint::slint! {
                             unread:     ch.unread;
                             unread_str: ch.unread_str;
                             selected:   i == root.selected_index;
+                            is_room:    ch.is_room;
                             clicked => { root.channel_selected(ch.hash); }
                         }
                     }
@@ -511,7 +532,8 @@ slint::slint! {
 // `docs/adr/0005-firmware-core-extraction.md`.
 use firmware_core::ui::contact_list::{format_unread_badge, unread_total_increased};
 pub use firmware_core::ui::contact_list::{
-    build_channel_items, build_contact_items, ChannelItem, ContactItem,
+    build_channel_items, build_contact_items, route_contact, ChannelItem, ContactItem,
+    ContactRoute,
 };
 
 /// Rust-side wrapper.
@@ -585,14 +607,15 @@ impl ContactListScreen {
             });
         }
         self.component.set_contacts(slint::ModelRc::new(model));
-        // Aggregate badge for the "📬 Messages" tab.
+        // Aggregate badge for the "Contacts" tab.
         self.component.set_contacts_unread_total(total);
         self.component.set_contacts_unread_str(format_unread_badge(total).into());
         // Comet-on-notify — see `maybe_fire_notify`'s doc.
         self.maybe_fire_notify(&self.prev_contacts_unread, total);
     }
 
-    /// Replace the full channel list model.
+    /// Replace the full Groups list model — the union of true channels and
+    /// role=`room` contacts (see [`ChannelItem::is_room`]'s doc).
     pub fn set_channels(&self, channels: &[ChannelItem]) {
         let model: slint::VecModel<ChannelEntry> = slint::VecModel::default();
         let mut total: i32 = 0;
@@ -610,10 +633,11 @@ impl ContactListScreen {
                 unread:     ch.unread,
                 unread_str: unread_str.into(),
                 hash:       ch.hash as i32,
+                is_room:    ch.is_room,
             });
         }
         self.component.set_channels(slint::ModelRc::new(model));
-        // Aggregate badge for the "📡 Channels" tab.
+        // Aggregate badge for the "Groups" tab.
         self.component.set_channels_unread_total(total);
         self.component.set_channels_unread_str(format_unread_badge(total).into());
         // Comet-on-notify — see `maybe_fire_notify`'s doc.
@@ -630,7 +654,7 @@ impl ContactListScreen {
     }
 
     /// Which tab is currently visible: `true` = Contacts (DMs), `false` =
-    /// Channels. Read by the trackball handler to know which list
+    /// Groups. Read by the trackball handler to know which list
     /// `selected_index` indexes into.
     pub fn show_contacts(&self) -> bool {
         self.component.get_show_contacts()

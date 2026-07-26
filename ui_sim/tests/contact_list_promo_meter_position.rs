@@ -3,7 +3,7 @@
 //! header's `SignalMeter` (ADR-0010) must render in its own slot to the
 //! RIGHT of the gear button (`HeaderIconButton { width: 44px; icon: "⚙"; …
 //! }`), not to its left — the two used to be declared meter-then-gear
-//! (meter read as part of the "📡 Channels" tab beside it, the defect this
+//! (meter read as part of the "Groups" tab beside it, the defect this
 //! guards against); `contact_list_promo.rs`'s copied markup now declares
 //! gear-then-meter, matching `contact_list.rs`'s real-screen header.
 //!
@@ -65,7 +65,7 @@ fn signal_meter_renders_right_of_the_gear_button_not_left() {
         ui_sim::contact_list_promo::HEIGHT,
     );
 
-    // Header HorizontalLayout is now [Messages tab: stretch][Channels tab:
+    // Header HorizontalLayout is now [Contacts tab: stretch][Groups tab:
     // stretch][gear: 44px fixed][SignalMeter slot: 26px fixed] across 320px,
     // so the gear occupies x: 250..294 and the meter slot occupies
     // x: 294..320 (tab rects each narrow to (320-44-26)/2 = 125px — same
