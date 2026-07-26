@@ -110,11 +110,13 @@ as originally verified.
 
 ## Landing-page promo screenshots
 
-Four more render rigs (`contact_list_promo`, `message_view_promo`,
+Four render rigs (`contact_list_promo`, `message_view_promo`,
 `compose_promo`, `splash_promo`) produce the promotional screenshots on
-`site/index.html`'s `#screenshots` gallery. Unlike every rig above — each a
-narrow, single-mechanism proof — these copy their target production
-screen's full `slint::slint!{}` markup (`firmware/src/ui/screens/
+`site/index.html`'s `#screenshots` gallery — one of them (`contact_list_promo`)
+twice over, via two separate binaries, since the same contact-list screen's
+markup renders both the Contacts tab and the Groups tab. Unlike every rig
+above — each a narrow, single-mechanism proof — these copy their target
+production screen's full `slint::slint!{}` markup (`firmware/src/ui/screens/
 {contact_list,message_view,compose,splash}.rs`) VERBATIM, because the
 deliverable is a screenshot of the REAL screen, seeded with tasteful,
 OSS-appropriate sample data (space-mission callsigns, no PII, no internal
@@ -123,16 +125,23 @@ relative-path imports as every rig above.
 
 ```sh
 cargo run -p ui_sim --bin contact_list_promo_render  # site/assets/screenshot-contacts.png
+cargo run -p ui_sim --bin groups_promo_render         # site/assets/screenshot-groups.png
 cargo run -p ui_sim --bin message_view_promo_render  # site/assets/screenshot-messages.png
 cargo run -p ui_sim --bin compose_promo_render       # site/assets/screenshot-compose.png
 cargo run -p ui_sim --bin splash_promo_render         # site/assets/screenshot-splash.png
 ```
 
-Regenerate all four after any change to one of those four screens' markup,
-`theme.slint`, or `motifs.slint` by re-copying the updated markup into the
-corresponding `ui_sim::*_promo` module and re-running its binary — see
-`site/README.md`'s `assets/` bullet for the site-side half of this
-contract.
+`groups_promo_render` seeds a MIXED Groups list (a true channel and a
+room-server entry) and switches the shared UI to that tab, so the room
+entry's `is_room` avatar-color distinction (a channel's `Theme.select` vs. a
+room's `Theme.nebula-violet` — see `ui_sim/tests/room_list_entry.rs`) shows
+up on the landing page, not just in a test assertion.
+
+Regenerate all five after any change to one of the underlying screens'
+markup, `theme.slint`, or `motifs.slint` by re-copying the updated markup
+into the corresponding `ui_sim::*_promo` module and re-running its
+binary(-ies) — see `site/README.md`'s `assets/` bullet for the site-side
+half of this contract.
 
 ## Env requirements
 

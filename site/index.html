@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>MeshCadet — mesh-radio messaging firmware for the LilyGo T-Deck Plus</title>
-  <meta name="description" content="MeshCadet is a polished, deliberately-limited MeshCore-interop firmware for the LilyGo T-Deck Plus: allowlist-only contacts, no advertising, pull-only telemetry, on a byte-exact MeshCore protocol port." />
+  <meta name="description" content="MeshCadet is a polished, deliberately-limited MeshCore-interop firmware for the LilyGo T-Deck Plus: allowlist-only contacts and channels, guest-only MeshCore Room Server support, no advertising, pull-only telemetry, on a byte-exact MeshCore protocol port." />
 
   <!-- All paths below are relative (no leading "/") — this is a GitHub Pages
        PROJECT site served under /meshcadet/, not a root site. A root-rooted
@@ -78,16 +78,26 @@
           </div>
           <div class="card">
             <img src="assets/planet-corner.png" alt="" aria-hidden="true" />
-            <h3>Touch UI for contacts &amp; messages</h3>
-            <p>A Slint touch-screen interface for contacts, conversations, and
-              composing messages with a curated <code>:shortcode:</code>
-              emoji set.</p>
+            <h3>Contacts &amp; Groups touch UI</h3>
+            <p>A Slint touch-screen interface with two tabs: <strong>Contacts</strong>
+              (direct-message peers) and <strong>Groups</strong> — provisioned
+              channels and room-server connections in one unified, visually
+              distinguished list — plus a conversation view and a composer
+              with a curated <code>:shortcode:</code> emoji set.</p>
           </div>
           <div class="card">
             <img src="assets/comet.png" alt="" aria-hidden="true" />
             <h3>PIN-gated admin menu</h3>
             <p>Lightweight on-device runtime toggles behind a PIN, plus a USB
               host CLI for provisioning, PIN reset, and history export.</p>
+          </div>
+          <div class="card">
+            <img src="assets/crescent-moon.png" alt="" aria-hidden="true" />
+            <h3>Room Server guest client</h3>
+            <p>Join a MeshCore Room Server as a guest: provisioned
+              out-of-band like any other contact, never advertised or
+              discovered. MeshCadet reads and posts as a guest — it never
+              administers a room and is never itself a room server.</p>
           </div>
         </div>
       </div>
@@ -103,8 +113,12 @@
             <figcaption>Boot splash</figcaption>
           </figure>
           <figure class="screenshot-card">
-            <img src="assets/screenshot-contacts.png" alt="MeshCadet contact list screen, showing several allowlisted contacts with unread badges and last-message previews." width="320" height="240" loading="lazy" />
+            <img src="assets/screenshot-contacts.png" alt="MeshCadet Contacts tab, showing several allowlisted direct-message peers with unread badges and last-message previews." width="320" height="240" loading="lazy" />
             <figcaption>Contacts</figcaption>
+          </figure>
+          <figure class="screenshot-card">
+            <img src="assets/screenshot-groups.png" alt="MeshCadet Groups tab, showing a unified list of a provisioned channel and a room-server connection, visually distinguished by avatar color." width="320" height="240" loading="lazy" />
+            <figcaption>Groups</figcaption>
           </figure>
           <figure class="screenshot-card">
             <img src="assets/screenshot-messages.png" alt="MeshCadet message thread screen, showing a sent and received conversation with delivery acknowledgement checkmarks." width="320" height="240" loading="lazy" />
@@ -140,8 +154,9 @@
             <span class="step-number">2</span>
             <div class="step-body">
               <h3>Provision your device</h3>
-              <p>Register contacts and channels over USB. The device stays
-                allowlist-only and off the mesh until you say so.</p>
+              <p>Register contacts, channels, and room servers over USB. The
+                device stays allowlist-only and off the mesh until you say
+                so.</p>
               <a class="btn btn-primary" href="provisioner.html">Provision device</a>
             </div>
           </li>
@@ -179,6 +194,19 @@
           underlying protocol to apply those limits. These are deliberate
           design choices for a controlled, minimal comms device, not anything
           the underlying protocol requires.
+        </p>
+        <p>
+          <strong>Room servers work the same way.</strong> A MeshCore Room
+          Server is acquired <strong>out-of-band only</strong> — an admin
+          provisions it as an allowlisted contact (pubkey, name, and guest
+          password) over USB, via the host CLI or the browser provisioner, or
+          by scanning a room QR/link. There is no advert and no discovery.
+          Once provisioned, the device logs in with the guest password,
+          drains the server's stored backlog into history, and from then on
+          reads and posts to the room live, right alongside true channels in
+          the Groups tab. MeshCadet is a room <strong>client</strong> only:
+          no remote administration of a room server, no ACL management, and
+          MeshCadet is never itself a room server.
         </p>
         <p class="muted">
           MeshCadet is provided as-is, with no warranty and no guarantee of
