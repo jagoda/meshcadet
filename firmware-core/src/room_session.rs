@@ -1350,6 +1350,90 @@ mod tests {
         );
     }
 
+    #[test]
+    fn keep_alive_force_since_recovers_a_stalled_sync() {
+        // Phase C's stall-recovery bullet: a nonzero force_since force-updates
+        // the server's view of this client's sync_since, letting the client
+        // rewind (recover posts it never got pushed) without a fresh login.
+        // Driven directly through `protocol::room::encode_keep_alive` (this
+        // module's own `encode_room_keep_alive_frame` is exercised for its
+        // route-direct FRAMING by `encode_room_keep_alive_frame_is_never_
+        // flood_routed`, above; this test is about the `force_since`
+        // VALUE's effect on the server, which composes with either encoder).
+        let (client, server) = make_pair();
+        let other_author = Identity::from_seed([0x90u8; 32]);
+        let mut double = RoomServerDouble::new(server.clone(), b"admin-pw", b"guest-pw", false);
+        login_direct(&mut double, &client, &server, b"guest-pw", 1000);
+
+        double.seed_post(&other_author.pubkey, 5000, b"missed post");
+
+        // Drain it normally first, so the server's sync_since has already
+        // moved past 5000 — simulating a client that legitimately received
+        // everything, then later wants to force a re-drain from an earlier
+        // point (e.g. after losing local history).
+        let shared = client.ecdh_shared_secret(&server.pubkey);
+        let mut wire = [0u8; 256];
+        let n = double
+            .push_next(&client.pubkey, &mut wire)
+            .expect("the seeded post must be eligible");
+        let mut pt = [0u8; 256];
+        let (_dest, _src, push) = decode_room_push(&shared, &wire[..n], &mut pt).unwrap();
+        let ack = room_push_ack_hash(
+            push.post_ts,
+            push.attempt,
+            push.push_body(&pt),
+            &client.pubkey,
+        );
+        assert!(double.handle_ack(&client.pubkey, &ack));
+        assert_eq!(double.client_sync_since(&client.pubkey), Some(5000));
+
+        // A keep-alive with force_since == the current watermark: no-op on
+        // the unsynced count (nothing new becomes eligible).
+        let mut raw = [0u8; 64];
+        let raw_n = protocol::room::encode_keep_alive(
+            &shared,
+            server.pub_hash(),
+            client.pub_hash(),
+            6000,
+            5000,
+            &mut raw,
+        );
+        let ka_ack = double
+            .handle_keep_alive(&client.pubkey, &raw[..raw_n])
+            .expect("keep-alive must be accepted");
+        assert_eq!(
+            decode_keep_alive_ack(&ka_ack).unwrap().unsynced_count,
+            0,
+            "force_since==current watermark: no new unsynced posts"
+        );
+        assert_eq!(double.client_sync_since(&client.pubkey), Some(5000));
+
+        // Force further BACK, past the post's own timestamp: it becomes
+        // re-eligible for push, proving the rewind actually recovers it —
+        // the concrete "recover a stalled sync" behaviour this bullet pins.
+        let raw_n2 = protocol::room::encode_keep_alive(
+            &shared,
+            server.pub_hash(),
+            client.pub_hash(),
+            7000,
+            1000,
+            &mut raw,
+        );
+        let ka_ack2 = double
+            .handle_keep_alive(&client.pubkey, &raw[..raw_n2])
+            .expect("keep-alive must be accepted");
+        assert_eq!(
+            decode_keep_alive_ack(&ka_ack2).unwrap().unsynced_count,
+            1,
+            "force_since=1000 rewinds past the post at ts=5000: it is unsynced again"
+        );
+        let mut wire2 = [0u8; 256];
+        assert!(
+            double.push_next(&client.pubkey, &mut wire2).is_some(),
+            "force_since must have made the already-delivered post re-eligible for push"
+        );
+    }
+
     // ── Phase D: session-phase notification classification ─────────────────
 
     #[test]
@@ -1464,5 +1548,81 @@ mod tests {
             "still draining: not yet 0"
         );
         assert!(phase.is_draining());
+    }
+
+    // ── Full integration: 32-post login backlog through the real double ────
+
+    #[test]
+    fn full_32_post_drain_through_the_double_yields_one_aggregate_and_32_deduped_entries() {
+        // This mission's first Acceptance bullet, end to end: a real login,
+        // a real 32-post drip through `RoomServerDouble` (one push/ACK at a
+        // time, exactly like on-air), `handle_room_push`'s content dedup
+        // feeding a growing `history` Vec exactly as `main.rs`'s
+        // `room.recent` would, AND `RoomSyncPhase` classifying every one of
+        // them — not the synthetic-outcome unit tests above, the actual
+        // wire pipeline.
+        let (client, server) = make_pair();
+        let other_author = Identity::from_seed([0xA0u8; 32]);
+        let mut double = RoomServerDouble::new(server.clone(), b"admin-pw", b"guest-pw", false);
+        login_direct(&mut double, &client, &server, b"guest-pw", 1000);
+
+        for i in 0..32u32 {
+            double.seed_post(
+                &other_author.pubkey,
+                2000 + i,
+                format!("post {i}").as_bytes(),
+            );
+        }
+
+        let shared = client.ecdh_shared_secret(&server.pubkey);
+        let conv_hash = server.pub_hash();
+        let mut history: Vec<HistoryEntry> = Vec::new();
+        let mut phase = RoomSyncPhase::new_after_login();
+
+        loop {
+            let mut wire = [0u8; 256];
+            let Some(n) = double.push_next(&client.pubkey, &mut wire) else {
+                break;
+            };
+            let outcome =
+                handle_room_push(&shared, &wire[..n], &client.pubkey, conv_hash, &history)
+                    .expect("push must decode");
+            assert_eq!(
+                phase.on_push_outcome(&outcome),
+                RoomNotification::None,
+                "every post in the initial drain must be suppressed, not individually notified"
+            );
+            let entry = outcome.entry.expect("a fresh push must produce an entry");
+            history.push(entry);
+            assert!(double.handle_ack(&client.pubkey, &outcome.ack_hash));
+        }
+
+        assert_eq!(
+            history.len(),
+            32,
+            "all 32 posts deduped into distinct entries"
+        );
+
+        // The drain window closes on the keep-alive ACK reporting 0 — this
+        // mission's own liveness/backlog-depth probe.
+        let mut ka_raw = [0u8; 64];
+        let ka_n = encode_keep_alive(
+            &shared,
+            server.pub_hash(),
+            client.pub_hash(),
+            9000,
+            0,
+            &mut ka_raw,
+        );
+        let ka_ack = double
+            .handle_keep_alive(&client.pubkey, &ka_raw[..ka_n])
+            .expect("keep-alive must be accepted");
+        let unsynced = decode_keep_alive_ack(&ka_ack).unwrap().unsynced_count;
+        assert_eq!(unsynced, 0, "everything was drained: nothing left unsynced");
+        assert_eq!(
+            phase.on_keep_alive_ack(unsynced),
+            Some(RoomNotification::Aggregate { count: 32 }),
+            "closing the drain window fires exactly ONE aggregate notification for all 32"
+        );
     }
 }
