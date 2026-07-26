@@ -3495,7 +3495,7 @@ mod tests {
 
         // [ack_hash(4)] [extended-attempt byte] [random byte]
         let payload_6_byte = [1u8, 2, 3, 4, 0x07, 0xFE];
-        handle_ack(&payload_6_byte, &mut pending, &mut ui_events);
+        handle_ack(&payload_6_byte, &mut pending, &mut [], &mut ui_events);
 
         assert!(pending.is_none(), "a prefix-matched 6-byte ack must clear pending_ack");
         assert_eq!(ui_events.len(), 1, "a prefix-matched 6-byte ack must raise exactly one UI event");
