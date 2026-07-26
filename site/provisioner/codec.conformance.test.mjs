@@ -10,24 +10,49 @@
 //   cargo run -q -p xtask --bin gen-prov-golden-vectors > /tmp/golden-vectors.json
 //   node site/provisioner/codec.conformance.test.mjs /tmp/golden-vectors.json
 //
-// No dependencies beyond Node's own `node:assert`/`node:fs` — no build step,
-// no package.json, matching site/README.md's "no build step, on purpose"
-// convention. `.github/workflows/pages-check.yml` runs exactly the two
-// commands above on every PR touching `site/provisioner/**` or
-// `protocol/src/{provisioning,history}.rs`.
+// The vectors path is OPTIONAL. Given none, this generates them itself by
+// invoking the same `cargo run` above — so the natural whole-suite command,
+//
+//   node --test site/provisioner/*.test.mjs
+//
+// actually works. Before that fallback existed, this file (which is a plain
+// argv-driven script, not a `node:test` module) was picked up by that glob,
+// exited 2 on "usage:", and made the whole suite red for a reason that was
+// not a real failure — a trap that repeatedly got copied into build-gate
+// checklists as a command that could never pass. The fallback fails LOUD if
+// cargo isn't available or the generator errors: a missing toolchain must
+// never read as a silent pass for a wire-conformance guard.
+//
+// No runtime dependencies beyond Node's own `node:assert`/`node:fs` — no
+// build step, no package.json, matching site/README.md's "no build step, on
+// purpose" convention. `.github/workflows/pages-check.yml` runs the two
+// explicit commands above (never the fallback) on every PR touching
+// `site/provisioner/**` or `protocol/src/{provisioning,history}.rs`.
 
 import { strict as assert } from "node:assert";
 import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
 
 import * as codec from "./codec.js";
 
-const vectorsPath = process.argv[2];
-if (!vectorsPath) {
-  console.error("usage: node codec.conformance.test.mjs <golden-vectors.json>");
-  process.exit(2);
+/// Generate the golden vectors straight from the real Rust codec. Throws
+/// (nonzero exit) rather than returning empty if the generator can't run.
+function generateVectors() {
+  const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+  console.log("codec.conformance: no vectors path given — generating from the Rust codec…");
+  return execFileSync(
+    "cargo",
+    ["run", "-q", "-p", "xtask", "--bin", "gen-prov-golden-vectors"],
+    { cwd: repoRoot, encoding: "utf-8", maxBuffer: 64 * 1024 * 1024 }
+  );
 }
 
-const vectors = JSON.parse(readFileSync(vectorsPath, "utf-8"));
+const vectorsPath = process.argv[2];
+const vectorsJson = vectorsPath ? readFileSync(vectorsPath, "utf-8") : generateVectors();
+
+const vectors = JSON.parse(vectorsJson);
 assert.ok(Array.isArray(vectors) && vectors.length > 0, "golden-vectors.json must be a non-empty array");
 
 let passed = 0;

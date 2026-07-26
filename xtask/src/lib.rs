@@ -75,6 +75,7 @@ use std::path::{Path, PathBuf};
 
 /// Provisioning-codec golden-vector generator — see `golden`'s module doc.
 pub mod golden;
+pub mod ui_event_parity;
 
 /// One known, already-documented, deliberately-deferred gap — see
 /// `firmware/gen_emoji_font.c`'s `EMOJI_SIZES` doc comment ("KNOWN, DEFERRED
@@ -250,14 +251,14 @@ struct Literal {
     decoded: String,
 }
 
-struct Tokenized {
+pub(crate) struct Tokenized {
     /// Same char-length as the source; comment bodies and string-literal
     /// bodies are blanked to spaces (quotes/braces/identifiers in real code
     /// are untouched) so brace-matching and regex scans never see comment
     /// or string CONTENT — only real markup structure. Guaranteed pure ASCII
     /// (every non-ASCII source char lives inside a string or comment, both
     /// blanked), so byte offsets == char offsets throughout.
-    masked: String,
+    pub(crate) masked: String,
     literals: Vec<Literal>,
 }
 
@@ -300,7 +301,7 @@ fn decode_rust_escapes(raw: &str) -> String {
     out
 }
 
-fn tokenize(src: &str) -> Tokenized {
+pub(crate) fn tokenize(src: &str) -> Tokenized {
     let chars: Vec<char> = src.chars().collect();
     let n = chars.len();
     let mut masked: Vec<char> = chars.clone();
@@ -366,7 +367,7 @@ fn tokenize(src: &str) -> Tokenized {
     }
 }
 
-fn brace_spans(masked: &str) -> Vec<(usize, usize)> {
+pub(crate) fn brace_spans(masked: &str) -> Vec<(usize, usize)> {
     let mut stack = Vec::new();
     let mut spans = Vec::new();
     for (idx, c) in masked.chars().enumerate() {
@@ -383,7 +384,7 @@ fn brace_spans(masked: &str) -> Vec<(usize, usize)> {
     spans
 }
 
-fn innermost_span(spans: &[(usize, usize)], pos: usize) -> Option<(usize, usize)> {
+pub(crate) fn innermost_span(spans: &[(usize, usize)], pos: usize) -> Option<(usize, usize)> {
     spans
         .iter()
         .filter(|(o, c)| *o < pos && pos < *c)
@@ -391,7 +392,7 @@ fn innermost_span(spans: &[(usize, usize)], pos: usize) -> Option<(usize, usize)
         .copied()
 }
 
-fn slice_chars(s: &str, start: usize, end: usize) -> String {
+pub(crate) fn slice_chars(s: &str, start: usize, end: usize) -> String {
     s.chars()
         .skip(start)
         .take(end.saturating_sub(start))
