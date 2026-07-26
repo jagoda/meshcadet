@@ -46,6 +46,12 @@
 //! one. It deliberately fails loud (a reported violation, never a silent
 //! skip) if an arm cannot be located or parsed at all, per this crate's
 //! "parse gap = NO-GO" doctrine.
+//!
+//! The corollary of failing loud is that a legitimate refactor — hoisting an
+//! arm's body into a helper function, say — will trip it. That is the
+//! intended trade: a false alarm you resolve by teaching this scanner the new
+//! shape is strictly better than a guard that quietly stops looking. Update
+//! the effect table and the matchers together when the arms move.
 
 use std::fs;
 use std::path::Path;
@@ -129,10 +135,6 @@ fn find_all(hay: &[char], needle: &str) -> Vec<usize> {
         .collect()
 }
 
-fn contains(hay: &str, needle: &str) -> bool {
-    hay.contains(needle)
-}
-
 /// Extract the body of the `UiEvent::<variant> { … } => { BODY }` match arm
 /// from already-tokenized (comment- and string-blanked) source.
 ///
@@ -206,10 +208,9 @@ fn arm_body(masked: &str, variant: &str) -> Result<String, String> {
 /// a false failure).
 fn effects_of(body: &str) -> NotificationEffects {
     NotificationEffects {
-        appends_content: contains(body, "self.messages") && contains(body, "MessageRecord"),
-        bumps_unread: contains(body, "incoming_message_is_unread")
-            && contains(body, "unread.entry("),
-        fires_notification: contains(body, "notif.fire(") && contains(body, "NotifEvent::"),
+        appends_content: body.contains("self.messages") && body.contains("MessageRecord"),
+        bumps_unread: body.contains("incoming_message_is_unread") && body.contains("unread.entry("),
+        fires_notification: body.contains("notif.fire(") && body.contains("NotifEvent::"),
     }
 }
 
