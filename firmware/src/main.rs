@@ -2956,18 +2956,32 @@ fn handle_ack(
         }
         if room.pending_keep_alive_ack == Some(got) {
             room.pending_keep_alive_ack = None;
-            let unsynced_count = payload.get(4).copied().unwrap_or(0);
-            log::info!(
-                "RX room keep-alive ACK for 0x{:02x}: unsynced_count={}",
-                room.hash, unsynced_count,
-            );
-            if let Some(room_session::RoomNotification::Aggregate { count }) =
-                room.sync_phase.on_keep_alive_ack(unsynced_count)
-            {
-                ui_events.push(ui::UiEvent::RoomDrainComplete {
-                    room_hash: room.hash,
-                    count,
-                });
+            // Decode through the module's own validated decoder rather than
+            // hand-indexing `payload[4]` — a payload truncated to exactly 4
+            // bytes (no appended unsynced-count byte at all) must NOT be
+            // silently treated as "0 unsynced" (which would prematurely
+            // close Phase D's drain window); `Err` here just skips the
+            // drain-phase update for this ACK, matching "unable to determine
+            // backlog depth" rather than assuming the most optimistic case.
+            match protocol::room::decode_keep_alive_ack(payload) {
+                Ok(ack) => {
+                    log::info!(
+                        "RX room keep-alive ACK for 0x{:02x}: unsynced_count={}",
+                        room.hash, ack.unsynced_count,
+                    );
+                    if let Some(room_session::RoomNotification::Aggregate { count }) =
+                        room.sync_phase.on_keep_alive_ack(ack.unsynced_count)
+                    {
+                        ui_events.push(ui::UiEvent::RoomDrainComplete {
+                            room_hash: room.hash,
+                            count,
+                        });
+                    }
+                }
+                Err(e) => log::warn!(
+                    "RX room keep-alive ACK for 0x{:02x}: missing unsynced-count byte ({:?})",
+                    room.hash, e,
+                ),
             }
             return;
         }
