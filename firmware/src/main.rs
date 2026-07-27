@@ -304,6 +304,23 @@ struct RoomRuntime {
     /// doc for the routine cadence's own airtime/liveness justification.
     #[cfg_attr(feature = "hil", allow(dead_code))]
     last_keep_alive_ms: u64,
+    /// Wall-clock ms this room last sent a RE-FLOOD login attempt via the
+    /// `out_path_len == 0` branch — `0` initially, doubling as that branch's
+    /// own "never yet" sentinel, exactly like `last_keep_alive_ms`'s.
+    /// `meshcadet-room-reflood-login-backoff`'s fix (FINDING B): kept
+    /// deliberately SEPARATE from `last_keep_alive_ms` so the reflood
+    /// cadence can never again be silently re-coupled to the route-direct/
+    /// drain cadence — see `room_session::room_reflood_interval_ms`'s doc.
+    #[cfg_attr(feature = "hil", allow(dead_code))]
+    last_reflood_ms: u64,
+    /// Consecutive re-flood-login attempts sent since the last proof this
+    /// session is live — a successful login reply
+    /// (`apply_room_login_outcome`) or an inbound push
+    /// (`handle_room_push_frame`) both reset it to `0`, mirroring
+    /// `keep_alive_stall`'s own reset conditions. Feeds
+    /// `room_session::room_reflood_interval_ms`'s exponential backoff.
+    #[cfg_attr(feature = "hil", allow(dead_code))]
+    reflood_attempts: u32,
     /// Phase D's session-phase notification classifier — see
     /// `firmware_core::room_session::RoomSyncPhase`'s doc. Starts assuming a
     /// drain is needed (every fresh boot does, until a keep-alive ACK proves
@@ -407,6 +424,52 @@ const ROOM_FIRST_KEEP_ALIVE_DELAY_MS: u64 = 10_000;
 /// `room_session::room_keep_alive_interval_ms`.
 #[cfg(not(feature = "hil"))]
 const ROOM_DRAINING_KEEP_ALIVE_INTERVAL_MS: u64 = 15_000;
+
+/// `meshcadet-room-reflood-login-backoff` fix (FINDING B): the
+/// `out_path_len == 0` re-flood-login branch's OWN cadence — deliberately
+/// NOT [`ROOM_DRAINING_KEEP_ALIVE_INTERVAL_MS`]. That constant gates the
+/// route-direct keep-alive/drain-window poll only; letting the reflood
+/// branch share it meant a room whose server never answers (offline,
+/// out-of-range, decommissioned) re-flooded a full `ANON_REQ` login every
+/// 15 s FOREVER, since [`firmware_core::room_session::RoomSyncPhase`]'s
+/// drain window — the only thing [`ROOM_DRAINING_KEEP_ALIVE_INTERVAL_MS`]
+/// exists to poll fast for — never closes against a server that never ACKs.
+/// See `firmware_core::room_session::room_reflood_interval_ms`'s doc for the
+/// full airtime/regulatory-duty-cycle rationale this fixes.
+///
+/// Starting wait for the first reflood attempt of a backoff epoch (an epoch
+/// resets — `RoomRuntime::reflood_attempts` back to `0` — the moment a login
+/// reply or inbound push proves the session live again).
+#[cfg(not(feature = "hil"))]
+const ROOM_REFLOOD_INITIAL_BACKOFF_MS: u64 = 30_000;
+
+/// Ceiling the reflood backoff exponentially climbs to and then holds at.
+/// Deliberately equal to [`ROOM_KEEP_ALIVE_INTERVAL_MS`] (the fix's own
+/// "at or above the routine 300s" requirement, satisfied at the boundary):
+/// a permanently-dead room server is never re-flooded more often than a
+/// routine keep-alive would have polled it anyway.
+#[cfg(not(feature = "hil"))]
+const ROOM_REFLOOD_BACKOFF_CEILING_MS: u64 = ROOM_KEEP_ALIVE_INTERVAL_MS;
+
+// A stall can only ever be DETECTED (and `out_path_len` zeroed) after at
+// least `ROOM_FIRST_KEEP_ALIVE_DELAY_MS` plus `KEEP_ALIVE_STALL_THRESHOLD`
+// draining-cadence ticks of uptime have elapsed — this is the floor the
+// scheduler loop's post-invalidation reflood relies on: since that floor is
+// always ABOVE `ROOM_REFLOOD_INITIAL_BACKOFF_MS`, the reflood branch's own
+// `now.saturating_sub(room.last_reflood_ms) < interval` gate is already
+// satisfied (given `last_reflood_ms` is at most that same age) the moment
+// invalidation happens, without the scheduler needing to special-case a
+// "just invalidated" reset — the very next scheduler pass re-floods
+// promptly, same as the pre-fix same-tick fallthrough did. If this ever
+// fires, that numeric relationship broke and the "prompt post-invalidation
+// reflood" property above needs re-deriving (or the scheduler needs an
+// explicit reset), not just a constant bumped past it.
+#[cfg(not(feature = "hil"))]
+const _: () = assert!(
+    ROOM_FIRST_KEEP_ALIVE_DELAY_MS
+        + room_session::KEEP_ALIVE_STALL_THRESHOLD as u64 * ROOM_DRAINING_KEEP_ALIVE_INTERVAL_MS
+        > ROOM_REFLOOD_INITIAL_BACKOFF_MS
+);
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -966,6 +1029,8 @@ fn run() -> anyhow::Result<()> {
                                             session,
                                             login_sent: false,
                                             last_keep_alive_ms: 0,
+                                            last_reflood_ms: 0,
+                                            reflood_attempts: 0,
                                             sync_phase: room_session::RoomSyncPhase::new_after_login(),
                                             pending_post_ack: None,
                                             pending_keep_alive_ack: None,
@@ -1659,35 +1724,88 @@ fn run() -> anyhow::Result<()> {
 
         // ── Room keep-alive scheduler (Phase C) ───────────────────────────────
         //
-        // Every `ROOM_KEEP_ALIVE_INTERVAL_MS` per provisioned, logged-in room:
-        // send a route-direct keep-alive if a route is known (consuming the
-        // ACK's appended unsynced-count byte closes Phase D's drain window —
-        // see `handle_ack`), or re-flood the login to relearn one if it was
-        // ever lost (`out_path_len == 0`) — a flood-routed keep-alive is a
-        // no-op the server ignores outright (`MyMesh.cpp:536`), so this
-        // scheduler must never attempt one. `room_runtime` is empty under
-        // `hil` (no rooms there), so this is a no-op in that build, exactly
-        // like the boot-time login loop above.
-        //
-        // Reconnect-stall detector: BEFORE overwriting `pending_keep_alive_ack`
-        // below, a still-`Some` value left over from the PRIOR tick means that
-        // keep-alive was never ACKed — feed it to `RoomKeepAliveStall`, which
-        // counts consecutive misses and — once it decides the route is dead,
-        // not just one dropped frame — zeroes `out_path_len` itself so THIS
-        // SAME tick falls through to the re-flood-login branch below (clean
-        // relearn), rather than waiting a further interval. See
-        // `firmware_core::room_session::RoomKeepAliveStall`'s doc for the
-        // full "why N misses, why zero out_path" rationale.
+        // TWO INDEPENDENT cadences per provisioned, logged-in room —
+        // `meshcadet-room-reflood-login-backoff`'s fix (FINDING B). Before
+        // this fix both branches below shared ONE gate
+        // (`room_keep_alive_interval_ms`), which meant a room whose server
+        // never answers (offline/out-of-range/decommissioned) re-flooded a
+        // full `ANON_REQ` login every `ROOM_DRAINING_KEEP_ALIVE_INTERVAL_MS`
+        // (15 s) FOREVER — that gate never relaxes to the routine cadence
+        // for such a room, because its only relaxer
+        // (`RoomSyncPhase::on_keep_alive_ack`) needs an ACK that will never
+        // arrive. A flood frame is rebroadcast by every relaying node in the
+        // mesh, so an unbounded 15 s cadence is an airtime/regulatory-duty-
+        // cycle defect, not merely a battery one. See
+        // `room_session::room_reflood_interval_ms`'s doc for the full
+        // rationale.
+        //   - `out_path_len == 0`: no learned route — re-flood the login on
+        //     its OWN, backed-off cadence (`room_reflood_interval_ms`),
+        //     never on the drain/routine cadence below.
+        //   - otherwise: route-direct keep-alive on the pre-existing
+        //     drain/routine cadence (`room_keep_alive_interval_ms`,
+        //     unchanged by this fix) — consuming the ACK's appended
+        //     unsynced-count byte closes Phase D's drain window (see
+        //     `handle_ack`). A flood-routed keep-alive is a no-op the server
+        //     ignores outright (`MyMesh.cpp:536`), so this branch must never
+        //     attempt one.
+        // `room_runtime` is empty under `hil` (no rooms there), so this is a
+        // no-op in that build, exactly like the boot-time login loop above.
         #[cfg(not(feature = "hil"))]
         for room in room_runtime.iter_mut() {
             if !room.login_sent {
                 continue; // login not even queued yet this boot
             }
-            // F2 fix: three distinct cadences instead of one fixed
-            // `ROOM_KEEP_ALIVE_INTERVAL_MS` gate — see
-            // `room_session::room_keep_alive_interval_ms`'s doc for the full
-            // "why the old single gate stranded the drain window open for up
-            // to 5 minutes" rationale.
+
+            if room.session.out_path_len == 0 {
+                // Decoupled reflood cadence — deliberately does NOT read
+                // `ROOM_DRAINING_KEEP_ALIVE_INTERVAL_MS`,
+                // `room.sync_phase.is_draining()`, or
+                // `room.last_keep_alive_ms`: see this block's doc above and
+                // `room_reflood_interval_ms`'s for why re-coupling this to
+                // the drain/routine gate is exactly the regression this
+                // mission fixes.
+                let interval = room_session::room_reflood_interval_ms(
+                    room.reflood_attempts,
+                    ROOM_REFLOOD_INITIAL_BACKOFF_MS,
+                    ROOM_REFLOOD_BACKOFF_CEILING_MS,
+                );
+                if now.saturating_sub(room.last_reflood_ms) < interval {
+                    continue;
+                }
+                let ts = tx_epoch_base.wrapping_add((now / 1000) as u32);
+                let shared = identity.ecdh_shared_secret(&room.pubkey);
+                let mut frame = [0u8; room_session::MAX_LOGIN_FRAME_LEN];
+                let n = room_session::encode_room_login_frame(
+                    &shared,
+                    room.hash,
+                    &identity.pubkey,
+                    ts,
+                    room.session.sync_since,
+                    &room.guest_password[..room.guest_password_len as usize],
+                    &mut frame,
+                );
+                log_tx_queue_eviction(txq.enqueue(&frame[..n]), "room re-flood login");
+                room.session.record_sent_timestamp(ts);
+                room.last_reflood_ms = now;
+                room.reflood_attempts = room.reflood_attempts.saturating_add(1);
+                log::info!(
+                    "room: 0x{:02x} has no learned out_path — re-flooding login \
+                     (attempt {}, next retry in {}ms if unanswered)",
+                    room.hash,
+                    room.reflood_attempts,
+                    room_session::room_reflood_interval_ms(
+                        room.reflood_attempts,
+                        ROOM_REFLOOD_INITIAL_BACKOFF_MS,
+                        ROOM_REFLOOD_BACKOFF_CEILING_MS,
+                    ),
+                );
+                continue;
+            }
+
+            // Route known: route-direct keep-alive, gated by the pre-
+            // existing three-cadence schedule (first-tick/draining/
+            // routine) — see `room_session::room_keep_alive_interval_ms`'s
+            // doc; unchanged by this mission's fix.
             let interval = room_session::room_keep_alive_interval_ms(
                 room.last_keep_alive_ms,
                 room.sync_phase.is_draining(),
@@ -1702,6 +1820,19 @@ fn run() -> anyhow::Result<()> {
             let ts = tx_epoch_base.wrapping_add((now / 1000) as u32);
             let shared = identity.ecdh_shared_secret(&room.pubkey);
 
+            // Reconnect-stall detector: BEFORE overwriting
+            // `pending_keep_alive_ack` below, a still-`Some` value left over
+            // from the PRIOR tick means that keep-alive was never ACKed —
+            // feed it to `RoomKeepAliveStall`, which counts consecutive
+            // misses and — once it decides the route is dead, not just one
+            // dropped frame — zeroes `out_path_len` itself. The re-flood
+            // branch above picks that up on the very next scheduler pass,
+            // on its own decoupled cadence (see the `ROOM_REFLOOD_INITIAL_
+            // BACKOFF_MS`-vs-detection-floor const assertion above this
+            // loop's constants for why "next pass" is effectively
+            // immediate, same as the pre-fix same-tick fallthrough was).
+            // See `firmware_core::room_session::RoomKeepAliveStall`'s doc
+            // for the full "why N misses, why zero out_path" rationale.
             let ack_outstanding = room.pending_keep_alive_ack.is_some();
             if ack_outstanding {
                 let invalidated = room.keep_alive_stall.on_tick(true, &mut room.session);
@@ -1713,32 +1844,13 @@ fn run() -> anyhow::Result<()> {
                         room.hash, room_session::KEEP_ALIVE_STALL_THRESHOLD,
                     );
                     room_session::save_room_session(nvs_partition.clone(), room.hash, &room.session);
+                    continue; // no learned path left this tick; reflood branch picks it up next pass
                 } else {
                     log::warn!(
                         "room: 0x{:02x} missed keep-alive ACK ({}/{})",
                         room.hash, room.keep_alive_stall.missed(), room_session::KEEP_ALIVE_STALL_THRESHOLD,
                     );
                 }
-            }
-
-            if room.session.out_path_len == 0 {
-                let mut frame = [0u8; room_session::MAX_LOGIN_FRAME_LEN];
-                let n = room_session::encode_room_login_frame(
-                    &shared,
-                    room.hash,
-                    &identity.pubkey,
-                    ts,
-                    room.session.sync_since,
-                    &room.guest_password[..room.guest_password_len as usize],
-                    &mut frame,
-                );
-                log_tx_queue_eviction(txq.enqueue(&frame[..n]), "room re-flood login");
-                room.session.record_sent_timestamp(ts);
-                log::info!(
-                    "room: 0x{:02x} has no learned out_path — re-flooding login",
-                    room.hash,
-                );
-                continue;
             }
 
             // Resumed keep-alive after a (re)login: force_since re-affirms
@@ -3236,6 +3348,12 @@ fn apply_room_login_outcome(
     // own push_failures reset conditions — this session is presumed live
     // again, so the missed-ACK counter must not carry a stale count into it.
     room.keep_alive_stall.reset();
+    // A successful login reply is one of the reflood backoff's two reset
+    // conditions (`room_session::room_reflood_interval_ms`'s doc) — this
+    // reply IS the reflood succeeding, so the next `out_path_len == 0`
+    // epoch (should one ever start again) begins fresh at the initial
+    // backoff, not wherever this epoch's exponent left off.
+    room.reflood_attempts = 0;
     // The next keep-alive should re-affirm this login's `sync_since` via
     // `force_since` rather than the routine `0` — see `resync_pending`'s doc.
     room.resync_pending = true;
@@ -3330,6 +3448,9 @@ fn handle_room_push_frame(
             // like a successful keep-alive ACK would (see
             // `RoomKeepAliveStall`'s doc).
             room.keep_alive_stall.reset();
+            // Same evidence resets the reflood backoff's other reset
+            // condition — see `room_session::room_reflood_interval_ms`'s doc.
+            room.reflood_attempts = 0;
             // ACK is non-negotiable: transmitted unconditionally, even for a
             // push `handle_room_push` recognises as an already-seen
             // duplicate (`outcome.entry: None`) — see that function's doc.

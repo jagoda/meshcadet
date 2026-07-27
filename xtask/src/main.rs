@@ -14,6 +14,10 @@
 //! - **verify-room-session-erase** — `admin_server.rs`'s `ADD_ROOM`/`DEL_ROOM`
 //!   arms erase the room's dedicated NVS session store (see
 //!   `xtask::room_session_erase`'s doc).
+//! - **verify-reflood-cadence-decoupling** — the room keep-alive scheduler's
+//!   re-flood-login branch gates on its own, backed-off cadence rather than
+//!   the route-direct keep-alive's drain/routine one (see
+//!   `xtask::room_reflood_cadence`'s doc).
 //!
 //! Both also run as `cargo test`s, which is what CI / every downstream change
 //! actually gates on; this binary exists for a quick manual re-check with a
@@ -89,6 +93,23 @@ fn main() -> ExitCode {
             session_erase.len()
         );
         for v in &session_erase {
+            eprintln!("  - {v}");
+        }
+    }
+
+    let reflood_cadence = xtask::room_reflood_cadence::check(&repo_root);
+    if reflood_cadence.is_empty() {
+        println!(
+            "xtask verify-reflood-cadence-decoupling: OK — {}'s re-flood-login branch stays on its own cadence.",
+            xtask::room_reflood_cadence::MAIN_RS_REL_PATH
+        );
+    } else {
+        ok = false;
+        eprintln!(
+            "xtask verify-reflood-cadence-decoupling: FAILED — {} violation(s):",
+            reflood_cadence.len()
+        );
+        for v in &reflood_cadence {
             eprintln!("  - {v}");
         }
     }
