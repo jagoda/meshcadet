@@ -90,4 +90,33 @@ fn read_only_room_renders_disabled_send_and_a_visible_banner() {
     let fb2 = frame.render();
     assert_eq!(at(&fb2, btn_x + 40, btn_y + 14), surface_raised);
     assert_eq!(at(&fb2, banner_corner_x, banner_corner_y), warn);
+
+    // ── Permission upgrade after login (`meshcadet-room-session-state-to-ui`
+    // F1 regression guard) ───────────────────────────────────────────────
+    // A room registered read-only at boot (the provisioning-time Guest seed
+    // — permissions are runtime-learned, ADR-0002 §7) that then completes a
+    // READ_WRITE login must render an ENABLED compose, not stay stuck at
+    // its boot-time value until reboot. `main.rs::apply_room_login_outcome`
+    // now raises `UiEvent::RoomPermissionUpdated`, and `UiRuntime::
+    // handle_event` re-runs `register_room` with the fresh `can_post` (and
+    // live-refreshes an already-open compose's `read_only`, if that's the
+    // conversation currently open) — see `firmware/src/ui/mod.rs`'s
+    // `UiEvent::RoomPermissionUpdated` doc for the full wiring, which lives
+    // in the `firmware` crate and so cannot itself run as a host test (see
+    // this module's doc). This pins the render-layer half of that contract:
+    // flipping `read_only` back to `false` — exactly what that live-refresh
+    // call does — must re-arm Send and clear the banner.
+    frame.set_read_only(false);
+    frame.set_has_draft(true);
+    let fb3 = frame.render();
+    assert_eq!(
+        at(&fb3, btn_x + 40, btn_y + 14),
+        star_gold,
+        "room upgraded to READ_WRITE after login: Send button must re-arm"
+    );
+    assert_ne!(
+        at(&fb3, banner_corner_x, banner_corner_y),
+        warn,
+        "room upgraded to READ_WRITE after login: read-only banner must clear"
+    );
 }

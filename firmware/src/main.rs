@@ -294,10 +294,14 @@ struct RoomRuntime {
     login_sent: bool,
     /// Wall-clock ms (`uptime_ms()`-scale, matching every other `last_*_ms`
     /// scheduler in this loop) this room last sent a keep-alive — `0`
-    /// initially, so the very first scheduler tick after login fires
-    /// immediately rather than waiting a full interval. See
-    /// `ROOM_KEEP_ALIVE_INTERVAL_MS`'s doc for the chosen cadence and its
-    /// airtime/liveness justification.
+    /// initially, doubling as the scheduler's "never ticked yet" sentinel:
+    /// `room_session::room_keep_alive_interval_ms` reads this exact `== 0`
+    /// check to gate the FIRST tick on `ROOM_FIRST_KEEP_ALIVE_DELAY_MS`
+    /// instead of the routine `ROOM_KEEP_ALIVE_INTERVAL_MS` (see that
+    /// function's doc for the F2 defect this fixes — gating the first tick
+    /// on the full routine cadence stranded every fresh boot's Phase D drain
+    /// window open for up to 5 minutes). See `ROOM_KEEP_ALIVE_INTERVAL_MS`'s
+    /// doc for the routine cadence's own airtime/liveness justification.
     #[cfg_attr(feature = "hil", allow(dead_code))]
     last_keep_alive_ms: u64,
     /// Phase D's session-phase notification classifier — see
@@ -381,6 +385,28 @@ const ROOM_RECENT_CAP: usize = 8;
 /// same airtime pressure that caused the stall in the first place.
 #[cfg(not(feature = "hil"))]
 const ROOM_KEEP_ALIVE_INTERVAL_MS: u64 = 300_000;
+
+/// F2 fix (this mission's Objective): the FIRST post-login keep-alive tick
+/// must not be gated on the full [`ROOM_KEEP_ALIVE_INTERVAL_MS`] the way
+/// `RoomRuntime::last_keep_alive_ms`'s `0` sentinel naively did against a
+/// same-scale `now` (`uptime_ms()`) — that left every fresh boot's Phase D
+/// drain window (`firmware_core::room_session::RoomSyncPhase`) unable to
+/// close for up to 5 minutes, no matter how quickly the actual backlog
+/// drained. 10 s is short enough that a user notices no meaningful lag, but
+/// long enough to give the boot-time flood login (`room_session::
+/// encode_room_login_frame`) a realistic chance to route-return before this
+/// tick's `out_path_len == 0` branch would otherwise re-flood it again.
+#[cfg(not(feature = "hil"))]
+const ROOM_FIRST_KEEP_ALIVE_DELAY_MS: u64 = 10_000;
+
+/// F2 fix: cadence used while `RoomSyncPhase::is_draining()` is still true —
+/// far tighter than the routine [`ROOM_KEEP_ALIVE_INTERVAL_MS`], since a
+/// keep-alive ACK is the ONLY thing that can ever close that drain window
+/// (`RoomSyncPhase::on_keep_alive_ack`'s doc). Once the window closes the
+/// scheduler falls back to the routine cadence — see
+/// `room_session::room_keep_alive_interval_ms`.
+#[cfg(not(feature = "hil"))]
+const ROOM_DRAINING_KEEP_ALIVE_INTERVAL_MS: u64 = 15_000;
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -1657,7 +1683,19 @@ fn run() -> anyhow::Result<()> {
             if !room.login_sent {
                 continue; // login not even queued yet this boot
             }
-            if now.saturating_sub(room.last_keep_alive_ms) < ROOM_KEEP_ALIVE_INTERVAL_MS {
+            // F2 fix: three distinct cadences instead of one fixed
+            // `ROOM_KEEP_ALIVE_INTERVAL_MS` gate — see
+            // `room_session::room_keep_alive_interval_ms`'s doc for the full
+            // "why the old single gate stranded the drain window open for up
+            // to 5 minutes" rationale.
+            let interval = room_session::room_keep_alive_interval_ms(
+                room.last_keep_alive_ms,
+                room.sync_phase.is_draining(),
+                ROOM_FIRST_KEEP_ALIVE_DELAY_MS,
+                ROOM_DRAINING_KEEP_ALIVE_INTERVAL_MS,
+                ROOM_KEEP_ALIVE_INTERVAL_MS,
+            );
+            if now.saturating_sub(room.last_keep_alive_ms) < interval {
                 continue;
             }
             room.last_keep_alive_ms = now;
@@ -2639,7 +2677,7 @@ fn on_receive(
             // sends `PAYLOAD_TYPE_REQ` itself, so nothing legitimate besides
             // a room login reply is expected here.
             #[cfg(not(feature = "hil"))]
-            handle_room_login_response(payload, our_id, room_runtime, nvs_partition.clone());
+            handle_room_login_response(payload, our_id, room_runtime, nvs_partition.clone(), ui_events);
             #[cfg(feature = "hil")]
             {
                 let _ = (room_runtime, nvs_partition);
@@ -3157,11 +3195,20 @@ fn match_pending_channel_ack(
 /// persist it to this room's dedicated NVS session store. Shared by both
 /// login-reply forms (`handle_room_login_response`'s direct datagram and
 /// `handle_path_return`'s bundled `PathExtra::Response`).
+///
+/// Raises [`ui::UiEvent::RoomPermissionUpdated`] with the outcome's fresh
+/// `can_post` — F1 of this mission's Objective: `register_room` used to be
+/// called ONCE at boot off the resumed session only, so a session upgrade
+/// (e.g. Guest→ReadWrite on a room's very first login) never reached the UI
+/// and compose stayed disabled until reboot. Every caller of this function
+/// MUST have a `ui_events` sink available; there is currently no login-reply
+/// path that doesn't.
 #[cfg(not(feature = "hil"))]
 fn apply_room_login_outcome(
     room: &mut RoomRuntime,
     outcome: &room_session::RoomLoginOutcome,
     nvs_partition: EspDefaultNvsPartition,
+    ui_events: &mut Vec<ui::UiEvent>,
 ) {
     room.session.apply_login_outcome(outcome);
     // A fresh login (boot OR stall-triggered relearn) mirrors the server's
@@ -3182,6 +3229,10 @@ fn apply_room_login_outcome(
             ""
         },
     );
+    ui_events.push(ui::UiEvent::RoomPermissionUpdated {
+        room_hash: room.hash,
+        can_post: room.session.permission().can_post(),
+    });
 }
 
 /// Handle a direct `RESPONSE` datagram (`PayloadType::Response`) login
@@ -3197,6 +3248,7 @@ fn handle_room_login_response(
     our_id: &Identity,
     room_runtime: &mut [RoomRuntime],
     nvs_partition: EspDefaultNvsPartition,
+    ui_events: &mut Vec<ui::UiEvent>,
 ) {
     let raw_src = payload.get(1).copied().unwrap_or(0);
     let Some(room) = room_runtime.iter_mut().find(|r| r.hash == raw_src) else {
@@ -3208,7 +3260,7 @@ fn handle_room_login_response(
     };
     let shared = our_id.ecdh_shared_secret(&room.pubkey);
     match room_session::decode_login_response_datagram(&shared, payload) {
-        Ok(outcome) => apply_room_login_outcome(room, &outcome, nvs_partition),
+        Ok(outcome) => apply_room_login_outcome(room, &outcome, nvs_partition, ui_events),
         Err(e) => log::warn!(
             "RX room login (direct RESPONSE) from 0x{:02x}: decode error: {:?}",
             raw_src, e,
@@ -3391,7 +3443,7 @@ fn handle_path_return(
                                         permissions: resp.permissions,
                                         out_path: Some((rp.path, rp.path_byte_count)),
                                     };
-                                    apply_room_login_outcome(room, &outcome, nvs_partition);
+                                    apply_room_login_outcome(room, &outcome, nvs_partition, ui_events);
                                 }
                                 Err(e) => log::warn!(
                                     "RX PATH room login from 0x{:02x}: decode error: {:?}",
