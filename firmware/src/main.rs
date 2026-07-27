@@ -1525,7 +1525,7 @@ fn run() -> anyhow::Result<()> {
                 &room.guest_password[..room.guest_password_len as usize],
                 &mut frame,
             );
-            txq.enqueue(&frame[..n]);
+            log_tx_queue_eviction(txq.enqueue(&frame[..n]), "room login");
             room.login_sent = true;
             room.session.record_sent_timestamp(boot_ts);
             log::info!(
@@ -1646,7 +1646,7 @@ fn run() -> anyhow::Result<()> {
             if let Some((n, ack)) =
                 build_test_dm(now, tx_epoch_base, &identity, &peer_pubkey, &shared_secret, &mut frame_buf)
             {
-                txq.enqueue(&frame_buf[..n]);
+                log_tx_queue_eviction(txq.enqueue(&frame_buf[..n]), "test DM");
                 pending_ack = Some(PendingAck { hash: ack, to_hash: peer_pubkey[0] });
                 log::debug!(
                     "dispatcher: enqueued TEST DM ({} bytes), expecting ack {}",
@@ -1732,7 +1732,7 @@ fn run() -> anyhow::Result<()> {
                     &room.guest_password[..room.guest_password_len as usize],
                     &mut frame,
                 );
-                txq.enqueue(&frame[..n]);
+                log_tx_queue_eviction(txq.enqueue(&frame[..n]), "room re-flood login");
                 room.session.record_sent_timestamp(ts);
                 log::info!(
                     "room: 0x{:02x} has no learned out_path — re-flooding login",
@@ -1762,7 +1762,7 @@ fn run() -> anyhow::Result<()> {
                 &mut frame,
             ) {
                 Some(n) => {
-                    txq.enqueue(&frame[..n]);
+                    log_tx_queue_eviction(txq.enqueue(&frame[..n]), "room keep-alive");
                     room.pending_keep_alive_ack = Some(protocol::room::keep_alive_ack_hash(
                         ts,
                         force_since,
@@ -2137,7 +2137,7 @@ fn run() -> anyhow::Result<()> {
                                     text.as_bytes(), &mut frame_buf,
                                 ) {
                                     Some((n, ack)) => {
-                                        txq.enqueue(&frame_buf[..n]);
+                                        log_tx_queue_eviction(txq.enqueue(&frame_buf[..n]), "UI DM");
                                         pending_ack = Some(PendingAck { hash: ack, to_hash });
                                         log::info!(
                                             "TX UI DM to 0x{:02x}: {:?} ({} bytes)",
@@ -2189,7 +2189,7 @@ fn run() -> anyhow::Result<()> {
                                 now, tx_epoch_base, channel_secret,
                                 sender_name.as_bytes(), text.as_bytes(), &mut frame_buf,
                             );
-                            txq.enqueue(&frame_buf[..n]);
+                            log_tx_queue_eviction(txq.enqueue(&frame_buf[..n]), "UI channel message");
                             // Record the dedup key of this send so a later heard repeat
                             // (this exact frame flooded back into the mesh by another
                             // node) can be recognised as the implicit channel ack —
@@ -2274,7 +2274,7 @@ fn run() -> anyhow::Result<()> {
                                         &mut frame_buf,
                                     ) {
                                         Ok((n, ack)) => {
-                                            txq.enqueue(&frame_buf[..n]);
+                                            log_tx_queue_eviction(txq.enqueue(&frame_buf[..n]), "room post");
                                             room.pending_post_ack = Some(ack);
                                             room.session.record_sent_timestamp(candidate_ts);
                                             log::info!(
@@ -2367,6 +2367,22 @@ fn build_ack_frame(ack_hash: &[u8; 4], out: &mut [u8]) -> usize {
     out[1] = PathLen::new(2, 0).map(|p| p.0).unwrap_or(0x40);
     out[2..6].copy_from_slice(ack_hash);
     6
+}
+
+/// Log the eviction `TxQueue::enqueue` just reported (if any) — a full queue
+/// silently dropping the oldest pending frame is otherwise invisible: the
+/// call site's own "TX ... queued" log fires unconditionally right after,
+/// so without this, a dropped frame and a successfully queued one are
+/// indistinguishable in the log. `what` names the frame that was just queued
+/// (the caller's own "TX ... queued" wording), for context on what pushed the
+/// queue over the edge.
+fn log_tx_queue_eviction(dropped: Option<usize>, what: &str) {
+    if let Some(dropped_len) = dropped {
+        log::warn!(
+            "TX queue full: dropped a pending {}-byte frame to make room for {}",
+            dropped_len, what,
+        );
+    }
 }
 
 // ── UI transmit builders ──────────────────────────────────────────────────────
@@ -2653,13 +2669,18 @@ fn on_receive(
             // (`TXT_TYPE_SIGNED_PLAIN`, not `TXT_TYPE_PLAIN`) — route by
             // src_hash to the room-push handler instead of `handle_dm`,
             // which assumes the plain-DM flag layout and would mis-parse a
-            // push's leading author-pubkey prefix as text.
+            // push's leading author-pubkey prefix as text. `raw_src` is only
+            // a 1-byte hash (1/256 collision odds per room/contact pair), so
+            // `handle_room_push_frame` can decline (a `NotSignedPlain`
+            // decode — see its doc) and hand the frame back here to fall
+            // through to the ordinary DM path instead of dropping it.
             #[cfg(not(feature = "hil"))]
             let raw_src = payload.get(1).copied().unwrap_or(0);
             #[cfg(not(feature = "hil"))]
             if let Some(room) = room_runtime.iter_mut().find(|r| r.hash == raw_src) {
-                handle_room_push_frame(payload, our_id, room, txq, ui_events, nvs_partition.clone());
-                return;
+                if handle_room_push_frame(payload, our_id, room, txq, ui_events, nvs_partition.clone()) {
+                    return;
+                }
             }
             handle_dm(payload, our_id, policy, txq, gps_snapshot, now_ms, tx_epoch_base, ui_events)
         }
@@ -2886,7 +2907,7 @@ fn handle_dm(
                     // Telemetry enabled: build and enqueue a location reply DM.
                     match build_telemetry_reply(now_ms, tx_epoch_base, our_id, contact_pubkey, gps_snapshot) {
                         Some((reply_frame, reply_len)) => {
-                            txq.enqueue(&reply_frame[..reply_len]);
+                            log_tx_queue_eviction(txq.enqueue(&reply_frame[..reply_len]), "telemetry reply");
                             match gps_snapshot {
                                 Some((_, _, age_secs)) => log::info!(
                                     "TX telemetry reply to 0x{:02x}: location (age={}s)",
@@ -2909,7 +2930,7 @@ fn handle_dm(
             let ack = compute_ack_hash(ts, type_byte, text, contact_pubkey);
             let mut ack_frame = [0u8; 8];
             let n = build_ack_frame(&ack, &mut ack_frame);
-            txq.enqueue(&ack_frame[..n]);
+            log_tx_queue_eviction(txq.enqueue(&ack_frame[..n]), "DM ACK");
             log::info!("TX ACK queued for 0x{:02x}: ack_hash={}", raw_src, hex4(&ack));
         }
         Err(protocol::CodecError::MacMismatch) => {
@@ -3020,7 +3041,7 @@ fn handle_req(
             let gps = gps_snapshot.map(|(lat_e7, lon_e7, _age)| (lat_e7, lon_e7));
             match build_telemetry_response(our_id, contact_pubkey, req.tag, gps, battery_snapshot) {
                 Some((resp_frame, resp_len)) => {
-                    txq.enqueue(&resp_frame[..resp_len]);
+                    log_tx_queue_eviction(txq.enqueue(&resp_frame[..resp_len]), "telemetry RESPONSE");
                     log::info!(
                         "TX telemetry RESPONSE to 0x{:02x} (tag={:#010x}): {}, battery={}%{}",
                         raw_src,
@@ -3275,6 +3296,16 @@ fn handle_room_login_response(
 /// `handle_dm` does for an ordinary DM (same conversation-hash keying, so the
 /// Groups-tab row and the message view Just Work), and persist the advanced
 /// `sync_since` watermark.
+///
+/// Returns `true` if the frame was handled here (decoded as a push, or
+/// rejected as malformed), `false` if the caller must fall through to
+/// `handle_dm` instead — the latter fires only on
+/// `RoomSessionError::Room(RoomCodecError::NotSignedPlain)`: the 1-byte
+/// `src_hash` routing in the caller is a 1-in-256 collision away from
+/// misrouting a genuine plain DM from an ordinary contact into this
+/// function, and `NotSignedPlain` is exactly the signature of that
+/// misroute (a plain DM decodes fine as `TXT_TYPE_PLAIN`, which is not
+/// `TXT_TYPE_SIGNED_PLAIN`) rather than of a corrupt or malicious push.
 #[cfg(not(feature = "hil"))]
 fn handle_room_push_frame(
     payload: &[u8],
@@ -3283,7 +3314,7 @@ fn handle_room_push_frame(
     txq: &mut TxQueue,
     ui_events: &mut Vec<ui::UiEvent>,
     nvs_partition: EspDefaultNvsPartition,
-) {
+) -> bool {
     let shared = our_id.ecdh_shared_secret(&room.pubkey);
     match room_session::handle_room_push(
         &shared,
@@ -3304,7 +3335,7 @@ fn handle_room_push_frame(
             // duplicate (`outcome.entry: None`) — see that function's doc.
             let mut ack_frame = [0u8; 8];
             let n = build_ack_frame(&outcome.ack_hash, &mut ack_frame);
-            txq.enqueue(&ack_frame[..n]);
+            log_tx_queue_eviction(txq.enqueue(&ack_frame[..n]), "room-push ACK");
             log::info!(
                 "TX room-push ACK queued for 0x{:02x}: ack_hash={}",
                 room.hash,
@@ -3371,15 +3402,28 @@ fn handle_room_push_frame(
             // Persist the advanced watermark now that the ACK is queued —
             // mirrors `append_history`'s own "record what we observed, don't
             // wait for on-air confirmation" convention (see that fn's doc on
-            // `acked` for inbound entries).
-            room.session.sync_since = outcome.post_ts;
+            // `acked` for inbound entries). `record_synced_post_ts` advances
+            // monotonically, mirroring `record_sent_timestamp`'s guard on
+            // `last_room_ts` — see that method's doc for why an unconditional
+            // assignment here would be a bug, not just an asymmetry.
+            room.session.record_synced_post_ts(outcome.post_ts);
             room_session::save_room_session(nvs_partition, room.hash, &room.session);
+            true
+        }
+        Err(e) if room_session::is_room_push_misroute(&e) => {
+            // Not a room push at all — most likely a genuine plain DM from a
+            // contact whose 1-byte src_hash collides with this room's (see
+            // this fn's doc and `is_room_push_misroute`'s). Tell the caller
+            // to fall through to `handle_dm` instead of silently dropping
+            // what may be a legitimate message.
+            false
         }
         Err(e) => {
             log::warn!(
                 "RX room push from 0x{:02x}: decode error: {:?}",
                 room.hash, e,
             );
+            true
         }
     }
 }

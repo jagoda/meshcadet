@@ -217,20 +217,30 @@ impl TxQueue {
 
     /// Enqueue `frame` for transmission (FIFO order; drops the oldest pending
     /// frame if the queue is already full).
-    pub fn enqueue(&mut self, frame: &[u8]) {
+    ///
+    /// Returns the byte length of the frame that was evicted to make room, or
+    /// `None` if the queue had a free slot and nothing was dropped. This is
+    /// `#[must_use]` — a caller that ignores it silently repeats the exact
+    /// defect shape this type's own doc above says is already fixed: a queued
+    /// frame vanishing with no log, no counter and no way for the call site to
+    /// know its own "queued" log line just lied.
+    #[must_use]
+    pub fn enqueue(&mut self, frame: &[u8]) -> Option<usize> {
         let n = frame.len().min(FRAME_BUF);
-        let idx = if self.count == TX_QUEUE_SLOTS {
+        let (idx, dropped) = if self.count == TX_QUEUE_SLOTS {
             // Full: drop the oldest to make room for this one.
             let idx = self.head;
+            let dropped_len = self.lens[idx];
             self.head = (self.head + 1) % TX_QUEUE_SLOTS;
-            idx
+            (idx, Some(dropped_len))
         } else {
             let idx = (self.head + self.count) % TX_QUEUE_SLOTS;
             self.count += 1;
-            idx
+            (idx, None)
         };
         self.bufs[idx][..n].copy_from_slice(&frame[..n]);
         self.lens[idx] = n;
+        dropped
     }
 
     /// Copy the oldest pending frame into `out` WITHOUT removing it from the
@@ -441,7 +451,11 @@ mod tests {
     fn txqueue_enqueue_take_roundtrip() {
         let mut q = TxQueue::new();
         assert!(!q.has_pending());
-        q.enqueue(b"test frame");
+        assert_eq!(
+            q.enqueue(b"test frame"),
+            None,
+            "queue had room; nothing evicted"
+        );
         assert!(q.has_pending());
         let mut buf = [0u8; 32];
         let n = q.peek(&mut buf);
@@ -458,8 +472,12 @@ mod tests {
     #[test]
     fn txqueue_both_frames_enqueued_same_pass_survive_fifo_order() {
         let mut q = TxQueue::new();
-        q.enqueue(b"first");
-        q.enqueue(b"second");
+        assert_eq!(q.enqueue(b"first"), None);
+        assert_eq!(
+            q.enqueue(b"second"),
+            None,
+            "queue has 4 slots; two frames never evicts"
+        );
         let mut buf = [0u8; 16];
         let n1 = q.peek(&mut buf);
         assert_eq!(
@@ -479,10 +497,16 @@ mod tests {
         let mut q = TxQueue::new();
         // Fill to capacity with distinct single-byte frames.
         for i in 0..TX_QUEUE_SLOTS {
-            q.enqueue(&[i as u8]);
+            assert_eq!(q.enqueue(&[i as u8]), None, "queue not yet full");
         }
-        // One more: queue is full, so the oldest (0) is dropped to make room.
-        q.enqueue(&[0xFFu8]);
+        // One more: queue is full, so the oldest (0) is dropped to make room —
+        // and `enqueue` must report it, not swallow it silently (F3).
+        let dropped = q.enqueue(&[0xFFu8]);
+        assert_eq!(
+            dropped,
+            Some(1),
+            "eviction must be reported so a warn can be logged at the call site"
+        );
         let mut buf = [0u8; 4];
         for i in 1..TX_QUEUE_SLOTS {
             let n = q.peek(&mut buf);
@@ -508,7 +532,7 @@ mod tests {
     #[test]
     fn txqueue_peek_does_not_consume_frame() {
         let mut q = TxQueue::new();
-        q.enqueue(b"channel reply");
+        assert_eq!(q.enqueue(b"channel reply"), None);
         let mut buf = [0u8; 32];
         let n = q.peek(&mut buf);
         assert_eq!(&buf[..n], b"channel reply");
@@ -526,8 +550,8 @@ mod tests {
     #[test]
     fn txqueue_pop_front_removes_peeked_frame() {
         let mut q = TxQueue::new();
-        q.enqueue(b"first");
-        q.enqueue(b"second");
+        let _ = q.enqueue(b"first");
+        let _ = q.enqueue(b"second");
         let mut buf = [0u8; 16];
         // Simulate a successful send of the head frame.
         let n = q.peek(&mut buf);

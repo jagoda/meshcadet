@@ -868,7 +868,7 @@ async function oversizedAdvertFrameSurvivesLogNoiseResync() {
 //
 // Before the fix, `queryAdvert()` read that leftover RSP_STATUS as if it
 // were its own answer and threw `unexpected response 0x82 to QUERY_ADVERT
-// (expected RSP_ADVERT 0x8A)` — verbatim the Commander's HIL report — while
+// (expected RSP_ADVERT 0x8A)` — verbatim the field HIL report — while
 // the device's real (correct, just slow — advert-card signing + an NVS
 // write) RSP_ADVERT reply was left orphaned in the buffer. That orphaned
 // reply then became `listContacts()`'s own stray ("unexpected frame 0x8A

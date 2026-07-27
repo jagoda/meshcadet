@@ -799,12 +799,20 @@ fn resolve_guest_password(
 /// or `None` if `password_len` fits under the device's limit. Reports only
 /// the byte counts — never the password itself — so the caller can print it
 /// straight to stderr without risking a leak.
+///
+/// The wire limit is `MAX_ROOM_PASSWORD_LEN` bytes INCLUDING the NUL
+/// terminator `encode_anon_req_login` always appends (see that fn's doc) —
+/// only `MAX_ROOM_PASSWORD_LEN - 1` password bytes ever reach the wire.
+/// Warning at `password_len > MAX_ROOM_PASSWORD_LEN` (the old boundary) let a
+/// password of exactly `MAX_ROOM_PASSWORD_LEN` bytes provision with no
+/// warning at all, while silently operating as only its first
+/// `MAX_ROOM_PASSWORD_LEN - 1` characters.
 fn password_truncation_warning(password_len: usize) -> Option<String> {
-    let limit = protocol::provisioning::MAX_ROOM_PASSWORD_LEN;
-    if password_len > limit {
+    let effective_limit = protocol::provisioning::MAX_ROOM_PASSWORD_LEN - 1;
+    if password_len > effective_limit {
         Some(format!(
-            "warning: guest password is {password_len} bytes; the device accepts at most \
-             {limit} and will truncate it."
+            "warning: guest password is {password_len} bytes; the device only uses the first \
+             {effective_limit} and will truncate it."
         ))
     } else {
         None
@@ -1407,17 +1415,34 @@ mod tests {
 
     #[test]
     fn password_truncation_warning_none_when_within_limit() {
-        let limit = protocol::provisioning::MAX_ROOM_PASSWORD_LEN;
-        assert_eq!(password_truncation_warning(limit), None);
+        // `MAX_ROOM_PASSWORD_LEN` includes the wire NUL terminator
+        // (`encode_anon_req_login`'s doc) — only `- 1` bytes ever transmit.
+        let effective_limit = protocol::provisioning::MAX_ROOM_PASSWORD_LEN - 1;
+        assert_eq!(password_truncation_warning(effective_limit), None);
         assert_eq!(password_truncation_warning(0), None);
+    }
+
+    /// REGRESSION (F6): a password of exactly `MAX_ROOM_PASSWORD_LEN` bytes
+    /// (the wire constant) is one byte too long once the NUL terminator is
+    /// accounted for — it must warn. Before this fix the warning boundary
+    /// was `> MAX_ROOM_PASSWORD_LEN`, so this exact, common length (16, a
+    /// round number a user is likely to pick) provisioned with no warning
+    /// and silently operated as only its first 15 characters.
+    #[test]
+    fn password_truncation_warning_fires_at_exactly_the_wire_limit() {
+        let limit = protocol::provisioning::MAX_ROOM_PASSWORD_LEN;
+        let warning = password_truncation_warning(limit)
+            .expect("a password of exactly MAX_ROOM_PASSWORD_LEN bytes must warn");
+        assert!(warning.contains(&limit.to_string()));
     }
 
     #[test]
     fn password_truncation_warning_fires_over_limit_without_leaking_the_value() {
         let limit = protocol::provisioning::MAX_ROOM_PASSWORD_LEN;
+        let effective_limit = limit - 1;
         let warning = password_truncation_warning(limit + 5).expect("must warn over the limit");
         assert!(warning.contains(&(limit + 5).to_string()));
-        assert!(warning.contains(&limit.to_string()));
+        assert!(warning.contains(&effective_limit.to_string()));
         assert!(warning.contains("truncat"));
     }
 }

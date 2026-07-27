@@ -297,6 +297,20 @@ impl PersistedRoomSession {
             self.last_room_ts = ts;
         }
     }
+
+    /// Record an inbound push's `post_ts` against the sync watermark —
+    /// advances `sync_since` to `post_ts` if it is a genuine increase, same
+    /// "never regress" guard as [`Self::record_sent_timestamp`] applies to
+    /// `last_room_ts`. A lower-timestamped push (a retry, or a reorder) must
+    /// not rewind `sync_since`: a rewound watermark makes the next
+    /// keep-alive's `force_since` tell the server to re-push everything from
+    /// the rewound point, a re-drain wider than the content-dedup tail
+    /// (`ROOM_RECENT_CAP`) can absorb.
+    pub fn record_synced_post_ts(&mut self, post_ts: u32) {
+        if post_ts > self.sync_since {
+            self.sync_since = post_ts;
+        }
+    }
 }
 
 /// Encode a [`PersistedRoomSession`] into `out` (at least
@@ -391,6 +405,22 @@ pub fn handle_room_push(
         post_ts: push.post_ts,
         entry,
     })
+}
+
+/// True if `e` — an error from [`handle_room_push`] — indicates the frame
+/// was never a room push at all, rather than a corrupt or malicious one.
+///
+/// The routing to [`handle_room_push`] in `firmware/src/main.rs::on_receive`
+/// is by 1-byte `src_hash` prefix, a 1-in-256 collision away from misrouting
+/// a genuine plain DM into this path. [`RoomCodecError::NotSignedPlain`] is
+/// exactly [`decode_room_push`]'s documented signal for "this decoded fine
+/// but is not `TXT_TYPE_SIGNED_PLAIN`" — i.e. the wire shape of an ordinary
+/// plain DM, not a push. Every other error (a MAC mismatch, a truncated
+/// payload, …) means the bytes really were garbled or hostile and must NOT
+/// fall through. Callers (`handle_room_push_frame`) should route a `true`
+/// result to their own plain-DM path instead of dropping the frame.
+pub fn is_room_push_misroute(e: &RoomSessionError) -> bool {
+    matches!(e, RoomSessionError::Room(RoomCodecError::NotSignedPlain))
 }
 
 /// A room post is a duplicate of one already in `recent`, by `(timestamp,
@@ -1345,6 +1375,54 @@ mod tests {
         assert_eq!(state.last_room_ts, 101);
     }
 
+    /// REGRESSION (F4): `sync_since` must advance the same way
+    /// `last_room_ts` already does — a lower-timestamped push (retry,
+    /// reorder) must never rewind the watermark. Before this fix
+    /// `handle_room_push_frame` assigned `sync_since` unconditionally, so a
+    /// rewind here would have made the next keep-alive's `force_since`
+    /// re-drain posts the server already delivered.
+    #[test]
+    fn record_synced_post_ts_never_regresses() {
+        let mut state = PersistedRoomSession::EMPTY;
+        state.record_synced_post_ts(2000);
+        assert_eq!(state.sync_since, 2000);
+        state.record_synced_post_ts(500); // smaller (retry/reorder): ignored
+        assert_eq!(
+            state.sync_since, 2000,
+            "a lower post_ts must not rewind sync_since"
+        );
+        state.record_synced_post_ts(2001);
+        assert_eq!(state.sync_since, 2001);
+    }
+
+    /// REGRESSION (F5): `NotSignedPlain` — and ONLY `NotSignedPlain` — must
+    /// classify as a misroute. `firmware/src/main.rs::handle_room_push_frame`
+    /// (untestable on host — see that fn's doc) delegates its fall-through
+    /// decision to this predicate specifically so the decision itself is
+    /// pinned by a real, running test rather than by comment alone.
+    #[test]
+    fn is_room_push_misroute_true_only_for_not_signed_plain() {
+        assert!(is_room_push_misroute(&RoomSessionError::Room(
+            RoomCodecError::NotSignedPlain
+        )));
+
+        // Every other error is a genuinely corrupt/hostile push, not a
+        // misrouted plain DM — must NOT fall through.
+        assert!(!is_room_push_misroute(&RoomSessionError::Room(
+            RoomCodecError::TruncatedPayload
+        )));
+        assert!(!is_room_push_misroute(&RoomSessionError::Room(
+            RoomCodecError::LoginRejected(1)
+        )));
+        assert!(!is_room_push_misroute(&RoomSessionError::Room(
+            RoomCodecError::Codec(CodecError::MacMismatch)
+        )));
+        assert!(!is_room_push_misroute(&RoomSessionError::Codec(
+            CodecError::TruncatedPayload
+        )));
+        assert!(!is_room_push_misroute(&RoomSessionError::NotLoginReply));
+    }
+
     // ── Phase A: encode_room_post_checked's monotonic-timestamp guard ──────
 
     #[test]
@@ -1686,7 +1764,7 @@ mod tests {
             &client.pubkey,
         );
         assert!(double.handle_ack(&client.pubkey, &ack));
-        session.sync_since = push.post_ts; // mirrors `handle_room_push_frame`'s watermark update
+        session.record_synced_post_ts(push.post_ts); // mirrors `handle_room_push_frame`'s watermark update
         stall.reset(); // mirrors the inbound-post reset condition
         assert_eq!(double.client_sync_since(&client.pubkey), Some(2000));
 
