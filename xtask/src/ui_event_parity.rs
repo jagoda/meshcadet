@@ -124,6 +124,19 @@ const EXPECTED: &[(&str, NotificationEffects)] = &[
 /// The two arms that must behave identically — the parity claim itself.
 const PARITY_PAIR: (&str, &str) = ("RoomPostLive", "IncomingGroupMsg");
 
+/// `meshcadet-room-session-state-to-ui`'s F1 fix: a room's session
+/// permission, learned at runtime (e.g. a Guest→ReadWrite login), only ever
+/// reaches the UI if this arm re-registers it. Before that mission,
+/// `register_room` was called exactly once, at boot, off the resumed
+/// session — a later permission upgrade left `room_permissions` stuck at
+/// the stale boot-time value with no code path able to correct it. This is
+/// a narrower, single-call-presence check rather than a full effects table
+/// (unlike [`EXPECTED`] above) because the arm has exactly one job; the same
+/// "structural scan over an un-host-testable crate" rationale as the rest of
+/// this module applies.
+const ROOM_PERMISSION_UPDATED_VARIANT: &str = "RoomPermissionUpdated";
+const ROOM_PERMISSION_UPDATED_REQUIRED_CALL: &str = "self.register_room(";
+
 /// Char-index positions of every occurrence of `needle` in `hay`.
 fn find_all(hay: &[char], needle: &str) -> Vec<usize> {
     let pat: Vec<char> = needle.chars().collect();
@@ -252,6 +265,22 @@ pub fn check_source(src: &str) -> Vec<String> {
         }
     }
 
+    // F1's session-state-reaches-the-UI contract: see
+    // `ROOM_PERMISSION_UPDATED_VARIANT`'s doc.
+    match arm_body(&masked, ROOM_PERMISSION_UPDATED_VARIANT) {
+        Err(e) => violations.push(e),
+        Ok(body) => {
+            if !body.contains(ROOM_PERMISSION_UPDATED_REQUIRED_CALL) {
+                violations.push(format!(
+                    "{UI_MOD_REL_PATH}: `UiEvent::{ROOM_PERMISSION_UPDATED_VARIANT}` arm does \
+                     not call `register_room` — a room's runtime-learned session permission \
+                     (e.g. a Guest→ReadWrite login) would no longer reach the UI, reintroducing \
+                     the `meshcadet-room-session-state-to-ui` F1 defect"
+                ));
+            }
+        }
+    }
+
     violations
 }
 
@@ -282,9 +311,13 @@ mod tests {
         );
     }
 
-    /// A minimal stand-in for `handle_event`'s four arms, used by the
+    /// A minimal stand-in for `handle_event`'s five arms, used by the
     /// mutation tests below to prove this scanner has teeth.
-    fn synthetic(live_fires_notification: bool, drained_fires_notification: bool) -> String {
+    fn synthetic(
+        live_fires_notification: bool,
+        drained_fires_notification: bool,
+        registers_permission: bool,
+    ) -> String {
         let live_notif = if live_fires_notification {
             "self.notif.fire(NotifEvent::IncomingGroupMsg, now_ms, self.screen_asleep);"
         } else {
@@ -292,6 +325,11 @@ mod tests {
         };
         let drained_notif = if drained_fires_notification {
             "self.notif.fire(NotifEvent::IncomingGroupMsg, now_ms, self.screen_asleep);"
+        } else {
+            ""
+        };
+        let register_call = if registers_permission {
+            "self.register_room(room_hash, can_post);"
         } else {
             ""
         };
@@ -324,6 +362,9 @@ mod tests {
                     }}
                     self.notif.fire(NotifEvent::IncomingGroupMsg, now_ms, self.screen_asleep);
                 }}
+                UiEvent::RoomPermissionUpdated {{ room_hash, can_post }} => {{
+                    {register_call}
+                }}
             }}
             "#
         )
@@ -331,7 +372,10 @@ mod tests {
 
     #[test]
     fn synthetic_baseline_is_clean() {
-        assert_eq!(check_source(&synthetic(true, false)), Vec::<String>::new());
+        assert_eq!(
+            check_source(&synthetic(true, false, true)),
+            Vec::<String>::new()
+        );
     }
 
     /// The mutation this guard exists for: `RoomPostLive` silently stops
@@ -340,7 +384,7 @@ mod tests {
     /// comparison.
     #[test]
     fn dropping_the_live_arms_notification_is_caught() {
-        let violations = check_source(&synthetic(false, false));
+        let violations = check_source(&synthetic(false, false, true));
         assert!(
             violations
                 .iter()
@@ -357,12 +401,26 @@ mod tests {
     /// notifying per post again, i.e. the 32-post backlog storms the tray.
     #[test]
     fn a_notification_leaking_into_the_drain_arm_is_caught() {
-        let violations = check_source(&synthetic(true, true));
+        let violations = check_source(&synthetic(true, true, true));
         assert!(
             violations
                 .iter()
                 .any(|v| v.contains("RoomPostDrained` arm does")),
             "expected a contract-row violation, got {violations:?}"
+        );
+    }
+
+    /// `meshcadet-room-session-state-to-ui`'s F1 mutation: `RoomPermissionUpdated`
+    /// stops calling `register_room`, silently reintroducing "session
+    /// upgrade never reaches the UI".
+    #[test]
+    fn dropping_the_register_room_call_is_caught() {
+        let violations = check_source(&synthetic(true, false, false));
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("RoomPermissionUpdated` arm does not call `register_room`")),
+            "expected a register_room-missing violation, got {violations:?}"
         );
     }
 
@@ -382,7 +440,7 @@ mod tests {
     /// its match arm (the tokenizer blanks comment bodies first).
     #[test]
     fn comment_mentions_are_not_counted_as_arms() {
-        let src = synthetic(true, false);
+        let src = synthetic(true, false, true);
         assert!(
             src.contains("[`UiEvent::RoomPostLive`]"),
             "fixture must actually contain a doc-comment mention"
