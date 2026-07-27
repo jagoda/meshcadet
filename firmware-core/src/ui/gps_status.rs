@@ -56,8 +56,8 @@ pub fn format_coords(has_fix: bool, lat_e7: i32, lon_e7: i32, fix_age_secs: u32)
 /// screen can render them as two rows instead of one over-wide line — see
 /// `firmware/src/ui/screens/gps_status.rs`'s `StatusRow.value2`. The full
 /// date INCLUDING YEAR is load-bearing, not decorative: it is what lets the
-/// Commander confirm the sync is actually CORRECT rather than merely that it
-/// happened. GPS week-number rollover is a real failure mode that produces a
+/// device owner confirm the sync is actually CORRECT rather than merely that
+/// it happened. GPS week-number rollover is a real failure mode that produces a
 /// correct time-of-day paired with a wrong date (often years off) — trimming
 /// the year would hide exactly the field that catches it. Never compact this
 /// line by dropping the date or the year.

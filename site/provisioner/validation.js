@@ -125,9 +125,16 @@ export function validatePin(input) {
  * (`host/src/main.rs`): unlike `validatePin`, an EMPTY password is valid
  * ("leave empty for none" — the CLI's own interactive-prompt copy), and an
  * over-length password is not rejected outright, only flagged — `encodeAddRoom`
- * silently truncates to `MAX_ROOM_PASSWORD_LEN` (16) bytes exactly as the
- * device does, so a longer password still round-trips (truncated) rather
- * than blocking the submit.
+ * silently truncates to `MAX_ROOM_PASSWORD_LEN` (16) bytes for the
+ * provisioning payload, matching the wire format's own byte budget.
+ *
+ * The WARNING boundary is one less than that, though:
+ * `MAX_ROOM_PASSWORD_LEN` bytes is the provisioning-payload ceiling, but the
+ * device's own room-login codec (`encode_anon_req_login`, `protocol/src/room.rs`)
+ * always NUL-terminates the plaintext, so only `MAX_ROOM_PASSWORD_LEN - 1`
+ * (15) password bytes ever reach the wire on login. Warning at
+ * `> MAX_ROOM_PASSWORD_LEN` let a password of exactly 16 bytes provision
+ * with no warning while silently operating as only its first 15 characters.
  *
  * Deliberately does NOT return or echo the password in the result (it's a
  * secret, same discipline as `validatePin`): on success it returns only
@@ -142,9 +149,10 @@ export function validatePin(input) {
 export function validateRoomPassword(input) {
   const password = input ?? "";
   const byteLen = new TextEncoder().encode(password).length;
+  const effectiveLimit = MAX_ROOM_PASSWORD_LEN - 1;
   const truncationWarning =
-    byteLen > MAX_ROOM_PASSWORD_LEN
-      ? `guest password is ${byteLen} bytes; the device accepts at most ${MAX_ROOM_PASSWORD_LEN} and will truncate it`
+    byteLen > effectiveLimit
+      ? `guest password is ${byteLen} bytes; the device only uses the first ${effectiveLimit} and will truncate it`
       : null;
   return { ok: true, truncationWarning };
 }
