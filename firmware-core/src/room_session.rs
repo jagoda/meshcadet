@@ -610,16 +610,34 @@ pub fn encode_room_keep_alive_frame(
 /// like on a route that is otherwise fine — invalidating `out_path` on that
 /// alone would spuriously re-flood (costing every relaying node airtime,
 /// unlike a route-direct keep-alive) on routine link noise. A SECOND
-/// consecutive miss, a full `ROOM_KEEP_ALIVE_INTERVAL_MS` (5 minutes) later,
-/// is the discriminator: back-to-back failures that far apart are no longer
-/// explainable as one unlucky frame — the route itself stopped working. At
-/// that 5-minute cadence, N=2 costs ~10 minutes worst-case to
-/// detect-and-recover: still well inside the "human notices the room went
-/// quiet, hasn't yet reached for the power button" window
-/// `ROOM_KEEP_ALIVE_INTERVAL_MS`'s own doc (`firmware/src/main.rs`) argues
-/// for, and it adds no extra airtime at all — the flood re-login this
-/// triggers is the exact same frame the `out_path_len == 0` branch already
-/// sends; this constant only changes when that branch fires.
+/// consecutive miss is the discriminator: back-to-back failures are no
+/// longer explainable as one unlucky frame — the route itself stopped
+/// working.
+///
+/// **Correction (`meshcadet-room-reflood-login-backoff`, FINDING C):** this
+/// doc used to claim the second miss lands "a full
+/// `ROOM_KEEP_ALIVE_INTERVAL_MS` (5 minutes) later", costing "~10 minutes
+/// worst-case to detect-and-recover". That was already false the moment
+/// `meshcadet-room-session-state-to-ui`'s F2 fix shipped: `firmware::main`'s
+/// scheduler ticks every `ROOM_DRAINING_KEEP_ALIVE_INTERVAL_MS` (15 s), not
+/// the routine 5-minute cadence, for as long as
+/// [`RoomSyncPhase::is_draining`] stays true — and it stays true forever
+/// against an offline/decommissioned room server, since a keep-alive ACK is
+/// its only closer. Two misses 15 s apart is exactly the kind of ordinary,
+/// closely-spaced frame loss this constant's N=2 exists to TOLERATE, not
+/// treat as proof of a dead route — so a healthy-but-noisy link can
+/// spuriously invalidate `out_path` under the draining cadence.
+///
+/// This is now a bounded, self-healing cost rather than an unbounded one:
+/// the `out_path_len == 0` re-flood-login branch this invalidation falls
+/// through to no longer shares the draining cadence at all (see
+/// [`room_reflood_interval_ms`]'s doc for FINDING B, the SEV1 this mission
+/// actually fixes) — a spurious invalidation costs exactly one extra flood
+/// re-login, which a healthy room's server answers immediately, resetting
+/// this counter right back via the same reply. Making detection itself
+/// elapsed-time-based (so the rationale above holds unchanged under ANY
+/// cadence, not just the routine one) remains open — tracked, not required
+/// by this mission's fix.
 pub const KEEP_ALIVE_STALL_THRESHOLD: u8 = 2;
 
 /// Reconnect-stall detector: counts consecutive keep-alive ticks whose PRIOR
@@ -827,6 +845,41 @@ pub fn room_keep_alive_interval_ms(
     } else {
         routine_interval_ms
     }
+}
+
+/// Cadence for `firmware::main`'s `out_path_len == 0` re-flood-login
+/// branch — **deliberately decoupled** from [`room_keep_alive_interval_ms`]
+/// above. `meshcadet-room-reflood-login-backoff`'s FINDING B (this
+/// function's whole reason to exist): that gate is
+/// `ROOM_DRAINING_KEEP_ALIVE_INTERVAL_MS` (15 s) for as long as
+/// [`RoomSyncPhase::is_draining`] stays true, and against an offline or
+/// decommissioned room server it stays true FOREVER (a keep-alive ACK is
+/// its only closer, and no ACK will ever arrive from a dead server) —
+/// wiring the reflood branch to that same gate meant such a room re-flooded
+/// a full `ANON_REQ` login every 15 s, forever, with no backoff and no cap.
+/// A flood frame is rebroadcast by every relaying node in the mesh, so an
+/// unbounded 15 s cadence is an airtime/regulatory-duty-cycle defect, not
+/// merely a battery one.
+///
+/// Exponential backoff, entirely independent of the drain/routine cadence
+/// above: `initial_ms` for the first reflood attempt of a "backoff epoch",
+/// doubling on every further consecutive attempt, capped at `ceiling_ms`
+/// (callers should pick a `ceiling_ms` at or above the routine keep-alive
+/// cadence, so a permanently-dead room never re-floods more often than a
+/// routine keep-alive would have anyway). `attempts` is the count of
+/// reflood attempts already sent since the epoch began — `0` for the very
+/// first attempt. The epoch resets (caller passes `attempts: 0` again) the
+/// moment the session proves live again: a successful login reply
+/// (`apply_room_login_outcome`) or an inbound push (`handle_room_push_frame`)
+/// — the exact same two reset conditions [`RoomKeepAliveStall::reset`]'s doc
+/// already documents for the OTHER failure counter this session tracks.
+pub fn room_reflood_interval_ms(attempts: u32, initial_ms: u64, ceiling_ms: u64) -> u64 {
+    // `attempts.min(32)` bounds the shift exponent well clear of `u64`'s 64
+    // bits (a panic in a debug build, silently wrong in release) — backoff
+    // is capped by `ceiling_ms` long before 32 doublings would ever matter.
+    initial_ms
+        .saturating_mul(1u64 << attempts.min(32))
+        .min(ceiling_ms)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -2125,5 +2178,54 @@ mod tests {
             room_keep_alive_interval_ms(12_345, false, 10_000, 15_000, 300_000),
             300_000,
         );
+    }
+
+    // ── `room_reflood_interval_ms` (FINDING B regression guard) ─────────────
+    //
+    // Pins `meshcadet-room-reflood-login-backoff`'s fix: the re-flood-login
+    // branch's cadence must be computable WITHOUT any of
+    // `room_keep_alive_interval_ms`'s inputs (`is_draining`,
+    // `draining_interval_ms`) — the whole point is that it can no longer be
+    // silently re-coupled to that gate.
+
+    #[test]
+    fn reflood_first_attempt_uses_the_initial_backoff() {
+        assert_eq!(room_reflood_interval_ms(0, 30_000, 300_000), 30_000);
+    }
+
+    #[test]
+    fn reflood_backoff_doubles_each_consecutive_attempt() {
+        assert_eq!(room_reflood_interval_ms(1, 30_000, 300_000), 60_000);
+        assert_eq!(room_reflood_interval_ms(2, 30_000, 300_000), 120_000);
+        assert_eq!(room_reflood_interval_ms(3, 30_000, 300_000), 240_000);
+    }
+
+    #[test]
+    fn reflood_backoff_caps_at_the_ceiling_and_never_regresses_below_it() {
+        // Regression guard for the exact FINDING B defect: an offline room
+        // server must never again be re-flooded on an unbounded, un-capped
+        // cadence — every attempt from here on must land at exactly the
+        // ceiling, never above it.
+        for attempts in 4..40 {
+            assert_eq!(
+                room_reflood_interval_ms(attempts, 30_000, 300_000),
+                300_000,
+                "attempt {attempts} must be capped at the ceiling, not left to grow unbounded"
+            );
+        }
+    }
+
+    #[test]
+    fn reflood_backoff_ceiling_is_never_below_the_routine_keep_alive_cadence() {
+        // FINDING B's fix direction: "a ceiling at or above the routine
+        // 300s" — a permanently-dead room server must never be re-flooded
+        // MORE often than a routine keep-alive would have polled anyway.
+        let routine_interval_ms = 300_000;
+        for attempts in 0..20 {
+            assert!(
+                room_reflood_interval_ms(attempts, 30_000, routine_interval_ms)
+                    <= routine_interval_ms,
+            );
+        }
     }
 }
