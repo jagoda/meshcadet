@@ -25,8 +25,8 @@
 //! | `FRAME_ADD_CHANNEL`     | host→device | upsert channel by secret (known key updates in place, new key appends), persist to NVS, reply `RSP_OK` / `RSP_ERROR` |
 //! | `FRAME_DEL_CHANNEL`     | host→device | remove channel, persist to NVS, reply `RSP_OK` / `RSP_ERROR` |
 //! | `FRAME_QUERY_ROOMS`     | host→device | stream `RSP_ROOM` per configured room-server contact, then `RSP_ROOMS_DONE` |
-//! | `FRAME_ADD_ROOM`        | host→device | upsert a room-server contact (`role = ROLE_ROOM`) by pubkey plus its `RoomExtra` (guest password, fresh session state), persist to NVS, reply `RSP_OK` / `RSP_ERROR` |
-//! | `FRAME_DEL_ROOM`        | host→device | remove a room-server contact AND its `RoomExtra`, persist to NVS, reply `RSP_OK` / `RSP_ERROR` |
+//! | `FRAME_ADD_ROOM`        | host→device | upsert a room-server contact (`role = ROLE_ROOM`) by pubkey plus its `RoomExtra` (guest password, fresh session state), erase its dedicated session-store blob (a re-add is a full replace — FINDING D), persist to NVS, reply `RSP_OK` / `RSP_ERROR` |
+//! | `FRAME_DEL_ROOM`        | host→device | remove a room-server contact AND its `RoomExtra`, erase its dedicated session-store blob (FINDING D), persist to NVS, reply `RSP_OK` / `RSP_ERROR` — the dispatcher's live `room_runtime` entry is pruned only on the NEXT REBOOT (FINDING E, reboot-required MVP, mirrors `FRAME_CLEAR_HISTORY`'s posture) |
 //! | `FRAME_SET_NOTIF_DEFAULTS`| host→device | update notif defaults, persist to NVS, reply `RSP_OK` / `RSP_ERROR` |
 //! | `FRAME_SET_PIN`         | host→device | set/reset PIN, persist to NVS, reply `RSP_OK` / `RSP_ERROR` |
 //! | `FRAME_SET_DEVICE_NAME` | host→device | set device display name, persist to identity store, reply `RSP_OK` / `RSP_ERROR` |
@@ -96,6 +96,7 @@ use crate::config_store::{
     NotifDefaults, ProvisionedConfig, ROLE_CHAT,
 };
 use crate::history_store::HistoryStore;
+use crate::room_session;
 
 /// Frame receive buffer.  Sized to match `provisioning_server` (512 B) so the
 /// largest host command frame always fits: an `ADD_CONTACT` / `ADD_CHANNEL`
@@ -571,6 +572,18 @@ fn handle_frame(
         // to the unknown-frame arm and left `meshcadet add-room` hanging to
         // the host's retry limit with no reply at all — the M1 gate's finding.
         //
+        // FINDING D (deep-review pass 2): `RoomExtra`'s reset above is not the
+        // whole story — `main.rs`'s dispatcher loop resumes a room's session
+        // from `room_session::load_room_session`'s *dedicated* `mc_room` NVS
+        // blob in preference to this freshly reset `RoomExtra` seed
+        // (`load_room_session(..).unwrap_or(seed)`). Left alone, that stale
+        // blob would shadow this reset at the next boot — a stale
+        // `sync_since` drops backlog, a stale `out_path` is a dead route, and
+        // a stale `permissions` outlives a password rotation. A re-add is
+        // documented above as a full replace, so the dedicated store must be
+        // erased here too, keyed by the same pub_hash byte the arm already
+        // reads below.
+        //
         // GUEST PASSWORD DISCIPLINE (ADR-0001 §4): the password crosses the
         // USB link in the clear by design, but it is never logged, echoed, or
         // placed in an error message here — the log line below deliberately
@@ -584,10 +597,12 @@ fn handle_frame(
                     // log, just read directly off the raw bytes since this arm
                     // never decodes the payload itself (that now lives in
                     // room_admin::handle_add_room).
-                    log::info!(
-                        "admin_server: ADD_ROOM pub_hash=0x{:02x}",
-                        payload.first().copied().unwrap_or(0)
-                    );
+                    let hash = payload.first().copied().unwrap_or(0);
+                    log::info!("admin_server: ADD_ROOM pub_hash=0x{:02x}", hash);
+                    // See FINDING D comment above: a re-add is a full replace,
+                    // so the dedicated session store must not be left to
+                    // shadow the reset RoomExtra seed at the next boot.
+                    room_session::delete_room_session(nvs_partition.clone(), hash);
                     persist_or_rollback(config, nvs_partition, out, ConfigKind::Room)?;
                 }
                 AddRoomOutcome::ListFull => {
@@ -604,15 +619,37 @@ fn handle_frame(
         // both the `Contact` entry AND its paired `RoomExtra`
         // (`ProvisionedConfig::remove_room`), leaving every neighbouring
         // contact/channel untouched.
+        //
+        // FINDING D (deep-review pass 2): also erase this room's dedicated
+        // `mc_room` session-store blob (see the ADD_ROOM arm's comment for the
+        // full mechanism) — otherwise a FUTURE room added later that happens
+        // to collide on this same 1-byte pubkey hash (1-in-256) would silently
+        // resume the deleted room's watermark/route/permission at boot.
+        //
+        // FINDING E (deep-review pass 2, reboot-required MVP — mirrors the
+        // CLEAR_HISTORY DESIGN DECISION above): this arm mutates only this
+        // thread's `ProvisionedConfig` and the two NVS blobs above. The
+        // dispatcher loop's `room_runtime: Vec<RoomRuntime>` (`main.rs`) is
+        // built ONCE at boot from the loaded config and is never pruned at
+        // runtime — this thread has no handle into it, same "no cross-thread
+        // live-mutation channel exists yet" limit CLEAR_HISTORY's comment
+        // documents for the UI thread. Concretely: until the next reboot, the
+        // device keeps logging in to, keep-aliving, ACKing pushes from, and
+        // appending history for a room the admin just explicitly deleted —
+        // an ACTIVE on-air consequence, not just a passive stale-allowlist
+        // one (contrast a deleted plain CONTACT/CHANNEL, which the dispatcher
+        // never proactively talks to on its own). `RSP_OK` here only promises
+        // the config/NVS state is gone; `host::del_room`'s caller prints the
+        // "reboot required to stop talking to this room" notice — never
+        // silently.
         FRAME_DEL_ROOM => {
             match room_admin::handle_del_room(config, payload) {
                 DelRoomOutcome::Removed => {
                     // payload[0] is the pubkey's first byte per DelRoomPayload's
                     // wire layout (`pubkey(32)`) — see the ADD_ROOM arm's comment.
-                    log::info!(
-                        "admin_server: DEL_ROOM pub_hash=0x{:02x}",
-                        payload.first().copied().unwrap_or(0)
-                    );
+                    let hash = payload.first().copied().unwrap_or(0);
+                    log::info!("admin_server: DEL_ROOM pub_hash=0x{:02x}", hash);
+                    room_session::delete_room_session(nvs_partition.clone(), hash);
                     persist_or_rollback(config, nvs_partition, out, ConfigKind::Room)?;
                 }
                 DelRoomOutcome::NotFound => {

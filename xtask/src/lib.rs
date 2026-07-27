@@ -75,6 +75,7 @@ use std::path::{Path, PathBuf};
 
 /// Provisioning-codec golden-vector generator — see `golden`'s module doc.
 pub mod golden;
+pub mod room_session_erase;
 pub mod ui_event_parity;
 
 /// One known, already-documented, deliberately-deferred gap — see

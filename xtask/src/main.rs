@@ -11,6 +11,9 @@
 //! - **verify-font-table-counts** — each `gen_emoji_font.c` `#define N_*`
 //!   matches its paired array's real element count (see
 //!   `xtask::font_table_count_mismatches`'s doc).
+//! - **verify-room-session-erase** — `admin_server.rs`'s `ADD_ROOM`/`DEL_ROOM`
+//!   arms erase the room's dedicated NVS session store (see
+//!   `xtask::room_session_erase`'s doc).
 //!
 //! Both also run as `cargo test`s, which is what CI / every downstream change
 //! actually gates on; this binary exists for a quick manual re-check with a
@@ -69,6 +72,24 @@ fn main() -> ExitCode {
         );
         for m in &count_mismatches {
             eprintln!("  - {m}");
+        }
+    }
+
+    let session_erase = xtask::room_session_erase::check(&repo_root);
+    if session_erase.is_empty() {
+        println!(
+            "xtask verify-room-session-erase: OK — {}'s ADD_ROOM/DEL_ROOM arms erase the \
+             dedicated room session store.",
+            xtask::room_session_erase::ADMIN_SERVER_REL_PATH
+        );
+    } else {
+        ok = false;
+        eprintln!(
+            "xtask verify-room-session-erase: FAILED — {} violation(s):",
+            session_erase.len()
+        );
+        for v in &session_erase {
+            eprintln!("  - {v}");
         }
     }
 
