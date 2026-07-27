@@ -8,6 +8,9 @@
 //!   Slint literal is registered and rasterised (see `xtask::check`'s doc).
 //! - **verify-ui-event-parity** — the room-post notification-surface contract
 //!   in `UiRuntime::handle_event` (see `xtask::ui_event_parity`'s doc).
+//! - **verify-font-table-counts** — each `gen_emoji_font.c` `#define N_*`
+//!   matches its paired array's real element count (see
+//!   `xtask::font_table_count_mismatches`'s doc).
 //!
 //! Both also run as `cargo test`s, which is what CI / every downstream change
 //! actually gates on; this binary exists for a quick manual re-check with a
@@ -49,6 +52,23 @@ fn main() -> ExitCode {
         );
         for v in &parity {
             eprintln!("  - {v}");
+        }
+    }
+
+    let count_mismatches =
+        xtask::font_table_count_mismatches(&repo_root.join("firmware/gen_emoji_font.c"));
+    if count_mismatches.is_empty() {
+        println!(
+            "xtask verify-font-table-counts: OK — every gen_emoji_font.c #define N_* matches its paired array's element count."
+        );
+    } else {
+        ok = false;
+        eprintln!(
+            "xtask verify-font-table-counts: FAILED — {} mismatch(es):",
+            count_mismatches.len()
+        );
+        for m in &count_mismatches {
+            eprintln!("  - {m}");
         }
     }
 
