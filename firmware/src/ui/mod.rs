@@ -210,6 +210,27 @@ pub enum UiEvent {
         room_hash: u8,
         count: u32,
     },
+    /// This room's session permission was just (re-)learned at runtime —
+    /// raised by `main.rs::apply_room_login_outcome` every time a room login
+    /// reply (boot login OR a stall-triggered relearn) applies a new
+    /// `RoomLoginOutcome`, carrying `can_post` off that outcome's
+    /// `RoomPermission::can_post()`.
+    ///
+    /// Fixes the defect where `register_room` was only ever called ONCE at
+    /// boot off the RESUMED session — on first boot after provisioning
+    /// that's the provisioning-time seed, `Guest`/`can_post: false`
+    /// (permissions are runtime-learned, ADR-0002 §7) — so a successful
+    /// `READ_WRITE` login left `room_permissions` stuck at the stale
+    /// boot-time value: compose stayed disabled and the read-only indicator
+    /// stayed lit until the device was rebooted. `handle_event` re-runs
+    /// [`UiRuntime::register_room`] with the fresh value so the NEXT
+    /// `navigate_to_compose` (and any already-open compose, via its
+    /// `read_only` re-check) reflects the session the device actually holds
+    /// right now, not the one it booted with.
+    RoomPermissionUpdated {
+        room_hash: u8,
+        can_post: bool,
+    },
 }
 
 /// Commands from the UI layer to the radio dispatcher.
@@ -2012,6 +2033,25 @@ impl<'d> UiRuntime<'d> {
                         &self.channel_items, &self.messages, &self.unread,
                     );
                     screen.set_channels(&channels);
+                }
+            }
+            UiEvent::RoomPermissionUpdated { room_hash, can_post } => {
+                log::info!(
+                    "ui: room 0x{:02x} session permission updated: can_post={}",
+                    room_hash, can_post,
+                );
+                self.register_room(room_hash, can_post);
+                // If this room's compose box happens to be open RIGHT NOW
+                // (a login/relearn completing while the user is mid-draft),
+                // flip its `read_only` live too — `register_room` alone only
+                // takes effect on the NEXT `navigate_to_compose`, and a
+                // stale disabled Send button while the session is actually
+                // writable now is the exact defect this event exists to
+                // close.
+                if self.active_convo == Some((room_hash, true)) {
+                    if let ActiveScreen::Compose(ref screen) = self.active_screen {
+                        screen.set_read_only(!can_post);
+                    }
                 }
             }
             UiEvent::DmAcked { to_hash } => {

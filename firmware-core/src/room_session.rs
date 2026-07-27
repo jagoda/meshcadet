@@ -753,6 +753,52 @@ impl RoomSyncPhase {
     }
 }
 
+/// Selects which cadence a room's keep-alive scheduler tick should gate on,
+/// given whether a keep-alive has EVER been sent for this session
+/// (`last_keep_alive_ms == 0` — `main.rs`'s `RoomRuntime::last_keep_alive_ms`
+/// doc: `0` is the "never yet" sentinel, set to a real, necessarily-nonzero
+/// `uptime_ms()` reading the first time a tick actually fires) and whether
+/// [`RoomSyncPhase::is_draining`] is still true.
+///
+/// F2 of `meshcadet-room-session-state-to-ui`'s Objective: a single
+/// `routine_interval_ms` gate compared against a `last_keep_alive_ms: 0`
+/// sentinel and a same-scale `now_ms` (both `uptime_ms()`-based) means the
+/// FIRST keep-alive of every boot doesn't fire until a full
+/// `routine_interval_ms` of uptime has elapsed — up to 5 minutes with
+/// `firmware::main::ROOM_KEEP_ALIVE_INTERVAL_MS`'s 300_000 ms cadence — even
+/// though [`RoomSyncPhase::new_after_login`] starts `draining: true` and its
+/// ONLY closer ([`RoomSyncPhase::on_keep_alive_ack`]) needs a keep-alive ACK
+/// to ever run. Every room push absorbed in that window is silently folded
+/// into an aggregate that then sits unfired for however much of the 5
+/// minutes remains, no matter how quickly the actual backlog drained.
+///
+/// Three distinct cadences:
+///   - `first_delay_ms`: gates the very first tick after login (detected via
+///     the `last_keep_alive_ms == 0` sentinel) — short, so the scheduler
+///     doesn't idle for a full `routine_interval_ms` while the login flood
+///     is still routing back, but still long enough to give that flood a
+///     realistic chance to land before this tick re-floods it again.
+///   - `draining_interval_ms`: every tick after that while the drain window
+///     is still open — must be polled far more often than the routine
+///     cadence, since it is the only thing that can ever close that window.
+///   - `routine_interval_ms`: the steady-state liveness cadence once the
+///     drain window has closed — unchanged from before this fix.
+pub fn room_keep_alive_interval_ms(
+    last_keep_alive_ms: u64,
+    is_draining: bool,
+    first_delay_ms: u64,
+    draining_interval_ms: u64,
+    routine_interval_ms: u64,
+) -> u64 {
+    if last_keep_alive_ms == 0 {
+        first_delay_ms
+    } else if is_draining {
+        draining_interval_ms
+    } else {
+        routine_interval_ms
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1953,6 +1999,53 @@ mod tests {
             phase.on_keep_alive_ack(unsynced),
             Some(RoomNotification::Aggregate { count: 32 }),
             "closing the drain window fires exactly ONE aggregate notification for all 32"
+        );
+    }
+
+    // ── `room_keep_alive_interval_ms` (F2 regression guard) ─────────────────
+    //
+    // Pins `meshcadet-room-session-state-to-ui`'s F2 fix: the scheduler must
+    // never gate its FIRST post-login tick on the full routine cadence, and
+    // must poll far more often than that routine cadence while
+    // `RoomSyncPhase::is_draining()` is still true.
+
+    #[test]
+    fn first_tick_always_uses_the_short_first_delay_regardless_of_drain_state() {
+        // `last_keep_alive_ms == 0` is the "never ticked yet" sentinel — the
+        // short delay applies whether or not `is_draining` happens to be
+        // true, since a fresh `RoomSyncPhase::new_after_login()` always is.
+        assert_eq!(
+            room_keep_alive_interval_ms(0, true, 10_000, 15_000, 300_000),
+            10_000,
+        );
+        assert_eq!(
+            room_keep_alive_interval_ms(0, false, 10_000, 15_000, 300_000),
+            10_000,
+        );
+    }
+
+    #[test]
+    fn draining_session_uses_the_tight_cadence_not_the_routine_one() {
+        // Regression guard for the exact F2 defect: with the old single-gate
+        // scheduler, a still-draining session waited the FULL routine
+        // interval (300_000 ms) between ticks — up to 5 minutes before the
+        // drain window's only closer (a keep-alive ACK) could even be sent
+        // again, no matter how quickly the underlying backlog itself
+        // finished pushing. `last_keep_alive_ms` nonzero here models "a
+        // keep-alive has already fired once" (the first-tick branch above
+        // no longer applies).
+        assert_eq!(
+            room_keep_alive_interval_ms(12_345, true, 10_000, 15_000, 300_000),
+            15_000,
+            "a still-draining session must poll on the tight cadence, not the 5-minute one"
+        );
+    }
+
+    #[test]
+    fn drained_session_reverts_to_the_routine_cadence() {
+        assert_eq!(
+            room_keep_alive_interval_ms(12_345, false, 10_000, 15_000, 300_000),
+            300_000,
         );
     }
 }
