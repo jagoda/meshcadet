@@ -36,8 +36,8 @@ pub use firmware_core::room_session::*;
 
 const NVS_NAMESPACE: &str = "mc_room";
 
-// Every call site of the three functions below lives in `main.rs` behind
-// `#[cfg(not(feature = "hil"))]` (there are no rooms under `hil`), so a
+// Every call site of the functions below lives in `main.rs` or `admin_server.rs`
+// behind `#[cfg(not(feature = "hil"))]` (there are no rooms under `hil`), so a
 // `hil` build never calls into this file at all — `allow(dead_code)` there
 // is genuinely dead in that profile, not a mistake.
 
@@ -113,6 +113,44 @@ pub fn save_room_session(
     if let Err(e) = nvs.set_blob(key, &blob[..n]) {
         log::warn!(
             "room_session: NVS write failed for room 0x{:02x} ({:?})",
+            hash,
+            e
+        );
+    }
+}
+
+/// Erase a room's dedicated session-learned state, keyed by its pubkey hash
+/// byte. Call sites: `admin_server`'s `DEL_ROOM` handler (the room is gone —
+/// leaving its blob behind would let a *different* future room that happens
+/// to collide on the same hash byte silently inherit a stale watermark/route/
+/// permission) and its `ADD_ROOM` handler (a re-add is a documented
+/// full-replace of `RoomExtra` — see `room_admin::handle_add_room`'s doc —
+/// and this dedicated store must not be allowed to shadow that reset seed at
+/// the next boot's `load_room_session(..).unwrap_or(seed)` resume, which is
+/// exactly what happens if this store still holds the pre-reset blob).
+///
+/// A missing key is not an error (`EspNvs::remove` reports `Ok(false)`, not
+/// `Err`) — nothing to do. An actual NVS error is logged and non-fatal, same
+/// posture as [`save_room_session`]: worst case a re-add's dedicated-store
+/// blob lingers stale, exactly the FINDING D defect this function exists to
+/// close, surfaced in the log for a human to notice.
+#[cfg_attr(feature = "hil", allow(dead_code))]
+pub fn delete_room_session(nvs_partition: EspNvsPartition<NvsDefault>, hash: u8) {
+    let nvs = match EspNvs::new(nvs_partition, NVS_NAMESPACE, true) {
+        Ok(nvs) => nvs,
+        Err(e) => {
+            log::warn!(
+                "room_session: failed to open NVS namespace for erase ({:?})",
+                e
+            );
+            return;
+        }
+    };
+    let mut key_buf = [0u8; 3];
+    let key = room_key(hash, &mut key_buf);
+    if let Err(e) = nvs.remove(key) {
+        log::warn!(
+            "room_session: NVS erase failed for room 0x{:02x} ({:?})",
             hash,
             e
         );

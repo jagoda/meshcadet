@@ -625,6 +625,18 @@ fn main() -> anyhow::Result<()> {
             let pk = parse_32bytes_hex(&pubkey, "pubkey")?;
             session.del_room(&pk)?;
             println!("room removed: {}", hex_short(&pk));
+            // FINDING E (deep-review pass 2, meshcadet-room-lifecycle-session-store):
+            // unlike a deleted plain contact/channel, a room server has an
+            // ACTIVE dispatcher-loop session (`RoomRuntime` in firmware's
+            // main.rs) that this edit does not touch — see admin_server.rs's
+            // FRAME_DEL_ROOM handler doc. Until the device reboots it keeps
+            // logging in to, keep-aliving, and syncing from this room exactly
+            // as before, so the operator must not be left assuming the device
+            // stopped talking to it the moment this command returns.
+            println!(
+                "  note: reboot the device to stop it logging in to / syncing from this room \
+                 (the live session keeps running until then)."
+            );
         }
 
         Cmd::SetNotifDefaults { visual, audible } => {
