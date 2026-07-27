@@ -221,6 +221,85 @@ fn extract_dec_numbers(body: &str) -> Vec<u32> {
         .collect()
 }
 
+/// A `#define NAME <value>` integer constant's numeral base — determines
+/// whether its paired array's element count is taken via
+/// [`extract_hex_numbers`] or [`extract_dec_numbers`].
+#[derive(Clone, Copy)]
+enum NumberKind {
+    Hex,
+    Dec,
+}
+
+/// The 5 hand-paired (`#define` count, sibling array) pairs `gen_emoji_font.c`
+/// requires callers to keep in sync manually (see the module doc's "Level 1"
+/// motivation for this check: the C generator's `for (i = 0; i < N_*; i++)`
+/// loops trust these counts blindly — a stale one is UB, not a compile error).
+const COUNT_PAIRS: &[(&str, &str, NumberKind)] = &[
+    ("N_EMOJI_TABLE", "EMOJI_CPS", NumberKind::Hex),
+    ("N_UI_EXTRA", "UI_EXTRA_CPS", NumberKind::Hex),
+    ("N_BMP_SYMBOLS", "BMP_SYMBOLS", NumberKind::Hex),
+    ("N_SIZES", "PIXEL_SIZES", NumberKind::Dec),
+    ("N_EMOJI_SIZES", "EMOJI_SIZES", NumberKind::Dec),
+];
+
+/// Extract a top-level `#define NAME <value>` integer constant's value.
+///
+/// Runs over `masked` (comment/string-blanked) text, not raw source, for the
+/// same reason [`font_table_count_mismatches`] extracts array bodies from
+/// masked text: consistency, even though a `#define` living inside a comment
+/// would be unusual.
+fn extract_define_value(masked: &str, name: &str) -> Option<i64> {
+    let re = Regex::new(&format!(
+        r"(?m)^\s*#define\s+{}\s+(-?\d+)\b",
+        regex::escape(name)
+    ))
+    .unwrap();
+    re.captures(masked)?.get(1)?.as_str().parse().ok()
+}
+
+/// Check all 5 `#define N_*` / sibling-array pairs in `gen_emoji_font.c` for
+/// count parity, returning a human-readable mismatch description per pair
+/// that disagrees (empty = all 5 pairs agree).
+///
+/// CRITICAL: array bodies here MUST be counted over `tokenize(&src).masked`,
+/// not raw source. `gen_emoji_font.c`'s array bodies carry codepoint hex
+/// literals INSIDE `// BUG FIX` comments (documenting codepoints swapped OUT
+/// of the table for font-coverage reasons) — a raw-text regex count over-
+/// counts those (measured: raw EMOJI_CPS=45 vs N_EMOJI_TABLE=40, raw
+/// BMP_SYMBOLS=15 vs N_BMP_SYMBOLS=10) and would fail this check on
+/// legitimate, already-correct code. `tokenize()` blanks comment/string
+/// bodies to spaces, so its masked output counts only real array elements.
+pub fn font_table_count_mismatches(gen_emoji_font_c: &Path) -> Vec<String> {
+    let src = fs::read_to_string(gen_emoji_font_c)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", gen_emoji_font_c.display()));
+    let masked = tokenize(&src).masked;
+
+    let mut mismatches = Vec::new();
+    for (define_name, array_name, kind) in COUNT_PAIRS {
+        let body = extract_array(&masked, array_name);
+        let count = match kind {
+            NumberKind::Hex => extract_hex_numbers(&body).len(),
+            NumberKind::Dec => extract_dec_numbers(&body).len(),
+        };
+        let Some(define_value) = extract_define_value(&masked, define_name) else {
+            mismatches.push(format!(
+                "#define {define_name} not found in {}",
+                gen_emoji_font_c.display()
+            ));
+            continue;
+        };
+        if define_value != count as i64 {
+            mismatches.push(format!(
+                "#define {define_name} = {define_value} but {array_name}[] has {count} \
+                 element(s) — a stale count makes gen_emoji_font.c's `for (i = 0; i < \
+                 {define_name}; i++)` loop read past the array bound (embedding garbage \
+                 codepoints) or silently drop trailing entries"
+            ));
+        }
+    }
+    mismatches
+}
+
 fn parse_font_tables(gen_emoji_font_c: &Path) -> FontTables {
     let src = fs::read_to_string(gen_emoji_font_c)
         .unwrap_or_else(|e| panic!("reading {}: {e}", gen_emoji_font_c.display()));
@@ -765,6 +844,69 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
+    }
+
+    #[test]
+    fn font_table_counts_match_array_lengths() {
+        let mismatches = font_table_count_mismatches(
+            &repo_root_from_manifest_dir().join("firmware/gen_emoji_font.c"),
+        );
+        assert!(
+            mismatches.is_empty(),
+            "\nfont-table count/array parity check found {} mismatch(es):\n{}\n",
+            mismatches.len(),
+            mismatches
+                .iter()
+                .map(|m| format!("  - {m}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// Regression guard for the exact gotcha this check exists to dodge: a
+    /// codepoint mentioned only in a `// BUG FIX` comment must NOT inflate
+    /// the counted array length (that would over-count and either mask a
+    /// real stale-count bug or spuriously fail on legitimate code) — while a
+    /// genuinely stale `#define` must still be caught.
+    #[test]
+    fn font_table_count_mismatch_is_detected_and_comment_codepoints_are_ignored() {
+        const FIXTURE: &str = r#"
+static const unsigned long EMOJI_CPS[] = {
+    // BUG FIX: 0x1F914 mentioned only in this comment must not be counted
+    0x1F600, 0x1F601,
+};
+#define N_EMOJI_TABLE 3
+static const unsigned long UI_EXTRA_CPS[] = {
+    0x1F4E4,
+};
+#define N_UI_EXTRA 1
+static const unsigned long BMP_SYMBOLS[] = {
+    0x2039,
+};
+#define N_BMP_SYMBOLS 1
+static const int PIXEL_SIZES[] = {8, 9};
+#define N_SIZES 2
+static const int EMOJI_SIZES[] = {11};
+#define N_EMOJI_SIZES 1
+"#;
+        let dir = std::env::temp_dir().join(format!(
+            "xtask-count-fixture-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gen_emoji_font.c");
+        fs::write(&path, FIXTURE).unwrap();
+        let mismatches = font_table_count_mismatches(&path);
+        cleanup_fixture(&dir);
+
+        assert_eq!(
+            mismatches.len(),
+            1,
+            "expected exactly the N_EMOJI_TABLE mismatch, got: {mismatches:?}"
+        );
+        assert!(mismatches[0].contains("N_EMOJI_TABLE = 3"));
+        assert!(mismatches[0].contains("2 element(s)"));
     }
 
     #[test]
