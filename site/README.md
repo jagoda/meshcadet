@@ -188,10 +188,13 @@ all three in sync.
   guidance and unsupported-browser fallback), then render status/identity
   (via `session.js`) and BOTH contact-sharing formats (via `contact-uri.js`),
   exactly mirroring the host CLI's `identity` command: **Format A**, a
-  MeshCore companion-app QR, rendered by a major-version-pinned CDN import of
-  the `qrcode` npm package via esm.sh (pure JS, no WASM) — the same
-  single-pinned-CDN-import, no-bundler pattern `flash.html` uses for
-  esp-web-tools; and **Format B**, the device's signed self-advert card
+  MeshCore companion-app QR, rendered by the `qrcode` npm package (pure JS, no
+  WASM) — vendored locally at `vendor/qrcode.js` rather than CDN-imported,
+  because this is the one page on the site that handles secrets (channel
+  secret, admin PIN, room guest password); see that file's own header and
+  `vendor/qrcode-LICENSE.txt` for provenance/license, and contrast
+  `flash.html`, which has no secrets to protect and still CDN-imports
+  esp-web-tools/esptool-js; and **Format B**, the device's signed self-advert card
   fetched fresh over Web Serial every read (`session.queryAdvert()`) and
   rendered as a copyable `meshcore://<hex>` string (`cardToUri`) for
   `meshcore-cli import-contact`. Format B's fetch is non-fatal on failure
@@ -232,6 +235,13 @@ all three in sync.
   (`session.smoke.test.mjs`'s room scenarios; `guest-password-hygiene.test.mjs`
   for the storage/console/URL/autofill invariants specifically) — see that
   test file's own header for why it's split from `session.smoke.test.mjs`.
+- `vendor/` — third-party browser code vendored (fetched, reviewed, and
+  committed) rather than CDN-imported, because `provisioner.html` is the one
+  page on the site that handles secrets and so loads no third-party script
+  origin at all (see `provisioner.html`'s Content-Security-Policy meta tag
+  and `provisioner.js`'s own header). `qrcode.js` is the only entry today —
+  see its own header for provenance/upgrade instructions and
+  `qrcode-LICENSE.txt` for the MIT license texts it carries.
 - `styles.css` — one stylesheet, no build step. Color tokens at the top
   mirror `firmware/src/ui/theme.slint`'s `Theme` global 1:1, so the site and
   the on-device UI read as the same product. Keep them in sync if the
@@ -274,6 +284,20 @@ all three in sync.
   two-step Actions job (`upload-pages-artifact` + `deploy-pages`) with zero
   toolchain. If this grows enough to need templating, revisit — but a static
   landing page doesn't.
+- **Every page carries a Content-Security-Policy `<meta>` tag** (GitHub Pages
+  can't set response headers, so this is the only enforcement mechanism
+  available — meshcadet-channel-secret-leak-security-audit finding B3). Each
+  page's policy is scoped to what it actually loads, not copy-pasted:
+  `index.html` has no script and no fetch of its own, so it's `default-src
+  'self'` and nothing more; `flash.html` CDN-imports `esptool-js` and fetches
+  `api.github.com` + same-origin `firmware/`, so it adds `script-src 'self'
+  https://unpkg.com; connect-src 'self' https://api.github.com` on top of the
+  same `default-src 'self'` baseline; `provisioner.html` is the one page that
+  handles secrets and, after `vendor/qrcode.js` above, loads no third-party
+  script and issues no fetch of any kind, so it adds `connect-src 'none'` —
+  the tightest policy on the site, on the page that most needs it. If you add
+  a new page or a new external resource to an existing one, update that
+  page's policy to match rather than loosening it site-wide.
 
 ## Local preview
 
