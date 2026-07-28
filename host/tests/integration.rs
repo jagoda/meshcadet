@@ -2314,6 +2314,31 @@ fn test_cli_help_lists_gen_channel_secret() {
     );
 }
 
+/// REGRESSION guard (finding C1, meshcadet-channel-secret-leak-security-audit):
+/// `gen-channel-secret --help`'s composition example must point at the
+/// `--secret-stdin` pipe form, not at capturing the secret into a shell
+/// variable / `--secret "$(...)"`, which lands right back on argv (visible
+/// via `ps`/`/proc/<pid>/cmdline`) and defeats the whole point of B1's
+/// `--secret-file`/`--secret-env`/`--secret-stdin` work.
+#[test]
+fn test_cli_gen_channel_secret_help_recommends_stdin_pipe_not_argv() {
+    let exe = env!("CARGO_BIN_EXE_meshcadet");
+    let output = std::process::Command::new(exe)
+        .args(["gen-channel-secret", "--help"])
+        .output()
+        .expect("meshcadet gen-channel-secret --help must run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--secret-stdin"),
+        "gen-channel-secret --help must recommend piping into --secret-stdin:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("--secret \"$("),
+        "gen-channel-secret --help must not show the argv-exposing \
+         --secret \"$(...)\" composition:\n{stdout}"
+    );
+}
+
 /// Acceptance: `meshcadet identity --help` must list the `--raw` flag — the
 /// host CLI's contract for exposing Format B's machine-readable/piping form.
 #[test]

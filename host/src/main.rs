@@ -234,14 +234,23 @@ enum Cmd {
     /// Uses `OsRng` (matches the RNG `firmware`/`protocol` already use for
     /// identity key material) — never hand-type a channel secret, since
     /// `parse_channel_secret_hex` only validates hex-ness and length, not
-    /// entropy. Output is exactly the hex format `add-channel --secret` /
-    /// `del-channel --secret` expect (lowercase, no `0x` prefix), so it
-    /// composes directly:
+    /// entropy. Output is exactly the hex format `add-channel --secret-stdin`
+    /// / `del-channel --secret-stdin` expect (lowercase, no `0x` prefix, one
+    /// line), so it composes directly via a pipe:
     ///
     /// ```text
-    /// meshcadet --port /dev/ttyUSB0 add-channel \
-    ///   --secret "$(meshcadet gen-channel-secret --bits 256)" --name family --primary
+    /// meshcadet gen-channel-secret --bits 256 \
+    ///   | meshcadet --port /dev/ttyUSB0 add-channel --secret-stdin --name family --primary
     /// ```
+    ///
+    /// Pipe it — do not capture it into a shell variable and hand it back on
+    /// the command line. A command-substituted argument still lands on
+    /// argv, which is visible to every other user via `ps`/`/proc/<pid>/cmdline`
+    /// for as long as the process runs, exactly the exposure
+    /// `--secret-file`/`--secret-env`/`--secret-stdin` exist to avoid (see
+    /// `AddChannel`'s doc comment). `--secret-stdin` reads a single line, so
+    /// a straight pipe from this command's one-line stdout is the canonical
+    /// composition.
     ///
     /// Does not require `--port` — this never touches the device.
     GenChannelSecret {
