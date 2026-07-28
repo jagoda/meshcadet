@@ -2223,6 +2223,122 @@ fn test_cli_clear_history_subcommand_help() {
     );
 }
 
+/// Acceptance: `meshcadet gen-channel-secret` runs end-to-end with NO
+/// `--port` at all — it's a pure-local CSPRNG operation with no device round
+/// trip, so requiring a (possibly nonexistent) serial port would be a
+/// regression. Covers both accepted widths and pins the exact hex shape
+/// `add-channel --secret` / `del-channel --secret` expect: lowercase, no
+/// `0x` prefix, exact length, trailing newline only.
+#[test]
+fn test_cli_gen_channel_secret_runs_without_port() {
+    let exe = env!("CARGO_BIN_EXE_meshcadet");
+
+    for (bits, expected_hex_len) in [("128", 32), ("256", 64)] {
+        let output = std::process::Command::new(exe)
+            .args(["gen-channel-secret", "--bits", bits])
+            .output()
+            .expect("gen-channel-secret must run without --port");
+        assert!(
+            output.status.success(),
+            "gen-channel-secret --bits {bits} must exit successfully: {:?}",
+            output
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let secret = stdout.trim_end_matches('\n');
+        assert_eq!(
+            secret.len(),
+            expected_hex_len,
+            "--bits {bits} must print exactly {expected_hex_len} hex chars, got {:?}",
+            stdout
+        );
+        assert!(
+            secret
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "gen-channel-secret output must be lowercase hex with no prefix: {:?}",
+            stdout
+        );
+    }
+}
+
+/// Regression guard for making `--port` optional at the `Cli` level (needed
+/// so `gen-channel-secret` can skip it): every OTHER command must still
+/// refuse to run without `--port`, with an actionable error rather than a
+/// panic or a confusing transport-layer failure.
+#[test]
+fn test_cli_status_without_port_errors_actionably() {
+    let exe = env!("CARGO_BIN_EXE_meshcadet");
+    let output = std::process::Command::new(exe)
+        .arg("status")
+        .output()
+        .expect("meshcadet status must run (and fail cleanly)");
+    assert!(!output.status.success(), "status without --port must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--port") && stderr.contains("required"),
+        "error must name --port as the missing requirement: {stderr}"
+    );
+}
+
+/// Two `gen-channel-secret` invocations must not print the same value —
+/// the cheapest possible check that this is actually drawing from the CSPRNG
+/// each run, not a fixed/cached buffer.
+#[test]
+fn test_cli_gen_channel_secret_two_runs_differ() {
+    let exe = env!("CARGO_BIN_EXE_meshcadet");
+    let run = || {
+        let output = std::process::Command::new(exe)
+            .args(["gen-channel-secret", "--bits", "256"])
+            .output()
+            .expect("gen-channel-secret must run");
+        String::from_utf8_lossy(&output.stdout)
+            .trim_end_matches('\n')
+            .to_string()
+    };
+    assert_ne!(run(), run());
+}
+
+/// Acceptance: `meshcadet --help` must list `gen-channel-secret` as a
+/// subcommand.
+#[test]
+fn test_cli_help_lists_gen_channel_secret() {
+    let exe = env!("CARGO_BIN_EXE_meshcadet");
+    let output = std::process::Command::new(exe)
+        .arg("--help")
+        .output()
+        .expect("meshcadet --help must run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("gen-channel-secret"),
+        "--help output must list the gen-channel-secret subcommand:\n{stdout}"
+    );
+}
+
+/// REGRESSION guard (finding C1, meshcadet-channel-secret-leak-security-audit):
+/// `gen-channel-secret --help`'s composition example must point at the
+/// `--secret-stdin` pipe form, not at capturing the secret into a shell
+/// variable / `--secret "$(...)"`, which lands right back on argv (visible
+/// via `ps`/`/proc/<pid>/cmdline`) and defeats the whole point of B1's
+/// `--secret-file`/`--secret-env`/`--secret-stdin` work.
+#[test]
+fn test_cli_gen_channel_secret_help_recommends_stdin_pipe_not_argv() {
+    let exe = env!("CARGO_BIN_EXE_meshcadet");
+    let output = std::process::Command::new(exe)
+        .args(["gen-channel-secret", "--help"])
+        .output()
+        .expect("meshcadet gen-channel-secret --help must run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--secret-stdin"),
+        "gen-channel-secret --help must recommend piping into --secret-stdin:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("--secret \"$("),
+        "gen-channel-secret --help must not show the argv-exposing \
+         --secret \"$(...)\" composition:\n{stdout}"
+    );
+}
+
 /// Acceptance: `meshcadet identity --help` must list the `--raw` flag — the
 /// host CLI's contract for exposing Format B's machine-readable/piping form.
 #[test]

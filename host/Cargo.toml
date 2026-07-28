@@ -26,6 +26,9 @@ qrcode = { version = "0.14", default-features = false }
 # Local-time rendering for export-history timestamps (std alone can't resolve
 # the local timezone offset).
 chrono = "0.4"
+# CSPRNG for `gen-channel-secret` (OsRng, matches firmware/src/identity_store.rs's
+# and protocol/src/identity.rs's use of the same crate/RNG for key material).
+rand = { version = "0.8", features = ["std"] }
 
 [dev-dependencies]
 # Signature verification for the advert-card integration tests (mirrors
