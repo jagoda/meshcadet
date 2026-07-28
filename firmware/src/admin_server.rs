@@ -122,7 +122,10 @@ mod err {
 /// Entry point for the admin server thread.
 ///
 /// Loops forever reading frames from stdin and responding over stdout.
-/// Intended to be spawned via `std::thread::Builder::new().stack_size(8192).spawn(...)`.
+/// Intended to be spawned via `std::thread::Builder::new().stack_size(12288).spawn(...)`
+/// — see `main.rs`'s actual spawn site (the `admin_server` thread) for the
+/// full 8 KiB → 12 KiB sizing history; this doc previously said `8192`, stale
+/// since that bump.
 ///
 /// `history` must be the shared global `HISTORY` mutex so that export reads
 /// are mutually excluded with main-thread appends (module-level mutex discipline).
@@ -138,7 +141,14 @@ mod err {
 /// `config` is the provisioned config loaded at boot — the single mutable
 /// source of truth for the `QUERY_*` replies and the `ADD_*` / `DEL_*` edits.
 /// It is moved into the thread; runtime edits mutate it and persist the whole
-/// blob back to `nvs_partition`.
+/// blob back to `nvs_partition`. `Box`ed rather than held inline: at ~3.5 KiB
+/// (`size_of::<ProvisionedConfig>()`, dominated by `room_extras:
+/// [RoomExtra; MAX_CONTACTS]`) an inline copy resident for this thread's
+/// entire lifetime — on top of the transient ~3.5 KiB `save_provisioned_config`
+/// blob buffer allocated on every persist — was the root cause of a boot-time
+/// stack overflow in this task (see the `boot-pthread-stack-overflow-fix`
+/// mission); the doc comment at this fn's `stack_size` call site had
+/// (incorrectly) budgeted the struct at ~1.6 KiB, half its real size.
 ///
 /// `gps_status` is the shared GPS status snapshot the main thread refreshes
 /// every dispatcher-loop iteration (same cross-thread mutex pattern as
@@ -155,7 +165,7 @@ pub fn run(
     gps_status: &'static std::sync::Mutex<crate::gps::GpsStatus>,
     battery_status: &'static std::sync::Mutex<crate::battery::BatteryStatus>,
     identity: Identity,
-    mut config: ProvisionedConfig,
+    mut config: Box<ProvisionedConfig>,
     nvs_partition: EspNvsPartition<NvsDefault>,
 ) {
     // Device display name lives in the identity store (`mc_id`/`name`), not
@@ -172,6 +182,16 @@ pub fn run(
     let mut rx_buf = [0u8; RX_BUF_LEN];
     let mut rx_len = 0usize;
     let mut stdout_ = std::io::stdout();
+
+    // Stack HWM immediately after setup, before the frame loop — the exact
+    // point an on-hardware boot crashed as a `pthread`-task stack overflow
+    // (see `main.rs`'s `admin_server` spawn site and the
+    // `boot-pthread-stack-overflow-fix` mission). Unconditional (not gated on
+    // a periodic timer, unlike `main.rs`'s 30 s sample): a stack overflow
+    // reboots the task before any later tick could fire, so this is the
+    // sample most likely to ever get logged if headroom regresses again.
+    const ADMIN_SERVER_STACK_B: u32 = 12288;
+    crate::log_thread_stack_hwm("admin_server", ADMIN_SERVER_STACK_B);
 
     loop {
         // ── Read more bytes ──────────────────────────────────────────────────
@@ -233,6 +253,13 @@ pub fn run(
                 ) {
                     log::warn!("admin_server: handle_frame error: {}", e);
                 }
+                // Every handled frame's own call depth (`handle_frame` →
+                // `handle_add_room`/`handle_del_room`/… → `persist_or_rollback`/
+                // `persist_setting` → `save_provisioned_config`) is the other
+                // place real HIL headroom matters — sampled here rather than
+                // only once at startup so an edit-triggered regression is
+                // caught too, not just the boot-time baseline logged above.
+                crate::log_thread_stack_hwm("admin_server", ADMIN_SERVER_STACK_B);
             }
             Err(ProvError::TruncatedFrame) => {
                 // Not enough bytes yet — wait for more.

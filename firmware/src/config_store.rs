@@ -66,8 +66,13 @@ pub fn load_provisioned_config(
         return Ok(None);
     }
 
-    // Read the config blob.
-    let mut blob = [0u8; MAX_BLOB_LEN];
+    // Read the config blob. Heap-allocated (not a `[0u8; MAX_BLOB_LEN]` stack
+    // array): `MAX_BLOB_LEN` is 3544 B (see `firmware_core::config_store`'s
+    // "Blob size budget" doc) — see the `boot-pthread-stack-overflow-fix`
+    // mission for why a buffer this size has no business living on a
+    // constrained pthread stack (`admin_server`/`prov_server` both call
+    // through here).
+    let mut blob = vec![0u8; MAX_BLOB_LEN].into_boxed_slice();
     match nvs.get_blob(NVS_KEY_CFG_BLOB, &mut blob)? {
         Some(bytes)
             if !bytes.is_empty() && (bytes[0] == CFG_VERSION || bytes[0] == CFG_VERSION_V2) =>
@@ -110,8 +115,13 @@ pub fn save_provisioned_config(
 ) -> Result<(), EspError> {
     let nvs = EspNvs::new(nvs_partition, NVS_NAMESPACE, true)?;
 
-    // Serialise the config.
-    let mut blob = [0u8; MAX_BLOB_LEN];
+    // Serialise the config. Heap-allocated — see `load_provisioned_config`'s
+    // matching comment: this is called from deep in the `admin_server`/
+    // `prov_server` thread call chain (`run` → `handle_frame` →
+    // `persist_or_rollback`/`persist_setting` → here), on top of whatever
+    // those threads already have resident, so a 3544 B stack array here was
+    // the dominant transient contributor to the boot-time stack overflow.
+    let mut blob = vec![0u8; MAX_BLOB_LEN].into_boxed_slice();
     let blob_len = serialize_config(config, &mut blob);
 
     // Write the blob first, then the flag (atomicity property).
