@@ -287,6 +287,20 @@ struct RoomRuntime {
     /// (falling back to the provisioning-time `RoomExtra` seed if nothing had
     /// been persisted yet).
     session: room_session::PersistedRoomSession,
+    /// This room's dedicated session-store erase epoch, as it stood at boot
+    /// ([`room_session::load_room_epoch`]) — FINDING G. Every
+    /// [`room_session::save_room_session`] call for this room passes this
+    /// value; that function re-reads the CURRENT epoch immediately before
+    /// writing and refuses the write if `admin_server`'s `ADD_ROOM`/
+    /// `DEL_ROOM` erased this room's store since this boot bumped it past
+    /// what's remembered here. This field is intentionally NEVER updated
+    /// after construction — a live `RoomRuntime` has no safe way to learn
+    /// its erase was legitimate rather than stale (that's the whole
+    /// "no cross-thread channel" limit this mechanism works around), so it
+    /// stays pinned to its boot-time value until the next reboot rebuilds
+    /// this `Vec` from scratch.
+    #[cfg_attr(feature = "hil", allow(dead_code))]
+    session_epoch: u8,
     /// Whether this boot has already enqueued the initial flood login for
     /// this room. A re-login can still happen later (Phase C: the
     /// keep-alive scheduler re-floods if `out_path` is ever lost), but the
@@ -1012,6 +1026,19 @@ fn run() -> anyhow::Result<()> {
                                             hash,
                                         )
                                         .unwrap_or(seed);
+                                        // FINDING G: this room's erase epoch as it
+                                        // stands right now — every later
+                                        // `save_room_session` call for this room
+                                        // passes this exact value back so it can
+                                        // detect (and refuse to persist through) an
+                                        // `ADD_ROOM`/`DEL_ROOM` erase that happens
+                                        // later this boot without a reboot in
+                                        // between. See `RoomRuntime::session_epoch`'s
+                                        // doc.
+                                        let session_epoch = room_session::load_room_epoch(
+                                            nvs_partition.clone(),
+                                            hash,
+                                        );
                                         // Phase B: never present a compose box
                                         // for a message the server will swallow
                                         // — register this room's CURRENT (resumed
@@ -1027,6 +1054,7 @@ fn run() -> anyhow::Result<()> {
                                             guest_password: extra.guest_password,
                                             guest_password_len: extra.guest_password_len,
                                             session,
+                                            session_epoch,
                                             login_sent: false,
                                             last_keep_alive_ms: 0,
                                             last_reflood_ms: 0,
@@ -1843,7 +1871,12 @@ fn run() -> anyhow::Result<()> {
                          invalidating out_path to force a relearn",
                         room.hash, room_session::KEEP_ALIVE_STALL_THRESHOLD,
                     );
-                    room_session::save_room_session(nvs_partition.clone(), room.hash, &room.session);
+                    room_session::save_room_session(
+                        nvs_partition.clone(),
+                        room.hash,
+                        room.session_epoch,
+                        &room.session,
+                    );
                     continue; // no learned path left this tick; reflood branch picks it up next pass
                 } else {
                     log::warn!(
@@ -3392,7 +3425,12 @@ fn apply_room_login_outcome(
     // The next keep-alive should re-affirm this login's `sync_since` via
     // `force_since` rather than the routine `0` — see `resync_pending`'s doc.
     room.resync_pending = true;
-    room_session::save_room_session(nvs_partition, room.hash, &room.session);
+    room_session::save_room_session(
+        nvs_partition,
+        room.hash,
+        room.session_epoch,
+        &room.session,
+    );
     log::info!(
         "room: login complete for 0x{:02x}: permissions={:?}{}",
         room.hash,
@@ -3563,7 +3601,12 @@ fn handle_room_push_frame(
             // `last_room_ts` — see that method's doc for why an unconditional
             // assignment here would be a bug, not just an asymmetry.
             room.session.record_synced_post_ts(outcome.post_ts);
-            room_session::save_room_session(nvs_partition, room.hash, &room.session);
+            room_session::save_room_session(
+                nvs_partition,
+                room.hash,
+                room.session_epoch,
+                &room.session,
+            );
             true
         }
         Err(e) if room_session::is_room_push_misroute(&e) => {

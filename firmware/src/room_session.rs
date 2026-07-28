@@ -22,13 +22,30 @@
 //!
 //! # NVS layout
 //!
-//! One namespace, one blob key per room, keyed by its pubkey hash byte
-//! (`"r{:02x}"`, e.g. `"r4a"`) — same "small dedicated store, one key per
-//! item" shape as `advert_ts_store.rs`/`gps_baud_store.rs`.
+//! One namespace, two keys per room, both keyed by its pubkey hash byte —
+//! same "small dedicated store, one key per item" shape as
+//! `advert_ts_store.rs`/`gps_baud_store.rs`.
 //!
 //! | Namespace | Key       | Type                                    | Contents |
 //! |-----------|-----------|------------------------------------------|----------|
 //! | `mc_room` | `r{:02x}` | blob (`PERSISTED_ROOM_SESSION_LEN` bytes) | one room's learned `permissions`/`sync_since`/`out_path` |
+//! | `mc_room` | `x{:02x}` | `u8`                                      | that room's erase epoch (FINDING G — see below) |
+//!
+//! # FINDING G: erase durability across a live, un-rebooted runtime
+//!
+//! `admin_server`'s `ADD_ROOM`/`DEL_ROOM` arms call [`delete_room_session`]
+//! on their own thread, but `main.rs`'s dispatcher loop built its
+//! `RoomRuntime` for this room once at boot and keeps calling
+//! [`save_room_session`] for it afterward (login replies, inbound pushes,
+//! stall invalidation) — with no cross-thread channel telling that loop an
+//! erase just happened. Left alone, the next one of those saves resurrects
+//! the very blob the erase just removed. The `x{:02x}` epoch closes that:
+//! [`delete_room_session`] bumps it every time it runs; `RoomRuntime`
+//! remembers the epoch it saw at boot ([`load_room_epoch`]); every
+//! [`save_room_session`] call re-reads the CURRENT epoch immediately before
+//! writing and silently skips the write if it no longer matches — see
+//! `firmware_core::room_session`'s "Session-store erase durability" module
+//! section for the full mechanism and its host-run proof.
 
 use esp_idf_svc::nvs::{EspNvs, EspNvsPartition, NvsDefault};
 
@@ -51,6 +68,54 @@ fn room_key(hash: u8, buf: &mut [u8; 3]) -> &str {
     buf[2] = HEX[(hash & 0x0F) as usize];
     // SAFETY: buf contains only ASCII — valid UTF-8.
     core::str::from_utf8(buf).unwrap()
+}
+
+/// Format a room's erase-epoch NVS key as `"x{:02x}"` into `buf` — same
+/// technique as [`room_key`], different leading byte so the epoch lives at
+/// its own key, independent of whatever the session-blob key currently
+/// holds (or doesn't).
+#[cfg_attr(feature = "hil", allow(dead_code))]
+fn room_epoch_key(hash: u8, buf: &mut [u8; 3]) -> &str {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    buf[0] = b'x';
+    buf[1] = HEX[(hash >> 4) as usize];
+    buf[2] = HEX[(hash & 0x0F) as usize];
+    // SAFETY: buf contains only ASCII — valid UTF-8.
+    core::str::from_utf8(buf).unwrap()
+}
+
+/// Load a room's current erase epoch (`0` if never bumped — the common case
+/// for a room that has never been deleted/re-added this device's uptime, and
+/// also the fallback on any NVS error). Callers: `RoomRuntime`'s
+/// construction (captures this as `session_epoch`, the value
+/// [`save_room_session`] later compares every write attempt against) and
+/// [`delete_room_session`] itself (reads the current value before bumping
+/// it).
+#[cfg_attr(feature = "hil", allow(dead_code))]
+pub fn load_room_epoch(nvs_partition: EspNvsPartition<NvsDefault>, hash: u8) -> u8 {
+    let nvs = match EspNvs::new(nvs_partition, NVS_NAMESPACE, true) {
+        Ok(nvs) => nvs,
+        Err(e) => {
+            log::warn!(
+                "room_session: failed to open NVS namespace for epoch read ({:?})",
+                e
+            );
+            return 0;
+        }
+    };
+    let mut key_buf = [0u8; 3];
+    let key = room_epoch_key(hash, &mut key_buf);
+    match nvs.get_u8(key) {
+        Ok(v) => v.unwrap_or(0),
+        Err(e) => {
+            log::warn!(
+                "room_session: NVS epoch read failed for room 0x{:02x} ({:?})",
+                hash,
+                e
+            );
+            0
+        }
+    }
 }
 
 /// Load a room's session-learned state, keyed by its pubkey hash byte.
@@ -86,7 +151,17 @@ pub fn load_room_session(
     decode_persisted_room_session(bytes)
 }
 
-/// Persist a room's session-learned state, overwriting any previous value.
+/// Persist a room's session-learned state, overwriting any previous value —
+/// UNLESS `remembered_epoch` (what the caller's `RoomRuntime` captured at
+/// boot, or at its last successful persist) no longer matches the store's
+/// CURRENT erase epoch (re-read here, immediately before the write). A
+/// mismatch means `delete_room_session` erased this room's store since —
+/// the caller's in-memory session is stale relative to that erase, and
+/// writing it would resurrect the exact blob the erase removed (FINDING G).
+/// The write is silently skipped in that case (logged, non-fatal, same
+/// posture as an NVS error below): the caller has no way to un-learn its own
+/// stale state without a reboot, but it can at least stop re-persisting it.
+///
 /// A failed write is logged and non-fatal — worst case, the next boot
 /// resumes from a stale (or absent) watermark and re-syncs a bounded backlog
 /// rather than losing data or corrupting the store.
@@ -94,6 +169,7 @@ pub fn load_room_session(
 pub fn save_room_session(
     nvs_partition: EspNvsPartition<NvsDefault>,
     hash: u8,
+    remembered_epoch: u8,
     state: &PersistedRoomSession,
 ) {
     let nvs = match EspNvs::new(nvs_partition, NVS_NAMESPACE, true) {
@@ -106,6 +182,30 @@ pub fn save_room_session(
             return;
         }
     };
+    let mut epoch_key_buf = [0u8; 3];
+    let epoch_key = room_epoch_key(hash, &mut epoch_key_buf);
+    let current_epoch = match nvs.get_u8(epoch_key) {
+        Ok(v) => v.unwrap_or(0),
+        Err(e) => {
+            log::warn!(
+                "room_session: NVS epoch read failed for room 0x{:02x} ({:?}) — \
+                 skipping persist rather than risk resurrecting an erased blob",
+                hash,
+                e
+            );
+            return;
+        }
+    };
+    if !room_session_persist_is_current(remembered_epoch, current_epoch) {
+        log::info!(
+            "room_session: skipping stale persist for room 0x{:02x} — erased since boot \
+             (epoch {} != {})",
+            hash,
+            remembered_epoch,
+            current_epoch
+        );
+        return;
+    }
     let mut blob = [0u8; PERSISTED_ROOM_SESSION_LEN];
     let n = encode_persisted_room_session(state, &mut blob);
     let mut key_buf = [0u8; 3];
@@ -134,6 +234,17 @@ pub fn save_room_session(
 /// posture as [`save_room_session`]: worst case a re-add's dedicated-store
 /// blob lingers stale, exactly the FINDING D defect this function exists to
 /// close, surfaced in the log for a human to notice.
+///
+/// FINDING G: also bumps this room's erase epoch (see this module's doc),
+/// unconditionally — regardless of whether the blob itself was actually
+/// present to remove. A live `RoomRuntime` for this room (if any) keeps
+/// running until reboot with no idea this happened; the bump is what makes
+/// its NEXT [`save_room_session`] call refuse to resurrect the blob just
+/// erased above rather than silently undoing this function's whole effect.
+/// A failed bump is logged and non-fatal, same posture as every other NVS
+/// error in this file — worst case a stale runtime's next persist slips
+/// through, exactly the defect this bump exists to close, surfaced in the
+/// log for a human to notice.
 #[cfg_attr(feature = "hil", allow(dead_code))]
 pub fn delete_room_session(nvs_partition: EspNvsPartition<NvsDefault>, hash: u8) {
     let nvs = match EspNvs::new(nvs_partition, NVS_NAMESPACE, true) {
@@ -151,6 +262,28 @@ pub fn delete_room_session(nvs_partition: EspNvsPartition<NvsDefault>, hash: u8)
     if let Err(e) = nvs.remove(key) {
         log::warn!(
             "room_session: NVS erase failed for room 0x{:02x} ({:?})",
+            hash,
+            e
+        );
+    }
+
+    let mut epoch_key_buf = [0u8; 3];
+    let epoch_key = room_epoch_key(hash, &mut epoch_key_buf);
+    let current_epoch = match nvs.get_u8(epoch_key) {
+        Ok(v) => v.unwrap_or(0),
+        Err(e) => {
+            log::warn!(
+                "room_session: NVS epoch read failed for room 0x{:02x} ({:?}) — \
+                 bumping from 0",
+                hash,
+                e
+            );
+            0
+        }
+    };
+    if let Err(e) = nvs.set_u8(epoch_key, next_room_session_epoch(current_epoch)) {
+        log::warn!(
+            "room_session: NVS epoch bump failed for room 0x{:02x} ({:?})",
             hash,
             e
         );

@@ -313,6 +313,54 @@ impl PersistedRoomSession {
     }
 }
 
+// ── Session-learned state: erase durability (FINDING G) ─────────────────────
+//
+// `admin_server`'s `ADD_ROOM`/`DEL_ROOM` arms erase this dedicated store
+// (`firmware::room_session::delete_room_session`) on the OTHER thread, but
+// `main.rs`'s dispatcher loop built its `RoomRuntime` for this room ONCE at
+// boot and keeps re-persisting that room's in-memory `session` on every
+// login reply / inbound push / stall-invalidation
+// (`firmware::room_session::save_room_session`'s call sites). Left alone,
+// the very next one of those re-persists resurrects the blob the erase just
+// removed — the eraser and the resurrector are racing with no cross-thread
+// signal between them, and the resurrector always runs again eventually.
+//
+// The fix is an erase EPOCH, kept in the same dedicated NVS namespace as a
+// tiny 1-byte counter alongside each room's session blob (see
+// `firmware::room_session`'s `room_epoch_key`): `delete_room_session` bumps
+// it every time it runs, and `RoomRuntime` remembers the epoch it saw at
+// boot (`load_room_epoch`). `save_room_session` re-reads the CURRENT epoch
+// immediately before every write and refuses to write if it no longer
+// matches what this room's runtime remembered — an erase that happened
+// since boot is visible via that epoch mismatch even though the two threads
+// share no other state. [`room_session_persist_is_current`] is the pure
+// decision the hardware layer defers to; [`next_room_session_epoch`] is the
+// pure bump. Both are trivial, but keeping them here (rather than inlined
+// into the `esp_idf_svc`-dependent hardware layer) is what makes the
+// mechanism itself provable on host — see this module's tests below for the
+// full del/re-add-without-reboot scenario this closes.
+
+/// Whether a room's in-memory session (loaded, or last confirmed persisted,
+/// under `remembered_epoch`) is still safe to write back to the dedicated
+/// NVS store. `current_epoch` is the epoch as it stands in the store right
+/// now, re-read immediately before the write. A mismatch means
+/// `delete_room_session` erased this room's store since `remembered_epoch`
+/// was captured — the caller's in-memory session is now stale relative to
+/// that erase and must not resurrect the blob it just removed.
+pub fn room_session_persist_is_current(remembered_epoch: u8, current_epoch: u8) -> bool {
+    remembered_epoch == current_epoch
+}
+
+/// Advance a room's erase epoch by one, wrapping at the `u8` boundary.
+/// Wraparound is a non-issue in practice (it would take 256 del/re-adds of
+/// the SAME room, all without an intervening reboot, to coincide with a
+/// stale `RoomRuntime`'s remembered epoch again) — the same "bounded,
+/// negligible edge case" posture the 1-byte pubkey routing hash already
+/// accepts elsewhere in this module.
+pub fn next_room_session_epoch(current: u8) -> u8 {
+    current.wrapping_add(1)
+}
+
 /// Encode a [`PersistedRoomSession`] into `out` (at least
 /// [`PERSISTED_ROOM_SESSION_LEN`] bytes). Returns the number of bytes written.
 pub fn encode_persisted_room_session(state: &PersistedRoomSession, out: &mut [u8]) -> usize {
@@ -1446,6 +1494,102 @@ mod tests {
         );
         state.record_synced_post_ts(2001);
         assert_eq!(state.sync_since, 2001);
+    }
+
+    // ── Session-store erase durability (FINDING G) ──────────────────────────
+
+    #[test]
+    fn room_session_persist_is_current_matches_only_the_remembered_epoch() {
+        assert!(room_session_persist_is_current(0, 0));
+        assert!(room_session_persist_is_current(7, 7));
+        assert!(!room_session_persist_is_current(0, 1));
+        assert!(!room_session_persist_is_current(1, 0));
+    }
+
+    #[test]
+    fn next_room_session_epoch_advances_and_wraps() {
+        assert_eq!(next_room_session_epoch(0), 1);
+        assert_eq!(next_room_session_epoch(254), 255);
+        assert_eq!(next_room_session_epoch(255), 0);
+    }
+
+    /// REGRESSION (FINDING G): a `DEL_ROOM`/`ADD_ROOM` erase, followed by a
+    /// re-add, must survive a live `RoomRuntime` that has no idea the erase
+    /// happened — WITHOUT an intervening reboot. This models the exact
+    /// mechanism `firmware/src/room_session.rs` implements in hardware (a
+    /// tiny fake NVS store standing in for `EspNvs`, driven through the same
+    /// pure decisions this module exposes), end to end:
+    ///
+    /// 1. Boot: a room's dedicated store already holds a stale session and
+    ///    epoch 0 — `RoomRuntime` remembers `remembered_epoch = 0`.
+    /// 2. `admin_server` handles a re-add: erases the blob AND bumps the
+    ///    epoch to 1 (`delete_room_session`'s contract).
+    /// 3. The live (still epoch-0) runtime reacts to an in-flight event
+    ///    (e.g. a stall) and tries to persist its OLD in-memory session —
+    ///    `room_session_persist_is_current` must refuse the write.
+    /// 4. The freshly reset `RoomExtra` seed — not the stale blob — is what
+    ///    the NEXT boot resumes from, because nothing re-created the blob.
+    #[test]
+    fn erase_survives_a_live_runtime_without_an_intervening_reboot() {
+        // A minimal in-memory stand-in for the two `mc_room` NVS keys real
+        // hardware persists (`r{:02x}` session blob, `x{:02x}` epoch byte).
+        struct FakeRoomStore {
+            blob: Option<PersistedRoomSession>,
+            epoch: u8,
+        }
+
+        let mut store = FakeRoomStore {
+            blob: Some(PersistedRoomSession {
+                permissions: RoomPermission::ReadWrite as u8,
+                sync_since: 999_999, // stale watermark a re-add must not resume from
+                out_path: [0xAAu8; MAX_PATH_SIZE],
+                out_path_len: 4,
+                last_room_ts: 0,
+            }),
+            epoch: 0,
+        };
+
+        // 1. Boot resumes from the stale blob (pre-existing FINDING D
+        // behaviour, unchanged) and remembers the epoch it saw.
+        let mut runtime_session = store.blob.expect("boot resume seeds from the stale blob");
+        let remembered_epoch = store.epoch;
+        assert_eq!(remembered_epoch, 0);
+
+        // 2. admin_server's re-add: erase the blob, bump the epoch — mirrors
+        // `delete_room_session`'s two effects exactly.
+        store.blob = None;
+        store.epoch = next_room_session_epoch(store.epoch);
+        assert_eq!(store.epoch, 1);
+
+        // The freshly reset RoomExtra seed a re-add produces — this is what
+        // admin_server.rs:566-569 promises a re-add resets to.
+        let fresh_seed = PersistedRoomSession::EMPTY;
+
+        // 3. The stale, still-epoch-0 runtime mutates its OWN in-memory
+        // session (e.g. a stall-triggered invalidation) and tries to
+        // persist it — this is the exact resurrection this fix closes.
+        runtime_session.sync_since = 999_998; // any further stale mutation
+        let persist_is_current = room_session_persist_is_current(remembered_epoch, store.epoch);
+        assert!(
+            !persist_is_current,
+            "a stale runtime must not be allowed to persist after an erase bumped the epoch"
+        );
+        if persist_is_current {
+            store.blob = Some(runtime_session); // would be the bug: never reached
+        }
+
+        // The erase survived: the store still holds no blob for this room.
+        assert!(
+            store.blob.is_none(),
+            "the erase must survive the live runtime without an intervening reboot"
+        );
+
+        // 4. Next boot resumes from the fresh seed, exactly as
+        // admin_server.rs's re-add promise requires — not the stale
+        // sync_since the pre-fix defect would have resurrected.
+        let next_boot_session = store.blob.unwrap_or(fresh_seed);
+        assert_eq!(next_boot_session, fresh_seed);
+        assert_eq!(next_boot_session.sync_since, 0);
     }
 
     /// REGRESSION (F5): `NotSignedPlain` — and ONLY `NotSignedPlain` — must
