@@ -297,7 +297,10 @@ all three in sync.
   script and issues no fetch of any kind, so it adds `connect-src 'none'` —
   the tightest policy on the site, on the page that most needs it. If you add
   a new page or a new external resource to an existing one, update that
-  page's policy to match rather than loosening it site-wide.
+  page's policy to match rather than loosening it site-wide — `csp.test.mjs`
+  (run by `pages-check.yml`'s `check` job) statically asserts every page's
+  exact policy and that `provisioner.js`'s QR import stays a local relative
+  path, so a silent regression fails CI rather than shipping.
 
 ## Local preview
 
