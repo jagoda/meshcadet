@@ -584,6 +584,16 @@ fn handle_frame(
         // erased here too, keyed by the same pub_hash byte the arm already
         // reads below.
         //
+        // FINDING G (deep-review pass 3): the erase below runs ONLY after
+        // `persist_or_rollback` reports the config edit actually landed —
+        // erasing first and persisting second would leave the erase
+        // un-rolled-back if the persist then failed (`persist_or_rollback`'s
+        // own doc). The erase's DURABILITY across a live, un-rebooted
+        // `room_runtime` entry (main.rs) is a separate mechanism —
+        // `room_session::delete_room_session`'s erase-epoch bump, consumed by
+        // every `save_room_session` call that room's runtime makes
+        // afterward.
+        //
         // GUEST PASSWORD DISCIPLINE (ADR-0001 §4): the password crosses the
         // USB link in the clear by design, but it is never logged, echoed, or
         // placed in an error message here — the log line below deliberately
@@ -599,11 +609,13 @@ fn handle_frame(
                     // room_admin::handle_add_room).
                     let hash = payload.first().copied().unwrap_or(0);
                     log::info!("admin_server: ADD_ROOM pub_hash=0x{:02x}", hash);
-                    // See FINDING D comment above: a re-add is a full replace,
-                    // so the dedicated session store must not be left to
-                    // shadow the reset RoomExtra seed at the next boot.
-                    room_session::delete_room_session(nvs_partition.clone(), hash);
-                    persist_or_rollback(config, nvs_partition, out, ConfigKind::Room)?;
+                    // See FINDING D/G comments above: a re-add is a full
+                    // replace, so the dedicated session store must not be
+                    // left to shadow the reset RoomExtra seed at the next
+                    // boot — but only once the reset itself is durable.
+                    if persist_or_rollback(config, nvs_partition, out, ConfigKind::Room)? {
+                        room_session::delete_room_session(nvs_partition.clone(), hash);
+                    }
                 }
                 AddRoomOutcome::ListFull => {
                     return send_error(out, err::CONTACT_LIST_FULL, b"contact list full");
@@ -625,6 +637,11 @@ fn handle_frame(
         // full mechanism) — otherwise a FUTURE room added later that happens
         // to collide on this same 1-byte pubkey hash (1-in-256) would silently
         // resume the deleted room's watermark/route/permission at boot.
+        //
+        // FINDING G (deep-review pass 3): erase only after the persist below
+        // durably lands, and see the ADD_ROOM arm's FINDING G comment for how
+        // that erase itself survives a live, un-rebooted `room_runtime` entry
+        // for this same room (the FINDING E gap immediately below).
         //
         // FINDING E (deep-review pass 2, reboot-required MVP — mirrors the
         // CLEAR_HISTORY DESIGN DECISION above): this arm mutates only this
@@ -649,8 +666,12 @@ fn handle_frame(
                     // wire layout (`pubkey(32)`) — see the ADD_ROOM arm's comment.
                     let hash = payload.first().copied().unwrap_or(0);
                     log::info!("admin_server: DEL_ROOM pub_hash=0x{:02x}", hash);
-                    room_session::delete_room_session(nvs_partition.clone(), hash);
-                    persist_or_rollback(config, nvs_partition, out, ConfigKind::Room)?;
+                    // FINDING G: erase only after the removal is durable —
+                    // see `persist_or_rollback`'s doc and the ADD_ROOM arm's
+                    // matching comment above.
+                    if persist_or_rollback(config, nvs_partition, out, ConfigKind::Room)? {
+                        room_session::delete_room_session(nvs_partition.clone(), hash);
+                    }
                 }
                 DelRoomOutcome::NotFound => {
                     return send_error(out, err::CONTACT_NOT_FOUND, b"room not found");
@@ -865,19 +886,31 @@ enum ConfigKind {
 
 /// Persist the whole config blob to NVS after an in-memory edit.
 ///
-/// On success, replies `RSP_OK`.  On NVS failure, rolls the just-applied edit's
-/// list count back by one (so the in-memory view matches what is durably stored)
-/// and replies `RSP_ERROR(STORAGE_ERROR)` — the host then knows the edit did not
-/// take.  Add/del both move the count by exactly one entry, so a single decrement
-/// restores the pre-edit count; the stale entry beyond `count` is never read.
+/// On success, replies `RSP_OK` and returns `Ok(true)`.  On NVS failure, rolls
+/// the just-applied edit's list count back by one (so the in-memory view
+/// matches what is durably stored), replies `RSP_ERROR(STORAGE_ERROR)` — the
+/// host then knows the edit did not take — and returns `Ok(false)`.  Add/del
+/// both move the count by exactly one entry, so a single decrement restores
+/// the pre-edit count; the stale entry beyond `count` is never read.
+///
+/// The `bool` lets a caller gate a FURTHER, irreversible action on the persist
+/// actually having landed — e.g. `ADD_ROOM`/`DEL_ROOM` erasing the paired
+/// `mc_room` session-store blob only once this config edit is durable (see
+/// those arms' call sites): erasing first and persisting second would leave
+/// the erase un-rolled-back if the persist then failed, silently violating
+/// this same function's own "in-memory view matches what is durably stored"
+/// invariant for that companion store.
 fn persist_or_rollback(
     config: &mut ProvisionedConfig,
     nvs_partition: &EspNvsPartition<NvsDefault>,
     out: &mut impl Write,
     kind: ConfigKind,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     match crate::config_store::save_provisioned_config(nvs_partition.clone(), config) {
-        Ok(()) => send_ok(out),
+        Ok(()) => {
+            send_ok(out)?;
+            Ok(true)
+        }
         Err(e) => {
             log::error!("admin_server: NVS save failed: {:?}", e);
             // Note: a delete has already shifted entries down; we cannot fully
@@ -896,7 +929,8 @@ fn persist_or_rollback(
                     config.room_count = config.room_count.saturating_sub(1);
                 }
             }
-            send_error(out, err::STORAGE_ERROR, b"NVS save failed").map(|_| ())
+            send_error(out, err::STORAGE_ERROR, b"NVS save failed")?;
+            Ok(false)
         }
     }
 }
