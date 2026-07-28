@@ -29,7 +29,7 @@
 // (`provisioner.js`'s `handleAddChannel`/`handleDelChannel`/
 // `clearFormStatuses`, `provisioner.html`'s `add-channel-secret`/
 // `del-channel-secret` fields) is NOT loadable under plain `node` at all
-// (same `https://esm.sh/...` top-level import blocker as
+// (same top-level `document.getElementById` DOM-wiring blocker as
 // guest-password-hygiene.test.mjs documents). Part 2 below instead asserts
 // directly against the shipped SOURCE TEXT of
 // `provisioner.js`/`provisioner.html`:
@@ -323,7 +323,7 @@ async function delChannelDeviceErrorNeverLeaksTheSecretEither() {
 // See guest-password-hygiene.test.mjs's header (and this file's own header)
 // for why these are source-text assertions rather than a driven DOM test:
 // provisioner.js cannot be loaded under plain node (top-level
-// `https://esm.sh/...` import).
+// `document.getElementById` DOM wiring).
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const siteDir = path.resolve(here, "..");

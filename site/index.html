@@ -6,6 +6,14 @@
   <title>MeshCadet — mesh-radio messaging firmware for the LilyGo T-Deck Plus</title>
   <meta name="description" content="MeshCadet is a polished, deliberately-limited MeshCore-interop firmware for the LilyGo T-Deck Plus: allowlist-only contacts and channels, guest-only MeshCore Room Server support, no advertising, pull-only telemetry, on a byte-exact MeshCore protocol port." />
 
+  <!-- GitHub Pages cannot set response headers, so the Content-Security-
+       Policy lives here instead (meshcadet-channel-secret-leak-security-audit
+       finding B3). This page loads no script and issues no fetch/XHR of its
+       own, so 'self' is exact, not a loosened default — see site/README.md
+       "Conventions" for why flash.html/provisioner.html each carry a
+       different, page-specific policy instead of this same one. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'" />
+
   <!-- All paths below are relative (no leading "/") — this is a GitHub Pages
        PROJECT site served under /meshcadet/, not a root site. A root-rooted
        path like "/styles.css" would 404 there. Keep it that way. -->

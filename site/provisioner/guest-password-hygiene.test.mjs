@@ -21,13 +21,15 @@
 // The code that actually HANDLES the password at the DOM layer
 // (`provisioner.js`'s `handleAddRoom`/`clearFormStatuses`, `provisioner.html`'s
 // `add-room-password` field) is NOT loadable under plain `node` at all:
-// `provisioner.js` top-level-imports the QR library from an `https://esm.sh/...`
-// URL, which requires Node's (currently unshipped/unstable) network-import
-// support — see this file's own header discussion, and contrast with why
-// `contact-uri.js`/`validation.js`/`session.js` were pulled out of
-// `provisioner.js` into DOM-free modules in the first place (site/README.md).
-// Building a full fake-DOM harness just to load one file was judged not
-// worth the maintenance cost for one mission's worth of coverage. Part 2
+// `provisioner.js` top-level-calls `document.getElementById(...)` to wire up
+// its DOM refs (its QR library import is now a plain relative import of the
+// vendored `./vendor/qrcode.js` — see that file's header — so it is no
+// longer network-import-blocked, but the DOM dependency alone still rules
+// out plain `node`), and contrast with why `contact-uri.js`/`validation.js`/
+// `session.js` were pulled out of `provisioner.js` into DOM-free modules in
+// the first place (site/README.md). Building a full fake-DOM harness just to
+// load one file was judged not worth the maintenance cost for one mission's
+// worth of coverage. Part 2
 // below instead asserts directly against the shipped SOURCE TEXT of
 // `provisioner.js`/`provisioner.html` — not a comment, an executable
 // assertion that fails loudly if any of these invariants regress:
@@ -250,7 +252,7 @@ async function addRoomDeviceErrorNeverLeaksThePasswordEither() {
 //
 // See this file's header for why these are source-text assertions rather
 // than a driven DOM test: provisioner.js cannot be loaded under plain node
-// (top-level `https://esm.sh/...` import).
+// (top-level `document.getElementById` DOM wiring).
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const siteDir = path.resolve(here, "..");

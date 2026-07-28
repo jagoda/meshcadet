@@ -7,11 +7,15 @@
 // list/add/remove plus its `type=3` QR/URI (see the "Rooms" section below).
 //
 // No build step (site/README.md convention): plain ES module, loaded
-// directly by the browser. The QR library is a major-version-pinned CDN
-// import via esm.sh (which serves the "qrcode" npm package — soldair/
-// node-qrcode, pure JS, no native deps — pre-bundled as a browser-ready ES
-// module), the same "single pinned CDN import, no bundler" pattern flash.html
-// uses for esp-web-tools.
+// directly by the browser. The QR library is VENDORED locally at
+// ./vendor/qrcode.js (a pre-bundled build of the "qrcode" npm package —
+// soldair/node-qrcode, pure JS, no native deps) rather than imported from a
+// CDN — this is the one page on the site that handles secrets (channel
+// secret, admin PIN, room guest password — see below), so it does not load
+// ANY third-party script origin (meshcadet-channel-secret-leak-security-
+// audit finding B3; see vendor/qrcode.js's own header for why, and for
+// upgrade instructions). Contrast flash.html, which has no secrets to
+// protect and still CDN-imports esp-web-tools/esptool-js.
 //
 // Client-side security model (docs/adr/0007-provisioner-codec.md): no
 // analytics/telemetry, nothing sent to a server (GitHub Pages is fully
@@ -37,7 +41,7 @@ import {
   validateRoomPassword,
 } from "./provisioner/validation.js";
 import { formatHistoryTranscript } from "./provisioner/history-format.js";
-import QRCode from "https://esm.sh/qrcode@1.5.3";
+import QRCode from "./vendor/qrcode.js";
 
 const unsupportedPanel = document.getElementById("unsupported-panel");
 const connectPanel = document.getElementById("connect-panel");
@@ -703,8 +707,9 @@ async function handleDelChannel() {
 //     teardown either.
 // See guest-password-hygiene.test.mjs for the executable checks backing
 // this comment (a static-source assertion this file and provisioner.html
-// uphold the above, since the QRCode CDN import means this file can't be
-// loaded standalone under plain `node` — see that test's own header).
+// uphold the above, since this file's top-level `document.getElementById`
+// calls mean it can't be loaded standalone under plain `node` — see that
+// test's own header).
 
 function renderRooms(rooms) {
   roomsTableBody.replaceChildren();

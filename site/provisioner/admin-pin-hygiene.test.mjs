@@ -23,9 +23,10 @@
 // The code that actually HANDLES the PIN at the DOM layer
 // (`provisioner.js`'s `handleSetPin`/`clearFormStatuses`, `provisioner.html`'s
 // `set-pin-input` field) is NOT loadable under plain `node` at all (same
-// `https://esm.sh/...` top-level import blocker as guest-password-hygiene.test.mjs
-// documents). Part 2 below instead asserts directly against the shipped
-// SOURCE TEXT of `provisioner.js`/`provisioner.html`:
+// top-level `document.getElementById` DOM-wiring blocker as
+// guest-password-hygiene.test.mjs documents). Part 2 below instead asserts
+// directly against the shipped SOURCE TEXT of
+// `provisioner.js`/`provisioner.html`:
 //   - `set-pin-input` is `type="password"` with `autocomplete="off"` on both
 //     the input and its enclosing form (no autofill/autocomplete).
 //   - Neither `provisioner.js` nor `provisioner.html` ever touches
@@ -243,7 +244,7 @@ async function setPinDeviceErrorNeverLeaksThePinEither() {
 // See guest-password-hygiene.test.mjs's header (and this file's own header)
 // for why these are source-text assertions rather than a driven DOM test:
 // provisioner.js cannot be loaded under plain node (top-level
-// `https://esm.sh/...` import).
+// `document.getElementById` DOM wiring).
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const siteDir = path.resolve(here, "..");
