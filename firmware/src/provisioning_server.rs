@@ -179,12 +179,14 @@ pub fn run(
             // Logs the cumulative byte count and last ≤16 bytes before
             // find_magic_start so non-frame bytes are visible during bring-up.
             //
-            // Once `rx_buf` is synced on a channel-secret-bearing frame
-            // (ADD_CHANNEL/DEL_CHANNEL — the only frame types whose payload is
-            // raw channel-secret bytes), the tail window can straddle that
-            // payload (a large frame commonly arrives split across multiple
-            // non-blocking `usb_serial_jtag_read_bytes` calls). Redact the hex
-            // in that case instead of dumping it — the byte count is still
+            // `buffer_holds_secret_bearing_frame` (firmware-core, host-tested)
+            // decides whether `rx_buf` currently holds — anywhere, not just at
+            // offset 0 — an ADD_CHANNEL/DEL_CHANNEL header. Those are the only
+            // frame types whose payload is raw channel-secret bytes, and a
+            // large one commonly arrives split across multiple non-blocking
+            // `usb_serial_jtag_read_bytes` calls, so the tail window can
+            // straddle the payload on more than one read. Redact the hex in
+            // that case instead of dumping it — the byte count is still
             // useful for bring-up, the secret material is not.
             #[cfg(feature = "diagnostics")]
             {
@@ -192,10 +194,8 @@ pub fn run(
                     n as u32,
                     std::sync::atomic::Ordering::Relaxed,
                 ) + n as u32;
-                let secret_bearing = rx_len >= 3
-                    && rx_buf[0] == PROV_MAGIC[0]
-                    && rx_buf[1] == PROV_MAGIC[1]
-                    && matches!(rx_buf[2], FRAME_ADD_CHANNEL | FRAME_DEL_CHANNEL);
+                let secret_bearing =
+                    firmware_core::prov_diag::buffer_holds_secret_bearing_frame(&rx_buf[..rx_len]);
                 if secret_bearing {
                     log::info!(
                         "prov_server: raw RX n={} total={} [redacted: channel-secret frame]",
