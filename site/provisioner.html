@@ -198,10 +198,10 @@
             </tbody>
           </table>
 
-          <form id="add-channel-form" class="inline-form footnote">
+          <form id="add-channel-form" class="inline-form footnote" autocomplete="off">
             <h3>Add channel</h3>
             <label class="version-label" for="add-channel-secret">Secret (32 hex chars = 128-bit, or 64 hex chars = 256-bit)</label>
-            <input id="add-channel-secret" class="text-input mono" type="text" placeholder="32 or 64 hex characters" />
+            <input id="add-channel-secret" class="text-input mono" type="password" autocomplete="off" placeholder="32 or 64 hex characters" />
             <div class="cta-row">
               <button id="gen-channel-128-button" class="btn btn-ghost" type="button">Generate 128-bit</button>
               <button id="gen-channel-256-button" class="btn btn-ghost" type="button">Generate 256-bit</button>
@@ -224,7 +224,7 @@
             <p id="add-channel-status" class="muted form-status" role="status"></p>
           </form>
 
-          <form id="del-channel-form" class="inline-form footnote">
+          <form id="del-channel-form" class="inline-form footnote" autocomplete="off">
             <h3>Remove channel</h3>
             <p class="muted">
               Channel removal requires the exact secret used to add it — the
@@ -232,7 +232,7 @@
               identify it for removal.
             </p>
             <label class="version-label" for="del-channel-secret">Secret (32 or 64 hex characters)</label>
-            <input id="del-channel-secret" class="text-input mono" type="text" placeholder="32 or 64 hex characters" />
+            <input id="del-channel-secret" class="text-input mono" type="password" autocomplete="off" placeholder="32 or 64 hex characters" />
             <div class="cta-row">
               <button id="del-channel-button" class="btn btn-ghost" type="submit">Remove channel</button>
             </div>

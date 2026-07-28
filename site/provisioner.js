@@ -315,14 +315,16 @@ function clearFormStatuses() {
   clearHistoryStatus.textContent = "";
   cardUriStatus.textContent = "";
   cardUriEl.textContent = "—";
-  // Scrub sensitive UI state on teardown: drop any typed PIN/guest password,
-  // forget any read-but-not-downloaded transcript, and re-arm the
-  // clear-history gate. The guest password (ADR-0002 §4/ADR-0001 §4) gets
-  // the exact same "gone from this page's memory the instant we disconnect"
-  // treatment as the admin PIN — see this mission's scope note on guest-
-  // password hygiene.
+  // Scrub sensitive UI state on teardown: drop any typed PIN/guest
+  // password/channel secret, forget any read-but-not-downloaded transcript,
+  // and re-arm the clear-history gate. The guest password (ADR-0002 §4/
+  // ADR-0001 §4) and channel secrets get the exact same "gone from this
+  // page's memory the instant we disconnect" treatment as the admin PIN —
+  // see this mission's scope note on guest-password/channel-secret hygiene.
   setPinInput.value = "";
   addRoomPassword.value = "";
+  addChannelSecret.value = "";
+  delChannelSecret.value = "";
   roomQrBlock.hidden = true;
   roomQrUri.textContent = "";
   pendingTranscript = null;
@@ -639,6 +641,10 @@ async function handleAddChannel() {
       addChannelForm.reset();
       await refreshLists();
     } catch (err) {
+      // Clear here too: a failed submit is not a reason to leave a secret
+      // sitting in the DOM any longer than the successful path (form.reset())
+      // would.
+      addChannelSecret.value = "";
       reportWriteError(addChannelStatus, "add channel", err);
     }
   });
@@ -658,6 +664,10 @@ async function handleDelChannel() {
       delChannelForm.reset();
       await refreshLists();
     } catch (err) {
+      // Clear here too: a failed submit is not a reason to leave a secret
+      // sitting in the DOM any longer than the successful path (form.reset())
+      // would.
+      delChannelSecret.value = "";
       reportWriteError(delChannelStatus, "remove channel", err);
     }
   });
