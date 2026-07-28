@@ -615,7 +615,10 @@ pub fn is_room_push_misroute(e: &RoomSessionError) -> bool {
 /// lowercase-hex `author_pubkey_prefix`, so every room post gets SOME bold
 /// sender prefix — parity with a channel message never means a blank
 /// prefix, even for a poster this device doesn't know as a contact.
-pub fn room_post_sender_label(contact_name: Option<&str>, author_pubkey_prefix: &[u8; 4]) -> String {
+pub fn room_post_sender_label(
+    contact_name: Option<&str>,
+    author_pubkey_prefix: &[u8; 4],
+) -> String {
     match contact_name {
         Some(name) if !name.is_empty() => name.to_string(),
         _ => format!(
