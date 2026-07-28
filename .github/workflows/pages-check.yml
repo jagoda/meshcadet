@@ -132,6 +132,19 @@ jobs:
         # this way.
         run: node site/provisioner/admin-pin-hygiene.test.mjs
 
+      - name: channel-secret-hygiene — the channel secret never reaches storage/console/URL and is cleared on every exit path
+        # Mirrors admin-pin-hygiene.test.mjs/guest-password-hygiene.test.mjs
+        # for the THIRD browser secret this page carries: drives session.js's
+        # addChannel/delChannel for real against hostile localStorage/
+        # sessionStorage traps + a console spy, then statically asserts
+        # provisioner.js/provisioner.html's source text upholds the rest (no
+        # URL/history manipulation, type="password" + autocomplete="off" on
+        # both add-channel-secret and del-channel-secret, the secret field
+        # cleared on every handleAddChannel/handleDelChannel exit path —
+        # success AND catch — and on disconnect). See the test file's own
+        # header for why it's split from session.smoke.test.mjs this way.
+        run: node site/provisioner/channel-secret-hygiene.test.mjs
+
   codec-conformance:
     name: site/provisioner/codec.js matches protocol::provisioning byte-for-byte
     runs-on: ubuntu-latest
