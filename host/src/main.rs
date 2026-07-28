@@ -704,8 +704,8 @@ fn main() -> anyhow::Result<()> {
             let name_bytes = name.as_deref().unwrap_or("").as_bytes().to_vec();
             session.add_channel(&sec, key_len, primary, &name_bytes)?;
             println!(
-                "channel added: {} ({}bit, primary={}{})",
-                hex_short(&sec),
+                "channel added: hash=0x{:02X} ({}bit, primary={}{})",
+                protocol::channel_hash_var(&sec[..key_len as usize]),
                 key_len as u32 * 8,
                 primary,
                 name.map(|n| format!(", name=\"{}\"", n))
@@ -725,9 +725,12 @@ fn main() -> anyhow::Result<()> {
                 secret_env.as_deref(),
                 secret_stdin,
             )?;
-            let (sec, _key_len) = parse_channel_secret_hex(&secret)?;
+            let (sec, key_len) = parse_channel_secret_hex(&secret)?;
             session.del_channel(&sec)?;
-            println!("channel removed: {}", hex_short(&sec));
+            println!(
+                "channel removed: hash=0x{:02X}",
+                protocol::channel_hash_var(&sec[..key_len as usize])
+            );
         }
 
         Cmd::GenChannelSecret { .. } => {

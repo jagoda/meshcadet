@@ -178,23 +178,42 @@ pub fn run(
             // Raw-byte hex log — compiled in only with --features diagnostics.
             // Logs the cumulative byte count and last ≤16 bytes before
             // find_magic_start so non-frame bytes are visible during bring-up.
+            //
+            // Once `rx_buf` is synced on a channel-secret-bearing frame
+            // (ADD_CHANNEL/DEL_CHANNEL — the only frame types whose payload is
+            // raw channel-secret bytes), the tail window can straddle that
+            // payload (a large frame commonly arrives split across multiple
+            // non-blocking `usb_serial_jtag_read_bytes` calls). Redact the hex
+            // in that case instead of dumping it — the byte count is still
+            // useful for bring-up, the secret material is not.
             #[cfg(feature = "diagnostics")]
             {
                 let total = rx_counter.fetch_add(
                     n as u32,
                     std::sync::atomic::Ordering::Relaxed,
                 ) + n as u32;
-                let tail_start = rx_len.saturating_sub(16);
-                let tail = &rx_buf[tail_start..rx_len];
-                let mut hex = [b'0'; 32];
-                for (i, &b) in tail.iter().enumerate().take(16) {
-                    let hi = b >> 4;
-                    let lo = b & 0x0F;
-                    hex[i * 2]     = if hi < 10 { b'0' + hi } else { b'a' + hi - 10 };
-                    hex[i * 2 + 1] = if lo < 10 { b'0' + lo } else { b'a' + lo - 10 };
+                let secret_bearing = rx_len >= 3
+                    && rx_buf[0] == PROV_MAGIC[0]
+                    && rx_buf[1] == PROV_MAGIC[1]
+                    && matches!(rx_buf[2], FRAME_ADD_CHANNEL | FRAME_DEL_CHANNEL);
+                if secret_bearing {
+                    log::info!(
+                        "prov_server: raw RX n={} total={} [redacted: channel-secret frame]",
+                        n, total
+                    );
+                } else {
+                    let tail_start = rx_len.saturating_sub(16);
+                    let tail = &rx_buf[tail_start..rx_len];
+                    let mut hex = [b'0'; 32];
+                    for (i, &b) in tail.iter().enumerate().take(16) {
+                        let hi = b >> 4;
+                        let lo = b & 0x0F;
+                        hex[i * 2]     = if hi < 10 { b'0' + hi } else { b'a' + hi - 10 };
+                        hex[i * 2 + 1] = if lo < 10 { b'0' + lo } else { b'a' + lo - 10 };
+                    }
+                    let hex_str = core::str::from_utf8(&hex[..tail.len() * 2]).unwrap_or("?");
+                    log::info!("prov_server: raw RX n={} total={} [{}]", n, total, hex_str);
                 }
-                let hex_str = core::str::from_utf8(&hex[..tail.len() * 2]).unwrap_or("?");
-                log::info!("prov_server: raw RX n={} total={} [{}]", n, total, hex_str);
             }
         }
 
@@ -431,12 +450,13 @@ fn process_frame(
                     match staging.upsert_channel(new_channel) {
                         Ok(outcome) => {
                             log::info!(
-                                "prov_server: ADD_CHANNEL ({}) secret[0]=0x{:02x} key_len={} primary={} name_len={}",
+                                "prov_server: ADD_CHANNEL ({}) hash=0x{:02x} key_len={} primary={} name_len={}",
                                 match outcome {
                                     ChannelUpsert::Updated => "updated",
                                     ChannelUpsert::Added => "added",
                                 },
-                                ch.secret[0], ch.key_len, ch.primary, ch.name_len
+                                channel_hash_var(&ch.secret[..ch.key_len as usize]),
+                                ch.key_len, ch.primary, ch.name_len
                             );
                             send_ok(out)?;
                         }
@@ -459,11 +479,14 @@ fn process_frame(
                     let cnt = staging.channel_count as usize;
                     match staging.channels[..cnt].iter().position(|ch| ch.secret == d.secret) {
                         Some(idx) => {
+                            let hash = channel_hash_var(
+                                &staging.channels[idx].secret[..staging.channels[idx].key_len as usize],
+                            );
                             for j in idx..cnt - 1 {
                                 staging.channels[j] = staging.channels[j + 1];
                             }
                             staging.channel_count -= 1;
-                            log::info!("prov_server: DEL_CHANNEL secret[0]=0x{:02x}", d.secret[0]);
+                            log::info!("prov_server: DEL_CHANNEL hash=0x{:02x}", hash);
                             send_ok(out)?;
                         }
                         None => return send_error(out, err::CHANNEL_NOT_FOUND, b"channel not found"),
