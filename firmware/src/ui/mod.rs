@@ -231,6 +231,36 @@ pub enum UiEvent {
         room_hash: u8,
         can_post: bool,
     },
+    /// A room post `on_send_message` queued (`UiCommand::SendRoomPost`)
+    /// actually reached the wire: `main.rs`'s handler ran
+    /// `room_session::encode_room_post_checked` and got `Ok`.
+    ///
+    /// This is where the outbound "sent" `MessageRecord` for a room post is
+    /// pushed — NOT in `on_send_message` itself, unlike `SendDm`/
+    /// `SendGroupMsg`'s optimistic-immediate bubbles. A room post is the one
+    /// send path with a post-hoc refusal step (the monotonic-timestamp
+    /// gate), so rendering it before that gate has run would sometimes be a
+    /// phantom: transmitted nowhere, persisted nowhere, gone on reboot with
+    /// no explanation — this mission's Objective
+    /// (`meshcadet-room-post-refusal-surface`). Deferring the bubble to this
+    /// confirmation event closes that gap by construction: nothing is ever
+    /// shown that wasn't actually sent, so `RoomPostRefused` below never has
+    /// anything to retract.
+    RoomPostSent {
+        room_hash: u8,
+        text: String,
+    },
+    /// A room post `on_send_message` queued was refused before reaching the
+    /// radio — see `RoomPostSent`'s doc for why no optimistic bubble exists
+    /// to retract here. `reason` is a short, non-alarming, user-facing
+    /// explanation (e.g. "clock not yet synced — cannot post to this room
+    /// yet"); `handle_event` renders it as a labelled system notice in the
+    /// same thread the user just tried to post to, rather than leaving the
+    /// tap looking like the app silently ignored it.
+    RoomPostRefused {
+        room_hash: u8,
+        reason: String,
+    },
 }
 
 /// Commands from the UI layer to the radio dispatcher.
@@ -2054,6 +2084,60 @@ impl<'d> UiRuntime<'d> {
                     }
                 }
             }
+            UiEvent::RoomPostSent { room_hash, text } => {
+                // The dispatcher confirmed this post actually reached the
+                // wire — only now does `on_send_message`'s queued room post
+                // get its bubble. See this variant's own doc + this
+                // mission's Objective (`meshcadet-room-post-refusal-
+                // surface`) for why it isn't rendered any earlier.
+                self.messages
+                    .entry(room_hash)
+                    .or_default()
+                    .push(MessageRecord {
+                        text,
+                        is_ours: true,
+                        acked: false,
+                        ts_ms: now_ms,
+                    });
+                if let ActiveScreen::ContactList(ref screen) = self.active_screen {
+                    let channels = build_channel_items(
+                        &self.channel_items, &self.messages, &self.unread,
+                    );
+                    screen.set_channels(&channels);
+                }
+                self.refresh_message_view_for(room_hash, true);
+            }
+            UiEvent::RoomPostRefused { room_hash, reason } => {
+                // Nothing to retract — `on_send_message`'s room branch never
+                // rendered a bubble to begin with (see `RoomPostSent`'s
+                // doc). The user still composed and tapped Send though, so
+                // they need to know why nothing appeared: surfaced as a
+                // labelled system notice through the exact same
+                // "<name>: <body>" received-message rendering path
+                // `build_message_items` already applies to every other room
+                // post (no new UI plumbing), rather than leaving the thread
+                // silently unchanged — which from the user's seat would be
+                // indistinguishable from the tap having done nothing at
+                // all. Deliberately no `notif.fire`/unread bump: a refusal
+                // is a "didn't happen", not a new incoming message.
+                log::warn!("ui: room 0x{:02x} post refused: {}", room_hash, reason);
+                self.messages
+                    .entry(room_hash)
+                    .or_default()
+                    .push(MessageRecord {
+                        text: format!("System: {reason}"),
+                        is_ours: false,
+                        acked: false,
+                        ts_ms: now_ms,
+                    });
+                if let ActiveScreen::ContactList(ref screen) = self.active_screen {
+                    let channels = build_channel_items(
+                        &self.channel_items, &self.messages, &self.unread,
+                    );
+                    screen.set_channels(&channels);
+                }
+                self.refresh_message_view_for(room_hash, true);
+            }
             UiEvent::DmAcked { to_hash } => {
                 // Mark the last outbound message to this contact as acked.
                 mark_last_unacked_outbound(&mut self.messages, to_hash);
@@ -2260,24 +2344,37 @@ impl<'d> UiRuntime<'d> {
             }
         }
 
-        self.messages
-            .entry(hash)
-            .or_default()
-            .push(MessageRecord {
-                text: text.clone(),
-                is_ours: true,
-                acked: false,
-                ts_ms: 0, // filled in by dispatcher
-            });
+        // This mission's Objective (`meshcadet-room-post-refusal-surface`):
+        // a room post can be refused AFTER this function returns, by the
+        // dispatcher's monotonic-timestamp gate (`main.rs`'s handling of
+        // `SendRoomPost`, `room_session::encode_room_post_checked`) — unlike
+        // `SendGroupMsg`/`SendDm` below, which have no post-hoc refusal
+        // step. So the room branch queues the command WITHOUT touching
+        // `self.messages` first: the "sent" bubble is rendered only once the
+        // dispatcher confirms the encode actually succeeded
+        // (`UiEvent::RoomPostSent`), and a refusal instead raises
+        // `UiEvent::RoomPostRefused` — see both variants' docs. Nothing
+        // shown here means nothing ever needs to be retracted there.
         if self.room_permissions.contains_key(&hash) {
             log::info!("ui: send room post room=0x{:02x} ({} bytes)", hash, text.len());
             self.commands.push(UiCommand::SendRoomPost { room_hash: hash, text });
-        } else if is_channel {
-            log::info!("ui: send GRP_TXT ch={:#04x} ({} bytes)", hash, text.len());
-            self.commands.push(UiCommand::SendGroupMsg { channel_hash: hash, text });
         } else {
-            log::info!("ui: send DM to={:#04x} ({} bytes)", hash, text.len());
-            self.commands.push(UiCommand::SendDm { to_hash: hash, text });
+            self.messages
+                .entry(hash)
+                .or_default()
+                .push(MessageRecord {
+                    text: text.clone(),
+                    is_ours: true,
+                    acked: false,
+                    ts_ms: 0, // filled in by dispatcher
+                });
+            if is_channel {
+                log::info!("ui: send GRP_TXT ch={:#04x} ({} bytes)", hash, text.len());
+                self.commands.push(UiCommand::SendGroupMsg { channel_hash: hash, text });
+            } else {
+                log::info!("ui: send DM to={:#04x} ({} bytes)", hash, text.len());
+                self.commands.push(UiCommand::SendDm { to_hash: hash, text });
+            }
         }
         // Refresh the live MessageView if this conversation is the active screen.
         // Currently the only caller is nav-code-6 (compose → send), where the

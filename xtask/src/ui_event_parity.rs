@@ -25,6 +25,17 @@
 //! | `RoomPostLive`     | yes             | yes          | yes                |
 //! | `RoomPostDrained`  | yes             | **no**       | **no**             |
 //! | `RoomDrainComplete`| **no**          | yes          | yes                |
+//! | `RoomPostSent`     | yes             | **no**       | **no**             |
+//! | `RoomPostRefused`  | yes             | **no**       | **no**             |
+//!
+//! The last two rows are `meshcadet-room-post-refusal-surface`'s own —
+//! confirmation/refusal of a room post the user just sent themselves is
+//! content the sender already knows about, not an *incoming* interruption:
+//! it must append (so the user sees the outcome) but never bump unread or
+//! fire the notification model. Pinning both here means the "non-alarming"
+//! half of that mission's Objective is mutation-tested for free by this
+//! table's existing generic machinery, on top of the dedicated sibling guard
+//! below for the phantom-bubble half.
 //!
 //! `RoomPostLive`'s row is required to equal `IncomingGroupMsg`'s row — that
 //! equality *is* the "full parity with the channel path" claim, which until
@@ -46,6 +57,20 @@
 //! one. It deliberately fails loud (a reported violation, never a silent
 //! skip) if an arm cannot be located or parsed at all, per this crate's
 //! "parse gap = NO-GO" doctrine.
+//!
+//! # Sibling guard: no phantom "sent" bubble for a refused room post
+//!
+//! `meshcadet-room-post-refusal-surface` added a second, unrelated
+//! invariant pinned in this same module (same file under scan, same
+//! "structural scan, no esp toolchain" rationale):
+//! `UiRuntime::on_send_message`'s room-post branch — the one that queues
+//! `UiCommand::SendRoomPost` — must never itself construct a
+//! `MessageRecord`. A room post can be refused post-hoc by the dispatcher's
+//! monotonic-timestamp gate (`main.rs`'s handling of that command,
+//! `room_session::encode_room_post_checked`); pushing an optimistic bubble
+//! before that gate runs left a phantom "sent" message with nothing behind
+//! it on the refusal path. See
+//! [`check_no_optimistic_room_post_bubble`]'s doc for the mechanics.
 //!
 //! The corollary of failing loud is that a legitimate refactor — hoisting an
 //! arm's body into a helper function, say — will trip it. That is the
@@ -119,6 +144,22 @@ const EXPECTED: &[(&str, NotificationEffects)] = &[
             fires_notification: true,
         },
     ),
+    (
+        "RoomPostSent",
+        NotificationEffects {
+            appends_content: true,
+            bumps_unread: false,
+            fires_notification: false,
+        },
+    ),
+    (
+        "RoomPostRefused",
+        NotificationEffects {
+            appends_content: true,
+            bumps_unread: false,
+            fires_notification: false,
+        },
+    ),
 ];
 
 /// The two arms that must behave identically — the parity claim itself.
@@ -136,6 +177,22 @@ const PARITY_PAIR: (&str, &str) = ("RoomPostLive", "IncomingGroupMsg");
 /// this module applies.
 const ROOM_PERMISSION_UPDATED_VARIANT: &str = "RoomPermissionUpdated";
 const ROOM_PERMISSION_UPDATED_REQUIRED_CALL: &str = "self.register_room(";
+
+/// `meshcadet-room-post-refusal-surface`'s regression guard: a room post can
+/// be refused post-hoc by the dispatcher's monotonic-timestamp gate
+/// (`main.rs`'s handling of `UiCommand::SendRoomPost`,
+/// `room_session::encode_room_post_checked`) — reachable roughly a coin-flip
+/// of the time on a GPS-unsynced boot (see that mission's Objective for the
+/// full reachability argument). Before the fix, `on_send_message` pushed an
+/// optimistic "sent" `MessageRecord` unconditionally, before that gate ever
+/// ran, so a refusal left a phantom bubble: transmitted nowhere, persisted
+/// nowhere, gone on reboot with no explanation. The fix moved the bubble to
+/// only ever be rendered once the dispatcher confirms the encode actually
+/// succeeded (`UiEvent::RoomPostSent`); this pins that `on_send_message`'s
+/// room-post branch — the block that queues `UiCommand::SendRoomPost` —
+/// never itself constructs a `MessageRecord` ahead of that confirmation.
+const ON_SEND_MESSAGE_FN_MARKER: &str = "fn on_send_message";
+const ROOM_POST_COMMAND_MARKER: &str = "UiCommand::SendRoomPost";
 
 /// Char-index positions of every occurrence of `needle` in `hay`.
 fn find_all(hay: &[char], needle: &str) -> Vec<usize> {
@@ -213,6 +270,92 @@ fn arm_body(masked: &str, variant: &str) -> Result<String, String> {
     Ok(slice_chars(masked, o + 1, c))
 }
 
+/// Extract the full body of a named function (`fn <name_marker>(...) { BODY
+/// }`) from already-tokenized (comment/string-blanked) source. Same
+/// ambiguity handling as [`arm_body`] above: exactly one hit, or fail loud
+/// rather than guess.
+fn fn_body(masked: &str, fn_name_marker: &str) -> Result<String, String> {
+    let chars: Vec<char> = masked.chars().collect();
+    let hits = find_all(&chars, fn_name_marker);
+    match hits.len() {
+        1 => {}
+        0 => {
+            return Err(format!(
+                "{UI_MOD_REL_PATH}: no `{fn_name_marker}` found — the function was renamed, \
+                 moved, or deleted, and this scanner needs updating"
+            ))
+        }
+        n => {
+            return Err(format!(
+                "{UI_MOD_REL_PATH}: {n} occurrences of `{fn_name_marker}` (expected exactly \
+                 one) — this scanner cannot tell which is the function"
+            ))
+        }
+    }
+    let start = hits[0];
+    let mut open = start;
+    while open < chars.len() && chars[open] != '{' {
+        open += 1;
+    }
+    if open >= chars.len() {
+        return Err(format!(
+            "{UI_MOD_REL_PATH}: `{fn_name_marker}` has no braced body this scanner can delimit"
+        ));
+    }
+    let spans = brace_spans(masked);
+    let (o, c) = innermost_span(&spans, open + 1)
+        .ok_or_else(|| format!("{UI_MOD_REL_PATH}: unbalanced braces around `{fn_name_marker}`"))?;
+    if o != open {
+        return Err(format!(
+            "{UI_MOD_REL_PATH}: could not delimit `{fn_name_marker}`'s body"
+        ));
+    }
+    Ok(slice_chars(masked, o + 1, c))
+}
+
+/// `meshcadet-room-post-refusal-surface`'s regression guard — see
+/// [`ON_SEND_MESSAGE_FN_MARKER`]'s doc for the invariant. Locates
+/// `on_send_message`'s body, finds the single `UiCommand::SendRoomPost`
+/// command push inside it, and asserts the innermost brace block enclosing
+/// that push (the room-post branch itself) never constructs a
+/// `MessageRecord`.
+fn check_no_optimistic_room_post_bubble(masked: &str) -> Vec<String> {
+    let body = match fn_body(masked, ON_SEND_MESSAGE_FN_MARKER) {
+        Err(e) => return vec![e],
+        Ok(b) => b,
+    };
+    let body_chars: Vec<char> = body.chars().collect();
+    let hits = find_all(&body_chars, ROOM_POST_COMMAND_MARKER);
+    if hits.len() != 1 {
+        return vec![format!(
+            "{UI_MOD_REL_PATH}: expected exactly one `{ROOM_POST_COMMAND_MARKER}` inside \
+             `on_send_message` (found {}) — this scanner cannot locate the room-post branch",
+            hits.len()
+        )];
+    }
+    let spans = brace_spans(&body);
+    match innermost_span(&spans, hits[0]) {
+        None => vec![format!(
+            "{UI_MOD_REL_PATH}: could not delimit the room-post branch enclosing \
+             `{ROOM_POST_COMMAND_MARKER}` inside `on_send_message`"
+        )],
+        Some((o, c)) => {
+            let branch = slice_chars(&body, o + 1, c);
+            if branch.contains("MessageRecord") {
+                vec![format!(
+                    "{UI_MOD_REL_PATH}: `on_send_message`'s room-post branch constructs a \
+                     `MessageRecord` ahead of the dispatcher's send-eligibility checks — this \
+                     reintroduces the phantom-sent-bubble defect fixed by \
+                     meshcadet-room-post-refusal-surface (a refused room post must leave no \
+                     record in `self.messages`)"
+                )]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+}
+
 /// Classify one arm body's notification-surface actions.
 ///
 /// Matching is on the two identifiers that carry each action's *meaning*
@@ -281,6 +424,12 @@ pub fn check_source(src: &str) -> Vec<String> {
         }
     }
 
+    // `meshcadet-room-post-refusal-surface`'s regression guard: no
+    // room-post send path may push a `MessageRecord` ahead of the
+    // dispatcher's send-eligibility checks — see
+    // `check_no_optimistic_room_post_bubble`'s doc.
+    violations.extend(check_no_optimistic_room_post_bubble(&masked));
+
     violations
 }
 
@@ -311,12 +460,44 @@ mod tests {
         );
     }
 
-    /// A minimal stand-in for `handle_event`'s five arms, used by the
-    /// mutation tests below to prove this scanner has teeth.
+    /// A minimal stand-in for `on_send_message`'s room-post branch, used by
+    /// [`synthetic`] below to feed [`check_no_optimistic_room_post_bubble`]'s
+    /// mutation test. `bad: true` reproduces the original
+    /// `meshcadet-room-post-refusal-surface` defect (an optimistic
+    /// `MessageRecord` pushed before `UiCommand::SendRoomPost` is queued).
+    fn synthetic_on_send_message(bad: bool) -> String {
+        let phantom_push = if bad {
+            r#"self.messages.entry(hash).or_default().push(MessageRecord { text: text.clone(), is_ours: true, acked: false, ts_ms: 0 });"#
+        } else {
+            ""
+        };
+        format!(
+            r#"
+            fn on_send_message(&mut self, hash: u8, is_channel: bool, raw_text: String) {{
+                if self.room_permissions.contains_key(&hash) {{
+                    {phantom_push}
+                    self.commands.push(UiCommand::SendRoomPost {{ room_hash: hash, text }});
+                }} else {{
+                    self.messages.entry(hash).or_default().push(MessageRecord {{
+                        text: text.clone(), is_ours: true, acked: false, ts_ms: 0,
+                    }});
+                    self.commands.push(UiCommand::SendDm {{ to_hash: hash, text }});
+                }}
+            }}
+            "#
+        )
+    }
+
+    /// A minimal stand-in for `handle_event`'s five arms plus
+    /// `on_send_message`'s room-post branch, used by the mutation tests
+    /// below to prove this scanner has teeth. `room_post_phantom_bubble`
+    /// drives [`synthetic_on_send_message`] — `false` everywhere except the
+    /// dedicated mutation test for that guard.
     fn synthetic(
         live_fires_notification: bool,
         drained_fires_notification: bool,
         registers_permission: bool,
+        room_post_phantom_bubble: bool,
     ) -> String {
         let live_notif = if live_fires_notification {
             "self.notif.fire(NotifEvent::IncomingGroupMsg, now_ms, self.screen_asleep);"
@@ -333,6 +514,7 @@ mod tests {
         } else {
             ""
         };
+        let on_send_message = synthetic_on_send_message(room_post_phantom_bubble);
         format!(
             r#"
             // A doc mention of [`UiEvent::RoomPostLive`] must not count as an arm.
@@ -365,7 +547,19 @@ mod tests {
                 UiEvent::RoomPermissionUpdated {{ room_hash, can_post }} => {{
                     {register_call}
                 }}
+                UiEvent::RoomPostSent {{ room_hash, text }} => {{
+                    // Confirmation of the user's own send: append only, no
+                    // unread bump, no notif.fire — see [`EXPECTED`]'s doc.
+                    self.messages.entry(room_hash).or_default().push(MessageRecord {{ text }});
+                }}
+                UiEvent::RoomPostRefused {{ room_hash, reason }} => {{
+                    // Refusal of the user's own send: append only, no
+                    // unread bump, no notif.fire — see [`EXPECTED`]'s doc.
+                    self.messages.entry(room_hash).or_default().push(MessageRecord {{ text: reason }});
+                }}
             }}
+
+            {on_send_message}
             "#
         )
     }
@@ -373,8 +567,24 @@ mod tests {
     #[test]
     fn synthetic_baseline_is_clean() {
         assert_eq!(
-            check_source(&synthetic(true, false, true)),
+            check_source(&synthetic(true, false, true, false)),
             Vec::<String>::new()
+        );
+    }
+
+    /// The mutation this sibling guard exists for: `on_send_message`'s
+    /// room-post branch pushes an optimistic `MessageRecord` before
+    /// `UiCommand::SendRoomPost` is even queued — the exact
+    /// `meshcadet-room-post-refusal-surface` defect (a refusal downstream
+    /// leaves a phantom "sent" bubble with nothing behind it).
+    #[test]
+    fn optimistic_room_post_bubble_is_caught() {
+        let violations = check_source(&synthetic(true, false, true, true));
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("constructs a `MessageRecord` ahead of")),
+            "expected the phantom-bubble violation, got {violations:?}"
         );
     }
 
@@ -384,7 +594,7 @@ mod tests {
     /// comparison.
     #[test]
     fn dropping_the_live_arms_notification_is_caught() {
-        let violations = check_source(&synthetic(false, false, true));
+        let violations = check_source(&synthetic(false, false, true, false));
         assert!(
             violations
                 .iter()
@@ -401,7 +611,7 @@ mod tests {
     /// notifying per post again, i.e. the 32-post backlog storms the tray.
     #[test]
     fn a_notification_leaking_into_the_drain_arm_is_caught() {
-        let violations = check_source(&synthetic(true, true, true));
+        let violations = check_source(&synthetic(true, true, true, false));
         assert!(
             violations
                 .iter()
@@ -415,7 +625,7 @@ mod tests {
     /// upgrade never reaches the UI".
     #[test]
     fn dropping_the_register_room_call_is_caught() {
-        let violations = check_source(&synthetic(true, false, false));
+        let violations = check_source(&synthetic(true, false, false, false));
         assert!(
             violations
                 .iter()
@@ -440,7 +650,7 @@ mod tests {
     /// its match arm (the tokenizer blanks comment bodies first).
     #[test]
     fn comment_mentions_are_not_counted_as_arms() {
-        let src = synthetic(true, false, true);
+        let src = synthetic(true, false, true, false);
         assert!(
             src.contains("[`UiEvent::RoomPostLive`]"),
             "fixture must actually contain a doc-comment mention"

@@ -2231,8 +2231,19 @@ fn run() -> anyhow::Result<()> {
             if let Err(e) = ui.step(now) {
                 log::warn!("UI step error: {:?}", e);
             }
-            // Drain any commands the UI generated (send DM, etc.)
-            for cmd in ui.drain_commands() {
+            // Drain any commands the UI generated (send DM, etc.). Collected
+            // into an owned `Vec` first rather than iterating
+            // `ui.drain_commands()` directly: the room-post handling below
+            // now calls `ui.post_event(...)` mid-loop, to confirm or refuse
+            // a send back to the UI (`UiEvent::RoomPostSent`/
+            // `RoomPostRefused` — this mission's Objective,
+            // `meshcadet-room-post-refusal-surface`), and the borrow checker
+            // ties `drain_commands`'s returned iterator to the whole `&mut
+            // UiRuntime` (its `&mut self` signature, even though it only
+            // touches `self.commands`) — a second `&mut ui` call from
+            // inside the loop body would conflict with that live borrow.
+            let cmds: Vec<ui::UiCommand> = ui.drain_commands().collect();
+            for cmd in cmds {
                 match cmd {
                     ui::UiCommand::SendDm { to_hash, text } => {
                         // Resolve contact pubkey by 1-byte hash; unknown hashes are silently
@@ -2348,11 +2359,13 @@ fn run() -> anyhow::Result<()> {
                     ui::UiCommand::SendRoomPost { room_hash, text } => {
                         // Phase A: post send. `room_session::encode_room_post_checked`
                         // enforces the strictly-monotonic per-room timestamp
-                        // invariant (this mission's Objective) — a refusal
-                        // is surfaced (logged), never silently sent, since
-                        // the server would either treat an equal timestamp
-                        // as a retry (discarded, still ACKed) or a lesser
-                        // one as an outright replay (no ACK at all).
+                        // invariant — a refusal is surfaced (logged, AND
+                        // raised to the UI as `UiEvent::RoomPostRefused` —
+                        // see `meshcadet-room-post-refusal-surface`'s
+                        // Objective), never silently sent, since the server
+                        // would either treat an equal timestamp as a retry
+                        // (discarded, still ACKed) or a lesser one as an
+                        // outright replay (no ACK at all).
                         #[cfg(not(feature = "hil"))]
                         match room_runtime.iter_mut().find(|r| r.hash == room_hash) {
                             None => log::warn!(
@@ -2405,12 +2418,28 @@ fn run() -> anyhow::Result<()> {
                                                 true,
                                                 false,
                                             );
+                                            // Confirm to the UI that this post actually
+                                            // reached the wire — see
+                                            // `ui::UiEvent::RoomPostSent`'s doc:
+                                            // `on_send_message`'s room branch queues
+                                            // this command WITHOUT rendering an
+                                            // optimistic bubble first, precisely so a
+                                            // refusal below never has one to retract.
+                                            ui.post_event(ui::UiEvent::RoomPostSent {
+                                                room_hash: room.hash,
+                                                text,
+                                            });
                                         }
                                         Err(e) => {
                                             // Phase A's non-negotiable: never send a
                                             // post the server's replay gate would
                                             // silently discard — surface it (logged)
-                                            // rather than transmit.
+                                            // rather than transmit. This mission's
+                                            // Objective (`meshcadet-room-post-refusal-
+                                            // surface`): logging alone left the user
+                                            // with no explanation for a post that
+                                            // simply never appeared — `RoomPostRefused`
+                                            // tells them why, directly in the thread.
                                             log::warn!(
                                                 "UI send room post to 0x{:02x} refused: \
                                                  {:?} — local clock has not advanced \
@@ -2419,6 +2448,12 @@ fn run() -> anyhow::Result<()> {
                                                  clock regression)",
                                                 room.hash, e,
                                             );
+                                            ui.post_event(ui::UiEvent::RoomPostRefused {
+                                                room_hash: room.hash,
+                                                reason: "clock not yet synced — cannot post \
+                                                         to this room yet"
+                                                    .to_string(),
+                                            });
                                         }
                                     }
                                 }
