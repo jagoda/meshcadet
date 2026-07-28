@@ -2365,3 +2365,71 @@ fn test_cli_add_room_help_documents_password_sources() {
         "add-room --help must warn that --password is recorded in shell history:\n{stdout}"
     );
 }
+
+// ── Channel-secret and admin-PIN off-argv sources (B1) ──────────────────────
+
+/// Acceptance: `add-channel --help` and `del-channel --help` document all
+/// four secret sources (`--secret`, `--secret-file`, `--secret-env`,
+/// `--secret-stdin`) and flag that the direct-value flag lands in shell
+/// history, mirroring `add-room --help`'s `--password` documentation.
+#[test]
+fn test_cli_channel_help_documents_secret_sources() {
+    let exe = env!("CARGO_BIN_EXE_meshcadet");
+    for subcmd in ["add-channel", "del-channel"] {
+        let output = std::process::Command::new(exe)
+            .args(["--port", "/dev/null", subcmd, "--help"])
+            .output()
+            .unwrap_or_else(|e| panic!("meshcadet {subcmd} --help must run: {e}"));
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for flag in [
+            "--secret",
+            "--secret-file",
+            "--secret-env",
+            "--secret-stdin",
+        ] {
+            assert!(
+                stdout.contains(flag),
+                "{subcmd} --help must document {flag}:\n{stdout}"
+            );
+        }
+        assert!(
+            stdout.to_lowercase().contains("history"),
+            "{subcmd} --help must warn that --secret is recorded in shell history:\n{stdout}"
+        );
+    }
+}
+
+/// Acceptance: `set-pin --help` and `reset-pin --help` document all four PIN
+/// sources (`--pin`, `--pin-file`, `--pin-env`, `--pin-stdin`) and flag that
+/// the direct-value flag lands in shell history.
+#[test]
+fn test_cli_pin_help_documents_pin_sources() {
+    let exe = env!("CARGO_BIN_EXE_meshcadet");
+    for subcmd in ["set-pin", "reset-pin"] {
+        let output = std::process::Command::new(exe)
+            .args(["--port", "/dev/null", subcmd, "--help"])
+            .output()
+            .unwrap_or_else(|e| panic!("meshcadet {subcmd} --help must run: {e}"));
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for flag in ["--pin", "--pin-file", "--pin-env", "--pin-stdin"] {
+            assert!(
+                stdout.contains(flag),
+                "{subcmd} --help must document {flag}:\n{stdout}"
+            );
+        }
+        assert!(
+            stdout.to_lowercase().contains("history"),
+            "{subcmd} --help must warn that --pin is recorded in shell history:\n{stdout}"
+        );
+    }
+}
+
+// Note: an end-to-end CLI-binary test of `--secret-file`/`--pin-file`
+// resolving through to the wire is not practical here — `main()` opens the
+// serial transport (`SerialTransport::open`, `host/src/main.rs:369`) before
+// dispatching to any subcommand, so a portless invocation always fails at
+// transport-open regardless of whether the secret/PIN resolver logic is
+// correct. `resolve_channel_secret`/`resolve_admin_pin`'s own unit tests
+// (in `src/main.rs`) exercise that logic directly instead.
