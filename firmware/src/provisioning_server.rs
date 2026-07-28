@@ -103,7 +103,18 @@ pub fn run(
         name_len: 0,
     };
 
-    let mut staging = ProvisionedConfig {
+    // `Box`ed rather than held inline on this thread's 8 KiB stack: at ~3.5 KiB
+    // (`size_of::<ProvisionedConfig>()`, dominated by `room_extras:
+    // [RoomExtra; MAX_CONTACTS]`), plus another ~3.5 KiB transiently on every
+    // `save_provisioned_config` persist (see that fn's own comment), this
+    // struct is exactly the pattern that caused a boot-time `pthread`-task
+    // stack overflow in the sibling `admin_server` thread — see the
+    // `boot-pthread-stack-overflow-fix` mission. `admin_server` was the
+    // CONFIRMED overflow site (its `pthread` task is what actually crashed on
+    // hardware), but this thread carries the identical struct on a SMALLER
+    // (8 KiB vs. 12 KiB) stack, so it gets the same fix preventively rather
+    // than left as a live, merely-unconfirmed risk.
+    let mut staging = Box::new(ProvisionedConfig {
         contacts:       [null_contact; MAX_CONTACTS],
         contact_count:  0,
         channels:       [null_channel; MAX_CHANNELS],
@@ -115,7 +126,7 @@ pub fn run(
         pin:            [0u8; MAX_PIN_LEN],
         pin_len:        0,
         lock_flags:     0,
-    };
+    });
 
     // Device display name lives in the identity store (`mc_id`/`name`), not
     // the provisioning config blob above — it applies immediately (like
@@ -131,6 +142,13 @@ pub fn run(
     let mut rx_buf  = [0u8; RX_BUF_LEN];
     let mut rx_len  = 0usize;
     let mut stdout_ = std::io::stdout();
+
+    // Stack HWM immediately after setup, before the frame loop — mirrors
+    // `admin_server::run`'s identical instrumentation, added the same
+    // mission. Unconditional: a stack overflow reboots the task before any
+    // later periodic tick could fire.
+    const PROV_SERVER_STACK_B: u32 = 8192;
+    crate::log_thread_stack_hwm("prov_server", PROV_SERVER_STACK_B);
 
     loop {
         // ── Read more bytes ──────────────────────────────────────────────────
@@ -216,6 +234,13 @@ pub fn run(
                     &mut device_name_len,
                     &mut stdout_,
                 )?;
+                // Sampled after every handled frame (not just at startup, and
+                // BEFORE the `done`-triggered early return below) so the
+                // deepest call path — `process_frame` →
+                // `save_provisioned_config` on `FRAME_COMMIT_PROVISIONING` —
+                // is covered too, not just the boot-time baseline above.
+                // Mirrors `admin_server::run`'s equivalent.
+                crate::log_thread_stack_hwm("prov_server", PROV_SERVER_STACK_B);
                 if done {
                     log::info!("prov_server: provisioning committed — caller will reboot");
                     return Ok(());

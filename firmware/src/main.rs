@@ -1470,10 +1470,22 @@ fn run() -> anyhow::Result<()> {
         let nvs_for_parent = nvs_partition.clone();
         std::thread::Builder::new()
             .name("admin_server".into())
-            // 12 KiB: the server now owns the loaded ProvisionedConfig (~1.6 KiB)
-            // for its run lifetime and serializes a full ~1.6 KiB config blob on
-            // the stack during each NVS persist (add/del edits) — headroom over
-            // the prior 8 KiB so the edit path cannot overflow the thread stack.
+            // 12 KiB. Originally bumped from 8 KiB (see `admin_server.rs`'s
+            // stale doc comment at `run`'s definition, since corrected) on the
+            // premise that the server owning the loaded `ProvisionedConfig`
+            // plus the per-persist serialize buffer cost only ~1.6 KiB each —
+            // wrong by ~2x (`size_of::<ProvisionedConfig>()` is 3560 B, and
+            // `save_provisioned_config`'s own blob buffer is another 3544 B),
+            // which is what actually caused a boot-time `pthread`-task stack
+            // overflow (`boot-pthread-stack-overflow-fix` mission). Both are
+            // now heap-allocated instead (`Box<ProvisionedConfig>` below;
+            // `config_store`'s serialize/deserialize blob buffers) rather than
+            // resident/transient on this stack, so 12 KiB is now generous
+            // headroom rather than a tight fit — kept at 12 KiB rather than
+            // trimmed back, since no HIL measurement of the new HWM exists yet
+            // to size a smaller budget from (see `admin_server::run`'s own
+            // `log_thread_stack_hwm` calls, added this same mission, for that
+            // measurement once hardware is available).
             .stack_size(12288)
             .spawn(move || {
                 admin_server::run(
@@ -1481,7 +1493,7 @@ fn run() -> anyhow::Result<()> {
                     &GPS_STATUS,
                     &BATTERY_STATUS,
                     identity_for_admin,
-                    provisioned_config,
+                    Box::new(provisioned_config),
                     nvs_for_parent,
                 );
             })
@@ -2245,17 +2257,8 @@ fn run() -> anyhow::Result<()> {
             // A follow-on trim pass can lower the budget once HIL confirms
             // a stable margin over several boot cycles.
             {
-                let hwm: u32 = unsafe {
-                    esp_idf_svc::sys::uxTaskGetStackHighWaterMark(core::ptr::null_mut())
-                };
                 const MAIN_TASK_STACK_B: u32 = 49_152;
-                log::info!(
-                    "main-task stack HWM: {} B free / {} B total = {} B peak ({}% headroom)",
-                    hwm,
-                    MAIN_TASK_STACK_B,
-                    MAIN_TASK_STACK_B.saturating_sub(hwm),
-                    hwm * 100 / MAIN_TASK_STACK_B,
-                );
+                log_thread_stack_hwm("main-task", MAIN_TASK_STACK_B);
             }
         }
 
@@ -3797,6 +3800,32 @@ fn hex4(h: &[u8; 4]) -> heapless_hex::Hex4 {
 #[inline]
 pub(crate) fn uptime_ms() -> u64 {
     unsafe { esp_idf_svc::sys::esp_timer_get_time() as u64 / 1000 }
+}
+
+/// Log the CALLING task's stack high-water mark: `uxTaskGetStackHighWaterMark`
+/// with a `NULL` handle always reports the current task, so `task_name` /
+/// `stack_total_b` are caller-supplied labels only — this must be called FROM
+/// the task being measured, not about it.
+///
+/// Shared by every long-lived spawned thread's own HWM log (`admin_server`,
+/// `provisioning_server`) and the main-task periodic sample below — pulled out
+/// once these threads all needed the identical `uxTaskGetStackHighWaterMark`→
+/// percentage-headroom computation, rather than three near-duplicate call
+/// sites (see the `boot-pthread-stack-overflow-fix` mission: a `pthread` task
+/// stack overflow that was invisible until an on-hardware crash precisely
+/// because neither spawned thread had this instrumentation the main task
+/// already carried).
+pub(crate) fn log_thread_stack_hwm(task_name: &str, stack_total_b: u32) {
+    let hwm: u32 =
+        unsafe { esp_idf_svc::sys::uxTaskGetStackHighWaterMark(core::ptr::null_mut()) };
+    log::info!(
+        "{}: stack HWM: {} B free / {} B total = {} B peak ({}% headroom)",
+        task_name,
+        hwm,
+        stack_total_b,
+        stack_total_b.saturating_sub(hwm),
+        hwm * 100 / stack_total_b,
+    );
 }
 
 /// Format a full 32-byte public key as 64 lowercase hex chars (no alloc).

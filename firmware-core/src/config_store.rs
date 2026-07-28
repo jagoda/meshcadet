@@ -959,6 +959,36 @@ mod tests {
         }
     }
 
+    // ── ProvisionedConfig in-memory size (stack-budget regression guard) ────
+    //
+    // `firmware/src/main.rs`'s `admin_server`/`prov_server` thread spawns pick
+    // their `.stack_size(...)` partly from this struct's in-memory size (it is
+    // moved/boxed onto those threads' stacks/heaps — see
+    // `admin_server::run`'s and `provisioning_server::run`'s doc comments).
+    // A prior stack-size bump was arithmetic'd from a WRONG ~1.6 KiB estimate
+    // (half the real ~3.5 KiB) and caused a boot-time `pthread`-task stack
+    // overflow (`boot-pthread-stack-overflow-fix` mission) before the owning
+    // struct was moved to the heap. Pinning the exact size here means any
+    // future field addition to `Contact`/`Channel`/`RoomExtra`/
+    // `ProvisionedConfig` fails this test loudly instead of silently
+    // shrinking whatever stack headroom the heap-move fix bought back —
+    // update the constant AND re-check the two spawn sites' stack budgets
+    // together, never just one.
+    #[test]
+    fn provisioned_config_size_is_pinned() {
+        assert_eq!(std::mem::size_of::<Contact>(), 67);
+        assert_eq!(std::mem::size_of::<Channel>(), 67);
+        assert_eq!(std::mem::size_of::<RoomExtra>(), 120);
+        assert_eq!(
+            std::mem::size_of::<ProvisionedConfig>(),
+            3560,
+            "ProvisionedConfig size changed — re-check the admin_server/prov_server \
+             thread stack budgets in firmware/src/main.rs (both now heap-allocate \
+             this struct, but the heap allocation itself still needs to fit, and \
+             the doc comments at each spawn site cite this exact figure)",
+        );
+    }
+
     // ── MAX_BLOB_LEN budget ──────────────────────────────────────────────────
 
     #[test]
