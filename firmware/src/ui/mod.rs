@@ -2352,6 +2352,18 @@ impl<'d> UiRuntime<'d> {
                     "ui: compose send blocked — room 0x{:02x} is read-only for this session",
                     hash,
                 );
+                // Don't just drop the typed text with no on-screen trace —
+                // that's the exact failure mode `UiEvent::RoomPostRefused`
+                // (see its doc) exists to prevent. This arm is reachable
+                // whenever a permission downgrade lands between Compose
+                // opening (read-only was false then) and this Send tap
+                // (read-only is true now): the compose screen's own guard
+                // didn't catch it, so this defense-in-depth check is the
+                // only place left to surface the refusal.
+                self.post_event(UiEvent::RoomPostRefused {
+                    room_hash: hash,
+                    reason: "this room is now read-only for your session".to_string(),
+                });
                 return;
             }
         }

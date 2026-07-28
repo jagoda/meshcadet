@@ -194,6 +194,18 @@ const ROOM_PERMISSION_UPDATED_REQUIRED_CALL: &str = "self.register_room(";
 const ON_SEND_MESSAGE_FN_MARKER: &str = "fn on_send_message";
 const ROOM_POST_COMMAND_MARKER: &str = "UiCommand::SendRoomPost";
 
+/// `meshcadet-room-readonly-refusal-surface-v2`'s regression guard: the
+/// defense-in-depth read-only recheck inside `on_send_message` (`if let
+/// Some(&can_post) = self.room_permissions.get(&hash) { if !can_post { … }
+/// }`) used to drop the composed post with only a `log::warn!` and a bare
+/// `return` — silently losing the user's typed text, the exact failure mode
+/// `UiEvent::RoomPostRefused` exists to prevent (per its own doc comment).
+/// This pins that the `!can_post` arm raises `RoomPostRefused` via
+/// `post_event` instead of returning silently.
+const ROOM_PERMISSIONS_GET_MARKER: &str = "self.room_permissions.get(&hash)";
+const ROOM_POST_REFUSED_EVENT_MARKER: &str = "UiEvent::RoomPostRefused";
+const POST_EVENT_CALL_MARKER: &str = "self.post_event(";
+
 /// Char-index positions of every occurrence of `needle` in `hay`.
 fn find_all(hay: &[char], needle: &str) -> Vec<usize> {
     let pat: Vec<char> = needle.chars().collect();
@@ -205,16 +217,55 @@ fn find_all(hay: &[char], needle: &str) -> Vec<usize> {
         .collect()
 }
 
+/// Is the `UiEvent::<variant>` occurrence starting at `end` (the index right
+/// after the variant name) a match-arm PATTERN (`UiEvent::Foo { .. } => {`
+/// or, for a unit variant, `UiEvent::Foo => {`), as opposed to a value
+/// CONSTRUCTION expression (`UiEvent::Foo { .. }` used to build a value, e.g.
+/// inside `self.post_event(UiEvent::Foo { .. })`)? Both share the identical
+/// `UiEvent::<variant> { .. }` prefix, so `find_all` alone cannot tell them
+/// apart — this walks past the (possibly braced) pattern and checks whether
+/// `=>` immediately follows, which only a match arm has.
+fn is_match_arm_hit(chars: &[char], end: usize, spans: &[(usize, usize)]) -> bool {
+    let mut i = end;
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
+    if i < chars.len() && chars[i] == '{' {
+        match innermost_span(spans, i + 1) {
+            Some((o, c)) if o == i => {
+                let mut j = c + 1;
+                while j < chars.len() && chars[j].is_whitespace() {
+                    j += 1;
+                }
+                j + 1 < chars.len() && chars[j] == '=' && chars[j + 1] == '>'
+            }
+            _ => false,
+        }
+    } else {
+        i + 1 < chars.len() && chars[i] == '=' && chars[i + 1] == '>'
+    }
+}
+
 /// Extract the body of the `UiEvent::<variant> { … } => { BODY }` match arm
 /// from already-tokenized (comment- and string-blanked) source.
 ///
 /// Returns `Err` rather than `None`-and-carry-on for every ambiguity: zero
 /// hits, more than one hit, or a hit that isn't followed by `=> {`. A doc
 /// comment mentioning `[UiEvent::RoomDrainComplete]` is not a hit, because
-/// `masked` has had every comment body blanked to spaces before we look.
+/// `masked` has had every comment body blanked to spaces before we look. A
+/// value-construction expression elsewhere in the file (e.g.
+/// `self.post_event(UiEvent::RoomPostRefused { .. })`) is likewise not a hit —
+/// see [`is_match_arm_hit`].
 fn arm_body(masked: &str, variant: &str) -> Result<String, String> {
     let chars: Vec<char> = masked.chars().collect();
-    let hits = find_all(&chars, &format!("UiEvent::{variant}"));
+    let all_hits = find_all(&chars, &format!("UiEvent::{variant}"));
+    let spans = brace_spans(masked);
+    let variant_end_offset = format!("UiEvent::{variant}").chars().count();
+    let hits: Vec<usize> = all_hits
+        .iter()
+        .copied()
+        .filter(|&start| is_match_arm_hit(&chars, start + variant_end_offset, &spans))
+        .collect();
     match hits.len() {
         1 => {}
         0 => {
@@ -356,6 +407,72 @@ fn check_no_optimistic_room_post_bubble(masked: &str) -> Vec<String> {
     }
 }
 
+/// `meshcadet-room-readonly-refusal-surface-v2`'s regression guard — see
+/// [`ROOM_PERMISSIONS_GET_MARKER`]'s doc for the invariant. Locates
+/// `on_send_message`'s body, finds the single `self.room_permissions.get(&hash)`
+/// re-check inside it, and asserts the innermost brace block enclosing that
+/// call (the `if let Some(&can_post) = …` guard, including its nested `if
+/// !can_post` arm) raises `UiEvent::RoomPostRefused` through `self.post_event(`
+/// rather than only logging and returning.
+fn check_readonly_guard_surfaces_refusal(masked: &str) -> Vec<String> {
+    let body = match fn_body(masked, ON_SEND_MESSAGE_FN_MARKER) {
+        Err(e) => return vec![e],
+        Ok(b) => b,
+    };
+    let body_chars: Vec<char> = body.chars().collect();
+    let hits = find_all(&body_chars, ROOM_PERMISSIONS_GET_MARKER);
+    if hits.len() != 1 {
+        return vec![format!(
+            "{UI_MOD_REL_PATH}: expected exactly one `{ROOM_PERMISSIONS_GET_MARKER}` inside \
+             `on_send_message` (found {}) — this scanner cannot locate the read-only \
+             defense-in-depth guard",
+            hits.len()
+        )];
+    }
+    // `ROOM_PERMISSIONS_GET_MARKER` sits in the `if let … = <marker> {` guard's
+    // CONDITION, i.e. before that block's own opening brace — unlike
+    // `check_no_optimistic_room_post_bubble`'s marker, which sits inside the
+    // branch it delimits. Walk forward to that brace first, then delimit the
+    // block it opens (which encloses the nested `if !can_post { … }` arm).
+    let mut open = hits[0];
+    while open < body_chars.len() && body_chars[open] != '{' {
+        open += 1;
+    }
+    if open >= body_chars.len() {
+        return vec![format!(
+            "{UI_MOD_REL_PATH}: `{ROOM_PERMISSIONS_GET_MARKER}` inside `on_send_message` has no \
+             braced guard block this scanner can delimit"
+        )];
+    }
+    let spans = brace_spans(&body);
+    match innermost_span(&spans, open + 1) {
+        None => vec![format!(
+            "{UI_MOD_REL_PATH}: could not delimit the read-only guard block enclosing \
+             `{ROOM_PERMISSIONS_GET_MARKER}` inside `on_send_message`"
+        )],
+        Some((o, c)) if o == open => {
+            let branch = slice_chars(&body, o + 1, c);
+            if branch.contains(ROOM_POST_REFUSED_EVENT_MARKER)
+                && branch.contains(POST_EVENT_CALL_MARKER)
+            {
+                Vec::new()
+            } else {
+                vec![format!(
+                    "{UI_MOD_REL_PATH}: `on_send_message`'s read-only defense-in-depth guard \
+                     no longer raises `{ROOM_POST_REFUSED_EVENT_MARKER}` via \
+                     `{POST_EVENT_CALL_MARKER}` — a room-post send blocked here would silently \
+                     drop the user's typed text with no on-screen explanation, reintroducing the \
+                     meshcadet-room-readonly-refusal-surface-v2 defect"
+                )]
+            }
+        }
+        Some(_) => vec![format!(
+            "{UI_MOD_REL_PATH}: could not delimit the read-only guard block enclosing \
+             `{ROOM_PERMISSIONS_GET_MARKER}` inside `on_send_message`"
+        )],
+    }
+}
+
 /// Classify one arm body's notification-surface actions.
 ///
 /// Matching is on the two identifiers that carry each action's *meaning*
@@ -430,6 +547,12 @@ pub fn check_source(src: &str) -> Vec<String> {
     // `check_no_optimistic_room_post_bubble`'s doc.
     violations.extend(check_no_optimistic_room_post_bubble(&masked));
 
+    // `meshcadet-room-readonly-refusal-surface-v2`'s regression guard: the
+    // read-only defense-in-depth recheck must surface `RoomPostRefused`
+    // rather than silently dropping the composed text — see
+    // `check_readonly_guard_surfaces_refusal`'s doc.
+    violations.extend(check_readonly_guard_surfaces_refusal(&masked));
+
     violations
 }
 
@@ -462,18 +585,38 @@ mod tests {
 
     /// A minimal stand-in for `on_send_message`'s room-post branch, used by
     /// [`synthetic`] below to feed [`check_no_optimistic_room_post_bubble`]'s
-    /// mutation test. `bad: true` reproduces the original
+    /// and [`check_readonly_guard_surfaces_refusal`]'s mutation tests.
+    /// `phantom_bubble: true` reproduces the original
     /// `meshcadet-room-post-refusal-surface` defect (an optimistic
     /// `MessageRecord` pushed before `UiCommand::SendRoomPost` is queued).
-    fn synthetic_on_send_message(bad: bool) -> String {
-        let phantom_push = if bad {
+    /// `readonly_guard_silent: true` reproduces the
+    /// `meshcadet-room-readonly-refusal-surface-v2` defect (the read-only
+    /// recheck logs and returns with no `RoomPostRefused`).
+    fn synthetic_on_send_message(phantom_bubble: bool, readonly_guard_silent: bool) -> String {
+        let phantom_push = if phantom_bubble {
             r#"self.messages.entry(hash).or_default().push(MessageRecord { text: text.clone(), is_ours: true, acked: false, ts_ms: 0 });"#
         } else {
             ""
         };
+        let readonly_arm = if readonly_guard_silent {
+            r#"log::warn!("ui: compose send blocked — room 0x{:02x} is read-only", hash);
+                    return;"#
+        } else {
+            r#"log::warn!("ui: compose send blocked — room 0x{:02x} is read-only", hash);
+                    self.post_event(UiEvent::RoomPostRefused {
+                        room_hash: hash,
+                        reason: "this room is now read-only for your session".to_string(),
+                    });
+                    return;"#
+        };
         format!(
             r#"
             fn on_send_message(&mut self, hash: u8, is_channel: bool, raw_text: String) {{
+                if let Some(&can_post) = self.room_permissions.get(&hash) {{
+                    if !can_post {{
+                        {readonly_arm}
+                    }}
+                }}
                 if self.room_permissions.contains_key(&hash) {{
                     {phantom_push}
                     self.commands.push(UiCommand::SendRoomPost {{ room_hash: hash, text }});
@@ -490,14 +633,15 @@ mod tests {
 
     /// A minimal stand-in for `handle_event`'s five arms plus
     /// `on_send_message`'s room-post branch, used by the mutation tests
-    /// below to prove this scanner has teeth. `room_post_phantom_bubble`
-    /// drives [`synthetic_on_send_message`] — `false` everywhere except the
-    /// dedicated mutation test for that guard.
+    /// below to prove this scanner has teeth. `room_post_phantom_bubble` and
+    /// `readonly_guard_silent` drive [`synthetic_on_send_message`] — both
+    /// `false` everywhere except the dedicated mutation test for each guard.
     fn synthetic(
         live_fires_notification: bool,
         drained_fires_notification: bool,
         registers_permission: bool,
         room_post_phantom_bubble: bool,
+        readonly_guard_silent: bool,
     ) -> String {
         let live_notif = if live_fires_notification {
             "self.notif.fire(NotifEvent::IncomingGroupMsg, now_ms, self.screen_asleep);"
@@ -514,7 +658,8 @@ mod tests {
         } else {
             ""
         };
-        let on_send_message = synthetic_on_send_message(room_post_phantom_bubble);
+        let on_send_message =
+            synthetic_on_send_message(room_post_phantom_bubble, readonly_guard_silent);
         format!(
             r#"
             // A doc mention of [`UiEvent::RoomPostLive`] must not count as an arm.
@@ -567,7 +712,7 @@ mod tests {
     #[test]
     fn synthetic_baseline_is_clean() {
         assert_eq!(
-            check_source(&synthetic(true, false, true, false)),
+            check_source(&synthetic(true, false, true, false, false)),
             Vec::<String>::new()
         );
     }
@@ -579,7 +724,7 @@ mod tests {
     /// leaves a phantom "sent" bubble with nothing behind it).
     #[test]
     fn optimistic_room_post_bubble_is_caught() {
-        let violations = check_source(&synthetic(true, false, true, true));
+        let violations = check_source(&synthetic(true, false, true, true, false));
         assert!(
             violations
                 .iter()
@@ -594,7 +739,7 @@ mod tests {
     /// comparison.
     #[test]
     fn dropping_the_live_arms_notification_is_caught() {
-        let violations = check_source(&synthetic(false, false, true, false));
+        let violations = check_source(&synthetic(false, false, true, false, false));
         assert!(
             violations
                 .iter()
@@ -611,7 +756,7 @@ mod tests {
     /// notifying per post again, i.e. the 32-post backlog storms the tray.
     #[test]
     fn a_notification_leaking_into_the_drain_arm_is_caught() {
-        let violations = check_source(&synthetic(true, true, true, false));
+        let violations = check_source(&synthetic(true, true, true, false, false));
         assert!(
             violations
                 .iter()
@@ -625,12 +770,27 @@ mod tests {
     /// upgrade never reaches the UI".
     #[test]
     fn dropping_the_register_room_call_is_caught() {
-        let violations = check_source(&synthetic(true, false, false, false));
+        let violations = check_source(&synthetic(true, false, false, false, false));
         assert!(
             violations
                 .iter()
                 .any(|v| v.contains("RoomPermissionUpdated` arm does not call `register_room`")),
             "expected a register_room-missing violation, got {violations:?}"
+        );
+    }
+
+    /// The mutation `meshcadet-room-readonly-refusal-surface-v2` exists for:
+    /// the read-only defense-in-depth recheck inside `on_send_message` logs
+    /// and returns silently, dropping the user's composed text with no
+    /// on-screen trace instead of raising `UiEvent::RoomPostRefused`.
+    #[test]
+    fn silent_readonly_guard_drop_is_caught() {
+        let violations = check_source(&synthetic(true, false, true, false, true));
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("no longer raises `UiEvent::RoomPostRefused`")),
+            "expected the silent-drop violation, got {violations:?}"
         );
     }
 
@@ -650,7 +810,7 @@ mod tests {
     /// its match arm (the tokenizer blanks comment bodies first).
     #[test]
     fn comment_mentions_are_not_counted_as_arms() {
-        let src = synthetic(true, false, true, false);
+        let src = synthetic(true, false, true, false, false);
         assert!(
             src.contains("[`UiEvent::RoomPostLive`]"),
             "fixture must actually contain a doc-comment mention"
