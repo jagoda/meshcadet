@@ -188,6 +188,15 @@ pub enum UiEvent {
     /// must not emit 32 notifications or badge increments. Folded instead
     /// into the single [`UiEvent::RoomDrainComplete`] the drain window's
     /// close fires.
+    ///
+    /// `text` already carries the MeshCore `"<name>: "` sender-name prefix —
+    /// `main.rs::handle_room_push_frame` resolves the wire's
+    /// `author_pubkey_prefix` against this device's contacts and formats it
+    /// on before raising this event, so `build_message_items`'s existing
+    /// `is_channel && !m.is_ours` bold-prefix split (rooms render as
+    /// `is_channel: true`) applies with no room-specific handling here —
+    /// exact parity with how a channel (GRP_TXT) message already carries
+    /// that prefix inline on the wire.
     RoomPostDrained {
         room_hash: u8,
         text: String,
@@ -196,6 +205,9 @@ pub enum UiEvent {
     /// full parity with [`UiEvent::IncomingGroupMsg`] (append + unread bump
     /// + `notif.fire` + list refresh) — a room's live posts must read
     /// exactly like a channel's.
+    ///
+    /// `text` already carries the sender-name prefix — see
+    /// [`UiEvent::RoomPostDrained`]'s doc.
     RoomPostLive {
         room_hash: u8,
         text: String,

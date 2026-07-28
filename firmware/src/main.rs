@@ -602,6 +602,21 @@ fn run() -> anyhow::Result<()> {
     // 2.5. Policy filter
     let mut policy = PolicyFilter::new();
 
+    // Pubkey-hash (`Contact::pub_hash`, i.e. `pubkey[0]`) → display name, for
+    // every provisioned contact — including room-server contacts and the
+    // OTHER room members a room push's `author_pubkey_prefix` might identify
+    // (see `handle_room_push_frame`'s use below). Populated alongside
+    // `policy` in the contact-provisioning loop and kept in this scope
+    // (unlike `provisioned_config`, which is moved into the admin_server
+    // thread) so the dispatch loop can still resolve a room post's sender
+    // name after that move. Deliberately a lookup table snapshot, not a live
+    // handle back into `provisioned_config` — a runtime ADD_ROOM/DEL_ROOM
+    // contact edit (admin/provisioning server) won't retroactively update an
+    // already-decoded sender name, matching how `policy` itself is already a
+    // boot-time snapshot with the same limitation.
+    let mut contact_display_names: std::collections::HashMap<u8, String> =
+        std::collections::HashMap::new();
+
     // 4. Board peripheral power-enable (BOARD_POWERON = GPIO10).
     //    Must be HIGH before any SPI/UART peripheral traffic, including the
     //    display — moved before the provisioning gate so the display is
@@ -997,6 +1012,9 @@ fn run() -> anyhow::Result<()> {
                             } else {
                                 String::new()
                             };
+                            if !display_name.is_empty() {
+                                contact_display_names.insert(hash, display_name.clone());
+                            }
                             // `route`'s variant is matched exhaustively below
                             // (never re-tested against `is_room()` again) so a
                             // future divergence between `route_contact`'s
@@ -1610,7 +1628,16 @@ fn run() -> anyhow::Result<()> {
     // does not re-drain the server's whole backlog. `room_runtime` is empty
     // under `hil` (no rooms there), so this loop is a no-op in that build.
     {
-        let boot_ts = tx_epoch_base.wrapping_add((uptime_ms() / 1000) as u32);
+        let boot_now = uptime_ms();
+        let boot_ts = tx_epoch_base.wrapping_add((boot_now / 1000) as u32);
+        // This login send runs before the dispatcher loop's first GPS poll
+        // ever executes, so `gps` has had no chance to sync yet — this is
+        // always `false` today. Read the real driver anyway (rather than
+        // hardcoding it) so `record_sent_timestamp`'s pre-sync-poisoning
+        // guard (see `PersistedRoomSession::last_room_ts_synced`'s doc)
+        // stays correct even if this ordering ever changes, instead of
+        // silently assuming it never will.
+        let boot_clock_synced = gps.synced_wall_clock_secs(boot_now).is_some();
         for room in room_runtime.iter_mut() {
             // Defensive: this loop runs exactly once per boot today (no
             // keep-alive/re-login scheduler until milestone 2), but guard on
@@ -1632,7 +1659,7 @@ fn run() -> anyhow::Result<()> {
             );
             log_tx_queue_eviction(txq.enqueue(&frame[..n]), "room login");
             room.login_sent = true;
-            room.session.record_sent_timestamp(boot_ts);
+            room.session.record_sent_timestamp(boot_ts, boot_clock_synced);
             log::info!(
                 "room: queued flood login for 0x{:02x} (sync_since={})",
                 room.hash, room.session.sync_since,
@@ -1686,6 +1713,16 @@ fn run() -> anyhow::Result<()> {
         if let Some(unix_secs) = gps.synced_wall_clock_secs(now) {
             tx_epoch_base = unix_secs.wrapping_sub((now / 1000) as u32);
         }
+        // Whether `tx_epoch_base` (and so every `ts`/`candidate_ts` derived
+        // from it this iteration) is a genuine GPS-synced wall-clock reading
+        // right now — the same source GPS Status reads. Threaded into every
+        // `record_sent_timestamp`/`effective_last_room_ts` call this tick so
+        // a room's persisted `last_room_ts` watermark can never be
+        // permanently poisoned by a pre-sync send (see
+        // `PersistedRoomSession::last_room_ts_synced`'s doc — Bug 2 of the
+        // `meshcadet-room-hil-sender-render-and-clock-post-fixes` mission).
+        #[cfg(not(feature = "hil"))]
+        let clock_synced = gps.synced_wall_clock_secs(now).is_some();
 
         // ── Battery poll (throttled ADC read + charging-trend refresh) ───────
         battery.poll(now);
@@ -1825,7 +1862,7 @@ fn run() -> anyhow::Result<()> {
                     &mut frame,
                 );
                 log_tx_queue_eviction(txq.enqueue(&frame[..n]), "room re-flood login");
-                room.session.record_sent_timestamp(ts);
+                room.session.record_sent_timestamp(ts, clock_synced);
                 room.last_reflood_ms = now;
                 room.reflood_attempts = room.reflood_attempts.saturating_add(1);
                 log::info!(
@@ -1925,7 +1962,7 @@ fn run() -> anyhow::Result<()> {
                         force_since,
                         &identity.pubkey,
                     ));
-                    room.session.record_sent_timestamp(ts);
+                    room.session.record_sent_timestamp(ts, clock_synced);
                     room.resync_pending = false;
                     log::info!(
                         "room: TX route-direct keep-alive for 0x{:02x} (ts={}, force_since={})",
@@ -2168,6 +2205,7 @@ fn run() -> anyhow::Result<()> {
                             &mut ui_events,
                             &mut room_runtime,
                             nvs_partition.clone(),
+                            &contact_display_names,
                         );
                         // Persist any DM ack flip to flash so it survives a
                         // power-cycle — before this fix, `match_pending_ack`
@@ -2424,12 +2462,25 @@ fn run() -> anyhow::Result<()> {
                                     let candidate_ts =
                                         tx_epoch_base.wrapping_add((now / 1000) as u32);
                                     let shared = identity.ecdh_shared_secret(&room.pubkey);
+                                    // Bug 2 fix (`meshcadet-room-hil-sender-render-and-
+                                    // clock-post-fixes`): gate on the REPAIRED watermark,
+                                    // not the raw persisted one — see
+                                    // `PersistedRoomSession::effective_last_room_ts`'s doc.
+                                    // A room whose `last_room_ts` was poisoned by a
+                                    // pre-GPS-sync boot login (or reflood/keep-alive) must
+                                    // not stay permanently unable to post once the clock
+                                    // genuinely syncs: a `u32` wall-clock timestamp can
+                                    // never numerically exceed a big enough random
+                                    // pre-sync seed, so gating on the raw value would
+                                    // brick posting forever, not just until the next sync.
+                                    let last_room_ts =
+                                        room.session.effective_last_room_ts(clock_synced);
                                     match room_session::encode_room_post_checked(
                                         &shared,
                                         room.hash,
                                         identity.pub_hash(),
                                         candidate_ts,
-                                        room.session.last_room_ts,
+                                        last_room_ts,
                                         text.as_bytes(),
                                         &identity.pubkey,
                                         &mut frame_buf,
@@ -2437,7 +2488,7 @@ fn run() -> anyhow::Result<()> {
                                         Ok((n, ack)) => {
                                             log_tx_queue_eviction(txq.enqueue(&frame_buf[..n]), "room post");
                                             room.pending_post_ack = Some(ack);
-                                            room.session.record_sent_timestamp(candidate_ts);
+                                            room.session.record_sent_timestamp(candidate_ts, clock_synced);
                                             log::info!(
                                                 "TX room post to 0x{:02x}: {:?} ({} bytes)",
                                                 room.hash, text, n,
@@ -2476,19 +2527,38 @@ fn run() -> anyhow::Result<()> {
                                             // with no explanation for a post that
                                             // simply never appeared — `RoomPostRefused`
                                             // tells them why, directly in the thread.
+                                            //
+                                            // Bug 2 fix: the refusal message must
+                                            // describe the REAL condition, not
+                                            // misdiagnose it. `effective_last_room_ts`
+                                            // above already repairs a pre-sync-poisoned
+                                            // watermark, so reaching this arm while
+                                            // `clock_synced` is true is NOT the "clock
+                                            // not synced" case GPS Status would agree
+                                            // with — it means the clock genuinely
+                                            // hasn't advanced past this room's last
+                                            // send yet (two posts within the same
+                                            // wall-clock second, or a real clock
+                                            // regression), which needs its own accurate
+                                            // message, not the unsynced one.
+                                            let reason = if clock_synced {
+                                                "clock has not advanced since this room's \
+                                                 last post — try again in a moment"
+                                                    .to_string()
+                                            } else {
+                                                "clock not yet synced — cannot post \
+                                                 to this room yet"
+                                                    .to_string()
+                                            };
                                             log::warn!(
                                                 "UI send room post to 0x{:02x} refused: \
-                                                 {:?} — local clock has not advanced \
-                                                 past this room's last sent timestamp \
-                                                 (unsynced GPS clock, or a genuine \
-                                                 clock regression)",
-                                                room.hash, e,
+                                                 {:?} (clock_synced={}, candidate_ts={}, \
+                                                 last_room_ts={})",
+                                                room.hash, e, clock_synced, candidate_ts, last_room_ts,
                                             );
                                             ui.post_event(ui::UiEvent::RoomPostRefused {
                                                 room_hash: room.hash,
-                                                reason: "clock not yet synced — cannot post \
-                                                         to this room yet"
-                                                    .to_string(),
+                                                reason,
                                             });
                                         }
                                     }
@@ -2807,7 +2877,12 @@ fn build_telemetry_response(
 /// passed through to `handle_req` so the native telemetry RESPONSE carries
 /// the same battery reading the host `status` command and admin-menu screen
 /// show (single shared source — see `battery` module docs).
+///
+/// `contact_display_names` is only consulted on the `not(hil)` room-push leg
+/// (there are no rooms under `hil`) — see `handle_ack`'s identical
+/// `#[cfg_attr]` for why the `hil` build still needs the blanket allow.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(feature = "hil", allow(unused_variables))]
 fn on_receive(
     frame: &[u8],
     our_id: &Identity,
@@ -2822,6 +2897,7 @@ fn on_receive(
     ui_events: &mut Vec<ui::UiEvent>,
     room_runtime: &mut [RoomRuntime],
     nvs_partition: EspDefaultNvsPartition,
+    contact_display_names: &std::collections::HashMap<u8, String>,
 ) {
     if frame.len() < 2 {
         rx_diag!("RX: frame too short ({} bytes)", frame.len());
@@ -2861,7 +2937,15 @@ fn on_receive(
             let raw_src = payload.get(1).copied().unwrap_or(0);
             #[cfg(not(feature = "hil"))]
             if let Some(room) = room_runtime.iter_mut().find(|r| r.hash == raw_src) {
-                if handle_room_push_frame(payload, our_id, room, txq, ui_events, nvs_partition.clone()) {
+                if handle_room_push_frame(
+                    payload,
+                    our_id,
+                    room,
+                    txq,
+                    ui_events,
+                    nvs_partition.clone(),
+                    contact_display_names,
+                ) {
                     return;
                 }
             }
@@ -3491,6 +3575,26 @@ fn handle_room_login_response(
 /// Groups-tab row and the message view Just Work), and persist the advanced
 /// `sync_since` watermark.
 ///
+/// **Sender-render parity with channel messages:** a room push carries no
+/// sender NAME on the wire, only the poster's `author_pubkey_prefix` (see
+/// `room_session::RoomPushOutcome`'s doc). `contact_display_names` resolves
+/// `author_pubkey_prefix[0]` (== `Contact::pub_hash`, the same 1-byte
+/// routing hash every other contact lookup in this codebase keys on)
+/// against this device's provisioned contacts, and the resolved label — the
+/// contact's display name, or a hex fallback for a poster this device
+/// doesn't know as a contact — is formatted onto the body with the exact
+/// `"<name>: "` MeshCore delimiter (`protocol::codec::CHANNEL_NAME_DELIM`)
+/// a channel (GRP_TXT) message already carries inline on the wire. That
+/// formatted text is what gets persisted (`append_history`) and posted to
+/// the UI, so `firmware_core::ui::message_view::build_message_items`'s
+/// existing `is_channel && !m.is_ours` bold-prefix split — already applied
+/// to rooms, which render as `is_channel: true` `ChannelItem`s — picks it up
+/// with no room-specific rendering logic. `room.recent` (the dedup input)
+/// keeps the RAW, un-prefixed body instead (`is_duplicate_post`'s doc
+/// explains why comparing against the wire's un-prefixed form must stay
+/// robust to a `recent` that's been reseeded from prefixed, persisted
+/// history after a reboot).
+///
 /// Returns `true` if the frame was handled here (decoded as a push, or
 /// rejected as malformed), `false` if the caller must fall through to
 /// `handle_dm` instead — the latter fires only on
@@ -3508,6 +3612,7 @@ fn handle_room_push_frame(
     txq: &mut TxQueue,
     ui_events: &mut Vec<ui::UiEvent>,
     nvs_partition: EspDefaultNvsPartition,
+    contact_display_names: &std::collections::HashMap<u8, String>,
 ) -> bool {
     let shared = our_id.ecdh_shared_secret(&room.pubkey);
     match room_session::handle_room_push(
@@ -3550,16 +3655,32 @@ fn handle_room_push_frame(
             if let Some(entry) = outcome.entry {
                 let text_len = (entry.text_len as usize).min(entry.text.len());
                 let text = &entry.text[..text_len];
-                let text_str = core::str::from_utf8(text).unwrap_or("<invalid utf8>");
+                let body_str = core::str::from_utf8(text).unwrap_or("<invalid utf8>");
+                // Sender-render parity with channel messages — see this
+                // function's doc. `room.recent.push(entry)` below keeps the
+                // pre-format `entry` (raw body, no prefix) for dedup; only
+                // the persisted/displayed copy gets the "<name>: " prefix.
+                // `room_session::room_post_sender_label` (the pure,
+                // host-tested half) does the name-or-hex-fallback decision;
+                // this call site only owns the actual contact lookup (which
+                // needs `contact_display_names`, a `main.rs`-local snapshot
+                // — this crate has no contact list of its own).
+                let sender_label = room_session::room_post_sender_label(
+                    contact_display_names
+                        .get(&outcome.author_pubkey_prefix[0])
+                        .map(|s| s.as_str()),
+                    &outcome.author_pubkey_prefix,
+                );
+                let display_text = format!("{}: {}", sender_label, body_str);
                 log::info!(
-                    "RX room push from 0x{:02x} ts={}: \"{}\"",
-                    room.hash, entry.timestamp, text_str,
+                    "RX room push from 0x{:02x} author={} ts={}: \"{}\"",
+                    room.hash, sender_label, entry.timestamp, body_str,
                 );
                 append_history(
                     room.hash,
                     protocol::history::HistoryMsgType::Dm,
                     entry.timestamp,
-                    text,
+                    display_text.as_bytes(),
                     false,
                     true,
                 );
@@ -3579,13 +3700,13 @@ fn handle_room_push_frame(
                     room_session::RoomNotification::None => {
                         ui_events.push(ui::UiEvent::RoomPostDrained {
                             room_hash: room.hash,
-                            text: text_str.to_owned(),
+                            text: display_text,
                         });
                     }
                     room_session::RoomNotification::Live => {
                         ui_events.push(ui::UiEvent::RoomPostLive {
                             room_hash: room.hash,
-                            text: text_str.to_owned(),
+                            text: display_text,
                         });
                     }
                     room_session::RoomNotification::Aggregate { .. } => {
