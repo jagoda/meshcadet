@@ -10,6 +10,7 @@
 //! meshcadet --port /dev/ttyUSB0 status
 //! meshcadet --port /dev/ttyUSB0 identity
 //! meshcadet --port /dev/ttyUSB0 identity --set-name "Alex's MeshCadet"
+//! meshcadet gen-channel-secret --bits 256
 //! meshcadet --port /dev/ttyUSB0 add-contact --pubkey <HEX64> --name "Alice" --telemetry
 //! meshcadet --port /dev/ttyUSB0 add-channel --secret <HEX64> --name "family" --primary
 //! meshcadet --port /dev/ttyUSB0 add-room --pubkey <HEX64> --name "Lobby" --password-stdin
@@ -20,6 +21,10 @@
 //! meshcadet --port /dev/ttyUSB0 reset-pin --pin 5678
 //! meshcadet --port /dev/ttyUSB0 clear-history
 //! ```
+//!
+//! `gen-channel-secret` is the one exception to "every command needs
+//! `--port`": it never touches the device, so it works standalone (see
+//! example above).
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -40,8 +45,11 @@ use host::transport::SerialTransport;
 )]
 struct Cli {
     /// USB-serial port path (e.g. /dev/ttyUSB0, /dev/ttyACM0, COM3).
+    ///
+    /// Required for every command except `gen-channel-secret`, which is a
+    /// pure-local CSPRNG operation with no device round trip.
     #[arg(short, long)]
-    port: String,
+    port: Option<String>,
 
     /// Serial baud rate.
     #[arg(short, long, default_value = "115200")]
@@ -49,6 +57,26 @@ struct Cli {
 
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+/// Channel-secret strength for [`Cmd::GenChannelSecret`], matching the two
+/// widths [`parse_channel_secret_hex`] accepts.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum SecretBits {
+    #[value(name = "128")]
+    Bits128,
+    #[value(name = "256")]
+    Bits256,
+}
+
+impl SecretBits {
+    /// Secret length in bytes: 16 for 128-bit, 32 for 256-bit.
+    fn byte_len(self) -> usize {
+        match self {
+            SecretBits::Bits128 => 16,
+            SecretBits::Bits256 => 32,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -143,6 +171,27 @@ enum Cmd {
         /// must match exactly what was passed to add-channel.
         #[arg(long)]
         secret: String,
+    },
+
+    /// Generate a CSPRNG channel secret and print it as hex.
+    ///
+    /// Uses `OsRng` (matches the RNG `firmware`/`protocol` already use for
+    /// identity key material) — never hand-type a channel secret, since
+    /// `parse_channel_secret_hex` only validates hex-ness and length, not
+    /// entropy. Output is exactly the hex format `add-channel --secret` /
+    /// `del-channel --secret` expect (lowercase, no `0x` prefix), so it
+    /// composes directly:
+    ///
+    /// ```text
+    /// meshcadet --port /dev/ttyUSB0 add-channel \
+    ///   --secret "$(meshcadet gen-channel-secret --bits 256)" --name family --primary
+    /// ```
+    ///
+    /// Does not require `--port` — this never touches the device.
+    GenChannelSecret {
+        /// Secret strength: 128-bit (32 hex chars) or 256-bit (64 hex chars).
+        #[arg(long)]
+        bits: SecretBits,
     },
 
     /// List the device's configured room-server contacts (pubkey + name +
@@ -263,7 +312,20 @@ enum Cmd {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let transport = SerialTransport::open(&cli.port, cli.baud)?;
+    // `gen-channel-secret` is a pure-local CSPRNG operation — it never
+    // touches the device, so it must run before (and without) the
+    // `--port`-gated transport open below. `bits` is `Copy`, so this only
+    // reads `cli.cmd`'s discriminant + copies that field; it does not move
+    // `cli.cmd`, which the `match` below still owns in full.
+    if let Cmd::GenChannelSecret { bits } = cli.cmd {
+        return gen_channel_secret(bits);
+    }
+
+    let port = cli
+        .port
+        .as_deref()
+        .context("--port is required for this command")?;
+    let transport = SerialTransport::open(port, cli.baud)?;
     let mut session = Session::new(transport);
 
     match cli.cmd {
@@ -536,6 +598,10 @@ fn main() -> anyhow::Result<()> {
             println!("channel removed: {}", hex_short(&sec));
         }
 
+        Cmd::GenChannelSecret { .. } => {
+            unreachable!("handled above, before the device transport is opened")
+        }
+
         Cmd::ListRooms => {
             let rooms = session.list_rooms()?;
             if rooms.is_empty() {
@@ -688,6 +754,27 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `gen-channel-secret` implementation: fill `bits.byte_len()` bytes from
+/// `OsRng` (a CSPRNG — matches `firmware`/`protocol`'s use of the same RNG
+/// for identity key material) and print them as lowercase hex, exactly the
+/// format [`parse_channel_secret_hex`] expects. No device round trip.
+fn gen_channel_secret(bits: SecretBits) -> anyhow::Result<()> {
+    println!("{}", generate_channel_secret_hex(bits));
+    Ok(())
+}
+
+/// Pure core of `gen-channel-secret`, split out from [`gen_channel_secret`]
+/// so tests can exercise the actual RNG-to-hex path without capturing
+/// stdout.
+fn generate_channel_secret_hex(bits: SecretBits) -> String {
+    use rand::RngCore;
+
+    let byte_len = bits.byte_len();
+    let mut buf = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut buf[..byte_len]);
+    hex::encode(&buf[..byte_len])
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Decode a 64-char hex string into a 32-byte array.
@@ -723,6 +810,9 @@ fn parse_32bytes_hex(s: &str, label: &str) -> anyhow::Result<[u8; 32]> {
 /// - 256-bit: `SHA-256(secret)[0]`
 fn parse_channel_secret_hex(s: &str) -> anyhow::Result<([u8; 32], u8)> {
     let bytes = hex::decode(s).map_err(|e| anyhow::anyhow!("invalid secret hex: {}", e))?;
+    if let Some(warning) = weak_secret_pattern_warning(&bytes) {
+        eprintln!("{}", warning);
+    }
     match bytes.len() {
         16 => {
             let mut arr = [0u8; 32];
@@ -740,6 +830,39 @@ fn parse_channel_secret_hex(s: &str) -> anyhow::Result<([u8; 32], u8)> {
             s.len()
         ),
     }
+}
+
+/// Floor-raiser for [`parse_channel_secret_hex`]: flags obviously
+/// low-entropy secret bytes with a stderr warning.
+///
+/// Deliberately a *floor*, not an entropy estimator: it only catches the
+/// patterns a hand-typed placeholder is likely to be (all-zero, all one
+/// repeated byte, a simple ascending/descending byte run like
+/// `000102030405…` or `ffedcba9…`). It never rejects — any real CSPRNG
+/// output, including one that coincidentally resembles a pattern in a tiny
+/// slice, still parses and provisions; this is a warning surface for the
+/// "operator hand-typed 32 zeroes" case the audit flagged, not a gate.
+fn weak_secret_pattern_warning(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 2 {
+        return None;
+    }
+    const ADVICE: &str =
+        "generate a real one with `meshcadet gen-channel-secret --bits 128` (or `--bits 256`).";
+    if bytes.iter().all(|&b| b == bytes[0]) {
+        return Some(format!(
+            "warning: secret is {} repeated 0x{:02x} bytes — this has near-zero entropy; {ADVICE}",
+            bytes.len(),
+            bytes[0],
+        ));
+    }
+    let ascending = bytes.windows(2).all(|w| w[1] == w[0].wrapping_add(1));
+    let descending = bytes.windows(2).all(|w| w[1] == w[0].wrapping_sub(1));
+    if ascending || descending {
+        return Some(format!(
+            "warning: secret is a simple sequential byte pattern — this has near-zero entropy; {ADVICE}"
+        ));
+    }
+    None
 }
 
 /// First 4 bytes of a 32-byte value as `aabbccdd…` shorthand for display.
@@ -1073,7 +1196,9 @@ mod tests {
     use super::{
         build_contact_add_uri, build_room_add_uri, format_battery, format_battery_held_raw_mv,
         format_battery_raw_mv, format_gps_clock, format_gps_coords, format_gps_fix,
-        parse_contact_uri, password_truncation_warning, resolve_guest_password,
+        generate_channel_secret_hex, parse_channel_secret_hex, parse_contact_uri,
+        password_truncation_warning, resolve_guest_password, weak_secret_pattern_warning,
+        SecretBits,
     };
     use protocol::provisioning::RspStatusPayload;
 
@@ -1456,5 +1581,88 @@ mod tests {
         assert!(warning.contains(&(limit + 5).to_string()));
         assert!(warning.contains(&effective_limit.to_string()));
         assert!(warning.contains("truncat"));
+    }
+
+    // ── weak_secret_pattern_warning / gen-channel-secret entropy floor ───────
+
+    #[test]
+    fn weak_pattern_flags_all_zero() {
+        let warning = weak_secret_pattern_warning(&[0u8; 32]);
+        assert!(warning.is_some());
+        assert!(warning.unwrap().contains("gen-channel-secret"));
+    }
+
+    #[test]
+    fn weak_pattern_flags_all_same_nonzero_byte() {
+        let warning = weak_secret_pattern_warning(&[0xAAu8; 16]);
+        assert!(warning.is_some());
+    }
+
+    #[test]
+    fn weak_pattern_flags_ascending_sequence() {
+        let bytes: Vec<u8> = (0..16).collect();
+        assert!(weak_secret_pattern_warning(&bytes).is_some());
+    }
+
+    #[test]
+    fn weak_pattern_flags_descending_sequence() {
+        let bytes: Vec<u8> = (0..16).rev().collect();
+        assert!(weak_secret_pattern_warning(&bytes).is_some());
+    }
+
+    #[test]
+    fn weak_pattern_does_not_flag_high_entropy_bytes() {
+        // A fixed, non-patterned byte string — not sequential, not a
+        // repeated byte. Must NOT warn: this is the "don't block valid
+        // high-entropy input" floor the mission scope calls out.
+        let bytes: [u8; 16] = [
+            0x4f, 0x1a, 0xc3, 0x08, 0x92, 0xe7, 0x15, 0x6b, 0xd4, 0x33, 0xa0, 0x5c, 0x77, 0x0e,
+            0xf9, 0x21,
+        ];
+        assert!(weak_secret_pattern_warning(&bytes).is_none());
+    }
+
+    #[test]
+    fn weak_pattern_does_not_flag_single_byte() {
+        // Degenerate input too short to have a "pattern"; the real length
+        // validation in `parse_channel_secret_hex` rejects this separately.
+        assert!(weak_secret_pattern_warning(&[0u8]).is_none());
+    }
+
+    #[test]
+    fn parse_channel_secret_hex_still_accepts_weak_patterns() {
+        // The weak-pattern check is a warning, never a rejection — a
+        // deliberately weak (or already-provisioned) secret must still
+        // parse successfully.
+        let (bytes, key_len) = parse_channel_secret_hex(&"00".repeat(32))
+            .expect("all-zero secret must still parse (warning only, not a rejection)");
+        assert_eq!(key_len, 32);
+        assert_eq!(bytes, [0u8; 32]);
+    }
+
+    #[test]
+    fn gen_channel_secret_128_and_256_round_trip_through_parse() {
+        // `gen-channel-secret`'s hex output must compose directly with
+        // `parse_channel_secret_hex` (same case, no prefix, exact length).
+        for (bits, expected_key_len) in [(SecretBits::Bits128, 16u8), (SecretBits::Bits256, 32u8)] {
+            let hex_out = generate_channel_secret_hex(bits);
+            assert_eq!(hex_out.len(), bits.byte_len() * 2);
+            assert!(hex_out
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+
+            let (_sec, key_len) =
+                parse_channel_secret_hex(&hex_out).expect("gen-channel-secret output must parse");
+            assert_eq!(key_len, expected_key_len);
+        }
+    }
+
+    #[test]
+    fn gen_channel_secret_two_calls_differ() {
+        // Sanity that this is actually drawing from the RNG each call, not
+        // returning a fixed/zeroed buffer.
+        let a = generate_channel_secret_hex(SecretBits::Bits256);
+        let b = generate_channel_secret_hex(SecretBits::Bits256);
+        assert_ne!(a, b);
     }
 }

@@ -250,10 +250,19 @@ part of the host-native workspace, so it builds and runs from the repo root:
 cargo run -p host -- --port /dev/ttyACM0 status
 cargo run -p host -- --port /dev/ttyACM0 identity
 cargo run -p host -- --port /dev/ttyACM0 add-contact --pubkey <HEX64> --name "Alice" --telemetry
-cargo run -p host -- --port /dev/ttyACM0 add-channel --secret <HEX64> --name "family" --primary
+SECRET=$(cargo run -q -p host -- gen-channel-secret --bits 256)
+cargo run -p host -- --port /dev/ttyACM0 add-channel --secret "$SECRET" --name "family" --primary
 cargo run -p host -- --port /dev/ttyACM0 add-room --pubkey <HEX64> --name "Lobby" --password-stdin
 cargo run -p host -- --port /dev/ttyACM0 commit
 ```
+
+`gen-channel-secret` generates the channel secret itself — a CSPRNG (`OsRng`)
+draw, `--bits 128` or `--bits 256` — rather than the admin hand-typing hex.
+`add-channel --secret <HEX64>` still accepts a hand-supplied 32- or 64-char
+hex string too (e.g. one shared out-of-band by another admin), but
+`gen-channel-secret` is how you produce one with a real entropy floor;
+`add-channel` warns on stderr if the supplied secret looks like an obviously
+weak placeholder (all-zero, a repeated byte, a simple sequential run).
 
 Flashing and provisioning can also be done straight from a browser, no
 toolchain install required — see [`site/README.md`](site/README.md) for the
