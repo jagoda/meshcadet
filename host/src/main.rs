@@ -123,10 +123,40 @@ enum Cmd {
     },
 
     /// Add (or replace) a channel on the device.
+    ///
+    /// The channel secret crosses the USB link in the clear — correct and
+    /// intentional, the cable is the authentication (see ADR-0001 §4) — but
+    /// it must not leak anywhere else: not in shell history, not in `ps`,
+    /// not in `--help`, not in an echoed confirmation or error message.
+    /// Supply it via `--secret-file`, `--secret-env`, or `--secret-stdin`
+    /// where practical; `--secret` exists for scriptability but is recorded
+    /// in shell history (and briefly visible in process listings on most
+    /// OSes). Omit all four to be prompted.
     AddChannel {
-        /// Channel secret — 32 hex chars (128-bit / 16-byte) or 64 hex chars (256-bit / 32-byte).
+        /// Channel secret — 32 hex chars (128-bit / 16-byte) or 64 hex chars
+        /// (256-bit / 32-byte), given directly on the command line. Exposed
+        /// in shell history (and briefly visible in process listings on
+        /// most OSes); prefer one of the other --secret-* sources. Mutually
+        /// exclusive with them.
         #[arg(long)]
-        secret: String,
+        secret: Option<String>,
+
+        /// Read the channel secret from a file (its trailing newline, if
+        /// any, is stripped). Mutually exclusive with the other --secret-*
+        /// sources.
+        #[arg(long = "secret-file", value_name = "PATH")]
+        secret_file: Option<PathBuf>,
+
+        /// Read the channel secret from the named environment variable.
+        /// Mutually exclusive with the other --secret-* sources.
+        #[arg(long = "secret-env", value_name = "VAR")]
+        secret_env: Option<String>,
+
+        /// Read the channel secret as one line from stdin (trailing
+        /// newline stripped). Mutually exclusive with the other --secret-*
+        /// sources.
+        #[arg(long = "secret-stdin", action = ArgAction::SetTrue)]
+        secret_stdin: bool,
 
         /// Channel name shown on screen.
         #[arg(long)]
@@ -138,11 +168,37 @@ enum Cmd {
     },
 
     /// Remove a channel from the device.
+    ///
+    /// The channel secret must match exactly what was passed to
+    /// `add-channel` — see that command's exposure note; the same
+    /// `--secret-file`/`--secret-env`/`--secret-stdin` sources (and
+    /// interactive prompt) apply here.
     DelChannel {
-        /// Channel secret — 32 hex chars (128-bit) or 64 hex chars (256-bit);
-        /// must match exactly what was passed to add-channel.
+        /// Channel secret — 32 hex chars (128-bit) or 64 hex chars
+        /// (256-bit), given directly on the command line; must match
+        /// exactly what was passed to add-channel. Exposed in shell
+        /// history (and briefly visible in process listings on most
+        /// OSes); prefer one of the other --secret-* sources. Mutually
+        /// exclusive with them.
         #[arg(long)]
-        secret: String,
+        secret: Option<String>,
+
+        /// Read the channel secret from a file (its trailing newline, if
+        /// any, is stripped). Mutually exclusive with the other --secret-*
+        /// sources.
+        #[arg(long = "secret-file", value_name = "PATH")]
+        secret_file: Option<PathBuf>,
+
+        /// Read the channel secret from the named environment variable.
+        /// Mutually exclusive with the other --secret-* sources.
+        #[arg(long = "secret-env", value_name = "VAR")]
+        secret_env: Option<String>,
+
+        /// Read the channel secret as one line from stdin (trailing
+        /// newline stripped). Mutually exclusive with the other --secret-*
+        /// sources.
+        #[arg(long = "secret-stdin", action = ArgAction::SetTrue)]
+        secret_stdin: bool,
     },
 
     /// List the device's configured room-server contacts (pubkey + name +
@@ -218,10 +274,37 @@ enum Cmd {
     },
 
     /// Set the admin PIN (used to access the on-device admin menu).
+    ///
+    /// The PIN crosses the USB link in the clear — correct and intentional,
+    /// the cable is the authentication (see ADR-0001 §4) — but it must not
+    /// leak anywhere else: not in shell history, not in `ps`, not in
+    /// `--help`, not in an echoed confirmation or error message. Supply it
+    /// via `--pin-file`, `--pin-env`, or `--pin-stdin` where practical;
+    /// `--pin` exists for scriptability but is recorded in shell history
+    /// (and briefly visible in process listings on most OSes). Omit all
+    /// four to be prompted.
     SetPin {
-        /// PIN string (UTF-8, max 16 bytes).
+        /// PIN string (UTF-8, max 16 bytes), given directly on the command
+        /// line. Exposed in shell history (and briefly visible in process
+        /// listings on most OSes); prefer one of the other --pin-*
+        /// sources. Mutually exclusive with them.
         #[arg(long)]
-        pin: String,
+        pin: Option<String>,
+
+        /// Read the PIN from a file (its trailing newline, if any, is
+        /// stripped). Mutually exclusive with the other --pin-* sources.
+        #[arg(long = "pin-file", value_name = "PATH")]
+        pin_file: Option<PathBuf>,
+
+        /// Read the PIN from the named environment variable. Mutually
+        /// exclusive with the other --pin-* sources.
+        #[arg(long = "pin-env", value_name = "VAR")]
+        pin_env: Option<String>,
+
+        /// Read the PIN as one line from stdin (trailing newline
+        /// stripped). Mutually exclusive with the other --pin-* sources.
+        #[arg(long = "pin-stdin", action = ArgAction::SetTrue)]
+        pin_stdin: bool,
     },
 
     /// Commit provisioning: persist config to flash.
@@ -233,11 +316,31 @@ enum Cmd {
 
     /// Reset the admin PIN (physical USB possession is the auth factor).
     ///
-    /// Equivalent to set-pin but clearly named for the recovery flow.
+    /// Equivalent to set-pin but clearly named for the recovery flow. The
+    /// same exposure note and --pin-file/--pin-env/--pin-stdin sources
+    /// (and interactive prompt) apply here.
     ResetPin {
-        /// New PIN string (UTF-8, max 16 bytes).
+        /// New PIN string (UTF-8, max 16 bytes), given directly on the
+        /// command line. Exposed in shell history (and briefly visible in
+        /// process listings on most OSes); prefer one of the other
+        /// --pin-* sources. Mutually exclusive with them.
         #[arg(long)]
-        pin: String,
+        pin: Option<String>,
+
+        /// Read the PIN from a file (its trailing newline, if any, is
+        /// stripped). Mutually exclusive with the other --pin-* sources.
+        #[arg(long = "pin-file", value_name = "PATH")]
+        pin_file: Option<PathBuf>,
+
+        /// Read the PIN from the named environment variable. Mutually
+        /// exclusive with the other --pin-* sources.
+        #[arg(long = "pin-env", value_name = "VAR")]
+        pin_env: Option<String>,
+
+        /// Read the PIN as one line from stdin (trailing newline
+        /// stripped). Mutually exclusive with the other --pin-* sources.
+        #[arg(long = "pin-stdin", action = ArgAction::SetTrue)]
+        pin_stdin: bool,
     },
 
     /// Export conversation history from the device (oldest-first).
@@ -514,9 +617,18 @@ fn main() -> anyhow::Result<()> {
 
         Cmd::AddChannel {
             secret,
+            secret_file,
+            secret_env,
+            secret_stdin,
             name,
             primary,
         } => {
+            let secret = resolve_channel_secret(
+                secret.as_deref(),
+                secret_file.as_deref(),
+                secret_env.as_deref(),
+                secret_stdin,
+            )?;
             let (sec, key_len) = parse_channel_secret_hex(&secret)?;
             let name_bytes = name.as_deref().unwrap_or("").as_bytes().to_vec();
             session.add_channel(&sec, key_len, primary, &name_bytes)?;
@@ -530,7 +642,18 @@ fn main() -> anyhow::Result<()> {
             );
         }
 
-        Cmd::DelChannel { secret } => {
+        Cmd::DelChannel {
+            secret,
+            secret_file,
+            secret_env,
+            secret_stdin,
+        } => {
+            let secret = resolve_channel_secret(
+                secret.as_deref(),
+                secret_file.as_deref(),
+                secret_env.as_deref(),
+                secret_stdin,
+            )?;
             let (sec, _key_len) = parse_channel_secret_hex(&secret)?;
             session.del_channel(&sec)?;
             println!("channel removed: {}", hex_short(&sec));
@@ -647,7 +770,18 @@ fn main() -> anyhow::Result<()> {
             );
         }
 
-        Cmd::SetPin { pin } => {
+        Cmd::SetPin {
+            pin,
+            pin_file,
+            pin_env,
+            pin_stdin,
+        } => {
+            let pin = resolve_admin_pin(
+                pin.as_deref(),
+                pin_file.as_deref(),
+                pin_env.as_deref(),
+                pin_stdin,
+            )?;
             session.set_pin(pin.as_bytes())?;
             println!("PIN set successfully");
         }
@@ -657,7 +791,18 @@ fn main() -> anyhow::Result<()> {
             println!("provisioning committed — config persisted to flash");
         }
 
-        Cmd::ResetPin { pin } => {
+        Cmd::ResetPin {
+            pin,
+            pin_file,
+            pin_env,
+            pin_stdin,
+        } => {
+            let pin = resolve_admin_pin(
+                pin.as_deref(),
+                pin_file.as_deref(),
+                pin_env.as_deref(),
+                pin_stdin,
+            )?;
             session.set_pin(pin.as_bytes())?;
             println!("PIN reset successfully (physical possession authenticated)");
         }
@@ -804,6 +949,122 @@ fn resolve_guest_password(
     std::io::stdin()
         .read_line(&mut raw)
         .context("reading guest password from stdin prompt")?;
+    Ok(raw.trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// Resolve `add-channel`/`del-channel`'s channel secret from exactly one of
+/// its four mutually-exclusive sources, or prompt for it interactively if
+/// none were given. Mirrors [`resolve_guest_password`].
+///
+/// Precedence is irrelevant by construction — at most one of `secret`,
+/// `secret_file`, `secret_env`, `secret_stdin` may be set; more than one is
+/// a user error, rejected up front. Never logs, echoes, or embeds the
+/// resolved secret in an error message (a file-read or env-lookup error
+/// names the *path*/*variable*, never the secret).
+///
+/// Only trailing `\r`/`\n` are stripped, never trimmed further —
+/// `del-channel --secret` must match EXACTLY what was passed to
+/// `add-channel`, and any additional trimming here (or divergent trimming
+/// between the file/env/stdin branches) would open a mismatch between the
+/// two commands' resolved values.
+fn resolve_channel_secret(
+    secret: Option<&str>,
+    secret_file: Option<&std::path::Path>,
+    secret_env: Option<&str>,
+    secret_stdin: bool,
+) -> anyhow::Result<String> {
+    let sources_given = secret.is_some() as u8
+        + secret_file.is_some() as u8
+        + secret_env.is_some() as u8
+        + secret_stdin as u8;
+    if sources_given > 1 {
+        anyhow::bail!(
+            "specify at most one of --secret, --secret-file, --secret-env, --secret-stdin"
+        );
+    }
+
+    if let Some(s) = secret {
+        return Ok(s.to_string());
+    }
+    if let Some(path) = secret_file {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading --secret-file {}", path.display()))?;
+        return Ok(raw.trim_end_matches(['\r', '\n']).to_string());
+    }
+    if let Some(var) = secret_env {
+        let raw = std::env::var(var)
+            .map_err(|_| anyhow::anyhow!("environment variable {var} is not set"))?;
+        return Ok(raw);
+    }
+    if secret_stdin {
+        let mut raw = String::new();
+        std::io::stdin()
+            .read_line(&mut raw)
+            .context("reading channel secret from stdin")?;
+        return Ok(raw.trim_end_matches(['\r', '\n']).to_string());
+    }
+
+    // No source given: prompt interactively on stderr (so `--raw`-style
+    // piping of stdout is never polluted) — mirrors resolve_guest_password.
+    eprint!("channel secret (hex): ");
+    std::io::stderr().flush().ok();
+    let mut raw = String::new();
+    std::io::stdin()
+        .read_line(&mut raw)
+        .context("reading channel secret from stdin prompt")?;
+    Ok(raw.trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// Resolve `set-pin`/`reset-pin`'s admin PIN from exactly one of its four
+/// mutually-exclusive sources, or prompt for it interactively if none were
+/// given. Mirrors [`resolve_guest_password`]/[`resolve_channel_secret`].
+///
+/// Precedence is irrelevant by construction — at most one of `pin`,
+/// `pin_file`, `pin_env`, `pin_stdin` may be set; more than one is a user
+/// error, rejected up front. Never logs, echoes, or embeds the resolved PIN
+/// in an error message (a file-read or env-lookup error names the
+/// *path*/*variable*, never the PIN).
+fn resolve_admin_pin(
+    pin: Option<&str>,
+    pin_file: Option<&std::path::Path>,
+    pin_env: Option<&str>,
+    pin_stdin: bool,
+) -> anyhow::Result<String> {
+    let sources_given =
+        pin.is_some() as u8 + pin_file.is_some() as u8 + pin_env.is_some() as u8 + pin_stdin as u8;
+    if sources_given > 1 {
+        anyhow::bail!("specify at most one of --pin, --pin-file, --pin-env, --pin-stdin");
+    }
+
+    if let Some(p) = pin {
+        return Ok(p.to_string());
+    }
+    if let Some(path) = pin_file {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading --pin-file {}", path.display()))?;
+        return Ok(raw.trim_end_matches(['\r', '\n']).to_string());
+    }
+    if let Some(var) = pin_env {
+        let raw = std::env::var(var)
+            .map_err(|_| anyhow::anyhow!("environment variable {var} is not set"))?;
+        return Ok(raw);
+    }
+    if pin_stdin {
+        let mut raw = String::new();
+        std::io::stdin()
+            .read_line(&mut raw)
+            .context("reading admin PIN from stdin")?;
+        return Ok(raw.trim_end_matches(['\r', '\n']).to_string());
+    }
+
+    // No source given: prompt interactively on stderr — mirrors
+    // resolve_guest_password.
+    eprint!("admin PIN (leave empty for none): ");
+    std::io::stderr().flush().ok();
+    let mut raw = String::new();
+    std::io::stdin()
+        .read_line(&mut raw)
+        .context("reading admin PIN from stdin prompt")?;
     Ok(raw.trim_end_matches(['\r', '\n']).to_string())
 }
 
@@ -1073,7 +1334,8 @@ mod tests {
     use super::{
         build_contact_add_uri, build_room_add_uri, format_battery, format_battery_held_raw_mv,
         format_battery_raw_mv, format_gps_clock, format_gps_coords, format_gps_fix,
-        parse_contact_uri, password_truncation_warning, resolve_guest_password,
+        parse_contact_uri, password_truncation_warning, resolve_admin_pin, resolve_channel_secret,
+        resolve_guest_password,
     };
     use protocol::provisioning::RspStatusPayload;
 
@@ -1456,5 +1718,132 @@ mod tests {
         assert!(warning.contains(&(limit + 5).to_string()));
         assert!(warning.contains(&effective_limit.to_string()));
         assert!(warning.contains("truncat"));
+    }
+
+    // ── Channel-secret resolution (add-channel / del-channel) ────────────────
+
+    #[test]
+    fn resolve_channel_secret_direct_flag() {
+        let secret = resolve_channel_secret(Some("deadbeef"), None, None, false).unwrap();
+        assert_eq!(secret, "deadbeef");
+    }
+
+    #[test]
+    fn resolve_channel_secret_from_file_strips_trailing_newline() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("meshcadet-test-secret-{}.txt", std::process::id()));
+        std::fs::write(&path, "abcdef0123456789\n").unwrap();
+        let secret = resolve_channel_secret(None, Some(path.as_path()), None, false).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(secret, "abcdef0123456789");
+    }
+
+    #[test]
+    fn resolve_channel_secret_from_env_var() {
+        let var = format!("MESHCADET_TEST_SECRET_{}", std::process::id());
+        std::env::set_var(&var, "cafebabe");
+        let secret = resolve_channel_secret(None, None, Some(var.as_str()), false).unwrap();
+        std::env::remove_var(&var);
+        assert_eq!(secret, "cafebabe");
+    }
+
+    #[test]
+    fn resolve_channel_secret_missing_env_var_errors() {
+        let var = format!("MESHCADET_TEST_SECRET_MISSING_{}", std::process::id());
+        std::env::remove_var(&var);
+        let err = resolve_channel_secret(None, None, Some(var.as_str()), false).unwrap_err();
+        assert!(err.to_string().contains(&var));
+    }
+
+    #[test]
+    fn resolve_channel_secret_rejects_multiple_sources() {
+        let err = resolve_channel_secret(
+            Some("00112233445566778899aabbccddeeff"),
+            None,
+            Some("SOME_VAR"),
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("at most one"));
+        // The error message must name the flags, never a candidate value.
+        assert!(!err.to_string().contains("00112233445566778899aabbccddeeff"));
+    }
+
+    #[test]
+    fn resolve_channel_secret_file_not_found_error_names_path_not_content() {
+        let missing = std::path::Path::new("/nonexistent/meshcadet-test-secret-does-not-exist");
+        let err = resolve_channel_secret(None, Some(missing), None, false).unwrap_err();
+        assert!(err.to_string().contains("secret-file"));
+    }
+
+    /// REGRESSION guard for the exact-match contract between `add-channel`
+    /// and `del-channel` (B1 finding): the file/stdin sources must trim
+    /// identically to the direct-flag path (i.e. only a trailing line
+    /// ending, nothing else) so a secret round-tripped through
+    /// `--secret-file` on `add-channel` still matches on `del-channel`.
+    #[test]
+    fn resolve_channel_secret_file_and_direct_flag_agree_after_trim() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "meshcadet-test-secret-roundtrip-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&path, "1234567890abcdef1234567890abcdef\n").unwrap();
+        let from_file = resolve_channel_secret(None, Some(path.as_path()), None, false).unwrap();
+        std::fs::remove_file(&path).ok();
+        let from_flag =
+            resolve_channel_secret(Some("1234567890abcdef1234567890abcdef"), None, None, false)
+                .unwrap();
+        assert_eq!(from_file, from_flag);
+    }
+
+    // ── Admin-PIN resolution (set-pin / reset-pin) ───────────────────────────
+
+    #[test]
+    fn resolve_admin_pin_direct_flag() {
+        let pin = resolve_admin_pin(Some("1234"), None, None, false).unwrap();
+        assert_eq!(pin, "1234");
+    }
+
+    #[test]
+    fn resolve_admin_pin_from_file_strips_trailing_newline() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("meshcadet-test-pin-{}.txt", std::process::id()));
+        std::fs::write(&path, "5678\n").unwrap();
+        let pin = resolve_admin_pin(None, Some(path.as_path()), None, false).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(pin, "5678");
+    }
+
+    #[test]
+    fn resolve_admin_pin_from_env_var() {
+        let var = format!("MESHCADET_TEST_PIN_{}", std::process::id());
+        std::env::set_var(&var, "9012");
+        let pin = resolve_admin_pin(None, None, Some(var.as_str()), false).unwrap();
+        std::env::remove_var(&var);
+        assert_eq!(pin, "9012");
+    }
+
+    #[test]
+    fn resolve_admin_pin_missing_env_var_errors() {
+        let var = format!("MESHCADET_TEST_PIN_MISSING_{}", std::process::id());
+        std::env::remove_var(&var);
+        let err = resolve_admin_pin(None, None, Some(var.as_str()), false).unwrap_err();
+        assert!(err.to_string().contains(&var));
+    }
+
+    #[test]
+    fn resolve_admin_pin_rejects_multiple_sources() {
+        let err = resolve_admin_pin(Some("13579"), None, Some("SOME_VAR"), false).unwrap_err();
+        assert!(err.to_string().contains("at most one"));
+        // The error message must name the flags, never a candidate value.
+        assert!(!err.to_string().contains("13579"));
+    }
+
+    #[test]
+    fn resolve_admin_pin_file_not_found_error_names_path_not_content() {
+        let missing = std::path::Path::new("/nonexistent/meshcadet-test-pin-does-not-exist");
+        let err = resolve_admin_pin(None, Some(missing), None, false).unwrap_err();
+        assert!(err.to_string().contains("pin-file"));
     }
 }
