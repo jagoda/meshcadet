@@ -531,12 +531,13 @@ fn handle_frame(
                     match config.upsert_channel(new_channel) {
                         Ok(outcome) => {
                             log::info!(
-                                "admin_server: ADD_CHANNEL ({}) secret[0]=0x{:02x} key_len={} primary={} name_len={}",
+                                "admin_server: ADD_CHANNEL ({}) hash=0x{:02x} key_len={} primary={} name_len={}",
                                 match outcome {
                                     ChannelUpsert::Updated => "updated",
                                     ChannelUpsert::Added => "added",
                                 },
-                                ch.secret[0], ch.key_len, ch.primary, ch.name_len
+                                channel_hash_var(&ch.secret[..ch.key_len as usize]),
+                                ch.key_len, ch.primary, ch.name_len
                             );
                             persist_or_rollback(config, nvs_partition, out, ConfigKind::Channel)?;
                         }
@@ -558,11 +559,14 @@ fn handle_frame(
                     let cnt = config.channel_count as usize;
                     match config.channels[..cnt].iter().position(|ch| ch.secret == d.secret) {
                         Some(idx) => {
+                            let hash = channel_hash_var(
+                                &config.channels[idx].secret[..config.channels[idx].key_len as usize],
+                            );
                             for j in idx..cnt - 1 {
                                 config.channels[j] = config.channels[j + 1];
                             }
                             config.channel_count -= 1;
-                            log::info!("admin_server: DEL_CHANNEL secret[0]=0x{:02x}", d.secret[0]);
+                            log::info!("admin_server: DEL_CHANNEL hash=0x{:02x}", hash);
                             persist_or_rollback(config, nvs_partition, out, ConfigKind::Channel)?;
                         }
                         None => return send_error(out, err::CHANNEL_NOT_FOUND, b"channel not found"),
