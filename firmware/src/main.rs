@@ -1077,7 +1077,7 @@ fn run() -> anyhow::Result<()> {
                                             last_keep_alive_ms: 0,
                                             last_reflood_ms: 0,
                                             reflood_attempts: 0,
-                                            sync_phase: room_session::RoomSyncPhase::new_after_login(),
+                                            sync_phase: room_session::RoomSyncPhase::new_after_login(uptime_ms()),
                                             pending_post_ack: None,
                                             pending_keep_alive_ack: None,
                                             keep_alive_stall: room_session::RoomKeepAliveStall::new(),
@@ -2959,6 +2959,7 @@ fn on_receive(
                     ui_events,
                     nvs_partition.clone(),
                     contact_display_names,
+                    now_ms,
                 ) {
                     return;
                 }
@@ -2969,7 +2970,7 @@ fn on_receive(
             handle_req(payload, our_id, policy, txq, gps_snapshot, battery_snapshot)
         }
         x if x == PayloadType::Ack as u8 => {
-            handle_ack(payload, pending_ack, room_runtime, ui_events)
+            handle_ack(payload, pending_ack, room_runtime, ui_events, now_ms)
         }
         x if x == PayloadType::Response as u8 => {
             // A direct RESPONSE datagram: the non-flood room-login-reply leg
@@ -3361,6 +3362,7 @@ fn handle_ack(
     pending_ack: &mut Option<PendingAck>,
     room_runtime: &mut [RoomRuntime],
     ui_events: &mut Vec<ui::UiEvent>,
+    now_ms: u64,
 ) {
     if payload.len() < 4 {
         log::warn!("RX ACK: truncated ({} bytes)", payload.len());
@@ -3397,7 +3399,7 @@ fn handle_ack(
                         room.hash, ack.unsynced_count,
                     );
                     if let Some(room_session::RoomNotification::Aggregate { count }) =
-                        room.sync_phase.on_keep_alive_ack(ack.unsynced_count)
+                        room.sync_phase.on_keep_alive_ack(ack.unsynced_count, now_ms)
                     {
                         // Same diagnostic trail as the per-post drained/live
                         // log above: this is the moment a drain window that
@@ -3640,6 +3642,7 @@ fn handle_room_push_frame(
     ui_events: &mut Vec<ui::UiEvent>,
     nvs_partition: EspDefaultNvsPartition,
     contact_display_names: &std::collections::HashMap<u8, String>,
+    now_ms: u64,
 ) -> bool {
     let shared = our_id.ecdh_shared_secret(&room.pubkey);
     match room_session::handle_room_push(
@@ -3677,7 +3680,7 @@ fn handle_room_push_frame(
             // counted nor notified, keeping the notification-suppression
             // rule in lockstep with the content dedup a re-drain after
             // reboot depends on.
-            let notification = room.sync_phase.on_push_outcome(&outcome);
+            let notification = room.sync_phase.on_push_outcome(&outcome, now_ms);
 
             if let Some(entry) = outcome.entry {
                 let text_len = (entry.text_len as usize).min(entry.text.len());
@@ -4102,7 +4105,7 @@ mod tests {
 
         // [ack_hash(4)] [extended-attempt byte] [random byte]
         let payload_6_byte = [1u8, 2, 3, 4, 0x07, 0xFE];
-        handle_ack(&payload_6_byte, &mut pending, &mut [], &mut ui_events);
+        handle_ack(&payload_6_byte, &mut pending, &mut [], &mut ui_events, 0);
 
         assert!(pending.is_none(), "a prefix-matched 6-byte ack must clear pending_ack");
         assert_eq!(ui_events.len(), 1, "a prefix-matched 6-byte ack must raise exactly one UI event");
