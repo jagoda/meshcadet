@@ -259,22 +259,38 @@ pub const PERSISTED_ROOM_SESSION_LEN: usize = PRE_SYNC_GUARD_LEN + 1;
 /// length serves as both "oldest accepted" and "current write" once more.
 const PRE_SYNC_GUARD_LEN: usize = 1 + 4 + 1 + MAX_PATH_SIZE + 4;
 
-/// A persisted `last_room_ts` at or above this ceiling cannot be a genuine
-/// GPS-synced wall-clock reading and must be treated as poisoned —
-/// [`decode_persisted_room_session`] resets it to `0` at load time rather
-/// than honoring it (Scope item 4, `meshcadet-room-monotonic-tx-timestamp`).
+/// A room-server-sourced wall-clock reading (`server_ts` from a login reply,
+/// or `post_ts` from an inbound push) at or above this ceiling cannot be
+/// genuine and must never be adopted as this device's trusted wall clock —
+/// [`adopt_server_clock`] refuses it (leaves `current` unchanged) rather than
+/// adopting it.
+///
+/// This is deliberately the ONLY plausibility check this module performs on
+/// a room timestamp, and deliberately applied here — at the moment an
+/// external, untrusted `server_ts`/`post_ts` is about to become trusted
+/// state — rather than after the fact on [`PersistedRoomSession::
+/// last_room_ts`] (`meshcadet-room-clock-plausibility-bounds`, Finding C).
+/// The adopted clock is device-WIDE, not per-room
+/// (`firmware/src/main.rs`'s `adopted_server_clock`), so a single
+/// misconfigured or hostile room server that hands this device an implausible
+/// `server_ts` would otherwise poison the one clock every OTHER,
+/// correctly-clocked room's `record_sent_timestamp` ratchets off of
+/// (`room_tx_timestamp` -> [`trusted_wall_clock_secs`]) — burning those
+/// rooms' replay ceilings for a fault that was never theirs. Bounding the
+/// value here, at its one entry point into trusted state, closes that
+/// regardless of the adopted clock staying global.
+///
+/// [`decode_persisted_room_session`] does NOT re-check an already-persisted
+/// `last_room_ts` against this ceiling at load time — see that function's
+/// doc for why a load-time repair of that field is actively harmful, not
+/// corrective (Finding F), and why bounding adoption here is sufficient on
+/// its own: no code path can manufacture a fresh implausible `last_room_ts`
+/// once its only external contamination source is bounded.
 ///
 /// Chosen as `2100-01-01T00:00:00Z` (`4_102_444_800`): comfortably beyond any
-/// device's realistic service life (so no genuine synced reading will ever
-/// trip it), yet comfortably below `u32::MAX` (`2106`) so it still catches a
-/// large-magnitude `esp_random()` seed a pre-fix firmware persisted as this
-/// room's `last_room_ts`. It does not need to catch EVERY possible poisoned
-/// seed (a seed that happens to land between "now" and this ceiling is, by
-/// definition, not yet causing a problem — real synced sends are still
-/// smaller than it and will overtake it in the ordinary course of time); it
-/// only needs to catch the pathological case that would otherwise persist far
-/// longer than this device will ever run.
-pub const ROOM_TS_REPAIR_CEILING_SECS: u32 = 4_102_444_800;
+/// device's realistic service life, yet comfortably below `u32::MAX`
+/// (`2106`).
+pub const ROOM_CLOCK_PLAUSIBILITY_CEILING_SECS: u32 = 4_102_444_800;
 
 /// The session-learned subset of a room's [`RoomExtra`] fields — see the
 /// section doc above for why this is persisted through its own store rather
@@ -294,13 +310,16 @@ pub struct PersistedRoomSession {
     /// why a regression here must be refused, not sent.
     ///
     /// Never seeded from entropy (`meshcadet-room-monotonic-tx-timestamp`):
-    /// every value ever stored here came from [`room_tx_timestamp`], which
-    /// is either a genuine GPS-synced wall-clock reading or `last_room_ts +
-    /// 1` — never a random `u32`. [`decode_persisted_room_session`] also
-    /// resets an implausibly large value back to `0` at load time (see
-    /// [`ROOM_TS_REPAIR_CEILING_SECS`]), so a device that already ran
-    /// pre-fix firmware self-repairs on the very next boot rather than
-    /// staying poisoned forever.
+    /// every value [`room_tx_timestamp`] ever produces is either a genuine
+    /// trusted wall-clock reading — itself bounded by
+    /// [`ROOM_CLOCK_PLAUSIBILITY_CEILING_SECS`] at the moment it was adopted
+    /// ([`adopt_server_clock`]) — or `last_room_ts + 1`, never a random
+    /// `u32`. A device that already ran pre-fix firmware, before either
+    /// guarantee existed, may still carry an implausibly large value here;
+    /// [`decode_persisted_room_session`] deliberately leaves it untouched
+    /// rather than resetting it (Finding F,
+    /// `meshcadet-room-clock-plausibility-bounds`) — see that function's doc
+    /// for why forcing it down is self-harm, not repair.
     pub last_room_ts: u32,
 }
 
@@ -430,10 +449,12 @@ impl PersistedRoomSession {
 /// value as its new floor.
 ///
 /// `saturating_add` rather than `wrapping_add`: a `last_room_ts` at
-/// `u32::MAX` (unreachable in practice — see [`ROOM_TS_REPAIR_CEILING_SECS`]'s
-/// doc for why a value anywhere near that magnitude gets repaired back to `0`
-/// at load time) must not wrap back around to a small timestamp, which would
-/// itself look like a replay to the server.
+/// `u32::MAX` — unreachable in practice for any value this module itself
+/// ever produces (bounded by [`ROOM_CLOCK_PLAUSIBILITY_CEILING_SECS`] at
+/// adoption, or by `+1` bumps off an already-bounded value) and, per
+/// [`decode_persisted_room_session`]'s doc, deliberately left un-clamped for
+/// a legacy pre-fix blob too — must not wrap back around to a small
+/// timestamp, which would itself look like a replay to the server.
 pub fn room_tx_timestamp(trusted_wall_clock_secs: Option<u32>, last_room_ts: u32) -> u32 {
     let floor = last_room_ts.saturating_add(1);
     match trusted_wall_clock_secs {
@@ -525,11 +546,22 @@ impl AdoptedServerClock {
 
 /// Decide whether a freshly-received room-server timestamp (`server_ts` from
 /// a login reply, or `post_ts` from an inbound push — both server-stamped,
-/// both equally trustworthy as a wall-clock reading) should be adopted as
-/// this device's [`AdoptedServerClock`], and return the resulting state.
+/// both equally trustworthy as a wall-clock reading, PROVIDED it is
+/// plausible at all) should be adopted as this device's
+/// [`AdoptedServerClock`], and return the resulting state.
 ///
-/// Two rules, both from this mission's Scope item 4 ("Priority +
-/// monotonicity"):
+/// Three rules:
+/// - **Implausible readings are refused outright**
+///   (`meshcadet-room-clock-plausibility-bounds`, Finding C). A `server_ts`
+///   at or above [`ROOM_CLOCK_PLAUSIBILITY_CEILING_SECS`] cannot be a genuine
+///   wall clock and is never adopted — `current` is returned unchanged, as if
+///   the reading had never arrived. This is the one point where an
+///   untrusted, network-supplied `server_ts`/`post_ts` crosses into trusted
+///   device state; checking it here (rather than only after the fact, on the
+///   persisted [`PersistedRoomSession::last_room_ts`] value it would
+///   otherwise poison via `room_tx_timestamp`) matters because the adopted
+///   clock is device-WIDE, not per-room — see that constant's doc for the
+///   full mechanism this closes.
 /// - **GPS outranks server time.** `gps_synced` true means the device
 ///   already has a genuine GPS-synced wall clock right now; a room server's
 ///   reading must never displace it, so `current` is returned unchanged
@@ -550,6 +582,9 @@ pub fn adopt_server_clock(
     server_ts: u32,
 ) -> Option<AdoptedServerClock> {
     if gps_synced {
+        return current;
+    }
+    if server_ts >= ROOM_CLOCK_PLAUSIBILITY_CEILING_SECS {
         return current;
     }
     if let Some(existing) = current {
@@ -681,12 +716,31 @@ pub fn encode_persisted_room_session(state: &PersistedRoomSession, out: &mut [u8
 /// beyond [`PRE_SYNC_GUARD_LEN`] are simply ignored; there is no field left
 /// to populate from them.
 ///
-/// Also repairs an implausible `last_room_ts`: a value at or above
-/// [`ROOM_TS_REPAIR_CEILING_SECS`] cannot be a genuine wall-clock reading —
-/// see that constant's doc — and is reset to `0` here, at the single choke
-/// point every persisted session passes through on its way into runtime
-/// state, rather than trusted forward from whatever a pre-fix firmware
-/// happened to write.
+/// Does NOT repair an implausible `last_room_ts`. An earlier revision of
+/// this function reset a value at or above the plausibility ceiling
+/// (`ROOM_CLOCK_PLAUSIBILITY_CEILING_SECS`) back to `0` here. That "repair"
+/// is retired (`meshcadet-room-clock-plausibility-bounds`, Finding F): it
+/// only ever touched THIS device's own watermark — never the room server's
+/// mirrored `client->last_timestamp` (`MyMesh.cpp:345`/`:434`/`:527`), which
+/// this code has no way to reach. On a device that was actually posting fine
+/// at `last_room_ts + 1` (client and server agree, however absurd the shared
+/// value looks), the reset dropped the client's watermark BELOW what the
+/// server had already recorded — every subsequent login/post/keep-alive is
+/// then `<=` the server's stored value and gets silently dropped (no ACK)
+/// forever; only a room-server power cycle recovers it. Leaving the value
+/// untouched instead keeps whatever relationship already existed with the
+/// server intact: at least as safe in every case, and strictly safer on the
+/// case that was actually working.
+///
+/// This is safe to do unconditionally, not just a lesser evil, because the
+/// one remaining question — "can a fresh implausible `last_room_ts` still
+/// appear going forward?" — is now answered "no" at its source:
+/// [`adopt_server_clock`] bounds every server-supplied reading against the
+/// same ceiling before it can ever reach `last_room_ts` via
+/// `room_tx_timestamp`. A blob carrying an implausible value can therefore
+/// only be a pre-existing artifact of firmware that predates that guarantee,
+/// and for exactly that blob, "leave it alone" is the only choice that does
+/// not risk breaking a session that already works.
 pub fn decode_persisted_room_session(blob: &[u8]) -> Option<PersistedRoomSession> {
     if blob.len() < PRE_SYNC_GUARD_LEN {
         return None;
@@ -700,10 +754,7 @@ pub fn decode_persisted_room_session(blob: &[u8]) -> Option<PersistedRoomSession
     let mut out_path = [0u8; MAX_PATH_SIZE];
     out_path.copy_from_slice(&blob[6..6 + MAX_PATH_SIZE]);
     let ts_off = 6 + MAX_PATH_SIZE;
-    let mut last_room_ts = u32::from_le_bytes(blob[ts_off..ts_off + 4].try_into().ok()?);
-    if last_room_ts >= ROOM_TS_REPAIR_CEILING_SECS {
-        last_room_ts = 0;
-    }
+    let last_room_ts = u32::from_le_bytes(blob[ts_off..ts_off + 4].try_into().ok()?);
     Some(PersistedRoomSession {
         permissions,
         sync_since,
@@ -2070,11 +2121,19 @@ mod tests {
     }
 
     #[test]
-    fn persisted_room_session_decode_repairs_a_poisoned_last_room_ts() {
-        // Scope item 4 (`meshcadet-room-monotonic-tx-timestamp`): a
-        // pre-fix firmware's `esp_random()`-seeded boot login could persist
-        // an absurdly large `last_room_ts`. Decoding it must reset it to `0`
-        // rather than honor it forever.
+    fn persisted_room_session_decode_leaves_a_poisoned_last_room_ts_untouched() {
+        // Finding F (`meshcadet-room-clock-plausibility-bounds`): decoding a
+        // legacy blob with an implausibly far-future `last_room_ts` (e.g. a
+        // pre-`meshcadet-room-monotonic-tx-timestamp` firmware's
+        // `esp_random()`-seeded boot login) must leave it exactly as
+        // persisted, NOT reset it to `0`. An earlier revision of this
+        // function did reset it — that "repair" only ever touched this
+        // device's own watermark, never the room server's mirrored
+        // `client->last_timestamp`, so a device that was actually posting
+        // fine at this poisoned watermark would have its client-side value
+        // dropped BELOW what the server already recorded, permanently
+        // stalling every future send. Leaving the value alone keeps whatever
+        // relationship already exists with the server intact.
         let mut out_path = [0u8; MAX_PATH_SIZE];
         out_path[0] = 0xCD;
         let poisoned = PersistedRoomSession {
@@ -2089,32 +2148,32 @@ mod tests {
 
         let decoded = decode_persisted_room_session(&blob[..n]).unwrap();
         assert_eq!(
-            decoded.last_room_ts, 0,
-            "an implausibly-far-future last_room_ts must be repaired to 0 at load, not honored"
+            decoded, poisoned,
+            "decode must round-trip a poisoned last_room_ts unchanged, not repair it"
         );
-        // Everything else round-trips untouched — only the poisoned field
-        // is repaired.
-        assert_eq!(decoded.permissions, poisoned.permissions);
-        assert_eq!(decoded.sync_since, poisoned.sync_since);
-        assert_eq!(decoded.out_path, poisoned.out_path);
-        assert_eq!(decoded.out_path_len, poisoned.out_path_len);
     }
 
     #[test]
     fn persisted_room_session_decode_leaves_a_plausible_last_room_ts_alone() {
-        // The repair ceiling must not clip a genuine, merely large-looking
-        // wall-clock reading well within this device's service life.
+        // A genuine, merely large-looking wall-clock reading well within
+        // this device's service life must obviously round-trip untouched
+        // too — decode no longer distinguishes it from the poisoned case
+        // above (Finding F: there is no load-time ceiling check left at
+        // all), but the case is worth pinning in its own right.
         let state = PersistedRoomSession {
             permissions: RoomPermission::ReadWrite as u8,
             sync_since: 0,
             out_path: [0u8; MAX_PATH_SIZE],
             out_path_len: 0,
-            last_room_ts: ROOM_TS_REPAIR_CEILING_SECS - 1,
+            last_room_ts: ROOM_CLOCK_PLAUSIBILITY_CEILING_SECS - 1,
         };
         let mut blob = [0u8; PERSISTED_ROOM_SESSION_LEN];
         let n = encode_persisted_room_session(&state, &mut blob);
         let decoded = decode_persisted_room_session(&blob[..n]).unwrap();
-        assert_eq!(decoded.last_room_ts, ROOM_TS_REPAIR_CEILING_SECS - 1);
+        assert_eq!(
+            decoded.last_room_ts,
+            ROOM_CLOCK_PLAUSIBILITY_CEILING_SECS - 1
+        );
     }
 
     #[test]
@@ -2301,6 +2360,66 @@ mod tests {
         let advanced = adopt_server_clock(regressed, false, later_ms, 1_800_000_500);
         let (secs, _) = trusted_wall_clock_secs(None, advanced, later_ms);
         assert_eq!(secs, Some(1_800_000_500));
+    }
+
+    // ── Clock plausibility bound (`meshcadet-room-clock-plausibility-bounds`,
+    // Finding C) ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn adopt_server_clock_refuses_a_far_future_server_ts() {
+        // A server_ts at or beyond the plausibility ceiling must never be
+        // adopted as the device-wide trusted clock — a single wrong-clock
+        // (or hostile) room server must not be able to poison the ONE clock
+        // every OTHER room's `record_sent_timestamp` ratchets off of.
+        let now_ms = 0;
+        let refused = adopt_server_clock(None, false, now_ms, ROOM_CLOCK_PLAUSIBILITY_CEILING_SECS);
+        assert_eq!(
+            refused, None,
+            "a far-future server_ts at the ceiling must not be adopted"
+        );
+
+        let refused = adopt_server_clock(None, false, now_ms, u32::MAX);
+        assert_eq!(
+            refused, None,
+            "an even-more-implausible server_ts must not be adopted either"
+        );
+
+        // One tick below the ceiling is still plausible and must adopt.
+        let adopted = adopt_server_clock(
+            None,
+            false,
+            now_ms,
+            ROOM_CLOCK_PLAUSIBILITY_CEILING_SECS - 1,
+        );
+        assert!(
+            adopted.is_some(),
+            "a reading just below the ceiling is plausible and must adopt"
+        );
+    }
+
+    #[test]
+    fn adopt_server_clock_refuses_a_far_future_reading_without_disturbing_an_existing_clock() {
+        // A device that already has a genuine adopted clock must not have it
+        // clobbered by a later implausible reading (e.g. a second room
+        // server's bad clock, or a corrupted push) — the existing, plausible
+        // clock is preserved exactly as `current` unchanged, same as the
+        // GPS-synced and stale-regression cases.
+        let now_ms = 0;
+        let clock = adopt_server_clock(None, false, now_ms, 1_800_000_000)
+            .expect("a plausible first reading must adopt");
+
+        let later_ms = 5_000;
+        let still_the_same = adopt_server_clock(
+            Some(clock),
+            false,
+            later_ms,
+            ROOM_CLOCK_PLAUSIBILITY_CEILING_SECS,
+        );
+        assert_eq!(
+            still_the_same,
+            Some(clock),
+            "an implausible later reading must leave an already-adopted clock untouched"
+        );
     }
 
     #[test]
