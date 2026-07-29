@@ -1306,6 +1306,14 @@ fn run() -> anyhow::Result<()> {
     // alone is sufficient to make every `tx_epoch_base.wrapping_add((now_ms
     // / 1000) as u32)` call site below (DM/GRP_TXT/telemetry-reply
     // timestamps) read real time post-sync with no other code change.
+    //
+    // ROOM FRAMES ARE THE ONE EXCEPTION (`meshcadet-room-monotonic-tx-
+    // timestamp`): a room login/keep-alive/post never reads `tx_epoch_base`
+    // — they use `room_session::room_tx_timestamp`, seeded from each room's
+    // OWN persisted `last_room_ts`, never from this random seed. Broadening
+    // that room-scoped source into DM/GRP_TXT/advert (which still rely on
+    // `tx_epoch_base` here) is explicitly out of scope — see that mission's
+    // Scope section.
     let mut tx_epoch_base: u32 = unsafe { esp_idf_svc::sys::esp_random() };
     log::info!("tx timestamp base seeded (per-boot anti-replay)");
 
@@ -1629,15 +1637,13 @@ fn run() -> anyhow::Result<()> {
     // under `hil` (no rooms there), so this loop is a no-op in that build.
     {
         let boot_now = uptime_ms();
-        let boot_ts = tx_epoch_base.wrapping_add((boot_now / 1000) as u32);
         // This login send runs before the dispatcher loop's first GPS poll
         // ever executes, so `gps` has had no chance to sync yet — this is
-        // always `false` today. Read the real driver anyway (rather than
-        // hardcoding it) so `record_sent_timestamp`'s pre-sync-poisoning
-        // guard (see `PersistedRoomSession::last_room_ts_synced`'s doc)
-        // stays correct even if this ordering ever changes, instead of
-        // silently assuming it never will.
-        let boot_clock_synced = gps.synced_wall_clock_secs(boot_now).is_some();
+        // always `None` today. Read the real driver anyway (rather than
+        // hardcoding it) so `room_session::room_tx_timestamp` stays correct
+        // even if this ordering ever changes, instead of silently assuming
+        // it never will.
+        let boot_wall_clock_secs = gps.synced_wall_clock_secs(boot_now);
         for room in room_runtime.iter_mut() {
             // Defensive: this loop runs exactly once per boot today (no
             // keep-alive/re-login scheduler until milestone 2), but guard on
@@ -1646,6 +1652,13 @@ fn run() -> anyhow::Result<()> {
             if room.login_sent {
                 continue;
             }
+            // `meshcadet-room-monotonic-tx-timestamp`: monotonic, never
+            // random, seeded from THIS room's own persisted watermark — not
+            // `tx_epoch_base` (that stays `esp_random()`-seeded pre-sync for
+            // DM/GRP_TXT/advert, out of scope here; see this fn's `tx_epoch_
+            // base` doc).
+            let boot_ts =
+                room_session::room_tx_timestamp(boot_wall_clock_secs, room.session.last_room_ts);
             let shared = identity.ecdh_shared_secret(&room.pubkey);
             let mut frame = [0u8; room_session::MAX_LOGIN_FRAME_LEN];
             let n = room_session::encode_room_login_frame(
@@ -1659,7 +1672,7 @@ fn run() -> anyhow::Result<()> {
             );
             log_tx_queue_eviction(txq.enqueue(&frame[..n]), "room login");
             room.login_sent = true;
-            room.session.record_sent_timestamp(boot_ts, boot_clock_synced);
+            room.session.record_sent_timestamp(boot_ts);
             log::info!(
                 "room: queued flood login for 0x{:02x} (sync_since={})",
                 room.hash, room.session.sync_since,
@@ -1710,19 +1723,25 @@ fn run() -> anyhow::Result<()> {
         // anti-replay (only ever compared against itself — see
         // `firmware/src/advert_ts_store.rs`'s doc), just not a real clock
         // reading yet.
+        // This same reading also feeds every room frame's timestamp this
+        // tick (`room_session::room_tx_timestamp`,
+        // `meshcadet-room-monotonic-tx-timestamp`) — captured once here so
+        // `tx_epoch_base`'s rebase below and every room send this iteration
+        // agree on exactly the same "is the clock synced right now, and to
+        // what" answer.
+        #[cfg(not(feature = "hil"))]
+        let synced_wall_clock_secs = gps.synced_wall_clock_secs(now);
         if let Some(unix_secs) = gps.synced_wall_clock_secs(now) {
             tx_epoch_base = unix_secs.wrapping_sub((now / 1000) as u32);
         }
-        // Whether `tx_epoch_base` (and so every `ts`/`candidate_ts` derived
-        // from it this iteration) is a genuine GPS-synced wall-clock reading
-        // right now — the same source GPS Status reads. Threaded into every
-        // `record_sent_timestamp`/`effective_last_room_ts` call this tick so
-        // a room's persisted `last_room_ts` watermark can never be
-        // permanently poisoned by a pre-sync send (see
-        // `PersistedRoomSession::last_room_ts_synced`'s doc — Bug 2 of the
-        // `meshcadet-room-hil-sender-render-and-clock-post-fixes` mission).
+        // Whether the wall clock is genuinely GPS-synced right now — the
+        // same source GPS Status reads. Used only for the room-post refusal
+        // message below (a real, still-relevant distinction: "clock not yet
+        // synced" vs. "clock hasn't advanced since the last send") — room
+        // TIMESTAMPS themselves no longer need this as a gate (see
+        // `room_tx_timestamp`'s doc).
         #[cfg(not(feature = "hil"))]
-        let clock_synced = gps.synced_wall_clock_secs(now).is_some();
+        let clock_synced = synced_wall_clock_secs.is_some();
 
         // ── Battery poll (throttled ADC read + charging-trend refresh) ───────
         battery.poll(now);
@@ -1849,7 +1868,8 @@ fn run() -> anyhow::Result<()> {
                 if now.saturating_sub(room.last_reflood_ms) < interval {
                     continue;
                 }
-                let ts = tx_epoch_base.wrapping_add((now / 1000) as u32);
+                let ts =
+                    room_session::room_tx_timestamp(synced_wall_clock_secs, room.session.last_room_ts);
                 let shared = identity.ecdh_shared_secret(&room.pubkey);
                 let mut frame = [0u8; room_session::MAX_LOGIN_FRAME_LEN];
                 let n = room_session::encode_room_login_frame(
@@ -1862,7 +1882,7 @@ fn run() -> anyhow::Result<()> {
                     &mut frame,
                 );
                 log_tx_queue_eviction(txq.enqueue(&frame[..n]), "room re-flood login");
-                room.session.record_sent_timestamp(ts, clock_synced);
+                room.session.record_sent_timestamp(ts);
                 room.last_reflood_ms = now;
                 room.reflood_attempts = room.reflood_attempts.saturating_add(1);
                 log::info!(
@@ -1894,7 +1914,7 @@ fn run() -> anyhow::Result<()> {
                 continue;
             }
             room.last_keep_alive_ms = now;
-            let ts = tx_epoch_base.wrapping_add((now / 1000) as u32);
+            let ts = room_session::room_tx_timestamp(synced_wall_clock_secs, room.session.last_room_ts);
             let shared = identity.ecdh_shared_secret(&room.pubkey);
 
             // Reconnect-stall detector: BEFORE overwriting
@@ -1962,7 +1982,7 @@ fn run() -> anyhow::Result<()> {
                         force_since,
                         &identity.pubkey,
                     ));
-                    room.session.record_sent_timestamp(ts, clock_synced);
+                    room.session.record_sent_timestamp(ts);
                     room.resync_pending = false;
                     log::info!(
                         "room: TX route-direct keep-alive for 0x{:02x} (ts={}, force_since={})",
@@ -2459,22 +2479,24 @@ fn run() -> anyhow::Result<()> {
                                         room_hash,
                                     );
                                 } else {
-                                    let candidate_ts =
-                                        tx_epoch_base.wrapping_add((now / 1000) as u32);
+                                    // `meshcadet-room-monotonic-tx-timestamp`:
+                                    // monotonic, never random, and never
+                                    // above real wall-clock time while
+                                    // untrusted — see `room_tx_timestamp`'s
+                                    // doc. Always strictly greater than
+                                    // `last_room_ts` by construction, so a
+                                    // device with no GPS fix yet can still
+                                    // post; `encode_room_post_checked`'s
+                                    // `NonMonotonicTimestamp` refusal below
+                                    // remains as defense-in-depth against a
+                                    // genuine same-tick collision, not a
+                                    // "clock not synced" gate anymore.
+                                    let candidate_ts = room_session::room_tx_timestamp(
+                                        synced_wall_clock_secs,
+                                        room.session.last_room_ts,
+                                    );
                                     let shared = identity.ecdh_shared_secret(&room.pubkey);
-                                    // Bug 2 fix (`meshcadet-room-hil-sender-render-and-
-                                    // clock-post-fixes`): gate on the REPAIRED watermark,
-                                    // not the raw persisted one — see
-                                    // `PersistedRoomSession::effective_last_room_ts`'s doc.
-                                    // A room whose `last_room_ts` was poisoned by a
-                                    // pre-GPS-sync boot login (or reflood/keep-alive) must
-                                    // not stay permanently unable to post once the clock
-                                    // genuinely syncs: a `u32` wall-clock timestamp can
-                                    // never numerically exceed a big enough random
-                                    // pre-sync seed, so gating on the raw value would
-                                    // brick posting forever, not just until the next sync.
-                                    let last_room_ts =
-                                        room.session.effective_last_room_ts(clock_synced);
+                                    let last_room_ts = room.session.last_room_ts;
                                     match room_session::encode_room_post_checked(
                                         &shared,
                                         room.hash,
@@ -2488,7 +2510,7 @@ fn run() -> anyhow::Result<()> {
                                         Ok((n, ack)) => {
                                             log_tx_queue_eviction(txq.enqueue(&frame_buf[..n]), "room post");
                                             room.pending_post_ack = Some(ack);
-                                            room.session.record_sent_timestamp(candidate_ts, clock_synced);
+                                            room.session.record_sent_timestamp(candidate_ts);
                                             log::info!(
                                                 "TX room post to 0x{:02x}: {:?} ({} bytes)",
                                                 room.hash, text, n,
@@ -2528,28 +2550,20 @@ fn run() -> anyhow::Result<()> {
                                             // simply never appeared — `RoomPostRefused`
                                             // tells them why, directly in the thread.
                                             //
-                                            // Bug 2 fix: the refusal message must
-                                            // describe the REAL condition, not
-                                            // misdiagnose it. `effective_last_room_ts`
-                                            // above already repairs a pre-sync-poisoned
-                                            // watermark, so reaching this arm while
-                                            // `clock_synced` is true is NOT the "clock
-                                            // not synced" case GPS Status would agree
-                                            // with — it means the clock genuinely
-                                            // hasn't advanced past this room's last
-                                            // send yet (two posts within the same
-                                            // wall-clock second, or a real clock
-                                            // regression), which needs its own accurate
-                                            // message, not the unsynced one.
-                                            let reason = if clock_synced {
-                                                "clock has not advanced since this room's \
-                                                 last post — try again in a moment"
-                                                    .to_string()
-                                            } else {
-                                                "clock not yet synced — cannot post \
-                                                 to this room yet"
-                                                    .to_string()
-                                            };
+                                            // `meshcadet-room-monotonic-tx-timestamp`,
+                                            // Scope item 6: "clock not yet synced" is
+                                            // no longer a valid reason a post is
+                                            // refused — `candidate_ts` above is always
+                                            // strictly greater than `last_room_ts` by
+                                            // construction, synced or not. Reaching
+                                            // this arm at all means the clock genuinely
+                                            // hasn't advanced past this room's last send
+                                            // yet (two sends within the same wall-clock
+                                            // second, or a real clock regression) — the
+                                            // one case the refusal path still exists for.
+                                            let reason = "clock has not advanced since this room's \
+                                                 last send — try again in a moment"
+                                                .to_string();
                                             log::warn!(
                                                 "UI send room post to 0x{:02x} refused: \
                                                  {:?} (clock_synced={}, candidate_ts={}, \
