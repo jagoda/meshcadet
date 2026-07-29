@@ -1154,6 +1154,20 @@ pub enum RoomNotification {
 /// a legitimately large, legitimately slow backlog is never force-closed as
 /// long as its closing mechanism is provably still alive. Only a round-trip
 /// that never even starts trips this.
+///
+/// **`meshcadet-room-post-no-notification`'s correction:** the escape hatch
+/// above is a *blind* elapsed-time bound — it has no visibility into
+/// whatever else the session already knows about the closer's health. HIL
+/// evidence, 2026-07-29: a room whose `out_path` keeps getting learned (a
+/// flood-routed re-login succeeds every cycle — `login complete` logs
+/// repeatedly) but whose route-direct keep-alive keeps going unanswered
+/// cycles through [`RoomKeepAliveStall`]'s 2-consecutive-miss invalidation
+/// roughly every 30 seconds, forever, without the 5-minute stall bound
+/// above ever hearing about it — see [`Self::note_closer_failed`], called
+/// the instant that invalidation fires, for why the bound's own "many
+/// re-flood attempts will have gone out by 5 minutes" justification does
+/// not hold for this failure mode and how the fix folds the stronger
+/// signal in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RoomSyncPhase {
     draining: bool,
@@ -1162,6 +1176,15 @@ pub struct RoomSyncPhase {
     /// keep-alive ACK (any unsynced_count) — the last moment the window's
     /// closing round-trip was proven alive. See this type's doc.
     last_progress_ms: u64,
+    /// Set by [`Self::note_closer_failed`], cleared the moment either the
+    /// window force-closes on the next post or the closer proves itself
+    /// alive again (any keep-alive ACK, via [`Self::on_keep_alive_ack`]). A
+    /// dedicated flag rather than back-dating `last_progress_ms` by
+    /// `DRAIN_WINDOW_STALL_TIMEOUT_MS`: `now_ms` is `uptime_ms()`-scale and
+    /// can be smaller than the timeout itself soon after boot, where
+    /// `saturating_sub` would silently floor at `0` and fail to force an
+    /// early close — a flag has no such underflow.
+    closer_failed: bool,
 }
 
 /// How long [`RoomSyncPhase`] tolerates a drain window with zero evidence
@@ -1187,6 +1210,7 @@ impl RoomSyncPhase {
             draining: true,
             drained_count: 0,
             last_progress_ms: now_ms,
+            closer_failed: false,
         }
     }
 
@@ -1202,12 +1226,16 @@ impl RoomSyncPhase {
         if !self.draining {
             return RoomNotification::Live;
         }
-        if now_ms.saturating_sub(self.last_progress_ms) >= DRAIN_WINDOW_STALL_TIMEOUT_MS {
+        let stalled = self.closer_failed
+            || now_ms.saturating_sub(self.last_progress_ms) >= DRAIN_WINDOW_STALL_TIMEOUT_MS;
+        if stalled {
             // The closing round-trip has shown no sign of life for the
-            // whole stall timeout: stop waiting for it. Force-close right
-            // here, folding THIS post into the aggregate that finally
-            // flushes — see this type's doc.
+            // whole stall timeout — or independent evidence
+            // ([`Self::note_closer_failed`]) already proved it dead sooner:
+            // stop waiting for it. Force-close right here, folding THIS post
+            // into the aggregate that finally flushes — see this type's doc.
             self.draining = false;
+            self.closer_failed = false;
             let count = self.drained_count.saturating_add(1);
             self.drained_count = 0;
             return RoomNotification::Aggregate { count };
@@ -1241,7 +1269,10 @@ impl RoomSyncPhase {
     /// `unsynced_count` — is proof the closing round-trip is alive, so it
     /// always resets [`DRAIN_WINDOW_STALL_TIMEOUT_MS`]'s clock
     /// (`last_progress_ms = now_ms`), even on the `unsynced_count != 0`
-    /// branch that otherwise returns `None`.
+    /// branch that otherwise returns `None` — and, for the same reason,
+    /// clears any pending [`Self::note_closer_failed`] flag: a keep-alive
+    /// ACK that actually arrived directly contradicts whatever earlier
+    /// evidence claimed the closer was dead.
     pub fn on_keep_alive_ack(
         &mut self,
         unsynced_count: u8,
@@ -1251,6 +1282,7 @@ impl RoomSyncPhase {
             return None;
         }
         self.last_progress_ms = now_ms;
+        self.closer_failed = false;
         if unsynced_count != 0 {
             return None;
         }
@@ -1261,6 +1293,50 @@ impl RoomSyncPhase {
             Some(RoomNotification::Aggregate { count })
         } else {
             None
+        }
+    }
+
+    /// Mark [`DRAIN_WINDOW_STALL_TIMEOUT_MS`]'s bound as already exceeded —
+    /// call the moment INDEPENDENT, STRONGER evidence proves the window's
+    /// only closer (a keep-alive ACK) has failed, rather than making the
+    /// drain window wait out the full bound from scratch with no visibility
+    /// into that evidence.
+    ///
+    /// [`RoomKeepAliveStall`] invalidating `out_path` (two consecutive
+    /// missed keep-alive round trips) is exactly that evidence — and
+    /// [`DRAIN_WINDOW_STALL_TIMEOUT_MS`]'s own doc justifies its 5-minute
+    /// size on an assumption this call corrects for: "by then... many
+    /// re-flood attempts, at the tight draining cadence, will have gone
+    /// out" — i.e. the reflood backoff will have escalated toward its own
+    /// ceiling, so 5 minutes buys many varied-interval retries. That
+    /// assumption silently fails for the failure mode
+    /// `meshcadet-room-post-no-notification`'s HIL capture pinned: a room
+    /// whose flood-routed LOGIN keeps succeeding (a fresh `login complete`
+    /// on every relearn) while only the SUBSEQUENT route-direct KEEP-ALIVE
+    /// fails resets the reflood backoff to its floor
+    /// (`apply_room_login_outcome`'s "successful login reply is one of the
+    /// reflood backoff's two reset conditions") on every cycle — the
+    /// backoff never escalates, "many re-flood attempts... will have gone
+    /// out" never becomes true, and the drain window sits suppressed for
+    /// the full 5 minutes despite the system already knowing, within one
+    /// ~30s relearn cycle, that its closer is stuck.
+    ///
+    /// Deliberately sets a flag rather than force-closing the window
+    /// outright, and rather than back-dating `last_progress_ms` by
+    /// subtracting [`DRAIN_WINDOW_STALL_TIMEOUT_MS`] (which underflows to a
+    /// no-op via `saturating_sub` whenever `now_ms` is still smaller than
+    /// the timeout itself — always true soon after boot, exactly the
+    /// window this needs to cover): this type's whole contract is
+    /// "classify off session phase and a post's own arrival, never off a
+    /// bare timer or count" (see this type's own doc) — the NEXT post
+    /// received is what actually force-closes the window and fires the
+    /// aggregate (through the ordinary [`Self::on_post_received`] path,
+    /// which now also stalls immediately on this flag); a room that stays
+    /// quiet after this call stays suppressed forever, exactly as it did
+    /// before this method existed. A no-op if the window is already closed.
+    pub fn note_closer_failed(&mut self) {
+        if self.draining {
+            self.closer_failed = true;
         }
     }
 }
@@ -3159,6 +3235,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn note_closer_failed_force_expires_the_stall_clock_for_the_next_post() {
+        // This mission's own fix, pinned at the classifier level:
+        // independent evidence the closer has failed must make the very
+        // NEXT post force-close the window, without waiting out
+        // `DRAIN_WINDOW_STALL_TIMEOUT_MS` from window-open.
+        let mut phase = RoomSyncPhase::new_after_login(0);
+        // Nowhere near the stall bound yet.
+        phase.note_closer_failed();
+        assert!(
+            phase.is_draining(),
+            "the call itself must not force-close anything — only the next post does"
+        );
+
+        let outcome = RoomPushOutcome {
+            ack_hash: [0; 4],
+            post_ts: 0,
+            entry: Some(HistoryEntry {
+                sender_hash: 0,
+                msg_type: HistoryMsgType::Dm,
+                timestamp: 0,
+                text: [0; MAX_HISTORY_TEXT_LEN],
+                text_len: 0,
+            }),
+            author_pubkey_prefix: [0; 4],
+        };
+        assert_eq!(
+            phase.on_push_outcome(&outcome, 1_001),
+            RoomNotification::Aggregate { count: 1 },
+            "closer-failure evidence must force-close on the very next post, not require the \
+             full DRAIN_WINDOW_STALL_TIMEOUT_MS to elapse from window-open"
+        );
+        assert!(!phase.is_draining());
+    }
+
+    #[test]
+    fn note_closer_failed_is_a_no_op_once_the_window_is_already_closed() {
+        let mut phase = RoomSyncPhase::new_after_login(0);
+        assert_eq!(
+            phase.on_keep_alive_ack(0, 100),
+            None,
+            "nothing drained, nothing to announce"
+        );
+        assert!(!phase.is_draining());
+        phase.note_closer_failed();
+        assert!(!phase.is_draining(), "must not reopen a closed window");
+    }
+
     // ── Full integration: 32-post login backlog through the real double ────
 
     #[test]
@@ -3348,6 +3472,142 @@ mod tests {
             RoomNotification::Live,
             "after the forced close, every subsequent post must get full live parity"
         );
+    }
+
+    // ── Full integration: this mission's fix — closer-failure evidence ─────
+    // short-circuits the blind stall bound ──────────────────────────────────
+
+    /// `meshcadet-room-post-no-notification`'s own defect, reproduced end to
+    /// end and proven fixed. HIL signature: a room whose flood-routed LOGIN
+    /// keeps succeeding (repeated `login complete` logs on every relearn)
+    /// while its route-direct KEEP-ALIVE never gets ACKed cycles through
+    /// [`RoomKeepAliveStall`]'s `KEEP_ALIVE_STALL_THRESHOLD`-consecutive-miss
+    /// invalidation over and over — and because `sync_phase` never once
+    /// hears a keep-alive ACK, its `DRAIN_WINDOW_STALL_TIMEOUT_MS` clock has
+    /// no idea anything is wrong. Before this mission's fix, a post landing
+    /// long before that 5-minute bound elapsed still got silently folded
+    /// (`RoomNotification::None`) even with definitive, repeated proof in
+    /// hand that the closer was never going to arrive. After the fix
+    /// (`RoomSyncPhase::note_closer_failed`, wired at the exact point
+    /// `main.rs`'s scheduler detects the invalidation), the very next post
+    /// after that invalidation fires the notification surface instead —
+    /// this test asserts that consequence, not just the classifier's return
+    /// value in isolation (this mission's own explicit ask).
+    #[test]
+    fn keep_alive_invalidation_short_circuits_the_blind_stall_bound() {
+        let (client, server) = make_pair();
+        let other_author = Identity::from_seed([0xC0u8; 32]);
+        let mut double = RoomServerDouble::new(server.clone(), b"admin-pw", b"guest-pw", false);
+
+        let outcome = login_direct(&mut double, &client, &server, b"guest-pw", 1000);
+        let mut session = PersistedRoomSession::EMPTY;
+        session.apply_login_outcome(&outcome);
+        session.out_path[..2].copy_from_slice(&[0xAB, 0xCD]);
+        session.out_path_len = 2;
+        let mut stall = RoomKeepAliveStall::new();
+        let mut phase = RoomSyncPhase::new_after_login(0);
+        let shared = client.ecdh_shared_secret(&server.pubkey);
+        let conv_hash = server.pub_hash();
+        let mut history: Vec<HistoryEntry> = Vec::new();
+
+        // A post arrives well before any keep-alive round-trip has had a
+        // chance to run — ordinary, correct, silent drain.
+        double.seed_post(&other_author.pubkey, 2000, b"first, still draining");
+        let mut wire = [0u8; 256];
+        let n = double
+            .push_next(&client.pubkey, &mut wire)
+            .expect("the seeded post must be deliverable");
+        let outcome1 = handle_room_push(&shared, &wire[..n], &client.pubkey, conv_hash, &history)
+            .expect("push must decode");
+        assert_eq!(
+            phase.on_push_outcome(&outcome1, 2_000),
+            RoomNotification::None
+        );
+        history.push(outcome1.entry.expect("a fresh push must produce an entry"));
+        assert!(double.handle_ack(&client.pubkey, &outcome1.ack_hash));
+        session.record_synced_post_ts(outcome1.post_ts); // mirrors `handle_room_push_frame`'s watermark update
+
+        // The route dies right after: every keep-alive from here on
+        // vanishes — nothing reaches `double` at all, exactly what a dead
+        // `out_path` means on the wire (mirrors `stall_then_relearn_
+        // recovers_backlog_without_reboot`'s identical setup).
+        for i in 1..KEEP_ALIVE_STALL_THRESHOLD {
+            assert!(
+                !stall.on_tick(true, &mut session),
+                "miss {i}/{KEEP_ALIVE_STALL_THRESHOLD} must not yet invalidate out_path"
+            );
+        }
+        assert!(
+            stall.on_tick(true, &mut session),
+            "the {KEEP_ALIVE_STALL_THRESHOLD}th consecutive miss must invalidate out_path"
+        );
+        assert_eq!(
+            session.out_path_len, 0,
+            "out_path must be zeroed on stall detection"
+        );
+
+        // `main.rs`'s exact call site: the moment invalidation fires, feed
+        // it into the drain window too.
+        phase.note_closer_failed();
+        assert!(
+            phase.is_draining(),
+            "the window itself is not force-closed yet — only the NEXT post closes it"
+        );
+
+        // Login keeps succeeding on relearn (this defect's whole HIL
+        // signature) even though the keep-alive that follows will fail
+        // again, identically — the reflood backoff resets to its floor
+        // every cycle because of exactly this.
+        let relearn = login_direct(&mut double, &client, &server, b"guest-pw", 10_100);
+        session.apply_login_outcome(&relearn);
+        session.out_path[..3].copy_from_slice(&[0x11, 0x22, 0x33]);
+        session.out_path_len = 3;
+        stall.reset();
+
+        // `stall_then_relearn_recovers_backlog_without_reboot`'s identical
+        // correction: the double's simplified login helper regresses
+        // `sync_since` to 0 on relogin, so the resumed keep-alive must carry
+        // `force_since` to re-affirm the watermark BEFORE any push retry —
+        // otherwise `push_next` below re-delivers the already-drained first
+        // post instead of the genuinely new one, which is not what this
+        // test exists to exercise.
+        let mut raw = [0u8; 64];
+        let ka_n = encode_keep_alive(
+            &shared,
+            server.pub_hash(),
+            client.pub_hash(),
+            10_150,
+            session.sync_since,
+            &mut raw,
+        );
+        let ka_ack = double
+            .handle_keep_alive(&client.pubkey, &raw[..ka_n])
+            .expect("the resumed keep-alive must be accepted");
+        decode_keep_alive_ack(&ka_ack).expect("resumed keep-alive ACK must decode");
+
+        // The very next post — far short of `DRAIN_WINDOW_STALL_TIMEOUT_MS`
+        // since window-open — must now fire the notification surface, not
+        // sit silently folded waiting out a bound with no idea the closer
+        // just proved itself dead.
+        double.seed_post(&other_author.pubkey, 2001, b"second, after invalidation");
+        let mut wire2 = [0u8; 256];
+        let n2 = double
+            .push_next(&client.pubkey, &mut wire2)
+            .expect("the seeded post must be deliverable");
+        let outcome2 = handle_room_push(&shared, &wire2[..n2], &client.pubkey, conv_hash, &history)
+            .expect("push must decode");
+        assert_eq!(
+            phase.on_push_outcome(&outcome2, 10_200),
+            RoomNotification::Aggregate { count: 2 },
+            "closer-failure evidence must fire the notification well before the blind \
+             5-minute stall bound would have — this is the consequence this mission's fix \
+             restores, not just a classifier return value in isolation"
+        );
+        assert!(!phase.is_draining());
+        // 10_200ms is nowhere near `DRAIN_WINDOW_STALL_TIMEOUT_MS`
+        // (300_000ms) measured from window-open (0) — the assertion above
+        // only passes because of the short-circuit, not a coincidental
+        // timeout.
     }
 
     // ── Full integration: a genuinely live post is never hash-filtered ──────

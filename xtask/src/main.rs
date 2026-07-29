@@ -114,6 +114,24 @@ fn main() -> ExitCode {
         }
     }
 
+    let aggregate_notification = xtask::room_aggregate_notification::check(&repo_root);
+    if aggregate_notification.is_empty() {
+        println!(
+            "xtask verify-room-aggregate-notification: OK — {}'s `RoomNotification::Aggregate` \
+             arm raises `UiEvent::RoomDrainComplete`.",
+            xtask::room_aggregate_notification::MAIN_RS_REL_PATH
+        );
+    } else {
+        ok = false;
+        eprintln!(
+            "xtask verify-room-aggregate-notification: FAILED — {} violation(s):",
+            aggregate_notification.len()
+        );
+        for v in &aggregate_notification {
+            eprintln!("  - {v}");
+        }
+    }
+
     if ok {
         ExitCode::SUCCESS
     } else {
