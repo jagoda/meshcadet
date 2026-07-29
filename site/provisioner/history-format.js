@@ -21,6 +21,12 @@
 
 import { HISTORY_MSG_TYPE_DM } from "./codec.js";
 
+// Sentinel `timestamp` value meaning "no trusted wall clock was available
+// when this entry was written" — never a genuine epoch reading. Mirrors
+// `protocol::history::TIMESTAMP_UNKNOWN` (`0`, doubling as the Rust crate's
+// existing all-zero default, so this needs no wire-format change).
+const TIMESTAMP_UNKNOWN = 0;
+
 // ── Column widths (mirror host/src/history_format.rs's consts) ──────────────
 
 // "YYYY-MM-DD HH:MM:SS +HH:MM" — always 26 chars (see formatLocalTimestamp).
@@ -74,14 +80,23 @@ export function historyHeader(iw) {
 
 /**
  * Render a stored `u32` unix-epoch-seconds value as a local, unambiguous,
- * human-readable timestamp, e.g. `2026-07-01 18:34:25 -04:00`. Mirrors
+ * human-readable timestamp, e.g. `2026-07-01 18:34:25 -04:00` — or
+ * `"unknown"` (never a computed epoch date) when `epochSeconds` is
+ * `TIMESTAMP_UNKNOWN`: `meshcadet-room-clock-ux`'s fix for a room post's
+ * local outbound echo, which is written with that sentinel whenever no
+ * trusted wall clock was available at send time (the room-post wire nonce
+ * is never a valid stand-in — see `TIMESTAMP_UNKNOWN`'s own doc). Mirrors
  * `history_format::format_local_timestamp` (`%Y-%m-%d %H:%M:%S %:z`), using
  * the browser's local timezone via `Date` — always 26 chars.
  *
- * Device timestamps are trusted as genuine epochs here (same assumption the
- * Rust module documents); device-clock discipline is a separate concern.
+ * Every OTHER (non-sentinel) device timestamp is trusted as a genuine epoch
+ * here (same assumption the Rust module documents); device-clock discipline
+ * for those is a separate, deferred concern.
  */
 export function formatLocalTimestamp(epochSeconds) {
+  if (epochSeconds === TIMESTAMP_UNKNOWN) {
+    return "unknown";
+  }
   const d = new Date(epochSeconds * 1000);
   const date = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
   const time = `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;

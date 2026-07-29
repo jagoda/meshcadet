@@ -160,7 +160,11 @@ mod tests {
     fn format_local_timestamp_unknown_sentinel_renders_as_unknown() {
         let s = format_local_timestamp(protocol::history::TIMESTAMP_UNKNOWN);
         assert_eq!(s, "unknown");
+        // Never a computed epoch date — check both sides of the UTC
+        // boundary, since a negative offset renders epoch 0 as 1969-12-31,
+        // not 1970-01-01.
         assert!(!s.contains("1970"));
+        assert!(!s.contains("1969"));
     }
 
     #[test]
@@ -249,6 +253,7 @@ mod tests {
         let ts_col = column_at(&line, ts_off, TIMESTAMP_WIDTH);
         assert_eq!(ts_col, "unknown");
         assert!(!ts_col.contains("1970"));
+        assert!(!ts_col.contains("1969"));
     }
 
     #[test]

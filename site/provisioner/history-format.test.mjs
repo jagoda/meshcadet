@@ -26,6 +26,9 @@ import {
 } from "./history-format.js";
 import { HISTORY_MSG_TYPE_DM, HISTORY_MSG_TYPE_GRP_TXT } from "./codec.js";
 
+// Mirrors `protocol::history::TIMESTAMP_UNKNOWN` — never a genuine epoch.
+const TIMESTAMP_UNKNOWN = 0;
+
 // Column widths — kept in sync with history-format.js (and history_format.rs).
 const TIMESTAMP_WIDTH = 26;
 const TYPE_WIDTH = 4;
@@ -84,6 +87,18 @@ const tests = [
     assert.equal(formatLocalTimestamp(1_700_000_000), "2023-11-14 22:13:20 +00:00");
   }],
 
+  // Acceptance (`meshcadet-room-clock-ux`, mirrored from history_format.rs):
+  // a history entry written with no trusted clock (the `TIMESTAMP_UNKNOWN`
+  // sentinel) renders as "unknown", never as a computed epoch date — checked
+  // on both sides of the UTC boundary, since a negative offset would render
+  // epoch 0 as 1969-12-31, not 1970-01-01.
+  ["formatLocalTimestamp renders the unknown sentinel as 'unknown'", () => {
+    const s = formatLocalTimestamp(TIMESTAMP_UNKNOWN);
+    assert.equal(s, "unknown");
+    assert.ok(!s.includes("1970"), `unexpected computed epoch date: ${JSON.stringify(s)}`);
+    assert.ok(!s.includes("1969"), `unexpected computed epoch date: ${JSON.stringify(s)}`);
+  }],
+
   ["formatHistoryLine renders all columns", () => {
     const entry = makeEntry(0xab, HISTORY_MSG_TYPE_DM, 1_700_000_000, "hello", false);
     const iw = idxWidth(4); // simulate a 4-entry export (indices 0..=3)
@@ -95,6 +110,17 @@ const tests = [
     assert.equal(columnAt(line, o.dr, DIR_WIDTH), "RECV");
     assert.equal(columnAt(line, o.fr, FROM_WIDTH), "0xAB");
     assert.equal(line.slice(o.tx), "hello");
+  }],
+
+  ["formatHistoryLine renders the unknown sentinel, not an epoch date", () => {
+    const entry = makeEntry(0x42, HISTORY_MSG_TYPE_DM, TIMESTAMP_UNKNOWN, "hi", true);
+    const iw = idxWidth(1);
+    const line = formatHistoryLine(0, entry, iw);
+    const o = offsets(iw);
+    const tsCol = columnAt(line, o.ts, TIMESTAMP_WIDTH);
+    assert.equal(tsCol, "unknown");
+    assert.ok(!tsCol.includes("1970"), `unexpected computed epoch date: ${JSON.stringify(tsCol)}`);
+    assert.ok(!tsCol.includes("1969"), `unexpected computed epoch date: ${JSON.stringify(tsCol)}`);
   }],
 
   ["formatHistoryLine renders GRP_TXT type", () => {
