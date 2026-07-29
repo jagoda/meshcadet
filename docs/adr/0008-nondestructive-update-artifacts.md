@@ -37,7 +37,7 @@ that discarded intermediate a first-class, published, kept build output, and
 defines the compatibility metadata a consumer needs to know when flashing it
 *alone* (i.e. without the bootloader/partition-table it was built against) is
 safe. It does **not** touch the merged/Fresh-install image or path at all —
-by design (see Scope in the owning mission's dossier) — and it does not
+by design — and it does not
 implement the actual non-erasing flash flow; that is the site-flasher
 child's job (ADR-0006 is the design record for it), consuming exactly the
 artifacts and metadata this ADR freezes.
@@ -194,8 +194,9 @@ exactly the invariant D5 exists to prevent. v0.2.0 users therefore still see
 effect is forward from the next tagged release built at or after this
 commit (recommended: a `v0.3.1` patch release, cut through the normal
 tag-triggered pipeline, so the corrected gate goes live with a properly
-attested `update-meta.json`) — not a mutation of a past one. See the owning
-mission's dossier for the full incident record.
+attested `update-meta.json`) — not a mutation of a past one. The full
+incident record — root cause, verification, and fix — is above in this
+section.
 
 ### D3 — `manifest-update.json`: esp-web-tools manifest shaped for a non-erasing flash
 

@@ -118,6 +118,44 @@ jobs:
             exit 1
           fi
 
+  vocabulary-hygiene:
+    name: no internal-ops vocabulary leaks in public docs
+    runs-on: ubuntu-latest
+    # This repo is public; its docs (ADRs especially) are sometimes drafted
+    # by an internal ops-automation workflow that has its own vocabulary for
+    # artifacts/roles that don't exist for an outside reader (a per-task
+    # "dossier" file, a "Commander"/"CapCom"/"Flight Director"/"EECOM"/
+    # "Surgeon" role, a "flight-manuals" doc tree). Four such leaks
+    # (docs/adr/0004-release-architecture.md:295,636 and
+    # docs/adr/0008-nondestructive-update-artifacts.md:40,198) were found and
+    # fixed 2026-07-29; this job is the regression guard so the next one
+    # fails CI instead of shipping. Deliberately NOT "mission" or "Mission
+    # Control" — "mission" is used generically throughout the ADRs (e.g.
+    # "mission-scoped") and "Mission Control" is this project's own,
+    # intentional dark-space/cyan UI theme name (site/*.html, styles.css,
+    # firmware/src/ui/theme.slint, firmware/src/ui/screens/splash.rs) — both
+    # would false-positive if added here.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Grep for internal-ops vocabulary
+        run: |
+          set -euo pipefail
+          pattern='\b(dossier|commander|capcom|flight[- ]director|eecom|flight-manuals)\b'
+          # Exclude this workflow file itself: the comment above (and
+          # `pattern` right above this line) necessarily spells out every
+          # banned term to document why it's banned, which would otherwise
+          # make this job flag itself on every run.
+          if hits=$(grep -rnoiE "$pattern" \
+              --exclude-dir=.git --exclude-dir=target --exclude-dir=node_modules \
+              --exclude=ci.yml \
+              .); then
+            echo "::error::Internal ops-automation vocabulary found in the public repo (see below). Rewrite these to plain language a repo outsider can follow — see docs/adr/0004-release-architecture.md and 0008-nondestructive-update-artifacts.md history for prior fixes of this exact class." >&2
+            echo "$hits"
+            exit 1
+          fi
+          echo "No internal-ops vocabulary leaks found."
+
   test:
     name: cargo test (protocol, host, xtask, ui_sim, ui_perf)
     runs-on: ubuntu-latest
