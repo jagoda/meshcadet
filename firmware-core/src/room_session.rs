@@ -223,24 +223,48 @@ pub fn apply_login_outcome(extra: &mut RoomExtra, outcome: &RoomLoginOutcome) {
 // `advert_ts_store.rs`'s "own small store" shape) — additive to, not a
 // replacement for, the provisioning-time `RoomExtra` seed.
 
-/// Bytes needed to encode a [`PersistedRoomSession`]:
+/// Bytes needed for [`decode_persisted_room_session`] to read the CURRENT
+/// on-flash format a device may already be carrying:
 /// `permissions(1) + sync_since(4) + out_path_len(1) + out_path(MAX_PATH_SIZE)
-/// + last_room_ts(4) + last_room_ts_synced(1)`.
+/// + last_room_ts(4) + trust_byte(1)`.
 ///
-/// The trailing `last_room_ts_synced` byte was added by the pre-sync-
-/// poisoning guard fix (see that field's doc) — [`decode_persisted_room_session`]
-/// still accepts a shorter, pre-fix blob (exactly [`PRE_SYNC_GUARD_LEN`]
-/// bytes) for backward compatibility with whatever a device already has on
-/// flash, defaulting the missing byte to "untrusted" (`false`), which is
-/// exactly the safe migration for a watermark that might already be
-/// poisoned.
+/// The trailing trust byte belonged to the pre-sync-poisoning guard
+/// (`last_room_ts_synced`), retired by `meshcadet-room-monotonic-tx-timestamp`
+/// — see the "Room TX timestamp" section below for why the guard's premise no
+/// longer holds. [`encode_persisted_room_session`] no longer writes it (it
+/// wrote no information the new scheme needs), but a device that already ran
+/// the guard-era firmware may still have a blob of exactly this length on
+/// flash, so [`decode_persisted_room_session`] must still accept — and simply
+/// ignore — the trailing byte rather than reject the whole blob. Kept as its
+/// own named constant (rather than folded into a size calculation at each
+/// call site) purely as the historical record of that longest-ever-written
+/// length.
 pub const PERSISTED_ROOM_SESSION_LEN: usize = PRE_SYNC_GUARD_LEN + 1;
 
-/// [`PERSISTED_ROOM_SESSION_LEN`] before the pre-sync-poisoning guard fix
-/// added the trailing trust byte — the minimum length
-/// [`decode_persisted_room_session`] still accepts, and the exact length of
-/// every blob any pre-fix firmware ever persisted.
+/// The current, and now also the ongoing, encoded length: `permissions(1) +
+/// sync_since(4) + out_path_len(1) + out_path(MAX_PATH_SIZE) +
+/// last_room_ts(4)`. Also the exact length of every blob a firmware from
+/// before the pre-sync-poisoning guard ever wrote — the guard only ever added
+/// a byte on top of this, never changed anything within it, so this same
+/// length serves as both "oldest accepted" and "current write" once more.
 const PRE_SYNC_GUARD_LEN: usize = 1 + 4 + 1 + MAX_PATH_SIZE + 4;
+
+/// A persisted `last_room_ts` at or above this ceiling cannot be a genuine
+/// GPS-synced wall-clock reading and must be treated as poisoned —
+/// [`decode_persisted_room_session`] resets it to `0` at load time rather
+/// than honoring it (Scope item 4, `meshcadet-room-monotonic-tx-timestamp`).
+///
+/// Chosen as `2100-01-01T00:00:00Z` (`4_102_444_800`): comfortably beyond any
+/// device's realistic service life (so no genuine synced reading will ever
+/// trip it), yet comfortably below `u32::MAX` (`2106`) so it still catches a
+/// large-magnitude `esp_random()` seed a pre-fix firmware persisted as this
+/// room's `last_room_ts`. It does not need to catch EVERY possible poisoned
+/// seed (a seed that happens to land between "now" and this ceiling is, by
+/// definition, not yet causing a problem — real synced sends are still
+/// smaller than it and will overtake it in the ordinary course of time); it
+/// only needs to catch the pathological case that would otherwise persist far
+/// longer than this device will ever run.
+pub const ROOM_TS_REPAIR_CEILING_SECS: u32 = 4_102_444_800;
 
 /// The session-learned subset of a room's [`RoomExtra`] fields — see the
 /// section doc above for why this is persisted through its own store rather
@@ -258,47 +282,16 @@ pub struct PersistedRoomSession {
     /// reboot's fresh, not-yet-GPS-synced clock can never regress below a
     /// value this room has already used — see [`RoomPostError`]'s doc for
     /// why a regression here must be refused, not sent.
+    ///
+    /// Never seeded from entropy (`meshcadet-room-monotonic-tx-timestamp`):
+    /// every value ever stored here came from [`room_tx_timestamp`], which
+    /// is either a genuine GPS-synced wall-clock reading or `last_room_ts +
+    /// 1` — never a random `u32`. [`decode_persisted_room_session`] also
+    /// resets an implausibly large value back to `0` at load time (see
+    /// [`ROOM_TS_REPAIR_CEILING_SECS`]), so a device that already ran
+    /// pre-fix firmware self-repairs on the very next boot rather than
+    /// staying poisoned forever.
     pub last_room_ts: u32,
-    /// Whether `last_room_ts` was recorded while the wall clock was
-    /// genuinely GPS-synced (`GpsDriver::synced_wall_clock_secs`'s source —
-    /// the same one `main.rs` derives every `tx_epoch_base` rebase from).
-    ///
-    /// The room LOGIN this room's `RoomRuntime` sends at boot
-    /// (`main.rs::run`'s "Room logins: flood ANON_REQ once per provisioned
-    /// room" block) always fires BEFORE the dispatcher loop's first
-    /// GPS-sync rebase even has a chance to run — so on a device that
-    /// hasn't GPS-synced yet this boot (the overwhelmingly common case:
-    /// GPS needs a fix, which takes time), that login's timestamp is
-    /// whatever `esp_random()` seeded `tx_epoch_base` to. Persisting THAT
-    /// value as `last_room_ts` (`record_sent_timestamp`'s ordinary
-    /// "advance if greater" rule) risks poisoning the watermark forever: a
-    /// `u32` unix timestamp from real wall-clock time (~1.7-1.8 billion, as
-    /// of any date in this device's service life) can only ever be LESS
-    /// than roughly half of the random `u32` range, so a big enough random
-    /// seed can make every future genuinely-synced post's `candidate_ts`
-    /// permanently unable to clear it — see [`RoomPostError`]'s doc.
-    ///
-    /// This flag is the guard against exactly that: `false` means
-    /// `last_room_ts` has never been confirmed as a real wall-clock
-    /// reading (either never sent anything, or every send so far was
-    /// pre-sync); `true` means it has. [`record_sent_timestamp`] uses it to
-    /// let the FIRST genuinely-synced send unconditionally supersede
-    /// whatever untrustworthy value is there — even if numerically SMALLER
-    /// — exactly once, after which ordinary monotonic (never-regress)
-    /// behavior resumes as the real anti-replay guarantee it's meant to be.
-    /// [`Self::effective_last_room_ts`] additionally lets a synced
-    /// `encode_room_post_checked` candidate through immediately, without
-    /// waiting for that repair to land via some OTHER send (e.g. the next
-    /// keep-alive tick) first.
-    ///
-    /// Defaults to `false` — both for [`Self::EMPTY`]/[`Self::from_room_extra`]
-    /// (a session that has never sent anything has nothing trustworthy yet)
-    /// and for a blob [`decode_persisted_room_session`] reads back that
-    /// predates this field (a device already running when this fix ships:
-    /// `false` is the correct, safe assumption for whatever pre-fix
-    /// `last_room_ts` might already be sitting there, possibly already
-    /// poisoned — exactly the case this fix exists to repair).
-    pub last_room_ts_synced: bool,
 }
 
 impl PersistedRoomSession {
@@ -311,7 +304,6 @@ impl PersistedRoomSession {
         out_path: [0u8; MAX_PATH_SIZE],
         out_path_len: 0,
         last_room_ts: 0,
-        last_room_ts_synced: false,
     };
 
     /// Snapshot the provisioning-time seed a `RoomExtra` carries (used as the
@@ -324,7 +316,6 @@ impl PersistedRoomSession {
             out_path: extra.out_path,
             out_path_len: extra.out_path_len,
             last_room_ts: 0,
-            last_room_ts_synced: false,
         }
     }
 
@@ -344,56 +335,21 @@ impl PersistedRoomSession {
     }
 
     /// Record that this room session has just sent the server a frame
-    /// timestamped `ts` (login, keep-alive, or a post), and whether the wall
-    /// clock was GPS-synced at that moment.
+    /// timestamped `ts` (login, keep-alive, or a post).
     ///
-    /// Ordinarily advances `last_room_ts` to `ts` if it is a genuine
-    /// increase (never regresses: callers that raced or retried with a
-    /// smaller `ts` leave the high-water mark untouched) — the real
-    /// anti-replay guarantee `RoomPostError::NonMonotonicTimestamp` exists
-    /// to enforce.
-    ///
-    /// EXCEPTION — the pre-sync-poisoning guard (see
-    /// [`Self::last_room_ts_synced`]'s doc): if `clock_synced` and this is
-    /// the FIRST time this session can confirm a real wall-clock reading
-    /// (`last_room_ts_synced` was `false`), `ts` unconditionally REPLACES
-    /// `last_room_ts` — even if `ts` is numerically smaller than whatever
-    /// untrustworthy value was there. A synced reading is axiomatically more
-    /// trustworthy than an unsynced one, regardless of magnitude; this is a
-    /// one-time repair (the flag latches `true` and never resets), not a
-    /// standing exception to the monotonic guarantee.
-    pub fn record_sent_timestamp(&mut self, ts: u32, clock_synced: bool) {
-        if clock_synced && !self.last_room_ts_synced {
-            self.last_room_ts = ts;
-            self.last_room_ts_synced = true;
-            return;
-        }
+    /// Advances `last_room_ts` to `ts` if it is a genuine increase — never
+    /// regresses: callers that raced or retried with a smaller `ts` leave
+    /// the high-water mark untouched — the real anti-replay guarantee
+    /// `RoomPostError::NonMonotonicTimestamp` exists to enforce. Plain
+    /// ratchet, no other case: `meshcadet-room-monotonic-tx-timestamp`
+    /// retired the one-time "first synced send repairs an untrusted
+    /// watermark" exception this method used to apply (see the "Room TX
+    /// timestamp" section above for why `ts` itself — now always produced
+    /// by [`room_tx_timestamp`] — can no longer be poisoned in the first
+    /// place, so there is nothing left to repair post-hoc here).
+    pub fn record_sent_timestamp(&mut self, ts: u32) {
         if ts > self.last_room_ts {
             self.last_room_ts = ts;
-        }
-    }
-
-    /// The watermark a caller about to call [`encode_room_post_checked`]
-    /// should compare a fresh candidate against — honors the same pre-sync-
-    /// poisoning guard [`Self::record_sent_timestamp`] applies, but as a
-    /// read-only projection so a POST attempt can self-heal immediately
-    /// (rather than only after some OTHER send, e.g. the next keep-alive
-    /// tick, happens to call `record_sent_timestamp` with a synced `ts`
-    /// first).
-    ///
-    /// Returns `0` (any post-provisioning timestamp clears it) when
-    /// `clock_synced` is true and `last_room_ts` has never been confirmed
-    /// as a genuine wall-clock reading; otherwise returns `last_room_ts`
-    /// unchanged. Does NOT itself mutate `last_room_ts_synced` — that only
-    /// latches `true` once the caller's send actually goes out and calls
-    /// `record_sent_timestamp(candidate_ts, true)`, mirroring how
-    /// `last_room_ts` itself only ever advances post-hoc, never inside the
-    /// checked-encode call.
-    pub fn effective_last_room_ts(&self, clock_synced: bool) -> u32 {
-        if clock_synced && !self.last_room_ts_synced {
-            0
-        } else {
-            self.last_room_ts
         }
     }
 
@@ -409,6 +365,70 @@ impl PersistedRoomSession {
         if post_ts > self.sync_since {
             self.sync_since = post_ts;
         }
+    }
+}
+
+// ── Room TX timestamp: monotonic, never random ──────────────────────────────
+//
+// `meshcadet-room-monotonic-tx-timestamp`'s fix. The room-post protocol needs
+// per-sender STRICT MONOTONICITY only — the server re-stamps every post with
+// its own clock (`MyMesh.cpp:41-51`; see `protocol::room::RoomServerDouble`'s
+// `handle_post` doc). Absolute wall-clock accuracy on the wire was never
+// required, but `main.rs` used to seed every outbound frame's timestamp
+// (login/keep-alive/post alike) from `tx_epoch_base`, itself seeded from
+// `esp_random()` at boot. A room login sent BEFORE the first GPS fix — the
+// overwhelmingly common case — therefore carried a uniform-random `u32`;
+// roughly half of all seeds exceed real Unix time. The server stores
+// whatever it's handed as `client->last_timestamp` and silently drops (no
+// ACK, no response) every later login/post/keep-alive that isn't strictly
+// greater — a no-GPS boot could self-brick a room session, and the poisoned
+// server-side watermark outlives any later fix to the client.
+//
+// [`room_tx_timestamp`] is the replacement rule: `max(trusted_wall_clock_or_0,
+// last_room_ts + 1)`. Monotonic (by construction: it is always at least
+// `last_room_ts + 1`), never random (it is either a real GPS reading or a
+// `+1` bump off the persisted watermark), and never above a genuinely
+// GPS-synced wall clock while that clock is untrusted (the untrusted branch
+// contributes `0` to the `max`, so the persisted watermark alone decides the
+// value — and a device that has never gone far above real time can only
+// climb slowly, one bump per send, while unsynced).
+//
+// This also retires the pre-sync-poisoning guard
+// (`last_room_ts_synced`/`effective_last_room_ts`, from
+// `meshcadet-room-hil-sender-render-and-clock-post-fixes`): that guard
+// existed because an UNSYNCED send under the old `esp_random()` scheme could
+// produce a value bigger than any later SYNCED send would ever be, so the
+// client had to detect and repair that after the fact. Under this rule an
+// unsynced send can never do that — its value is bounded by `last_room_ts +
+// 1`, never a fresh random draw — so there is nothing left for a repair-at-
+// send-time guard to repair. `decode_persisted_room_session` below still
+// repairs an ALREADY-poisoned on-flash value (one a pre-fix firmware wrote),
+// but that is a one-time, load-time migration, not a standing mechanism two
+// pieces of code would otherwise have to agree on.
+
+/// Compute the next TX timestamp for a room login, keep-alive, or post frame:
+/// `max(trusted_wall_clock_secs.unwrap_or(0), last_room_ts + 1)` — see the
+/// section doc above for why this is monotonic, never random, and never
+/// above a genuinely-synced wall clock while the clock is untrusted.
+///
+/// `trusted_wall_clock_secs` is `Some(now)` only when the caller's clock
+/// source (GPS) is genuinely synced right now — `None` (not a fabricated
+/// reading) otherwise. `last_room_ts` is this room session's persisted
+/// high-water mark ([`PersistedRoomSession::last_room_ts`]); the caller must
+/// advance it via [`PersistedRoomSession::record_sent_timestamp`] once the
+/// returned value actually goes out, so the NEXT call sees this send's
+/// value as its new floor.
+///
+/// `saturating_add` rather than `wrapping_add`: a `last_room_ts` at
+/// `u32::MAX` (unreachable in practice — see [`ROOM_TS_REPAIR_CEILING_SECS`]'s
+/// doc for why a value anywhere near that magnitude gets repaired back to `0`
+/// at load time) must not wrap back around to a small timestamp, which would
+/// itself look like a replay to the server.
+pub fn room_tx_timestamp(trusted_wall_clock_secs: Option<u32>, last_room_ts: u32) -> u32 {
+    let floor = last_room_ts.saturating_add(1);
+    match trusted_wall_clock_secs {
+        Some(wall) => wall.max(floor),
+        None => floor,
     }
 }
 
@@ -461,10 +481,12 @@ pub fn next_room_session_epoch(current: u8) -> u8 {
 }
 
 /// Encode a [`PersistedRoomSession`] into `out` (at least
-/// [`PERSISTED_ROOM_SESSION_LEN`] bytes). Returns the number of bytes written.
-/// Always writes the CURRENT (post-pre-sync-guard-fix) format, trailing
-/// trust byte included — the shorter, pre-fix format is a read-only decode
-/// compatibility affordance, never something this crate writes anymore.
+/// [`PERSISTED_ROOM_SESSION_LEN`] bytes, though only [`PRE_SYNC_GUARD_LEN`]
+/// of them are ever written now — see that constant's doc). Returns the
+/// number of bytes written. The pre-sync-poisoning guard's trailing trust
+/// byte is retired (`meshcadet-room-monotonic-tx-timestamp`) and no longer
+/// written; [`decode_persisted_room_session`] still tolerates reading it back
+/// from a blob a guard-era firmware already wrote.
 pub fn encode_persisted_room_session(state: &PersistedRoomSession, out: &mut [u8]) -> usize {
     out[0] = state.permissions;
     out[1..5].copy_from_slice(&state.sync_since.to_le_bytes());
@@ -472,20 +494,26 @@ pub fn encode_persisted_room_session(state: &PersistedRoomSession, out: &mut [u8
     out[6..6 + MAX_PATH_SIZE].copy_from_slice(&state.out_path);
     let ts_off = 6 + MAX_PATH_SIZE;
     out[ts_off..ts_off + 4].copy_from_slice(&state.last_room_ts.to_le_bytes());
-    out[ts_off + 4] = state.last_room_ts_synced as u8;
-    PERSISTED_ROOM_SESSION_LEN
+    PRE_SYNC_GUARD_LEN
 }
 
 /// Decode a [`PersistedRoomSession`] blob. `None` if shorter than
 /// [`PRE_SYNC_GUARD_LEN`] (genuinely truncated/corrupt) or if `out_path_len`
 /// exceeds [`MAX_PATH_SIZE`] (a corrupt/foreign blob).
 ///
-/// Accepts two lengths: the current [`PERSISTED_ROOM_SESSION_LEN`] (trailing
-/// trust byte present) and the shorter pre-fix [`PRE_SYNC_GUARD_LEN`] (no
-/// trust byte — every blob a pre-fix firmware ever wrote) — see
-/// [`PersistedRoomSession::last_room_ts_synced`]'s doc for why defaulting
-/// the missing byte to `false` on that shorter form is the correct,
-/// safe migration rather than a compatibility shortcut.
+/// Accepts any length at or above [`PRE_SYNC_GUARD_LEN`] — in particular both
+/// that exact length (every blob a pre-guard, and now once again every
+/// current, firmware writes) and the longer, guard-era
+/// [`PERSISTED_ROOM_SESSION_LEN`] (trailing trust byte present) — any bytes
+/// beyond [`PRE_SYNC_GUARD_LEN`] are simply ignored; there is no field left
+/// to populate from them.
+///
+/// Also repairs an implausible `last_room_ts`: a value at or above
+/// [`ROOM_TS_REPAIR_CEILING_SECS`] cannot be a genuine wall-clock reading —
+/// see that constant's doc — and is reset to `0` here, at the single choke
+/// point every persisted session passes through on its way into runtime
+/// state, rather than trusted forward from whatever a pre-fix firmware
+/// happened to write.
 pub fn decode_persisted_room_session(blob: &[u8]) -> Option<PersistedRoomSession> {
     if blob.len() < PRE_SYNC_GUARD_LEN {
         return None;
@@ -499,15 +527,16 @@ pub fn decode_persisted_room_session(blob: &[u8]) -> Option<PersistedRoomSession
     let mut out_path = [0u8; MAX_PATH_SIZE];
     out_path.copy_from_slice(&blob[6..6 + MAX_PATH_SIZE]);
     let ts_off = 6 + MAX_PATH_SIZE;
-    let last_room_ts = u32::from_le_bytes(blob[ts_off..ts_off + 4].try_into().ok()?);
-    let last_room_ts_synced = blob.get(ts_off + 4).is_some_and(|&b| b != 0);
+    let mut last_room_ts = u32::from_le_bytes(blob[ts_off..ts_off + 4].try_into().ok()?);
+    if last_room_ts >= ROOM_TS_REPAIR_CEILING_SECS {
+        last_room_ts = 0;
+    }
     Some(PersistedRoomSession {
         permissions,
         sync_since,
         out_path,
         out_path_len,
         last_room_ts,
-        last_room_ts_synced,
     })
 }
 
@@ -685,11 +714,13 @@ pub enum RoomPostError {
     /// `MyMesh.cpp:435`). Sending anyway risks exactly the trap this
     /// campaign's Objective calls out: the server treats an EQUAL timestamp
     /// as a retry (post silently discarded, still ACKed) and a LESSER one as
-    /// an outright replay (no ACK at all). Typically caused by the local
-    /// wall clock not yet being GPS-synced this boot (still on its per-boot
-    /// random seed) or having gone backwards relative to a value this room
-    /// has already used — the caller must surface this to the user rather
-    /// than transmit.
+    /// an outright replay (no ACK at all). A caller using [`room_tx_timestamp`]
+    /// to compute `candidate_ts` should never actually hit this (that
+    /// function's result is always strictly greater than the `last_room_ts`
+    /// it was given) — this remains a defense-in-depth guard against a
+    /// genuine same-tick collision or a caller that didn't use it, not a
+    /// "clock not yet synced" gate — the caller must surface this to the
+    /// user rather than transmit.
     NonMonotonicTimestamp,
 }
 
@@ -1677,15 +1708,14 @@ mod tests {
             sync_since: 0xDEAD_BEEF,
             out_path,
             out_path_len: 2,
-            last_room_ts: 0xC0FF_EE42,
-            last_room_ts_synced: true,
+            last_room_ts: 1_800_000_000, // plausible wall-clock reading
         };
 
         let mut blob = [0u8; PERSISTED_ROOM_SESSION_LEN];
         let n = encode_persisted_room_session(&state, &mut blob);
-        assert_eq!(n, PERSISTED_ROOM_SESSION_LEN);
+        assert_eq!(n, PRE_SYNC_GUARD_LEN);
 
-        let decoded = decode_persisted_room_session(&blob).unwrap();
+        let decoded = decode_persisted_room_session(&blob[..n]).unwrap();
         assert_eq!(decoded, state);
     }
 
@@ -1696,35 +1726,77 @@ mod tests {
     }
 
     #[test]
-    fn persisted_room_session_decode_accepts_a_pre_fix_blob_as_untrusted() {
-        // Backward compatibility: every blob a pre-pre-sync-guard-fix
-        // firmware ever wrote is exactly `PRE_SYNC_GUARD_LEN` bytes — no
-        // trailing trust byte. Decoding one must succeed (not silently
-        // reset the whole session — only `last_room_ts_synced` needs a
-        // safe default) and must default `last_room_ts_synced` to `false`,
-        // exactly the assumption this fix's guard needs to repair a
-        // watermark that might already be poisoned.
+    fn persisted_room_session_decode_accepts_a_guard_era_blob_ignoring_trailing_byte() {
+        // Backward compatibility: a device that already ran the (now
+        // retired) pre-sync-poisoning guard may still have a
+        // `PERSISTED_ROOM_SESSION_LEN`-byte blob on flash — one byte longer
+        // than what this crate writes today. Decoding one must still
+        // succeed and must simply ignore that trailing byte — there is no
+        // field left to populate from it.
         let mut out_path = [0u8; MAX_PATH_SIZE];
         out_path[0] = 0xAB;
-        let pre_fix_state = PersistedRoomSession {
+        let state = PersistedRoomSession {
             permissions: RoomPermission::Guest as u8,
             sync_since: 42,
             out_path,
             out_path_len: 1,
-            last_room_ts: 0xFFFF_0000, // could well be a poisoned watermark
-            last_room_ts_synced: false, // irrelevant: the pre-fix format never wrote this
+            last_room_ts: 1_700_000_000,
         };
-        let mut full_blob = [0u8; PERSISTED_ROOM_SESSION_LEN];
-        encode_persisted_room_session(&pre_fix_state, &mut full_blob);
-        let pre_fix_blob = &full_blob[..PRE_SYNC_GUARD_LEN]; // simulate the shorter, pre-fix on-disk form
+        let mut blob = [0u8; PERSISTED_ROOM_SESSION_LEN];
+        encode_persisted_room_session(&state, &mut blob); // writes PRE_SYNC_GUARD_LEN bytes
+        blob[PRE_SYNC_GUARD_LEN] = 1; // simulate a guard-era firmware's trailing trust byte
 
-        let decoded = decode_persisted_room_session(pre_fix_blob)
-            .expect("a pre-fix-length blob must still decode");
-        assert_eq!(decoded.last_room_ts, 0xFFFF_0000);
-        assert!(
-            !decoded.last_room_ts_synced,
-            "a blob with no trust byte must default to untrusted"
+        let decoded = decode_persisted_room_session(&blob[..PERSISTED_ROOM_SESSION_LEN])
+            .expect("a guard-era-length blob must still decode");
+        assert_eq!(decoded, state);
+    }
+
+    #[test]
+    fn persisted_room_session_decode_repairs_a_poisoned_last_room_ts() {
+        // Scope item 4 (`meshcadet-room-monotonic-tx-timestamp`): a
+        // pre-fix firmware's `esp_random()`-seeded boot login could persist
+        // an absurdly large `last_room_ts`. Decoding it must reset it to `0`
+        // rather than honor it forever.
+        let mut out_path = [0u8; MAX_PATH_SIZE];
+        out_path[0] = 0xCD;
+        let poisoned = PersistedRoomSession {
+            permissions: RoomPermission::ReadWrite as u8,
+            sync_since: 7,
+            out_path,
+            out_path_len: 1,
+            last_room_ts: 0xFFFF_0000, // ~year 2554: absurdly far in the future
+        };
+        let mut blob = [0u8; PERSISTED_ROOM_SESSION_LEN];
+        let n = encode_persisted_room_session(&poisoned, &mut blob);
+
+        let decoded = decode_persisted_room_session(&blob[..n]).unwrap();
+        assert_eq!(
+            decoded.last_room_ts, 0,
+            "an implausibly-far-future last_room_ts must be repaired to 0 at load, not honored"
         );
+        // Everything else round-trips untouched — only the poisoned field
+        // is repaired.
+        assert_eq!(decoded.permissions, poisoned.permissions);
+        assert_eq!(decoded.sync_since, poisoned.sync_since);
+        assert_eq!(decoded.out_path, poisoned.out_path);
+        assert_eq!(decoded.out_path_len, poisoned.out_path_len);
+    }
+
+    #[test]
+    fn persisted_room_session_decode_leaves_a_plausible_last_room_ts_alone() {
+        // The repair ceiling must not clip a genuine, merely large-looking
+        // wall-clock reading well within this device's service life.
+        let state = PersistedRoomSession {
+            permissions: RoomPermission::ReadWrite as u8,
+            sync_since: 0,
+            out_path: [0u8; MAX_PATH_SIZE],
+            out_path_len: 0,
+            last_room_ts: ROOM_TS_REPAIR_CEILING_SECS - 1,
+        };
+        let mut blob = [0u8; PERSISTED_ROOM_SESSION_LEN];
+        let n = encode_persisted_room_session(&state, &mut blob);
+        let decoded = decode_persisted_room_session(&blob[..n]).unwrap();
+        assert_eq!(decoded.last_room_ts, ROOM_TS_REPAIR_CEILING_SECS - 1);
     }
 
     #[test]
@@ -1761,139 +1833,125 @@ mod tests {
 
     #[test]
     fn record_sent_timestamp_never_regresses() {
-        // All three calls are `clock_synced: true` — once `last_room_ts` is
-        // trusted (which the very first synced call latches — see
-        // `record_sent_timestamp_repairs_a_pre_sync_watermark_exactly_once`
-        // below for the untrusted case), this is the plain, ordinary
-        // monotonic behavior `RoomPostError::NonMonotonicTimestamp` relies
-        // on: a smaller `ts` never rewinds the high-water mark.
+        // The plain, ordinary monotonic behavior `RoomPostError::
+        // NonMonotonicTimestamp` relies on: a smaller `ts` never rewinds
+        // the high-water mark.
         let mut state = PersistedRoomSession::EMPTY;
-        state.record_sent_timestamp(100, true);
+        state.record_sent_timestamp(100);
         assert_eq!(state.last_room_ts, 100);
-        assert!(state.last_room_ts_synced);
-        state.record_sent_timestamp(50, true); // smaller: ignored
+        state.record_sent_timestamp(50); // smaller: ignored
         assert_eq!(state.last_room_ts, 100);
-        state.record_sent_timestamp(101, true);
+        state.record_sent_timestamp(101);
         assert_eq!(state.last_room_ts, 101);
     }
 
-    // ── Pre-sync-poisoning guard (Bug 2: false "clock not synced" refusal) ──
+    // ── Room TX timestamp (`meshcadet-room-monotonic-tx-timestamp`) ────────
 
     #[test]
-    fn record_sent_timestamp_repairs_a_pre_sync_watermark_exactly_once() {
-        // The exact poisoning mechanism this guard exists to fix: a boot
-        // login sends a pre-GPS-sync `esp_random()`-seeded timestamp (huge,
-        // here standing in for "bigger than any real wall-clock time this
-        // device will see"), unconditionally advancing `last_room_ts` since
-        // `clock_synced: false` gets the plain "advance if greater" rule.
+    fn room_tx_timestamp_never_exceeds_wall_clock_while_untrusted() {
+        // Acceptance: no room frame carries a value above real wall clock
+        // while the clock is untrusted. Simulate many successive unsynced
+        // sends (boot logins/reflood attempts/keep-alives across many
+        // reboots, GPS never fixing) — each one only ever bumps the floor
+        // by 1, so even after many sends the value stays nowhere near a
+        // real wall-clock reading.
+        const PLAUSIBLE_REAL_NOW_SECS: u32 = 1_800_000_000;
         let mut state = PersistedRoomSession::EMPTY;
-        state.record_sent_timestamp(0xFFFF_0000, false);
-        assert_eq!(state.last_room_ts, 0xFFFF_0000);
-        assert!(!state.last_room_ts_synced);
+        for _ in 0..1000 {
+            let ts = room_tx_timestamp(None, state.last_room_ts);
+            assert!(
+                ts < PLAUSIBLE_REAL_NOW_SECS,
+                "an untrusted room TX timestamp must never approach real wall-clock time"
+            );
+            state.record_sent_timestamp(ts);
+        }
+        assert_eq!(state.last_room_ts, 1000);
+    }
 
-        // GPS syncs; the first SYNCED send since then — a real, much
-        // smaller wall-clock timestamp — must unconditionally repair the
-        // watermark, even though it's numerically smaller than the poison.
-        state.record_sent_timestamp(1_800_000_000, true);
-        assert_eq!(
-            state.last_room_ts, 1_800_000_000,
-            "the first synced send must supersede a pre-sync watermark regardless of magnitude"
+    #[test]
+    fn room_tx_timestamp_strictly_increases_across_a_simulated_reboot() {
+        // Acceptance: the value strictly increases across a simulated
+        // reboot (persist -> reload -> next send is strictly greater) —
+        // the whole point of seeding from persistence instead of a fresh
+        // `esp_random()` draw every boot.
+        let mut state = PersistedRoomSession::EMPTY;
+        let boot1_ts = room_tx_timestamp(None, state.last_room_ts);
+        state.record_sent_timestamp(boot1_ts);
+
+        let mut blob = [0u8; PERSISTED_ROOM_SESSION_LEN];
+        let n = encode_persisted_room_session(&state, &mut blob);
+        let reloaded = decode_persisted_room_session(&blob[..n]).unwrap();
+
+        // "Reboot": still no GPS fix yet.
+        let boot2_ts = room_tx_timestamp(None, reloaded.last_room_ts);
+        assert!(
+            boot2_ts > boot1_ts,
+            "a reboot must never regress or repeat the room TX timestamp"
         );
-        assert!(state.last_room_ts_synced);
-
-        // The repair is one-time: normal monotonic behavior resumes.
-        state.record_sent_timestamp(1_700_000_000, true); // smaller: ignored now
-        assert_eq!(state.last_room_ts, 1_800_000_000);
-        state.record_sent_timestamp(1_900_000_000, true); // greater: advances
-        assert_eq!(state.last_room_ts, 1_900_000_000);
     }
 
     #[test]
-    fn record_sent_timestamp_leaves_an_already_trusted_watermark_alone_when_unsynced() {
-        // A momentary clock-sync dropout (`clock_synced: false` on some
-        // later send) must not re-arm the one-time repair — once
-        // `last_room_ts_synced` is `true`, every send is ordinary monotonic
-        // behavior regardless of that particular send's own sync state.
+    fn room_tx_timestamp_rebases_upward_on_sync_with_no_regression() {
+        // Acceptance: a GPS sync rebases the value upward with no
+        // regression.
         let mut state = PersistedRoomSession::EMPTY;
-        state.record_sent_timestamp(1_800_000_000, true);
-        assert!(state.last_room_ts_synced);
-        state.record_sent_timestamp(1_700_000_000, false); // smaller, unsynced: still ignored
+        for _ in 0..3 {
+            let ts = room_tx_timestamp(None, state.last_room_ts);
+            state.record_sent_timestamp(ts);
+        }
+        assert_eq!(state.last_room_ts, 3);
+
+        // GPS syncs: a real wall-clock reading, far above the small
+        // unsynced watermark, takes over.
+        let synced_ts = room_tx_timestamp(Some(1_800_000_000), state.last_room_ts);
+        assert_eq!(synced_ts, 1_800_000_000);
+        state.record_sent_timestamp(synced_ts);
         assert_eq!(state.last_room_ts, 1_800_000_000);
+
+        // A later sync dropout must not regress back toward the small
+        // pre-sync values — the floor is now the synced watermark.
+        let dropout_ts = room_tx_timestamp(None, state.last_room_ts);
+        assert_eq!(dropout_ts, 1_800_000_001);
     }
 
     #[test]
-    fn effective_last_room_ts_unblocks_a_synced_candidate_before_any_repair_lands() {
-        // `effective_last_room_ts` is what lets a POST attempt self-heal
-        // immediately, without first waiting for some OTHER send (e.g. the
-        // next keep-alive tick) to call `record_sent_timestamp` and
-        // perform the repair. A poisoned, never-synced watermark must not
-        // block a synced candidate at read time either.
-        let mut state = PersistedRoomSession::EMPTY;
-        state.record_sent_timestamp(0xFFFF_0000, false); // poisoned, pre-sync
-        assert_eq!(
-            state.effective_last_room_ts(true),
-            0,
-            "an untrusted watermark must not gate a synced candidate at all"
-        );
-        // Unsynced callers still see the real (poisoned) stored value — no
-        // free pass while the clock itself isn't trustworthy.
-        assert_eq!(state.effective_last_room_ts(false), 0xFFFF_0000);
-
-        // Once genuinely repaired, the real value gates normally again.
-        state.record_sent_timestamp(1_800_000_000, true);
-        assert_eq!(state.effective_last_room_ts(true), 1_800_000_000);
-        assert_eq!(state.effective_last_room_ts(false), 1_800_000_000);
-    }
-
-    #[test]
-    fn a_synced_post_survives_a_pre_sync_poisoned_watermark_end_to_end() {
-        // Integration guard tying `effective_last_room_ts` to
-        // `encode_room_post_checked`: this mission's Bug 2 acceptance
-        // criterion, "posting to a room succeeds... including on a device
-        // whose room last_sent_ts was set pre-sync on a prior boot."
+    fn a_post_succeeds_with_clock_synced_false_against_the_room_server_double() {
+        // Acceptance: a post succeeds with `clock_synced == false` (against
+        // the corrected `RoomServerDouble` — the post is stored and ACKed).
+        // The refusal path stays for genuine non-monotonicity, but "clock
+        // not yet synced" alone must never be a reason a post is refused
+        // (Scope item 6).
         let (client, server) = make_pair();
+        let mut double = RoomServerDouble::new(server.clone(), b"admin-pw", b"guest-pw", false);
+
+        // Unsynced boot login — never random, just the "nothing sent yet"
+        // floor (`room_tx_timestamp(None, 0) == 1`).
         let mut state = PersistedRoomSession::EMPTY;
-        state.record_sent_timestamp(0xFFFF_0000, false); // poisoned boot login
+        let login_ts = room_tx_timestamp(None, state.last_room_ts);
+        login_direct(&mut double, &client, &server, b"guest-pw", login_ts);
+        state.record_sent_timestamp(login_ts);
 
+        // Still unsynced: the post must succeed too.
         let shared = client.ecdh_shared_secret(&server.pubkey);
-        let candidate_ts: u32 = 1_800_000_000; // a plausible real wall-clock time
+        let post_ts = room_tx_timestamp(None, state.last_room_ts);
         let mut out = [0u8; MAX_POST_FRAME_LEN];
-
-        // Naively gating on the raw (poisoned) watermark would refuse this.
-        assert!(matches!(
-            encode_room_post_checked(
-                &shared,
-                server.pub_hash(),
-                client.pub_hash(),
-                candidate_ts,
-                state.last_room_ts,
-                b"hello",
-                &client.pubkey,
-                &mut out,
-            ),
-            Err(RoomPostError::NonMonotonicTimestamp)
-        ));
-
-        // Gating on `effective_last_room_ts` instead lets the synced,
-        // legitimately post-able candidate through.
-        let (n, _ack) = encode_room_post_checked(
+        let (n, expected_ack) = encode_room_post_checked(
             &shared,
             server.pub_hash(),
             client.pub_hash(),
-            candidate_ts,
-            state.effective_last_room_ts(true),
-            b"hello",
+            post_ts,
+            state.last_room_ts,
+            b"hello, unsynced",
             &client.pubkey,
             &mut out,
         )
-        .expect("a synced candidate must not be blocked by a pre-sync watermark");
-        assert!(n > 0);
+        .expect("a post must succeed with clock_synced == false");
 
-        // And the caller's post-send repair (mirroring `main.rs`'s call
-        // site) leaves the session correctly un-poisoned going forward.
-        state.record_sent_timestamp(candidate_ts, true);
-        assert_eq!(state.last_room_ts, candidate_ts);
-        assert!(state.last_room_ts_synced);
+        let ack = double
+            .handle_post(&client.pubkey, &out[2..n])
+            .expect("the double must store and ACK an unsynced-but-monotonic post");
+        assert_eq!(ack, expected_ack);
+        state.record_sent_timestamp(post_ts);
     }
 
     /// REGRESSION (F4): `sync_since` must advance the same way
@@ -1965,7 +2023,6 @@ mod tests {
                 out_path: [0xAAu8; MAX_PATH_SIZE],
                 out_path_len: 4,
                 last_room_ts: 0,
-                last_room_ts_synced: false,
             }),
             epoch: 0,
         };
