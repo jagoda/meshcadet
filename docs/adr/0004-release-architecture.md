@@ -292,7 +292,7 @@ ruleset `18807600` (`gh api .../rulesets/18807600/history` shows it present
 as of version `42771384` and gone by `42874592`, dated the same evening as
 the abandoned attempt referenced above) — restored as a separate,
 explicitly-logged action once this fix's own PR no longer depended on it
-being off (see this mission's dossier for the exact sequencing). The
+being off. The
 squash-merge framing in this section's title/opening paragraphs is left
 in place below as the historical record of the (mistaken) original design
 premise; treat this correction as superseding it.
@@ -633,8 +633,8 @@ hand-pushed-tag recovery always worked). Rejected in favor of the
 `workflow_dispatch` chain because it achieves the identical end state
 (release.yml fires automatically, unmodified trigger semantics for
 hand-pushed tags) with **zero new secrets to provision, rotate, or scope**
-— a fine-grained PAT would need to be minted by the Commander outside this
-mission (a worker cannot self-issue repo credentials), stored as a new
+— a fine-grained PAT would need to be minted by a repo admin out-of-band
+(automation cannot self-issue repo credentials), stored as a new
 Actions secret, and re-provisioned on expiry/rotation forever after; a
 GitHub App installation token is even more infrastructure (an App
 registration + installation) for the same outcome. `workflow_dispatch` is
