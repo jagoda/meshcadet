@@ -517,6 +517,42 @@ impl DoublePost {
     };
 }
 
+/// A re-implementation of `RTCClock::getCurrentTimeUnique()` (`MeshCore.h:100-106`):
+/// the real room server never stamps a post (or a login reply) with a raw
+/// clock read — it stamps with this monotonic-and-unique derivative, so two
+/// events landing in the same clock second still get distinct timestamps.
+///
+/// `current_time` is the double's stand-in for the RTC's raw `getCurrentTime()`
+/// read; [`Self::set_current_time`] is this double's `setCurrentTime()` — the
+/// knob a test uses to advance the server's clock between operations. It
+/// starts at `0` so a fresh double is fully deterministic without a test
+/// having to touch it.
+#[derive(Clone, Copy, Debug, Default)]
+struct ServerClock {
+    current_time: u32,
+    last_unique: u32,
+}
+
+impl ServerClock {
+    /// `setCurrentTime()` — advance (or set) the underlying clock read.
+    fn set_current_time(&mut self, time: u32) {
+        self.current_time = time;
+    }
+
+    /// `getCurrentTimeUnique()` (`MeshCore.h:100-106`):
+    /// `t = getCurrentTime(); if t <= last_unique { return ++last_unique }
+    /// else { return last_unique = t }`.
+    fn current_time_unique(&mut self) -> u32 {
+        let t = self.current_time;
+        if t <= self.last_unique {
+            self.last_unique += 1;
+        } else {
+            self.last_unique = t;
+        }
+        self.last_unique
+    }
+}
+
 /// A from-scratch double of `simple_room_server`'s server-side state machine.
 ///
 /// Operates on raw wire bytes in both directions (the same bytes a real client
@@ -532,6 +568,9 @@ pub struct RoomServerDouble {
     clients: [DoubleClient; MAX_ROOM_CLIENTS],
     posts: [DoublePost; MAX_UNSYNCED_POSTS],
     next_post_idx: usize,
+    /// The server's own clock — stamps posts and login replies. Not the
+    /// client-supplied timestamp (see [`Self::handle_post`]).
+    clock: ServerClock,
 }
 
 impl RoomServerDouble {
@@ -561,7 +600,16 @@ impl RoomServerDouble {
             clients: [DoubleClient::EMPTY; MAX_ROOM_CLIENTS],
             posts: [DoublePost::EMPTY; MAX_UNSYNCED_POSTS],
             next_post_idx: 0,
+            clock: ServerClock::default(),
         }
+    }
+
+    /// Advance the double's server clock (`setCurrentTime()`). Deterministic
+    /// by default (starts at `0`); a test calls this to control what the
+    /// *next* re-stamped post or login reply's `server_ts` will be. Does not
+    /// retroactively change already-stored posts.
+    pub fn set_server_time(&mut self, time: u32) {
+        self.clock.set_current_time(time);
     }
 
     fn client_idx(&self, pubkey: &[u8; 32]) -> Option<usize> {
@@ -643,8 +691,9 @@ impl RoomServerDouble {
         client.last_timestamp = timestamp;
         client.pending_ack = None;
 
+        let server_ts = self.clock.current_time_unique();
         let mut reply = [0u8; 13];
-        reply[0..4].copy_from_slice(&timestamp.to_le_bytes()); // reflect a "now"; double has no RTC of its own
+        reply[0..4].copy_from_slice(&server_ts.to_le_bytes()); // the server's own clock (MyMesh.cpp:366-367, getCurrentTimeUnique())
         reply[4] = RESP_SERVER_LOGIN_OK;
         reply[5] = 0; // legacy keepalive interval
         reply[6] = match permissions {
@@ -665,9 +714,11 @@ impl RoomServerDouble {
         ))
     }
 
-    /// Directly seed a post into the cyclic queue, as if `client_pubkey` had
-    /// posted it — bypasses [`Self::handle_post`]'s wire decode, for setting up
-    /// posts authored by clients other than the one under test.
+    /// Directly seed a post into the cyclic queue at an explicit `timestamp`,
+    /// as if `author_pubkey` had posted it — bypasses [`Self::handle_post`]'s
+    /// wire decode (and its server-clock re-stamping) entirely, for setting
+    /// up posts authored by clients other than the one under test, at
+    /// timestamps the test chooses.
     pub fn seed_post(&mut self, author_pubkey: &[u8; 32], timestamp: u32, text: &[u8]) {
         let idx = self.next_post_idx;
         let text_len = text.len().min(MAX_POST_TEXT_LEN);
@@ -754,6 +805,14 @@ impl RoomServerDouble {
 
     /// Handle a raw room-post DM (as built by [`encode_room_post`]).
     ///
+    /// The stored post is stamped with the **server's own clock**
+    /// (`MyMesh.cpp:41-51`, `addPost`), not the sender's decoded timestamp —
+    /// the real server never even passes the sender's timestamp into
+    /// `addPost` (`MyMesh.cpp:471`). The decoded timestamp is used only as
+    /// the replay gate (below) and as the post-ACK hash input
+    /// (`MyMesh.cpp:434`, `:445-448`); a far-future or far-past sender clock
+    /// does not skew what gets stored.
+    ///
     /// Returns `None` — with **no ACK emitted and no post stored** — for a
     /// replayed timestamp, or for a sub-`ReadWrite` client's post
     /// (`MyMesh.cpp:466`; silently dropped, no ACK, no error). On success,
@@ -786,7 +845,12 @@ impl RoomServerDouble {
         let text = &pt[off..text_end];
 
         if !is_retry {
-            self.seed_post(client_pubkey, timestamp, text);
+            // Re-stamp with the SERVER's clock, not the sender's decoded
+            // timestamp (MyMesh.cpp:41-51, `addPost`) — `timestamp` above is
+            // used only as the replay gate and the ACK-hash input below, per
+            // the real server's `onPeerDataRecv` (MyMesh.cpp:434, :445-448).
+            let server_ts = self.clock.current_time_unique();
+            self.seed_post(client_pubkey, server_ts, text);
         }
 
         Some(room_post_ack_hash(timestamp, attempt, text, client_pubkey))
@@ -1576,6 +1640,223 @@ mod tests {
         assert!(
             double.handle_login(&anon_req[..n], &mut out).is_none(),
             "wrong password with allow_read_only unset: no response at all"
+        );
+    }
+
+    // ── Server re-stamp fidelity (MyMesh.cpp:41-51, `addPost`) ───────────────
+
+    #[test]
+    fn double_handle_post_restamps_with_server_clock_not_sender_timestamp() {
+        let author = Identity::from_seed([0x90u8; 32]);
+        let server = Identity::from_seed([0x91u8; 32]);
+        let observer = Identity::from_seed([0x92u8; 32]);
+
+        let mut double = RoomServerDouble::new(server.clone(), b"admin-pw", b"guest-pw", false);
+        // Login timestamp (1) must stay below the post's sender timestamp (5)
+        // below — `handle_post`'s replay gate is keyed on the *sender's*
+        // last-seen timestamp, login included.
+        login_as(&mut double, &author, &server, b"guest-pw", 1);
+        login_as(&mut double, &observer, &server, b"guest-pw", 1);
+        // Set the server clock *after* login (login itself re-stamps and
+        // ticks the clock) so the post below deterministically lands on 9000.
+        double.set_server_time(9000);
+
+        let shared = author.ecdh_shared_secret(&server.pubkey);
+        let mut post_wire = [0u8; 256];
+        let n = encode_room_post(
+            &shared,
+            server.pub_hash(),
+            author.pub_hash(),
+            5, // sender's timestamp — must NOT end up as the stored/pushed ts
+            0,
+            b"restamp me",
+            &mut post_wire,
+        );
+        double
+            .handle_post(&author.pubkey, &post_wire[..n])
+            .expect("ReadWrite client's post must be accepted");
+
+        // Only push (not seed_post) exercises what actually got stored.
+        let observer_shared = observer.ecdh_shared_secret(&server.pubkey);
+        let mut wire = [0u8; 256];
+        let pn = double
+            .push_next(&observer.pubkey, &mut wire)
+            .expect("the post must be eligible for push to a different client");
+        let mut pt = [0u8; 256];
+        let (_dest, _src, push) = decode_room_push(&observer_shared, &wire[..pn], &mut pt).unwrap();
+        assert_ne!(push.post_ts, 5, "must not store the sender's timestamp");
+        assert_eq!(push.post_ts, 9000, "must stamp from the server's own clock");
+    }
+
+    #[test]
+    fn double_login_reply_server_ts_uses_server_clock_not_client_timestamp() {
+        let client = Identity::from_seed([0x93u8; 32]);
+        let server = Identity::from_seed([0x94u8; 32]);
+
+        let mut double = RoomServerDouble::new(server.clone(), b"admin-pw", b"guest-pw", false);
+        double.set_server_time(555);
+        let login = login_as(&mut double, &client, &server, b"guest-pw", 42);
+        assert_ne!(
+            login.server_ts, 42,
+            "must not echo the client's timestamp back"
+        );
+        assert_eq!(login.server_ts, 555, "must reflect the server's own clock");
+    }
+
+    #[test]
+    fn double_handle_post_replay_gate_still_keyed_on_sender_timestamp() {
+        // Re-stamping must not weaken anti-replay: the gate still runs off
+        // the *sender's* decoded timestamp, exactly as before.
+        let author = Identity::from_seed([0x95u8; 32]);
+        let server = Identity::from_seed([0x96u8; 32]);
+        let observer = Identity::from_seed([0x97u8; 32]);
+
+        let mut double = RoomServerDouble::new(server.clone(), b"admin-pw", b"guest-pw", false);
+        double.set_server_time(1000);
+        login_as(&mut double, &author, &server, b"guest-pw", 1);
+        login_as(&mut double, &observer, &server, b"guest-pw", 1);
+
+        let shared = author.ecdh_shared_secret(&server.pubkey);
+
+        // `<` last_timestamp (0 initially... use a first post to set last_timestamp=100).
+        let mut wire = [0u8; 256];
+        let n = encode_room_post(
+            &shared,
+            server.pub_hash(),
+            author.pub_hash(),
+            100,
+            0,
+            b"first",
+            &mut wire,
+        );
+        let ack = double
+            .handle_post(&author.pubkey, &wire[..n])
+            .expect("first post at ts=100 must be accepted and stored");
+        assert_eq!(ack, room_post_ack_hash(100, 0, b"first", &author.pubkey));
+
+        // `<`: strictly-lesser sender timestamp is dropped outright.
+        let mut lt_wire = [0u8; 256];
+        let lt_n = encode_room_post(
+            &shared,
+            server.pub_hash(),
+            author.pub_hash(),
+            50,
+            0,
+            b"replayed",
+            &mut lt_wire,
+        );
+        assert_eq!(
+            double.handle_post(&author.pubkey, &lt_wire[..lt_n]),
+            None,
+            "sender timestamp < last_timestamp must be dropped"
+        );
+
+        // `==`: retry — ACKed, but must NOT be stored as a second post.
+        let mut eq_wire = [0u8; 256];
+        let eq_n = encode_room_post(
+            &shared,
+            server.pub_hash(),
+            author.pub_hash(),
+            100,
+            0,
+            b"first",
+            &mut eq_wire,
+        );
+        let retry_ack = double
+            .handle_post(&author.pubkey, &eq_wire[..eq_n])
+            .expect("sender timestamp == last_timestamp must still ACK (retry)");
+        assert_eq!(
+            retry_ack,
+            room_post_ack_hash(100, 0, b"first", &author.pubkey)
+        );
+
+        // Only one post was ever stored: the observer sees exactly one
+        // eligible push, then none — proving the retry above added nothing.
+        let observer_shared = observer.ecdh_shared_secret(&server.pubkey);
+        let mut push_wire = [0u8; 256];
+        let pn = double
+            .push_next(&observer.pubkey, &mut push_wire)
+            .expect("the one genuinely-new post must be eligible");
+        let mut pt = [0u8; 256];
+        let (_dest, _src, push) =
+            decode_room_push(&observer_shared, &push_wire[..pn], &mut pt).unwrap();
+        let push_ack = room_push_ack_hash(
+            push.post_ts,
+            push.attempt,
+            push.push_body(&pt),
+            &observer.pubkey,
+        );
+        assert!(double.handle_ack(&observer.pubkey, &push_ack));
+
+        let mut push_wire2 = [0u8; 256];
+        assert!(
+            double
+                .push_next(&observer.pubkey, &mut push_wire2)
+                .is_none(),
+            "the retry must not have stored a second post"
+        );
+
+        // `>`: strictly-greater sender timestamp is accepted and stored.
+        let mut gt_wire = [0u8; 256];
+        let gt_n = encode_room_post(
+            &shared,
+            server.pub_hash(),
+            author.pub_hash(),
+            200,
+            0,
+            b"second",
+            &mut gt_wire,
+        );
+        assert!(double
+            .handle_post(&author.pubkey, &gt_wire[..gt_n])
+            .is_some());
+    }
+
+    #[test]
+    fn double_handle_post_far_future_sender_timestamp_still_gets_a_sane_server_stamp() {
+        // The case the whole campaign turns on: a sender clock that is wildly
+        // wrong (e.g. no GPS fix yet) must not corrupt what the server stores.
+        let author = Identity::from_seed([0x98u8; 32]);
+        let server = Identity::from_seed([0x99u8; 32]);
+        let observer = Identity::from_seed([0x9Au8; 32]);
+
+        let mut double = RoomServerDouble::new(server.clone(), b"admin-pw", b"guest-pw", false);
+        login_as(&mut double, &author, &server, b"guest-pw", 1);
+        login_as(&mut double, &observer, &server, b"guest-pw", 1);
+        // Set the server clock *after* login (login itself re-stamps and
+        // ticks the clock) so the post below deterministically lands on 2000.
+        double.set_server_time(2000);
+
+        let shared = author.ecdh_shared_secret(&server.pubkey);
+        let mut post_wire = [0u8; 256];
+        let n = encode_room_post(
+            &shared,
+            server.pub_hash(),
+            author.pub_hash(),
+            u32::MAX, // absurd, far-future sender clock
+            0,
+            b"from the future",
+            &mut post_wire,
+        );
+        double
+            .handle_post(&author.pubkey, &post_wire[..n])
+            .expect("post must still be accepted (first post: no prior last_timestamp to violate)");
+
+        let observer_shared = observer.ecdh_shared_secret(&server.pubkey);
+        let mut wire = [0u8; 256];
+        let pn = double
+            .push_next(&observer.pubkey, &mut wire)
+            .expect("post must be eligible for push");
+        let mut pt = [0u8; 256];
+        let (_dest, _src, push) = decode_room_push(&observer_shared, &wire[..pn], &mut pt).unwrap();
+        assert_ne!(
+            push.post_ts,
+            u32::MAX,
+            "must not store the absurd sender clock"
+        );
+        assert_eq!(
+            push.post_ts, 2000,
+            "must stamp with the server's own sane clock"
         );
     }
 
