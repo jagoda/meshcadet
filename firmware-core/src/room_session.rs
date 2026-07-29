@@ -148,6 +148,14 @@ pub struct RoomLoginOutcome {
     /// (the flood PATH-return leg). `None` for a direct `RESPONSE` datagram —
     /// no new path to learn.
     pub out_path: Option<([u8; MAX_PATH_SIZE], usize)>,
+    /// The room server's own clock at reply time
+    /// (`protocol::room::LoginResponse::server_ts` — already decoded out of
+    /// every login RESPONSE, `MyMesh.cpp:366-395`). Zero wire change: this
+    /// field rides in on a byte the v1.16 server already sends; it was
+    /// simply discarded before `meshcadet-room-adopt-server-time`. See
+    /// [`adopt_server_clock`]'s doc for how a caller turns this into a
+    /// trusted wall clock when GPS has none.
+    pub server_ts: u32,
 }
 
 /// Decode a direct `RESPONSE` datagram login reply
@@ -162,6 +170,7 @@ pub fn decode_login_response_datagram(
     Ok(RoomLoginOutcome {
         permissions: resp.permissions,
         out_path: None,
+        server_ts: resp.server_ts,
     })
 }
 
@@ -183,6 +192,7 @@ pub fn decode_login_path_return(
             Ok(RoomLoginOutcome {
                 permissions: resp.permissions,
                 out_path: Some((rp.path, rp.path_byte_count)),
+                server_ts: resp.server_ts,
             })
         }
         _ => Err(RoomSessionError::NotLoginReply),
@@ -429,6 +439,136 @@ pub fn room_tx_timestamp(trusted_wall_clock_secs: Option<u32>, last_room_ts: u32
     match trusted_wall_clock_secs {
         Some(wall) => wall.max(floor),
         None => floor,
+    }
+}
+
+// ── Clock provenance: adopting the room server's clock ──────────────────────
+//
+// `meshcadet-room-adopt-server-time`'s fix. `room_tx_timestamp` above only
+// needs a monotonic NONCE — it never required a genuine wall clock. But a
+// GPS-denied device has no wall clock at all until its first fix, so every
+// rendered room timestamp before that (and every device that never gets a
+// fix indoors) is either absent or, pre-`meshcadet-room-clock-ux`, a
+// misleading epoch date. `LoginResponse.server_ts`
+// (`protocol/src/room.rs:220`) is already decoded out of every login
+// RESPONSE and was simply thrown away (no field on `RoomLoginOutcome` to
+// carry it) — it is a real wall-clock reading, server-stamped, that arrives
+// for free on the very first login. An inbound push's `post_ts` is the same
+// kind of reading (server-stamped, `MyMesh.cpp:41-51`), arriving continuously
+// rather than once per login.
+//
+// [`ClockSource`] is the provenance `meshcadet-room-clock-ux` surfaces to the
+// user. [`AdoptedServerClock`] is the anchor a caller keeps in RAM —
+// deliberately the same "(uptime_ms, unix_secs) anchor, projected forward by
+// elapsed uptime" shape `gps::synced_wall_clock_secs` already uses, so a
+// caller combining the two sources (`trusted_wall_clock_secs` below) treats
+// them uniformly. [`adopt_server_clock`] is the priority + monotonicity rule
+// a caller applies every time a `server_ts` (login) or `post_ts` (push)
+// arrives; [`trusted_wall_clock_secs`] is the combinator a caller uses every
+// tick to decide the one wall-clock reading (and its provenance) actually in
+// effect right now.
+
+/// Where the device's current trusted wall-clock reading comes from — the
+/// provenance `meshcadet-room-clock-ux` surfaces on the GPS status screen so
+/// "why does this say no fix but the time is right?" has a visible answer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClockSource {
+    /// No trusted wall clock at all — neither a GPS fix nor an adopted room-
+    /// server reading has ever landed since boot.
+    #[default]
+    None,
+    /// The device's own GPS has synced the clock. Always wins over
+    /// [`Self::RoomServer`] — see [`adopt_server_clock`]'s doc.
+    Gps,
+    /// No GPS sync, but a room server's own clock (`server_ts` from a login
+    /// reply, or `post_ts` from an inbound push) has been adopted instead.
+    RoomServer,
+}
+
+/// A wall clock adopted from a room server's own clock, anchored the same
+/// way `gps::synced_wall_clock_secs` anchors a GPS sync: the `uptime_ms`
+/// reading at the moment the server's timestamp was RECEIVED, paired with
+/// the server's timestamp itself. [`Self::now_secs`] projects it forward by
+/// elapsed uptime, exactly like the GPS anchor, so a room server heard once
+/// at login keeps producing a plausible "now" for as long as the device
+/// stays up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdoptedServerClock {
+    anchor_uptime_ms: u64,
+    anchor_unix_secs: u32,
+}
+
+impl AdoptedServerClock {
+    /// The current Unix time this anchor projects to, given `now_ms`
+    /// (`uptime_ms()`-scale, same clock [`Self::anchor_uptime_ms`] was
+    /// captured on). Saturates rather than underflowing if `now_ms` is
+    /// somehow before the anchor (defensive — mirrors
+    /// `gps::synced_wall_clock_secs`'s own `saturating_sub`).
+    pub fn now_secs(&self, now_ms: u64) -> u32 {
+        let elapsed_secs = now_ms.saturating_sub(self.anchor_uptime_ms) / 1000;
+        self.anchor_unix_secs.saturating_add(elapsed_secs as u32)
+    }
+}
+
+/// Decide whether a freshly-received room-server timestamp (`server_ts` from
+/// a login reply, or `post_ts` from an inbound push — both server-stamped,
+/// both equally trustworthy as a wall-clock reading) should be adopted as
+/// this device's [`AdoptedServerClock`], and return the resulting state.
+///
+/// Two rules, both from this mission's Scope item 4 ("Priority +
+/// monotonicity"):
+/// - **GPS outranks server time.** `gps_synced` true means the device
+///   already has a genuine GPS-synced wall clock right now; a room server's
+///   reading must never displace it, so `current` is returned unchanged
+///   (whatever it was — including `None`, which is fine: [`Self`]-adjacent
+///   callers only ever consult an [`AdoptedServerClock`] when GPS is
+///   *not* synced, via [`trusted_wall_clock_secs`] below, so a stale one
+///   left in place here is simply never read while GPS remains synced).
+/// - **Never move a trusted clock backwards.** Adopting into `current: None`
+///   is always allowed (there is nothing to regress). Once a server clock is
+///   already adopted, a new reading is adopted only if it is not a
+///   regression relative to what the EXISTING anchor would report right now
+///   (`existing.now_secs(now_ms)`) — a stale or reordered reply (e.g. a
+///   login-retry racing a newer push) must not drag the clock backwards.
+pub fn adopt_server_clock(
+    current: Option<AdoptedServerClock>,
+    gps_synced: bool,
+    now_ms: u64,
+    server_ts: u32,
+) -> Option<AdoptedServerClock> {
+    if gps_synced {
+        return current;
+    }
+    if let Some(existing) = current {
+        if server_ts < existing.now_secs(now_ms) {
+            return Some(existing);
+        }
+    }
+    Some(AdoptedServerClock {
+        anchor_uptime_ms: now_ms,
+        anchor_unix_secs: server_ts,
+    })
+}
+
+/// The single wall-clock reading (and its provenance) in effect right now,
+/// combining GPS and an adopted room-server clock per this mission's
+/// priority rule: GPS wins whenever it is synced; the adopted server clock
+/// (if any) is the fallback; `None`/[`ClockSource::None`] only when neither
+/// source has ever synced.
+///
+/// `gps_secs` is the caller's own `gps::synced_wall_clock_secs(now_ms)`
+/// reading — `Some` exactly when GPS is genuinely synced right now.
+pub fn trusted_wall_clock_secs(
+    gps_secs: Option<u32>,
+    server_clock: Option<AdoptedServerClock>,
+    now_ms: u64,
+) -> (Option<u32>, ClockSource) {
+    match gps_secs {
+        Some(secs) => (Some(secs), ClockSource::Gps),
+        None => match server_clock {
+            Some(clock) => (Some(clock.now_secs(now_ms)), ClockSource::RoomServer),
+            None => (None, ClockSource::None),
+        },
     }
 }
 
@@ -1384,6 +1524,7 @@ mod tests {
             &RoomLoginOutcome {
                 permissions: RoomPermission::ReadWrite,
                 out_path: None,
+                server_ts: 0,
             },
         );
         assert_eq!(extra.permissions, RoomPermission::ReadWrite as u8);
@@ -1402,6 +1543,7 @@ mod tests {
             &RoomLoginOutcome {
                 permissions: RoomPermission::Guest,
                 out_path: Some((new_path, 2)),
+                server_ts: 0,
             },
         );
         assert_eq!(extra.permissions, RoomPermission::Guest as u8);
@@ -1882,6 +2024,7 @@ mod tests {
         let outcome = RoomLoginOutcome {
             permissions: RoomPermission::Admin,
             out_path: Some(([0xAAu8; MAX_PATH_SIZE], 3)),
+            server_ts: 0,
         };
 
         let mut extra = RoomExtra::EMPTY;
@@ -1979,6 +2122,105 @@ mod tests {
         // pre-sync values — the floor is now the synced watermark.
         let dropout_ts = room_tx_timestamp(None, state.last_room_ts);
         assert_eq!(dropout_ts, 1_800_000_001);
+    }
+
+    // ── Clock provenance (`meshcadet-room-adopt-server-time`) ──────────────
+
+    #[test]
+    fn login_server_ts_establishes_a_trusted_clock_with_no_gps() {
+        // Acceptance: a login reply carrying a server timestamp establishes
+        // a trusted wall clock on a device with no GPS sync.
+        let now_ms = 60_000;
+        let clock = adopt_server_clock(None, /* gps_synced */ false, now_ms, 1_800_000_000);
+        let (secs, source) = trusted_wall_clock_secs(None, clock, now_ms);
+        assert_eq!(secs, Some(1_800_000_000));
+        assert_eq!(source, ClockSource::RoomServer);
+    }
+
+    #[test]
+    fn gps_outranks_server_time_and_adoption_never_regresses() {
+        // Acceptance: GPS outranks server time (adopting server time never
+        // overrides a GPS-synced clock, and never moves a trusted clock
+        // backwards).
+        let now_ms = 0;
+
+        // GPS is synced right now: a server_ts reply must not displace it —
+        // `adopt_server_clock` leaves `current` untouched, and even if a
+        // stale adopted clock were passed in, `trusted_wall_clock_secs`
+        // reports GPS's own reading, not the server's.
+        let unchanged = adopt_server_clock(None, /* gps_synced */ true, now_ms, 1_900_000_000);
+        assert_eq!(unchanged, None, "GPS-synced must not adopt a server clock");
+        let (secs, source) = trusted_wall_clock_secs(Some(1_800_000_000), unchanged, now_ms);
+        assert_eq!(secs, Some(1_800_000_000), "GPS's own reading wins");
+        assert_eq!(source, ClockSource::Gps);
+
+        // No GPS: a first server_ts is adopted...
+        let clock = adopt_server_clock(None, false, now_ms, 1_800_000_000);
+        assert!(clock.is_some());
+        // ...but a LATER, LOWER reading (a stale reply, a reordered login
+        // retry) must never drag the adopted clock backwards.
+        let later_ms = 10_000; // 10s elapsed => existing anchor now reports 1_800_000_010
+        let regressed = adopt_server_clock(clock, false, later_ms, 1_700_000_000);
+        let (secs, source) = trusted_wall_clock_secs(None, regressed, later_ms);
+        assert_eq!(
+            secs,
+            Some(1_800_000_010),
+            "a lower server_ts must not regress the adopted clock"
+        );
+        assert_eq!(source, ClockSource::RoomServer);
+
+        // A genuine advance (a later login/push, further in real time) is
+        // adopted, moving the clock forward.
+        let advanced = adopt_server_clock(regressed, false, later_ms, 1_800_000_500);
+        let (secs, _) = trusted_wall_clock_secs(None, advanced, later_ms);
+        assert_eq!(secs, Some(1_800_000_500));
+    }
+
+    #[test]
+    fn clock_provenance_reported_for_none_gps_and_room_server() {
+        // Acceptance: clock provenance is reported correctly for each of
+        // `None` / `Gps` / `RoomServer`.
+        let now_ms = 0;
+
+        let (secs, source) = trusted_wall_clock_secs(None, None, now_ms);
+        assert_eq!(secs, None);
+        assert_eq!(source, ClockSource::None);
+
+        let (secs, source) = trusted_wall_clock_secs(Some(1_800_000_000), None, now_ms);
+        assert_eq!(secs, Some(1_800_000_000));
+        assert_eq!(source, ClockSource::Gps);
+
+        let clock = adopt_server_clock(None, false, now_ms, 1_800_000_000);
+        let (secs, source) = trusted_wall_clock_secs(None, clock, now_ms);
+        assert_eq!(secs, Some(1_800_000_000));
+        assert_eq!(source, ClockSource::RoomServer);
+    }
+
+    #[test]
+    fn inbound_push_post_ts_raises_the_trusted_lower_bound() {
+        // Acceptance: an inbound push's `post_ts` raises the trusted lower
+        // bound — the same `adopt_server_clock` rule a login's `server_ts`
+        // uses, since a push's `post_ts` is equally server-stamped
+        // (`MyMesh.cpp:41-51`), just a weaker/continuous source rather than
+        // a once-per-login one.
+        let now_ms = 0;
+        let clock = adopt_server_clock(None, false, now_ms, 1_800_000_000);
+
+        // A later push, further in time, raises the bound.
+        let after_push_ms = 5_000;
+        let clock = adopt_server_clock(clock, false, after_push_ms, 1_800_000_100);
+        let (secs, source) = trusted_wall_clock_secs(None, clock, after_push_ms);
+        assert_eq!(secs, Some(1_800_000_100));
+        assert_eq!(source, ClockSource::RoomServer);
+
+        // A stale/reordered push must not lower it.
+        let clock = adopt_server_clock(clock, false, after_push_ms, 1_000);
+        let (secs, _) = trusted_wall_clock_secs(None, clock, after_push_ms);
+        assert_eq!(
+            secs,
+            Some(1_800_000_100),
+            "a stale push post_ts must not regress the adopted clock"
+        );
     }
 
     #[test]

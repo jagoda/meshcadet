@@ -190,6 +190,18 @@ static GPS_STATUS: std::sync::Mutex<gps::GpsStatus> =
 static BATTERY_STATUS: std::sync::Mutex<battery::BatteryStatus> =
     std::sync::Mutex::new(battery::BatteryStatus::unknown());
 
+/// Latest room wall-clock provenance (`meshcadet-room-adopt-server-time`):
+/// `None` (no trusted wall clock at all), `Gps`, or `RoomServer` (adopted
+/// from a room server's own clock while GPS has none —
+/// `room_session::adopt_server_clock`/`trusted_wall_clock_secs`). The main
+/// thread refreshes this on every dispatcher-loop iteration, same
+/// cross-thread pattern as [`GPS_STATUS`]; `meshcadet-room-clock-ux` is the
+/// consumer that surfaces it (GPS status screen — "why does this say no fix
+/// but the time is right?").
+#[cfg(not(feature = "hil"))]
+static ROOM_CLOCK_SOURCE: std::sync::Mutex<room_session::ClockSource> =
+    std::sync::Mutex::new(room_session::ClockSource::None);
+
 use battery::BatteryDriver;
 use dispatcher::{AirtimeBudget, DuplicateFilter, TxQueue, lora_airtime_ms, tx_guard_allows};
 use gps::GpsDriver;
@@ -1317,6 +1329,25 @@ fn run() -> anyhow::Result<()> {
     let mut tx_epoch_base: u32 = unsafe { esp_idf_svc::sys::esp_random() };
     log::info!("tx timestamp base seeded (per-boot anti-replay)");
 
+    // Device-wide wall clock adopted from a room server's own clock
+    // (`meshcadet-room-adopt-server-time`) — `None` until either a room
+    // login reply's `server_ts` or an inbound push's `post_ts` is adopted
+    // (`room_session::adopt_server_clock`). Deliberately NOT per-room: any
+    // room server's clock is an equally trustworthy wall-clock reading, and
+    // a device may have provisioned more than one room — whichever answers
+    // first seeds this for all of them. Combined with GPS every tick via
+    // `room_session::trusted_wall_clock_secs` (GPS always wins while
+    // synced — see that function's doc).
+    //
+    // Deliberately NOT `#[cfg(not(feature = "hil"))]`, unlike most other
+    // room state: `on_receive` below threads it through unconditionally
+    // (same shape as `room_runtime`/`nvs_partition`, both already compiled
+    // in every build) — a `hil` build simply never reaches the call sites
+    // that ever adopt anything into it (`room_runtime` is empty there), so
+    // it stays `None` for the life of the process, exactly like a `hil`
+    // build's `room_runtime` stays empty.
+    let mut adopted_server_clock: Option<room_session::AdoptedServerClock> = None;
+
     // 5b. Initialise SX1262 radio (pins per LilyGo utilities.h).
     //     Board power enable (step 4) and SPI2 bus driver (step 5a) were moved
     //     above the provisioning gate so the display is available on first boot.
@@ -1747,13 +1778,33 @@ fn run() -> anyhow::Result<()> {
             tx_epoch_base = unix_secs.wrapping_sub((now / 1000) as u32);
         }
         // Whether the wall clock is genuinely GPS-synced right now — the
-        // same source GPS Status reads. Used only for the room-post refusal
-        // message below (a real, still-relevant distinction: "clock not yet
-        // synced" vs. "clock hasn't advanced since the last send") — room
-        // TIMESTAMPS themselves no longer need this as a gate (see
-        // `room_tx_timestamp`'s doc).
+        // same source GPS Status reads. Feeds the room-post refusal message
+        // below (a real, still-relevant distinction: "clock not yet synced"
+        // vs. "clock hasn't advanced since the last send" — room TIMESTAMPS
+        // themselves no longer need this as a gate, see `room_tx_timestamp`'s
+        // doc) AND `room_session::adopt_server_clock`'s priority rule (GPS
+        // outranks an adopted room-server clock while synced). Computed
+        // unconditionally (both `hil` and production, mirroring the rebase
+        // just above) so `on_receive`'s room clock-adoption threading below
+        // has a value in every build — a `hil` build never reaches the call
+        // sites that actually consume it (`room_runtime` is empty there).
+        let gps_synced_now = gps.synced_wall_clock_secs(now).is_some();
+
+        // Combine GPS with any adopted room-server clock
+        // (`meshcadet-room-adopt-server-time`): GPS always wins while synced
+        // (`room_session::trusted_wall_clock_secs`'s doc — same priority
+        // `gps_synced_now` above reflects); every room-scoped TX-timestamp
+        // call site below reads `room_wall_clock_secs` instead of
+        // `synced_wall_clock_secs` directly, so a GPS-denied device's room
+        // frames — and, once `meshcadet-room-clock-ux` lands, its rendered
+        // room timestamps — carry a real wall-clock reading as soon as any
+        // room server has answered, not only once GPS fixes.
         #[cfg(not(feature = "hil"))]
-        let clock_synced = synced_wall_clock_secs.is_some();
+        let (room_wall_clock_secs, room_clock_source) = room_session::trusted_wall_clock_secs(
+            synced_wall_clock_secs,
+            adopted_server_clock,
+            now,
+        );
 
         // ── Battery poll (throttled ADC read + charging-trend refresh) ───────
         battery.poll(now);
@@ -1778,6 +1829,19 @@ fn run() -> anyhow::Result<()> {
             }
             if let Some(ref mut ui) = ui_opt {
                 ui.set_gps_status(gps_status);
+            }
+        }
+
+        // Refresh the shared room-clock-provenance snapshot — same
+        // cross-thread mutex pattern as GPS_STATUS immediately above.
+        #[cfg(not(feature = "hil"))]
+        match ROOM_CLOCK_SOURCE.lock() {
+            Ok(mut guard) => *guard = room_clock_source,
+            Err(e) => {
+                log::warn!(
+                    "ROOM_CLOCK_SOURCE mutex poisoned — stale room clock provenance may be served"
+                );
+                *e.into_inner() = room_clock_source;
             }
         }
 
@@ -1881,7 +1945,7 @@ fn run() -> anyhow::Result<()> {
                     continue;
                 }
                 let ts =
-                    room_session::room_tx_timestamp(synced_wall_clock_secs, room.session.last_room_ts);
+                    room_session::room_tx_timestamp(room_wall_clock_secs, room.session.last_room_ts);
                 let shared = identity.ecdh_shared_secret(&room.pubkey);
                 let mut frame = [0u8; room_session::MAX_LOGIN_FRAME_LEN];
                 let n = room_session::encode_room_login_frame(
@@ -1936,7 +2000,7 @@ fn run() -> anyhow::Result<()> {
                 continue;
             }
             room.last_keep_alive_ms = now;
-            let ts = room_session::room_tx_timestamp(synced_wall_clock_secs, room.session.last_room_ts);
+            let ts = room_session::room_tx_timestamp(room_wall_clock_secs, room.session.last_room_ts);
             let shared = identity.ecdh_shared_secret(&room.pubkey);
 
             // Reconnect-stall detector: BEFORE overwriting
@@ -2261,6 +2325,8 @@ fn run() -> anyhow::Result<()> {
                             &mut room_runtime,
                             nvs_partition.clone(),
                             &contact_display_names,
+                            gps_synced_now,
+                            &mut adopted_server_clock,
                         );
                         // Persist any DM ack flip to flash so it survives a
                         // power-cycle — before this fix, `match_pending_ack`
@@ -2527,7 +2593,7 @@ fn run() -> anyhow::Result<()> {
                                     // genuine same-tick collision, not a
                                     // "clock not synced" gate anymore.
                                     let candidate_ts = room_session::room_tx_timestamp(
-                                        synced_wall_clock_secs,
+                                        room_wall_clock_secs,
                                         room.session.last_room_ts,
                                     );
                                     let shared = identity.ecdh_shared_secret(&room.pubkey);
@@ -2603,7 +2669,7 @@ fn run() -> anyhow::Result<()> {
                                                 "UI send room post to 0x{:02x} refused: \
                                                  {:?} (clock_synced={}, candidate_ts={}, \
                                                  last_room_ts={})",
-                                                room.hash, e, clock_synced, candidate_ts, last_room_ts,
+                                                room.hash, e, gps_synced_now, candidate_ts, last_room_ts,
                                             );
                                             ui.post_event(ui::UiEvent::RoomPostRefused {
                                                 room_hash: room.hash,
@@ -2947,6 +3013,8 @@ fn on_receive(
     room_runtime: &mut [RoomRuntime],
     nvs_partition: EspDefaultNvsPartition,
     contact_display_names: &std::collections::HashMap<u8, String>,
+    gps_synced: bool,
+    adopted_server_clock: &mut Option<room_session::AdoptedServerClock>,
 ) {
     if frame.len() < 2 {
         rx_diag!("RX: frame too short ({} bytes)", frame.len());
@@ -2995,6 +3063,8 @@ fn on_receive(
                     nvs_partition.clone(),
                     contact_display_names,
                     now_ms,
+                    gps_synced,
+                    adopted_server_clock,
                 ) {
                     return;
                 }
@@ -3015,15 +3085,35 @@ fn on_receive(
             // sends `PAYLOAD_TYPE_REQ` itself, so nothing legitimate besides
             // a room login reply is expected here.
             #[cfg(not(feature = "hil"))]
-            handle_room_login_response(payload, our_id, room_runtime, nvs_partition.clone(), ui_events);
+            handle_room_login_response(
+                payload,
+                our_id,
+                room_runtime,
+                nvs_partition.clone(),
+                ui_events,
+                now_ms,
+                gps_synced,
+                adopted_server_clock,
+            );
             #[cfg(feature = "hil")]
             {
-                let _ = (room_runtime, nvs_partition);
+                let _ = (room_runtime, nvs_partition, gps_synced, adopted_server_clock);
                 rx_diag!("RX RESPONSE: ignored under hil (no rooms)");
             }
         }
         x if x == PayloadType::Path as u8 => {
-            handle_path_return(payload, our_id, policy, pending_ack, ui_events, room_runtime, nvs_partition)
+            handle_path_return(
+                payload,
+                our_id,
+                policy,
+                pending_ack,
+                ui_events,
+                room_runtime,
+                nvs_partition,
+                now_ms,
+                gps_synced,
+                adopted_server_clock,
+            )
         }
         x if x == PayloadType::GrpTxt as u8 => handle_grp_txt(payload, channel_secret, ui_events),
         other => {
@@ -3555,14 +3645,31 @@ fn match_pending_channel_ack(
 /// and compose stayed disabled until reboot. Every caller of this function
 /// MUST have a `ui_events` sink available; there is currently no login-reply
 /// path that doesn't.
+///
+/// Also adopts `outcome.server_ts` into `adopted_server_clock`
+/// (`meshcadet-room-adopt-server-time`) via
+/// `room_session::adopt_server_clock` — GPS-outranks-server-time and
+/// never-regresses are both enforced there, not here; this call site only
+/// supplies `gps_synced` (whether GPS is synced RIGHT NOW, so a later login
+/// reply never displaces a GPS clock that synced after adoption) and `now_ms`
+/// (the anchor's uptime reading).
 #[cfg(not(feature = "hil"))]
 fn apply_room_login_outcome(
     room: &mut RoomRuntime,
     outcome: &room_session::RoomLoginOutcome,
     nvs_partition: EspDefaultNvsPartition,
     ui_events: &mut Vec<ui::UiEvent>,
+    now_ms: u64,
+    gps_synced: bool,
+    adopted_server_clock: &mut Option<room_session::AdoptedServerClock>,
 ) {
     room.session.apply_login_outcome(outcome);
+    *adopted_server_clock = room_session::adopt_server_clock(
+        *adopted_server_clock,
+        gps_synced,
+        now_ms,
+        outcome.server_ts,
+    );
     // A fresh login (boot OR stall-triggered relearn) mirrors the server's
     // own push_failures reset conditions — this session is presumed live
     // again, so the missed-ACK counter must not carry a stale count into it.
@@ -3606,12 +3713,16 @@ fn apply_room_login_outcome(
 /// this is the leg a later re-login (milestone 2's keep-alive scheduler)
 /// would exercise once `out_path` is known.
 #[cfg(not(feature = "hil"))]
+#[allow(clippy::too_many_arguments)]
 fn handle_room_login_response(
     payload: &[u8],
     our_id: &Identity,
     room_runtime: &mut [RoomRuntime],
     nvs_partition: EspDefaultNvsPartition,
     ui_events: &mut Vec<ui::UiEvent>,
+    now_ms: u64,
+    gps_synced: bool,
+    adopted_server_clock: &mut Option<room_session::AdoptedServerClock>,
 ) {
     let raw_src = payload.get(1).copied().unwrap_or(0);
     let Some(room) = room_runtime.iter_mut().find(|r| r.hash == raw_src) else {
@@ -3623,7 +3734,15 @@ fn handle_room_login_response(
     };
     let shared = our_id.ecdh_shared_secret(&room.pubkey);
     match room_session::decode_login_response_datagram(&shared, payload) {
-        Ok(outcome) => apply_room_login_outcome(room, &outcome, nvs_partition, ui_events),
+        Ok(outcome) => apply_room_login_outcome(
+            room,
+            &outcome,
+            nvs_partition,
+            ui_events,
+            now_ms,
+            gps_synced,
+            adopted_server_clock,
+        ),
         Err(e) => log::warn!(
             "RX room login (direct RESPONSE) from 0x{:02x}: decode error: {:?}",
             raw_src, e,
@@ -3669,6 +3788,7 @@ fn handle_room_login_response(
 /// misroute (a plain DM decodes fine as `TXT_TYPE_PLAIN`, which is not
 /// `TXT_TYPE_SIGNED_PLAIN`) rather than of a corrupt or malicious push.
 #[cfg(not(feature = "hil"))]
+#[allow(clippy::too_many_arguments)]
 fn handle_room_push_frame(
     payload: &[u8],
     our_id: &Identity,
@@ -3678,6 +3798,8 @@ fn handle_room_push_frame(
     nvs_partition: EspDefaultNvsPartition,
     contact_display_names: &std::collections::HashMap<u8, String>,
     now_ms: u64,
+    gps_synced: bool,
+    adopted_server_clock: &mut Option<room_session::AdoptedServerClock>,
 ) -> bool {
     let shared = our_id.ecdh_shared_secret(&room.pubkey);
     match room_session::handle_room_push(
@@ -3811,6 +3933,19 @@ fn handle_room_push_frame(
             // `last_room_ts` — see that method's doc for why an unconditional
             // assignment here would be a bug, not just an asymmetry.
             room.session.record_synced_post_ts(outcome.post_ts);
+            // Treat this push's `post_ts` as a trusted lower bound on real
+            // time too (`meshcadet-room-adopt-server-time`, Scope item 5) —
+            // it is equally server-stamped (`MyMesh.cpp:41-51`), just a
+            // weaker/continuous source than a once-per-login `server_ts`.
+            // Same priority + monotonicity rule as the login path (see
+            // `apply_room_login_outcome`'s doc): GPS still outranks it, and
+            // it can never regress the already-adopted clock.
+            *adopted_server_clock = room_session::adopt_server_clock(
+                *adopted_server_clock,
+                gps_synced,
+                now_ms,
+                outcome.post_ts,
+            );
             room_session::save_room_session(
                 nvs_partition,
                 room.hash,
@@ -3838,6 +3973,7 @@ fn handle_room_push_frame(
 }
 
 /// Handle a PATH-return (0x08) — decrypt and extract bundled ACK.
+#[allow(clippy::too_many_arguments)]
 fn handle_path_return(
     payload: &[u8],
     our_id: &Identity,
@@ -3846,6 +3982,9 @@ fn handle_path_return(
     ui_events: &mut Vec<ui::UiEvent>,
     room_runtime: &mut [RoomRuntime],
     nvs_partition: EspDefaultNvsPartition,
+    now_ms: u64,
+    gps_synced: bool,
+    adopted_server_clock: &mut Option<room_session::AdoptedServerClock>,
 ) {
     let raw_src = payload.get(1).copied().unwrap_or(0);
 
@@ -3895,8 +4034,17 @@ fn handle_path_return(
                                     let outcome = room_session::RoomLoginOutcome {
                                         permissions: resp.permissions,
                                         out_path: Some((rp.path, rp.path_byte_count)),
+                                        server_ts: resp.server_ts,
                                     };
-                                    apply_room_login_outcome(room, &outcome, nvs_partition, ui_events);
+                                    apply_room_login_outcome(
+                                        room,
+                                        &outcome,
+                                        nvs_partition,
+                                        ui_events,
+                                        now_ms,
+                                        gps_synced,
+                                        adopted_server_clock,
+                                    );
                                 }
                                 Err(e) => log::warn!(
                                     "RX PATH room login from 0x{:02x}: decode error: {:?}",
@@ -3911,7 +4059,14 @@ fn handle_path_return(
                     }
                     #[cfg(feature = "hil")]
                     {
-                        let _ = (room_runtime, nvs_partition, bundled);
+                        let _ = (
+                            room_runtime,
+                            nvs_partition,
+                            bundled,
+                            now_ms,
+                            gps_synced,
+                            adopted_server_clock,
+                        );
                         rx_diag!("RX PATH: bundled RESPONSE extra ignored under hil (no rooms)");
                     }
                 }
