@@ -22,6 +22,10 @@
 //!   local outbound-echo history entry is sourced from the trusted wall
 //!   clock, never the room's wire nonce (see
 //!   `xtask::room_post_history_timestamp`'s doc).
+//! - **verify-room-closer-failed-notification** — `main.rs`'s keep-alive-
+//!   stall-invalidation call site of `note_closer_failed()` raises
+//!   `UiEvent::RoomDrainComplete` whenever it returns `Some(Aggregate)` (see
+//!   `xtask::room_aggregate_notification::check_closer_failed_wiring`'s doc).
 //!
 //! Both also run as `cargo test`s, which is what CI / every downstream change
 //! actually gates on; this binary exists for a quick manual re-check with a
@@ -132,6 +136,25 @@ fn main() -> ExitCode {
             aggregate_notification.len()
         );
         for v in &aggregate_notification {
+            eprintln!("  - {v}");
+        }
+    }
+
+    let closer_failed_notification =
+        xtask::room_aggregate_notification::check_closer_failed_wiring(&repo_root);
+    if closer_failed_notification.is_empty() {
+        println!(
+            "xtask verify-room-closer-failed-notification: OK — {}'s `note_closer_failed()` \
+             call site raises `UiEvent::RoomDrainComplete` when it returns `Some(Aggregate)`.",
+            xtask::room_aggregate_notification::MAIN_RS_REL_PATH
+        );
+    } else {
+        ok = false;
+        eprintln!(
+            "xtask verify-room-closer-failed-notification: FAILED — {} violation(s):",
+            closer_failed_notification.len()
+        );
+        for v in &closer_failed_notification {
             eprintln!("  - {v}");
         }
     }

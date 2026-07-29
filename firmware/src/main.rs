@@ -2060,7 +2060,38 @@ fn run() -> anyhow::Result<()> {
                     // escalation to justify the wait (this room's LOGIN
                     // keeps succeeding, which is exactly the case that
                     // resets the backoff to its floor every cycle).
-                    room.sync_phase.note_closer_failed();
+                    //
+                    // `meshcadet-room-post-still-no-notify-hil`: unlike the
+                    // per-post call sites (`handle_ack`, `handle_room_push_
+                    // frame`), THIS call site carries no post of its own —
+                    // it fires from the keep-alive scheduler, possibly with
+                    // no post pending at all. `note_closer_failed` now
+                    // returns `Some(Aggregate)` directly whenever a backlog
+                    // was already silently absorbed at the moment the
+                    // closer is confirmed dead, so that backlog gets its
+                    // badge/tone/blink right here instead of waiting on a
+                    // next post that may never arrive (the HIL capture that
+                    // motivates this: a single test post, no follow-up
+                    // ever sent).
+                    if let Some(room_session::RoomNotification::Aggregate { count }) =
+                        room.sync_phase.note_closer_failed()
+                    {
+                        log::info!(
+                            "room: 0x{:02x} drain window closed — firing one aggregate \
+                             notification for {} post(s) absorbed while draining",
+                            room.hash, count,
+                        );
+                        // This scheduler loop isn't already collecting into a
+                        // `ui_events` buffer (unlike `on_receive`'s call
+                        // sites) — post directly, same as `RoomPostSent`/
+                        // `RoomPostRefused` further down this same loop.
+                        if let Some(ref mut ui) = ui_opt {
+                            ui.post_event(ui::UiEvent::RoomDrainComplete {
+                                room_hash: room.hash,
+                                count,
+                            });
+                        }
+                    }
                     log::warn!(
                         "room: 0x{:02x} exceeded {} consecutive missed keep-alive ACKs — \
                          invalidating out_path to force a relearn",
