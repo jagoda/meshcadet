@@ -225,6 +225,14 @@ slint::slint! {
         // "" (renders no second row at all) when never synced — mirrors
         // `time_sync_text`'s "Not synced"/populated pairing 1:1.
         in property <string> time_sync_age_text: "";
+        // Time-sync row LABEL — `meshcadet-room-clock-ux`: was a static
+        // "Time sync" literal on the row instantiation below; now driven by
+        // `GpsStatusScreen::set_clock_source` so the row reads "GPS time" /
+        // "Room time" / "Time sync" depending on which clock source is
+        // currently in effect (`firmware_core::ui::gps_status::format_
+        // clock_source_label`'s doc explains why this answers "why does
+        // this say no fix but the time is right?").
+        in property <string> time_sync_label_text: "Time sync";
         // Repeater signal-meter reading (ADR-0010): 0 = direct-only,
         // 1..=5 = bars. Pushed by `GpsStatusScreen::set_signal_level`
         // (`UiRuntime::set_signal_level` in `ui/mod.rs`); see
@@ -333,7 +341,7 @@ slint::slint! {
                 icon-kind: "planet";
             }
             StatusRow {
-                label: "Time sync";
+                label: time_sync_label_text;
                 value: time_sync_text;
                 value2: time_sync_age_text;
                 // 60px (was the 48px default): the only row wide enough in
@@ -361,7 +369,8 @@ slint::slint! {
 // never run). Only this Slint-backed view wrapper stays. See
 // `docs/adr/0005-firmware-core-extraction.md`.
 use firmware_core::ui::gps_status::{
-    format_coords, format_fix_state, format_sat_count, format_time_sync_age, format_time_sync_date,
+    format_clock_source_label, format_coords, format_fix_state, format_sat_count,
+    format_time_sync_age, format_time_sync_date,
 };
 
 /// Rust-side wrapper.
@@ -378,20 +387,50 @@ impl GpsStatusScreen {
         Ok(GpsStatusScreen { component })
     }
 
-    /// Push a fresh GPS status snapshot into the four display rows. Safe to
-    /// call repeatedly while the screen is open (e.g. every `step()`) so the
-    /// fix/sync ages tick upward live rather than freezing at nav-open time.
+    /// Push a fresh GPS status snapshot into the Fix/Satellites/Coordinates
+    /// rows. Safe to call repeatedly while the screen is open (e.g. every
+    /// `step()`) so the fix age ticks upward live rather than freezing at
+    /// nav-open time.
+    ///
+    /// Does NOT touch the Time-sync row — see [`Self::set_clock_source`].
+    /// Before `meshcadet-room-clock-ux` this method also drove that row
+    /// directly off `status.clock_unix_secs`/`clock_sync_age_secs`, which
+    /// is GPS-only and so stayed "Not synced" forever on a GPS-denied
+    /// device even once a room server's clock had been adopted — exactly
+    /// the "why does this say no fix but the time is right?" gap that
+    /// split call now closes.
     pub fn set_status(&self, status: &crate::gps::GpsStatus) {
         self.component.set_fix_state_text(format_fix_state(status.fix_state).into());
         self.component.set_sat_count_text(format_sat_count(status.sat_count).into());
         self.component.set_coords_text(
             format_coords(status.has_fix, status.lat_e7, status.lon_e7, status.fix_age_secs).into(),
         );
+    }
+
+    /// Push a fresh room-clock-provenance snapshot into the Time-sync row —
+    /// `meshcadet-room-clock-ux`'s Objective item 3. `source` picks the row's
+    /// label (`format_clock_source_label`: "GPS time" / "Room time" / "Time
+    /// sync"); `unix_secs`/`age_secs` are the SAME combined "whichever clock
+    /// is trusted right now" reading `room_session::trusted_wall_clock_secs`
+    /// produces (GPS while synced, else an adopted room-server clock, else
+    /// `None`) — not raw `GpsStatus` fields, so the row stays populated on a
+    /// GPS-denied device once a room server's clock has been adopted.
+    ///
+    /// Safe to call repeatedly while the screen is open, same "cheap no-op
+    /// on an unchanged reading" caller discipline `UiRuntime::set_room_
+    /// clock_source` applies before ever reaching here.
+    pub fn set_clock_source(
+        &self,
+        source: crate::room_session::ClockSource,
+        unix_secs: Option<u32>,
+        age_secs: u32,
+    ) {
         self.component
-            .set_time_sync_text(format_time_sync_date(status.clock_unix_secs).into());
-        self.component.set_time_sync_age_text(
-            format_time_sync_age(status.clock_unix_secs, status.clock_sync_age_secs).into(),
-        );
+            .set_time_sync_label_text(format_clock_source_label(source).into());
+        self.component
+            .set_time_sync_text(format_time_sync_date(unix_secs).into());
+        self.component
+            .set_time_sync_age_text(format_time_sync_age(unix_secs, age_secs).into());
     }
 
     /// Push a fresh repeater signal-meter reading (ADR-0010) into the

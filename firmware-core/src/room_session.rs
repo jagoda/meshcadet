@@ -508,6 +508,19 @@ impl AdoptedServerClock {
         let elapsed_secs = now_ms.saturating_sub(self.anchor_uptime_ms) / 1000;
         self.anchor_unix_secs.saturating_add(elapsed_secs as u32)
     }
+
+    /// Seconds elapsed since this anchor was captured, i.e. since the
+    /// room-server timestamp it wraps was adopted — given `now_ms`
+    /// (`uptime_ms()`-scale, same clock [`Self::anchor_uptime_ms`] was
+    /// captured on). Saturates rather than underflowing — same defensive
+    /// posture as [`Self::now_secs`]. `meshcadet-room-clock-ux`'s GPS status
+    /// screen surfaces this as the Time-sync row's relative-age line
+    /// (`"synced Ns ago"`) whenever [`ClockSource::RoomServer`] is the
+    /// active provenance, mirroring what `gps::GpsStatus::clock_sync_age_
+    /// secs` already provides while [`ClockSource::Gps`] is active.
+    pub fn age_secs(&self, now_ms: u64) -> u32 {
+        (now_ms.saturating_sub(self.anchor_uptime_ms) / 1000) as u32
+    }
 }
 
 /// Decide whether a freshly-received room-server timestamp (`server_ts` from
@@ -570,6 +583,25 @@ pub fn trusted_wall_clock_secs(
             None => (None, ClockSource::None),
         },
     }
+}
+
+/// The timestamp to persist in the LOCAL outbound-echo history entry for a
+/// just-sent room post — `meshcadet-room-clock-ux`'s fix for the "real bug"
+/// its Objective names.
+///
+/// NEVER the room's wire nonce ([`room_tx_timestamp`]'s output — a
+/// monotonic anti-replay value that may bear no relation to real time, by
+/// that function's own contract). Only ever a genuine trusted wall-clock
+/// reading (`trusted_wall_clock_secs`'s `Some` case — GPS or an adopted
+/// room-server clock), or [`protocol::history::TIMESTAMP_UNKNOWN`] when
+/// neither has ever synced, so a renderer shows "unknown" rather than
+/// computing a false epoch date from the nonce (see that constant's doc).
+///
+/// A caller passes this same tick's `trusted_wall_clock_secs(..).0` (the
+/// `Option<u32>` half of that combinator's return) as `trusted_wall_clock_
+/// secs` here.
+pub fn room_post_history_timestamp(trusted_wall_clock_secs: Option<u32>) -> u32 {
+    trusted_wall_clock_secs.unwrap_or(protocol::history::TIMESTAMP_UNKNOWN)
 }
 
 // ── Session-learned state: erase durability (FINDING G) ─────────────────────
@@ -860,8 +892,9 @@ pub enum RoomPostError {
     /// function's result is always strictly greater than the `last_room_ts`
     /// it was given) — this remains a defense-in-depth guard against a
     /// genuine same-tick collision or a caller that didn't use it, not a
-    /// "clock not yet synced" gate — the caller must surface this to the
-    /// user rather than transmit.
+    /// clock-sync gate (that gate was retired — see `room_tx_timestamp`'s
+    /// doc) — the caller must surface this to the user rather than
+    /// transmit.
     NonMonotonicTimestamp,
 }
 
@@ -2213,6 +2246,24 @@ mod tests {
         assert_eq!(source, ClockSource::RoomServer);
     }
 
+    /// Acceptance (`meshcadet-room-clock-ux`): `AdoptedServerClock::age_secs`
+    /// ticks forward with elapsed uptime, mirroring `now_secs`'s own
+    /// anchor-plus-elapsed shape — the GPS status screen's relative-age line
+    /// for a room-server-sourced clock.
+    #[test]
+    fn adopted_server_clock_age_secs_ticks_forward_with_elapsed_uptime() {
+        let anchor_ms = 60_000;
+        let clock = adopt_server_clock(None, false, anchor_ms, 1_800_000_000)
+            .expect("first adoption must succeed");
+        assert_eq!(clock.age_secs(anchor_ms), 0, "no time has elapsed yet");
+        assert_eq!(clock.age_secs(anchor_ms + 5_000), 5, "5s elapsed");
+        assert_eq!(
+            clock.age_secs(anchor_ms.saturating_sub(1_000)),
+            0,
+            "before the anchor saturates to 0, never underflows"
+        );
+    }
+
     #[test]
     fn gps_outranks_server_time_and_adoption_never_regresses() {
         // Acceptance: GPS outranks server time (adopting server time never
@@ -2325,6 +2376,41 @@ mod tests {
         let (secs, source) = trusted_wall_clock_secs(None, clock, now_ms);
         assert_eq!(secs, Some(1_800_000_000));
         assert_eq!(source, ClockSource::RoomServer);
+    }
+
+    /// Acceptance (`meshcadet-room-clock-ux`): a room post's LOCAL outbound-
+    /// echo history entry must never be sourced from the wire nonce
+    /// (`room_tx_timestamp`'s output) — only a genuine trusted wall-clock
+    /// reading, or `TIMESTAMP_UNKNOWN` when there is none.
+    #[test]
+    fn room_post_history_timestamp_uses_the_trusted_clock_when_present() {
+        assert_eq!(
+            room_post_history_timestamp(Some(1_800_000_000)),
+            1_800_000_000
+        );
+    }
+
+    #[test]
+    fn room_post_history_timestamp_is_unknown_sentinel_when_no_trusted_clock() {
+        assert_eq!(
+            room_post_history_timestamp(None),
+            protocol::history::TIMESTAMP_UNKNOWN,
+        );
+    }
+
+    /// REGRESSION: a GPS-denied device's own wire nonce
+    /// (`room_tx_timestamp(None, last_room_ts)`, always `last_room_ts + 1`,
+    /// e.g. `1` on a fresh session) must never leak through as a history
+    /// timestamp — that nonce is exactly what an epoch-1970-adjacent value
+    /// would be mistaken for if this helper were ever bypassed in favor of
+    /// wiring `room_tx_timestamp`'s output straight into history.
+    #[test]
+    fn room_post_history_timestamp_never_equals_the_wire_nonce_when_unsynced() {
+        let state = PersistedRoomSession::EMPTY;
+        let wire_nonce = room_tx_timestamp(None, state.last_room_ts);
+        let history_ts = room_post_history_timestamp(None);
+        assert_ne!(history_ts, wire_nonce);
+        assert_eq!(history_ts, protocol::history::TIMESTAMP_UNKNOWN);
     }
 
     #[test]

@@ -76,6 +76,7 @@ use std::path::{Path, PathBuf};
 /// Provisioning-codec golden-vector generator — see `golden`'s module doc.
 pub mod golden;
 pub mod room_aggregate_notification;
+pub mod room_post_history_timestamp;
 pub mod room_reflood_cadence;
 pub mod room_session_erase;
 pub mod ui_event_parity;

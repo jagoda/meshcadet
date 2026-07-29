@@ -18,6 +18,10 @@
 //!   re-flood-login branch gates on its own, backed-off cadence rather than
 //!   the route-direct keep-alive's drain/routine one (see
 //!   `xtask::room_reflood_cadence`'s doc).
+//! - **verify-room-post-history-timestamp** — the room-post send path's
+//!   local outbound-echo history entry is sourced from the trusted wall
+//!   clock, never the room's wire nonce (see
+//!   `xtask::room_post_history_timestamp`'s doc).
 //!
 //! Both also run as `cargo test`s, which is what CI / every downstream change
 //! actually gates on; this binary exists for a quick manual re-check with a
@@ -128,6 +132,24 @@ fn main() -> ExitCode {
             aggregate_notification.len()
         );
         for v in &aggregate_notification {
+            eprintln!("  - {v}");
+        }
+    }
+
+    let history_ts = xtask::room_post_history_timestamp::check(&repo_root);
+    if history_ts.is_empty() {
+        println!(
+            "xtask verify-room-post-history-timestamp: OK — {}'s room-post local outbound echo \
+             is sourced from the trusted wall clock, never the wire nonce.",
+            xtask::room_post_history_timestamp::MAIN_RS_REL_PATH
+        );
+    } else {
+        ok = false;
+        eprintln!(
+            "xtask verify-room-post-history-timestamp: FAILED — {} violation(s):",
+            history_ts.len()
+        );
+        for v in &history_ts {
             eprintln!("  - {v}");
         }
     }

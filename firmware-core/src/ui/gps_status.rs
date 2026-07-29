@@ -97,6 +97,28 @@ pub fn format_time_sync_age(clock_unix_secs: Option<u32>, clock_sync_age_secs: u
     }
 }
 
+/// Format the Time-sync row's LABEL according to which clock is currently
+/// in effect (`meshcadet-room-clock-ux`'s Objective item 3, "Clock source
+/// display"): replaces the row's previously-static "Time sync" caption so a
+/// GPS-denied device that has adopted a room server's clock instead reads
+/// "Room time", not a bare "Time sync" that gives no hint why the row is
+/// populated despite the Fix row above it reading "No signal" — the exact
+/// "why does this say no fix but the time is right?" question this mission
+/// exists to answer.
+///
+/// `crate::room_session::ClockSource::None` keeps the original "Time sync"
+/// wording — [`format_time_sync_date`] already renders "Not synced" for
+/// that case, so the row reads identically to before this mission on a
+/// device that has never synced either way.
+pub fn format_clock_source_label(source: crate::room_session::ClockSource) -> &'static str {
+    use crate::room_session::ClockSource;
+    match source {
+        ClockSource::None => "Time sync",
+        ClockSource::Gps => "GPS time",
+        ClockSource::RoomServer => "Room time",
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
@@ -186,6 +208,34 @@ mod tests {
         assert_eq!(
             format_time_sync_age(Some(unix_secs), 300),
             "synced 300s ago"
+        );
+    }
+
+    /// Acceptance (`meshcadet-room-clock-ux`): the GPS status screen's
+    /// Time-sync row label covers all three `ClockSource` provenance
+    /// values, so "why does this say no fix but the time is right?" always
+    /// has a visible answer.
+    #[test]
+    fn clock_source_label_none_keeps_the_original_wording() {
+        assert_eq!(
+            format_clock_source_label(crate::room_session::ClockSource::None),
+            "Time sync"
+        );
+    }
+
+    #[test]
+    fn clock_source_label_gps() {
+        assert_eq!(
+            format_clock_source_label(crate::room_session::ClockSource::Gps),
+            "GPS time"
+        );
+    }
+
+    #[test]
+    fn clock_source_label_room_server() {
+        assert_eq!(
+            format_clock_source_label(crate::room_session::ClockSource::RoomServer),
+            "Room time"
         );
     }
 

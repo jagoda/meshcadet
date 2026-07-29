@@ -43,6 +43,23 @@ pub const MAX_HISTORY_TEXT_LEN: usize = 64;
 /// Maximum number of entries in the ring buffer.
 pub const MAX_HISTORY_ENTRIES: usize = 32;
 
+/// Sentinel `HistoryEntry::timestamp` value meaning "no trusted wall clock
+/// was available when this entry was written" — never a genuine epoch
+/// reading. `0` (Unix epoch 1970-01-01T00:00:00Z) doubles as this crate's
+/// existing all-zero default (`RingBuffer::new`'s empty slot, an
+/// unwritten/erased NVS blob region), so adopting it as the sentinel needs
+/// no wire/NVS format change.
+///
+/// `meshcadet-room-clock-ux`: a room post's LOCAL outbound-echo history
+/// entry must be written with this sentinel — not the room's monotonic TX
+/// nonce (see `room_session::room_tx_timestamp`'s "anti-replay nonce, never
+/// a clock reading" contract) — whenever no trusted wall clock (GPS, or an
+/// adopted room-server clock) is in effect. A renderer (e.g.
+/// `host::history_format::format_local_timestamp`) must check for this
+/// value and display "unknown" rather than computing a false 1970 date from
+/// it.
+pub const TIMESTAMP_UNKNOWN: u32 = 0;
+
 /// Bytes used to encode one entry in the NVS blob:
 ///   sender_hash(1) + msg_type(1) + timestamp(4) + text_len(1) + text(64) + reserved(1) = 72
 pub const HISTORY_ENTRY_BLOB_LEN: usize = 72;

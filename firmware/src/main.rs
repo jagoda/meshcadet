@@ -1779,11 +1779,12 @@ fn run() -> anyhow::Result<()> {
         }
         // Whether the wall clock is genuinely GPS-synced right now — the
         // same source GPS Status reads. Feeds the room-post refusal message
-        // below (a real, still-relevant distinction: "clock not yet synced"
-        // vs. "clock hasn't advanced since the last send" — room TIMESTAMPS
-        // themselves no longer need this as a gate, see `room_tx_timestamp`'s
-        // doc) AND `room_session::adopt_server_clock`'s priority rule (GPS
-        // outranks an adopted room-server clock while synced). Computed
+        // below (a real, still-relevant distinction: an unsynced clock is no
+        // longer a refusal reason at all — see `room_tx_timestamp`'s doc —
+        // vs. "clock hasn't advanced since the last send", the one refusal
+        // reason that remains) AND `room_session::adopt_server_clock`'s
+        // priority rule (GPS outranks an adopted room-server clock while
+        // synced). Computed
         // unconditionally (both `hil` and production, mirroring the rebase
         // just above) so `on_receive`'s room clock-adoption threading below
         // has a value in every build — a `hil` build never reaches the call
@@ -1830,18 +1831,38 @@ fn run() -> anyhow::Result<()> {
             if let Some(ref mut ui) = ui_opt {
                 ui.set_gps_status(gps_status);
             }
-        }
 
-        // Refresh the shared room-clock-provenance snapshot — same
-        // cross-thread mutex pattern as GPS_STATUS immediately above.
-        #[cfg(not(feature = "hil"))]
-        match ROOM_CLOCK_SOURCE.lock() {
-            Ok(mut guard) => *guard = room_clock_source,
-            Err(e) => {
-                log::warn!(
-                    "ROOM_CLOCK_SOURCE mutex poisoned — stale room clock provenance may be served"
-                );
-                *e.into_inner() = room_clock_source;
+            // Refresh the shared room-clock-provenance snapshot — same
+            // cross-thread mutex pattern as GPS_STATUS immediately above.
+            match ROOM_CLOCK_SOURCE.lock() {
+                Ok(mut guard) => *guard = room_clock_source,
+                Err(e) => {
+                    log::warn!(
+                        "ROOM_CLOCK_SOURCE mutex poisoned — stale room clock provenance may be served"
+                    );
+                    *e.into_inner() = room_clock_source;
+                }
+            }
+            // `meshcadet-room-clock-ux`: the GPS status screen's Time-sync
+            // row surfaces this provenance directly (`UiRuntime::set_room_
+            // clock_source`) — "why does this say no fix but the time is
+            // right?" now has a visible answer. The relative-age half of
+            // that row mirrors whichever source is actually active:
+            // `GpsStatus::clock_sync_age_secs` while GPS is synced (the row
+            // already read this before this mission), or
+            // `AdoptedServerClock::age_secs` once a room server's clock has
+            // been adopted instead — both answer the same "how long ago did
+            // THIS source last confirm the time" question, just for
+            // different sources.
+            let room_clock_age_secs = match room_clock_source {
+                room_session::ClockSource::Gps => gps_status.clock_sync_age_secs,
+                room_session::ClockSource::RoomServer => {
+                    adopted_server_clock.map(|c| c.age_secs(now)).unwrap_or(0)
+                }
+                room_session::ClockSource::None => 0,
+            };
+            if let Some(ref mut ui) = ui_opt {
+                ui.set_room_clock_source(room_clock_source, room_wall_clock_secs, room_clock_age_secs);
             }
         }
 
@@ -2630,10 +2651,38 @@ fn run() -> anyhow::Result<()> {
                                             // Mirrors SendDm's append-on-send — a room's
                                             // posts render through the exact same
                                             // hash-keyed history region a DM's do.
+                                            //
+                                            // `meshcadet-room-clock-ux`: NEVER `candidate_ts`
+                                            // here — that's the wire nonce
+                                            // (`room_session::room_tx_timestamp`'s
+                                            // "monotonic anti-replay value, not a clock
+                                            // reading" contract), and on a GPS-denied
+                                            // device it can be nothing more than
+                                            // `last_room_ts + 1`. Using it as a display
+                                            // timestamp is exactly the bug this mission
+                                            // fixes: our own posts rendering at a
+                                            // fabricated date in our own thread while
+                                            // every other client in the room sees the
+                                            // server-re-stamped time fine (the server
+                                            // always re-stamps on receipt — see
+                                            // `MyMesh.cpp:41-51` — so only OUR echo of
+                                            // OUR OWN send was ever wrong; an inbound
+                                            // push's `post_ts` was always server-stamped
+                                            // and unaffected). `room_wall_clock_secs` is
+                                            // the actual trusted wall clock in effect
+                                            // this tick (GPS, or an adopted room-server
+                                            // clock — `room_session::trusted_wall_clock_
+                                            // secs`); `TIMESTAMP_UNKNOWN` when neither has
+                                            // ever synced, so a renderer shows "unknown"
+                                            // rather than computing a false epoch date
+                                            // (`host::history_format::format_local_
+                                            // timestamp`).
                                             append_history(
                                                 room.hash,
                                                 protocol::history::HistoryMsgType::Dm,
-                                                candidate_ts,
+                                                room_session::room_post_history_timestamp(
+                                                    room_wall_clock_secs,
+                                                ),
                                                 text.as_bytes(),
                                                 true,
                                                 false,
@@ -2662,8 +2711,8 @@ fn run() -> anyhow::Result<()> {
                                             // tells them why, directly in the thread.
                                             //
                                             // `meshcadet-room-monotonic-tx-timestamp`,
-                                            // Scope item 6: "clock not yet synced" is
-                                            // no longer a valid reason a post is
+                                            // Scope item 6: an unsynced clock is no
+                                            // longer a valid reason a post is
                                             // refused — `candidate_ts` above is always
                                             // strictly greater than `last_room_ts` by
                                             // construction, synced or not. Reaching
