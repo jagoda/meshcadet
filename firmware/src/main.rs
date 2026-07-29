@@ -2683,6 +2683,16 @@ fn run() -> anyhow::Result<()> {
                                             log_tx_queue_eviction(txq.enqueue(&frame_buf[..n]), "room post");
                                             room.pending_post_ack = Some(ack);
                                             room.session.record_sent_timestamp(candidate_ts);
+                                            // `meshcadet-room-post-watermark-persist`: same
+                                            // write-through as the boot/reflood login and
+                                            // keep-alive sites (a56c7b7) — this room-post
+                                            // site was the one that fix missed.
+                                            room_session::save_room_session(
+                                                nvs_partition.clone(),
+                                                room.hash,
+                                                room.session_epoch,
+                                                &room.session,
+                                            );
                                             log::info!(
                                                 "TX room post to 0x{:02x}: {:?} ({} bytes)",
                                                 room.hash, text, n,
