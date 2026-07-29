@@ -2735,6 +2735,81 @@ mod tests {
         );
     }
 
+    // ── Full integration: a genuinely live post is never hash-filtered ──────
+
+    /// `meshcadet-room-notification-parity`'s Acceptance bullet 3: "add
+    /// host-run coverage for the room-post notification path (event fires +
+    /// is not filtered for a room `channel_hash`)". The synthetic-outcome
+    /// unit tests above (`live_post_after_drain_closes_gets_full_parity`)
+    /// already pin the classifier's behaviour against a hand-built
+    /// `RoomPushOutcome`; this test drives the SAME claim through the real
+    /// wire codec end to end (`RoomServerDouble` + `handle_room_push`,
+    /// exactly like `full_32_post_drain_through_the_double_...` above does
+    /// for the drain case) for a post that arrives genuinely live — after
+    /// the drain window has already closed with nothing outstanding — and,
+    /// critically, repeats the whole sequence against TWO independent room
+    /// identities (so two different `channel_hash` values). If a per-hash
+    /// filter ever crept into this path, one of these two hashes would fail
+    /// to notify while the other succeeded; running both and asserting both
+    /// `Live` is what actually rules that out, rather than merely asserting
+    /// on one hash and hoping.
+    fn assert_live_post_after_drain_closes_is_never_filtered(server_seed: u8) {
+        let client = Identity::from_seed([0x11u8; 32]);
+        let server = Identity::from_seed([server_seed; 32]);
+        let other_author = Identity::from_seed([0xA0u8; 32]);
+        let mut double = RoomServerDouble::new(server.clone(), b"admin-pw", b"guest-pw", false);
+        login_direct(&mut double, &client, &server, b"guest-pw", 1000);
+
+        let shared = client.ecdh_shared_secret(&server.pubkey);
+        let conv_hash = server.pub_hash();
+        let mut phase = RoomSyncPhase::new_after_login();
+
+        // Close the drain window immediately: no backlog was seeded, so the
+        // very first keep-alive reports unsynced_count == 0.
+        let mut ka_raw = [0u8; 64];
+        let ka_n = encode_keep_alive(&shared, conv_hash, client.pub_hash(), 1500, 0, &mut ka_raw);
+        let ka_ack = double
+            .handle_keep_alive(&client.pubkey, &ka_raw[..ka_n])
+            .expect("keep-alive must be accepted");
+        let unsynced = decode_keep_alive_ack(&ka_ack).unwrap().unsynced_count;
+        assert_eq!(unsynced, 0, "nothing was ever seeded — no backlog to drain");
+        assert_eq!(
+            phase.on_keep_alive_ack(unsynced),
+            None,
+            "closing an empty drain window announces nothing (count == 0)"
+        );
+        assert!(!phase.is_draining(), "drain window must now be closed");
+
+        // NOW a genuinely new post arrives — after the window closed, same
+        // as a real live message posted by another room member.
+        double.seed_post(&other_author.pubkey, 2000, b"live hello");
+        let mut wire = [0u8; 256];
+        let n = double
+            .push_next(&client.pubkey, &mut wire)
+            .expect("the live post must be deliverable");
+        let history: Vec<HistoryEntry> = Vec::new();
+        let outcome = handle_room_push(&shared, &wire[..n], &client.pubkey, conv_hash, &history)
+            .expect("push must decode");
+        assert_eq!(
+            phase.on_push_outcome(&outcome),
+            RoomNotification::Live,
+            "channel_hash 0x{:02x} (server_seed 0x{server_seed:02x}): a live post after the \
+             drain window closed must get full notification parity with a channel message, not \
+             be silently suppressed",
+            conv_hash,
+        );
+        assert!(double.handle_ack(&client.pubkey, &outcome.ack_hash));
+    }
+
+    #[test]
+    fn live_post_after_drain_through_the_double_is_never_filtered_by_room_hash() {
+        // Two distinct server identities → two distinct `channel_hash`
+        // values (`Identity::pub_hash()` is derived from the pubkey). Both
+        // must classify identically.
+        assert_live_post_after_drain_closes_is_never_filtered(0x12);
+        assert_live_post_after_drain_closes_is_never_filtered(0x99);
+    }
+
     // ── `room_keep_alive_interval_ms` (F2 regression guard) ─────────────────
     //
     // Pins `meshcadet-room-session-state-to-ui`'s F2 fix: the scheduler must

@@ -3385,6 +3385,19 @@ fn handle_ack(
                     if let Some(room_session::RoomNotification::Aggregate { count }) =
                         room.sync_phase.on_keep_alive_ack(ack.unsynced_count)
                     {
+                        // Same diagnostic trail as the per-post drained/live
+                        // log above: this is the moment a drain window that
+                        // absorbed one or more silently-appended posts
+                        // finally fires ITS single delayed badge/tone/blink
+                        // — the gap between a post rendering and this line
+                        // appearing in the log is exactly how long that post
+                        // sat with content visible but no notification, by
+                        // design (see `RoomSyncPhase`'s doc).
+                        log::info!(
+                            "room: 0x{:02x} drain window closed — firing one aggregate \
+                             notification for {} post(s) absorbed while draining",
+                            room.hash, count,
+                        );
                         ui_events.push(ui::UiEvent::RoomDrainComplete {
                             room_hash: room.hash,
                             count,
@@ -3696,14 +3709,35 @@ fn handle_room_push_frame(
                 // entry today, but matching exhaustively rather than
                 // wildcarding keeps this in lockstep if `RoomSyncPhase`'s
                 // classification ever grows a new suppressed case).
+                // Diagnostic trail for the room-notification-parity
+                // investigation (`meshcadet-room-notification-parity`): a
+                // HIL report of "renders but never notifies" is
+                // indistinguishable, from the screen alone, between (a) this
+                // post landing in the `None` arm below — by design, still
+                // draining, silently folded into the eventual aggregate —
+                // and (b) a genuine defect. Logging which arm fired, per
+                // post, means the next HIL run's serial capture can answer
+                // that question directly (grep for "post drained" vs "post
+                // live" at the timestamp the tester sent the test message)
+                // instead of requiring another round of static tracing.
                 match notification {
                     room_session::RoomNotification::None => {
+                        log::info!(
+                            "room: 0x{:02x} post drained (still draining) — appended silently, \
+                             no badge/tone/blink yet; folded into the pending aggregate",
+                            room.hash,
+                        );
                         ui_events.push(ui::UiEvent::RoomPostDrained {
                             room_hash: room.hash,
                             text: display_text,
                         });
                     }
                     room_session::RoomNotification::Live => {
+                        log::info!(
+                            "room: 0x{:02x} post live — full notification parity with the \
+                             channel path (badge + tone + blink)",
+                            room.hash,
+                        );
                         ui_events.push(ui::UiEvent::RoomPostLive {
                             room_hash: room.hash,
                             text: display_text,
