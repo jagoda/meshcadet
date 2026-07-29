@@ -18,9 +18,8 @@
 //!
 //! # The invariant being pinned
 //!
-//! `flight-manuals/library/deferral-bound-is-load-bearing.md` § Third
-//! recurrence: `DRAIN_WINDOW_STALL_TIMEOUT_MS` had two closers before this
-//! mission, both reachable only from INSIDE a handler for some other event
+//! `DRAIN_WINDOW_STALL_TIMEOUT_MS` had two closers before this fix, both
+//! reachable only from INSIDE a handler for some other event
 //! (a post arriving — `RoomSyncPhase::on_post_received`; a keep-alive-stall
 //! detection — `RoomSyncPhase::note_closer_failed`, itself unreachable
 //! without a learned `out_path`). A session whose `out_path` is never
@@ -173,8 +172,7 @@ pub fn check_source(src: &str) -> Vec<String> {
                  periodic, event-independent drain-window re-evaluation \
                  (`RoomSyncPhase::on_scheduler_tick`) is missing; a session whose `out_path` is \
                  never learned that absorbs exactly one post and no successor will lose that \
-                 post's notification forever (see \
-                 flight-manuals/library/deferral-bound-is-load-bearing.md § Third recurrence)"
+                 post's notification forever (see this module's doc for the full history)"
             ));
             return violations;
         }

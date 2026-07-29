@@ -1362,10 +1362,8 @@ impl RoomSyncPhase {
     /// cadence — every scheduler pass, independent of whether a post,
     /// keep-alive, or anything else has happened — so a pending non-empty
     /// backlog eventually force-closes and flushes even when nothing else
-    /// ever triggers it. See
-    /// `flight-manuals/library/deferral-bound-is-load-bearing.md` § Third
-    /// recurrence ("independent" must mean "re-evaluated on its own periodic
-    /// tick," not just "reachable from more event handlers").
+    /// ever triggers it ("independent" must mean "re-evaluated on its own
+    /// periodic tick," not just "reachable from more event handlers").
     ///
     /// Returns `None` whenever there's nothing to report: the window is
     /// already closed, still has live evidence of a working closer, or

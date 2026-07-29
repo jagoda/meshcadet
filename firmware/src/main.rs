@@ -1969,9 +1969,8 @@ fn run() -> anyhow::Result<()> {
             // `DRAIN_WINDOW_STALL_TIMEOUT_MS` on their own — a session that
             // absorbs exactly one post and no successor would otherwise sit
             // with that post's notification lost forever. See
-            // `room_session::RoomSyncPhase::on_scheduler_tick`'s doc and
-            // `flight-manuals/library/deferral-bound-is-load-bearing.md`
-            // § Third recurrence.
+            // `room_session::RoomSyncPhase::on_scheduler_tick`'s doc for the
+            // full history of this failure mode.
             if let Some(room_session::RoomNotification::Aggregate { count }) =
                 room.sync_phase.on_scheduler_tick(now)
             {
