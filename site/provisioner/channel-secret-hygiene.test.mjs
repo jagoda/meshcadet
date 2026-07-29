@@ -66,6 +66,15 @@ import {
   FRAME_RSP_ERROR,
 } from "./codec.js";
 import { ProvisionerSession, DeviceError } from "./session.js";
+import {
+  makeFakePort,
+  installHostileGlobals,
+  spyOnConsole,
+  assertSecretNeverCaptured as assertSecretNeverCapturedShared,
+  usesStorageApi,
+  extractFunctionBody,
+  countValueClears,
+} from "./secret-hygiene-test-helpers.mjs";
 
 let checks = 0;
 function ok(cond, label) {
@@ -79,116 +88,12 @@ const CHANNEL_SECRET_BYTES = Uint8Array.from({ length: 32 }, (_, i) => (i * 7 + 
 const CHANNEL_SECRET_HEX = bytesToHex(CHANNEL_SECRET_BYTES); // the exact substring every Part 1 check greps for
 
 // ── Part 1: session.js's addChannel/delChannel, driven for real, against hostile globals ──
-
-function makeFakePort(onWrite) {
-  let controller;
-  const readable = new ReadableStream({
-    start(c) {
-      controller = c;
-    },
-  });
-  const writable = new WritableStream({
-    write(chunk) {
-      onWrite(chunk);
-    },
-  });
-  const port = {
-    readable,
-    writable,
-    async open() {},
-    async close() {
-      try {
-        controller.close();
-      } catch {
-        // Already closed — fine.
-      }
-    },
-  };
-  return { port, push: (bytes) => controller.enqueue(bytes) };
-}
-
-/**
- * Install `navigator`/`window` (same minimal shape session.smoke.test.mjs
- * uses), PLUS a `localStorage`/`sessionStorage` pair that throws on ANY
- * property access or assignment — not a spy that records calls, an actual
- * trap — so if `session.js`'s `addChannel`/`delChannel` path (or anything it
- * transitively imports) ever so much as reads `localStorage.foo`, the test
- * fails immediately with a thrown error rather than relying on us
- * remembering to assert "it wasn't called".
- */
-function installHostileGlobals(port) {
-  Object.defineProperty(globalThis, "navigator", {
-    value: {
-      serial: {
-        async requestPort() {
-          return port;
-        },
-        addEventListener() {},
-      },
-    },
-    writable: true,
-    configurable: true,
-  });
-  globalThis.window = { isSecureContext: true };
-
-  const storageTrap = (label) =>
-    new Proxy(
-      {},
-      {
-        get() {
-          throw new Error(`channel-secret-hygiene: ${label} was touched (get) — must never be touched at all`);
-        },
-        set() {
-          throw new Error(`channel-secret-hygiene: ${label} was touched (set) — must never be touched at all`);
-        },
-      }
-    );
-  Object.defineProperty(globalThis, "localStorage", {
-    value: storageTrap("localStorage"),
-    writable: true,
-    configurable: true,
-  });
-  Object.defineProperty(globalThis, "sessionStorage", {
-    value: storageTrap("sessionStorage"),
-    writable: true,
-    configurable: true,
-  });
-}
-
-/** Wrap console.log/warn/error to capture every argument, restoring on manual restore(). */
-function spyOnConsole() {
-  const original = { log: console.log, warn: console.warn, error: console.error };
-  const captured = [];
-  for (const level of ["log", "warn", "error"]) {
-    console[level] = (...args) => {
-      captured.push(args);
-    };
-  }
-  return {
-    captured,
-    restore() {
-      console.log = original.log;
-      console.warn = original.warn;
-      console.error = original.error;
-    },
-  };
-}
+// (makeFakePort/installHostileGlobals/spyOnConsole/assertSecretNeverCaptured
+// are shared with guest-password-hygiene.test.mjs/admin-pin-hygiene.test.mjs
+// — see secret-hygiene-test-helpers.mjs's own header.)
 
 function assertSecretNeverCaptured(captured, label) {
-  for (const args of captured) {
-    for (const arg of args) {
-      const rendered = typeof arg === "string" ? arg : safeStringify(arg);
-      ok(!rendered.includes(CHANNEL_SECRET_HEX), `${label}: console output must never contain the channel secret (got: ${rendered})`);
-    }
-  }
-}
-
-function safeStringify(value) {
-  try {
-    return JSON.stringify(value, (_key, v) => (v instanceof Error ? { message: v.message, stack: v.stack } : v));
-  } catch {
-    return String(value);
-  }
+  assertSecretNeverCapturedShared(ok, captured, CHANNEL_SECRET_HEX, "the channel secret", label);
 }
 
 async function addChannelNeverTouchesStorageOrLogsTheSecret() {
@@ -330,11 +235,6 @@ const siteDir = path.resolve(here, "..");
 const provisionerJs = readFileSync(path.join(siteDir, "provisioner.js"), "utf-8");
 const provisionerHtml = readFileSync(path.join(siteDir, "provisioner.html"), "utf-8");
 
-/** True if `source` contains an actual `identifier.`/`identifier[` API touch — not merely the word appearing inside prose/backticks. */
-function usesStorageApi(source, identifier) {
-  return new RegExp(`\\b${identifier}\\s*[.[]`).test(source);
-}
-
 ok(!usesStorageApi(provisionerJs, "localStorage"), "provisioner.js never calls the localStorage API");
 ok(!usesStorageApi(provisionerJs, "sessionStorage"), "provisioner.js never calls the sessionStorage API");
 ok(!usesStorageApi(provisionerHtml, "localStorage"), "provisioner.html never calls the localStorage API");
@@ -352,23 +252,9 @@ for (const [label, source] of [
   ok(!/history\s*\.\s*(push|replace)State/.test(source), `${label} never manipulates history state`);
 }
 
-/** Extract a top-level `async function <name>(...) { ... }` body by brace-balance scanning — good enough for this file's own straight-line functions (no template-literal braces inside the extracted range). */
-function extractFunctionBody(source, name) {
-  const sigMatch = source.match(new RegExp(`(?:async\\s+)?function\\s+${name}\\s*\\([^)]*\\)\\s*\\{`));
-  ok(sigMatch !== null, `found a "function ${name}(...)" declaration to extract`);
-  const start = sigMatch.index + sigMatch[0].length;
-  let depth = 1;
-  let i = start;
-  for (; i < source.length && depth > 0; i++) {
-    if (source[i] === "{") depth++;
-    else if (source[i] === "}") depth--;
-  }
-  return source.slice(start, i - 1);
-}
-
-const handleAddChannelBody = extractFunctionBody(provisionerJs, "handleAddChannel");
-const handleDelChannelBody = extractFunctionBody(provisionerJs, "handleDelChannel");
-const clearFormStatusesBody = extractFunctionBody(provisionerJs, "clearFormStatuses");
+const handleAddChannelBody = extractFunctionBody(ok, provisionerJs, "handleAddChannel");
+const handleDelChannelBody = extractFunctionBody(ok, provisionerJs, "handleDelChannel");
+const clearFormStatusesBody = extractFunctionBody(ok, provisionerJs, "clearFormStatuses");
 
 // No console.* call in handleAddChannel/handleDelChannel may reference a
 // secret-carrying identifier — every console.* line in these functions must
@@ -390,21 +276,21 @@ for (const [label, body, fieldIdent] of [
 {
   ok(/addChannelForm\.reset\(\)/.test(handleAddChannelBody), "handleAddChannel clears the form (and thus addChannelSecret.value) on success via form.reset()");
   ok(
-    /addChannelSecret\.value\s*=\s*("|')("|')/.test(handleAddChannelBody),
+    countValueClears(handleAddChannelBody, "addChannelSecret") >= 1,
     "handleAddChannel clears addChannelSecret.value on the catch (failure) path"
   );
 }
 {
   ok(/delChannelForm\.reset\(\)/.test(handleDelChannelBody), "handleDelChannel clears the form (and thus delChannelSecret.value) on success via form.reset()");
   ok(
-    /delChannelSecret\.value\s*=\s*("|')("|')/.test(handleDelChannelBody),
+    countValueClears(handleDelChannelBody, "delChannelSecret") >= 1,
     "handleDelChannel clears delChannelSecret.value on the catch (failure) path"
   );
 }
 
 // clearFormStatuses (the disconnect path) also scrubs both fields.
-ok(/addChannelSecret\.value\s*=\s*("|')("|')/.test(clearFormStatusesBody), "clearFormStatuses clears addChannelSecret.value on disconnect");
-ok(/delChannelSecret\.value\s*=\s*("|')("|')/.test(clearFormStatusesBody), "clearFormStatuses clears delChannelSecret.value on disconnect");
+ok(countValueClears(clearFormStatusesBody, "addChannelSecret") >= 1, "clearFormStatuses clears addChannelSecret.value on disconnect");
+ok(countValueClears(clearFormStatusesBody, "delChannelSecret") >= 1, "clearFormStatuses clears delChannelSecret.value on disconnect");
 
 // ── HTML: type=password + autocomplete=off (no form autofill/autocomplete) ──
 
