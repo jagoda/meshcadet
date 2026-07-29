@@ -79,6 +79,7 @@ pub mod room_aggregate_notification;
 pub mod room_post_history_timestamp;
 pub mod room_reflood_cadence;
 pub mod room_session_erase;
+pub mod room_watermark_persist;
 pub mod ui_event_parity;
 
 /// One known, already-documented, deliberately-deferred gap — see

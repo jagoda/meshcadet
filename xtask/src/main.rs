@@ -26,6 +26,11 @@
 //!   stall-invalidation call site of `note_closer_failed()` raises
 //!   `UiEvent::RoomDrainComplete` whenever it returns `Some(Aggregate)` (see
 //!   `xtask::room_aggregate_notification::check_closer_failed_wiring`'s doc).
+//! - **verify-room-watermark-persist** — every
+//!   `<room>.session.record_sent_timestamp(..)` call site in
+//!   `firmware/src/main.rs`, enumerated by shape rather than a fixed list,
+//!   is followed by a `save_room_session` for that same room (see
+//!   `xtask::room_watermark_persist`'s doc).
 //!
 //! Both also run as `cargo test`s, which is what CI / every downstream change
 //! actually gates on; this binary exists for a quick manual re-check with a
@@ -173,6 +178,24 @@ fn main() -> ExitCode {
             history_ts.len()
         );
         for v in &history_ts {
+            eprintln!("  - {v}");
+        }
+    }
+
+    let watermark_persist = xtask::room_watermark_persist::check(&repo_root);
+    if watermark_persist.is_empty() {
+        println!(
+            "xtask verify-room-watermark-persist: OK — every `record_sent_timestamp` call site \
+             in {} is followed by a `save_room_session` for the same room.",
+            xtask::room_watermark_persist::MAIN_RS_REL_PATH
+        );
+    } else {
+        ok = false;
+        eprintln!(
+            "xtask verify-room-watermark-persist: FAILED — {} violation(s):",
+            watermark_persist.len()
+        );
+        for v in &watermark_persist {
             eprintln!("  - {v}");
         }
     }
