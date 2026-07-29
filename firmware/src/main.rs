@@ -3531,15 +3531,53 @@ fn handle_req(
     }
 }
 
+/// Match an inbound 4-byte ACK hash against any room's outstanding
+/// `pending_post_ack` (Phase A post-send). Shared by both shapes a room
+/// post's ACK can arrive in: a bare `Ack` datagram (`handle_ack`) and an ACK
+/// bundled inside a PATH-return (`handle_path_return`'s `PathExtra::Ack`
+/// arm). A room post is sent flood-routed
+/// (`room_session::encode_room_post_checked`'s `RouteType::Flood`), so the
+/// responder often doesn't have a return route yet and teaches one back by
+/// bundling the ACK inside a PATH-return — the exact same "teach the route
+/// while replying" mechanism the flood-login's bundled `PathExtra::Response`
+/// uses (see `handle_path_return`'s doc). Before this fix only the bare-`Ack`
+/// shape ever consulted `room_runtime`; a post ACK arriving bundled fell
+/// through to `match_pending_ack`'s DM slot, found nothing pending, and was
+/// logged-and-dropped (`main.rs`'s `ACK received (no pending DM)` line) —
+/// the delivery check never flipped.
+///
+/// On a match, clears `pending_post_ack` and raises `UiEvent::DmAcked` (mirrors
+/// `DmAcked`'s "flip the sent-message checkmark", reusing that same UiEvent
+/// since a room's posts render through the exact same hash-keyed message
+/// view a DM's do — see `room_message_view.rs`'s module doc). Room
+/// *keep-alive* ACKs are NOT matched here: a keep-alive is sent route-direct
+/// over an already-learned path (`room_session::encode_room_direct_prefix`'s
+/// doc), so its reply is always a bare `Ack`, never a PATH-return — that
+/// match stays local to `handle_ack`.
+#[cfg_attr(feature = "hil", allow(unused_variables))]
+fn match_room_post_ack(
+    got: [u8; 4],
+    room_runtime: &mut [RoomRuntime],
+    ui_events: &mut Vec<ui::UiEvent>,
+) -> bool {
+    #[cfg(not(feature = "hil"))]
+    for room in room_runtime.iter_mut() {
+        if room.pending_post_ack == Some(got) {
+            room.pending_post_ack = None;
+            log::info!("RX room post ACK for 0x{:02x}: matched", room.hash);
+            ui_events.push(ui::UiEvent::DmAcked { to_hash: room.hash });
+            return true;
+        }
+    }
+    false
+}
+
 /// Match an inbound ACK against the pending ACK for our last-sent DM, OR —
 /// checked first, before falling through to the DM slot — a room's
-/// in-flight post or keep-alive ACK (Phase A/C). A room post ACK just clears
-/// the pending flag (mirrors `DmAcked`'s "flip the sent-message checkmark",
-/// reusing that same UiEvent since a room's posts render through the exact
-/// same hash-keyed message view a DM's do — see `room_message_view.rs`'s
-/// module doc). A room keep-alive ACK additionally carries the appended
-/// unsynced-count byte (`payload[4]`) that closes Phase D's drain window —
-/// see `firmware_core::room_session::RoomSyncPhase::on_keep_alive_ack`.
+/// in-flight post ([`match_room_post_ack`]) or keep-alive ACK (Phase C). A
+/// room keep-alive ACK additionally carries the appended unsynced-count byte
+/// (`payload[4]`) that closes Phase D's drain window — see
+/// `firmware_core::room_session::RoomSyncPhase::on_keep_alive_ack`.
 #[cfg_attr(feature = "hil", allow(unused_variables))]
 fn handle_ack(
     payload: &[u8],
@@ -3555,14 +3593,12 @@ fn handle_ack(
     let mut got = [0u8; 4];
     got.copy_from_slice(&payload[..4]);
 
+    if match_room_post_ack(got, room_runtime, ui_events) {
+        return;
+    }
+
     #[cfg(not(feature = "hil"))]
     for room in room_runtime.iter_mut() {
-        if room.pending_post_ack == Some(got) {
-            room.pending_post_ack = None;
-            log::info!("RX room post ACK for 0x{:02x}: matched", room.hash);
-            ui_events.push(ui::UiEvent::DmAcked { to_hash: room.hash });
-            return;
-        }
         if room.pending_keep_alive_ack == Some(got) {
             room.pending_keep_alive_ack = None;
             // A successful ACK proves the route is live — reset the
@@ -4136,7 +4172,16 @@ fn handle_path_return(
                 raw_src, rp.path_byte_count, rp.extra,
             );
             match rp.extra {
-                PathExtra::Ack(got) => match_pending_ack(got, pending_ack, ui_events),
+                PathExtra::Ack(got) => {
+                    // A room post's ACK often arrives bundled here rather
+                    // than as a bare `Ack` datagram (this mission's
+                    // Objective) — check `room_runtime` before falling
+                    // through to the DM slot; see `match_room_post_ack`'s
+                    // doc.
+                    if !match_room_post_ack(got, room_runtime, ui_events) {
+                        match_pending_ack(got, pending_ack, ui_events);
+                    }
+                }
                 PathExtra::None => {
                     rx_diag!("RX PATH: no bundled ACK (extra=None)");
                 }
@@ -4488,5 +4533,115 @@ mod tests {
         let second = match_pending_channel_ack([1, 2, 3, 4], &mut pending, &mut ui_events);
         assert_eq!(second, None, "a second repeat has nothing pending to match anymore");
         assert_eq!(ui_events.len(), 1, "no additional UI event on the second repeat");
+    }
+
+    // ── Room post-ACK regression guard ──────────────────────────────────────
+    //
+    // This mission's defect: a room post's ACK routinely arrives bundled
+    // inside a PATH-return (`handle_path_return`'s `PathExtra::Ack` arm),
+    // not just as a bare `Ack` datagram (`handle_ack`) — see
+    // `match_room_post_ack`'s doc for why (posts are flood-routed, so the
+    // responder often teaches its return route back by bundling the ACK,
+    // exactly like the flood-login's bundled `PathExtra::Response`). Before
+    // this fix only `handle_ack` ever consulted `room_runtime`; a bundled
+    // ACK fell straight through to `match_pending_ack`'s DM-only slot,
+    // matched nothing, and was logged-and-dropped ("ACK received (no
+    // pending DM)") — the delivery check never flipped.
+    //
+    // `handle_ack` and `handle_path_return`'s `PathExtra::Ack` arm now BOTH
+    // delegate to `match_room_post_ack`, so exercising that one function
+    // (plus `handle_ack`'s dispatch order below) is the shared regression
+    // guard for both call sites — `handle_path_return`'s own arm is a single
+    // line forwarding to the exact same function.
+
+    /// Minimal `RoomRuntime` fixture — only `hash` and `pending_post_ack`
+    /// matter to these tests; every other field takes its boot-time-empty
+    /// default.
+    ///
+    /// `allow(dead_code)`: this `[[bin]]` sets `harness = false` (see
+    /// Cargo.toml), so `#[test]` functions are compiled but never invoked by
+    /// any generated dispatcher (CONTRIBUTING.md: they "only run on real
+    /// hardware") — `#[test]` items themselves are lint-exempted as
+    /// live roots, but a plain helper only reachable through them, like this
+    /// one, is not.
+    #[allow(dead_code)]
+    fn test_room(hash: u8, pending_post_ack: Option<[u8; 4]>) -> RoomRuntime {
+        RoomRuntime {
+            pubkey: [0u8; 32],
+            hash,
+            guest_password: [0u8; MAX_LOGIN_PASSWORD_LEN],
+            guest_password_len: 0,
+            session: room_session::PersistedRoomSession::EMPTY,
+            session_epoch: 0,
+            login_sent: true,
+            last_keep_alive_ms: 0,
+            last_reflood_ms: 0,
+            reflood_attempts: 0,
+            sync_phase: room_session::RoomSyncPhase::new_after_login(0),
+            pending_post_ack,
+            pending_keep_alive_ack: None,
+            keep_alive_stall: room_session::RoomKeepAliveStall::new(),
+            resync_pending: false,
+            recent: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn matching_room_post_ack_clears_pending_and_raises_dm_acked_for_room_hash() {
+        let mut rooms = [test_room(0x99, Some([5, 6, 7, 8]))];
+        let mut ui_events: Vec<ui::UiEvent> = Vec::new();
+
+        let matched = match_room_post_ack([5, 6, 7, 8], &mut rooms, &mut ui_events);
+
+        assert!(matched, "a matching room post ack must report matched");
+        assert!(rooms[0].pending_post_ack.is_none(), "a matched ack must clear pending_post_ack");
+        assert_eq!(ui_events.len(), 1, "a matched room post ack must raise exactly one UI event");
+        match &ui_events[0] {
+            ui::UiEvent::DmAcked { to_hash } => assert_eq!(*to_hash, 0x99),
+            other => panic!("expected DmAcked, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mismatched_room_post_ack_leaves_pending_and_reports_unmatched() {
+        let mut rooms = [test_room(0x99, Some([5, 6, 7, 8]))];
+        let mut ui_events: Vec<ui::UiEvent> = Vec::new();
+
+        let matched = match_room_post_ack([1, 2, 3, 4], &mut rooms, &mut ui_events);
+
+        assert!(!matched);
+        assert!(rooms[0].pending_post_ack.is_some());
+        assert!(ui_events.is_empty());
+    }
+
+    #[test]
+    fn no_pending_room_post_ack_reports_unmatched() {
+        let mut rooms = [test_room(0x99, None)];
+        let mut ui_events: Vec<ui::UiEvent> = Vec::new();
+
+        let matched = match_room_post_ack([5, 6, 7, 8], &mut rooms, &mut ui_events);
+
+        assert!(!matched);
+        assert!(ui_events.is_empty());
+    }
+
+    /// Drives `handle_ack`'s full dispatch order: a room post ack must be
+    /// matched and must NOT fall through to (or disturb) the DM slot, even
+    /// when an unrelated DM ack is also pending.
+    #[test]
+    fn handle_ack_matches_room_post_ack_before_falling_through_to_dm_slot() {
+        let mut pending_dm = Some(PendingAck { hash: [9, 9, 9, 9], to_hash: 0x11 });
+        let mut rooms = [test_room(0x99, Some([5, 6, 7, 8]))];
+        let mut ui_events: Vec<ui::UiEvent> = Vec::new();
+
+        handle_ack(&[5, 6, 7, 8], &mut pending_dm, &mut rooms, &mut ui_events, 0);
+
+        assert!(rooms[0].pending_post_ack.is_none(), "the room's post ack must be matched");
+        assert!(pending_dm.is_some(), "the unrelated DM pending ack must be untouched");
+        assert_eq!(ui_events.len(), 1);
+        match &ui_events[0] {
+            ui::UiEvent::DmAcked { to_hash } => assert_eq!(*to_hash, 0x99),
+            other => panic!("expected DmAcked, got {:?}", other),
+        }
     }
 }
