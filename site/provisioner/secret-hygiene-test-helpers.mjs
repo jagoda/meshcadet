@@ -10,11 +10,9 @@
 // counter — three times, by hand, with no shared module asserting parity
 // between the copies. Two hand-duplicated copies (guest-password, admin-pin)
 // was a coincidence; channel-secret-hygiene.test.mjs made it three, which is
-// the documented extraction trigger — see
-// flight-manuals/checklists/meshcadet-browser-secret-handler-hygiene.md's
-// "third or later secret-carrying handler" item and
-// flight-manuals/library/hand-duplicated-invariant-drift.md. Extracted here
-// so the NEXT secret-carrying handler's hygiene test is a call site, not a
+// this project's own N=3 dedup-or-extract threshold for hand-duplicated
+// logic. Extracted here so the NEXT secret-carrying handler's hygiene test
+// is a call site, not a
 // fourth from-scratch transcription.
 //
 // `extractFunctionBody` and `countValueClears` (and, transitively, anything

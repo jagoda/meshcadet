@@ -235,6 +235,22 @@ all three in sync.
   (`session.smoke.test.mjs`'s room scenarios; `guest-password-hygiene.test.mjs`
   for the storage/console/URL/autofill invariants specifically) — see that
   test file's own header for why it's split from `session.smoke.test.mjs`.
+  `guest-password-hygiene.test.mjs`, `admin-pin-hygiene.test.mjs`, and
+  `channel-secret-hygiene.test.mjs` (one per secret-carrying field this page
+  handles) share their fixture/assertion logic — a fake Web Serial port,
+  hostile `localStorage`/`sessionStorage` traps, a console spy, the
+  never-captured-in-console-output check, a brace-balance function-body
+  extractor, and an exit-path clear-count counter — via
+  `provisioner/secret-hygiene-test-helpers.mjs`, extracted once a third
+  hand-duplicated copy of that logic crossed the project's own N=3
+  dedup-or-extract threshold. `provisioner/secret-hygiene-coverage.test.mjs`
+  is the mechanized counterpart: it enumerates every `type="password"`
+  `<input>` in this file's shipped source text and asserts each one's `id`
+  is covered by at least one `*-hygiene.test.mjs`, so a future fourth secret
+  field fails CI immediately instead of waiting for a security audit to
+  notice it has no hygiene test — see that test file's own header. All are
+  run by `pages-check.yml`'s `check` job (each hygiene/coverage test file
+  gets its own explicit `run:` step — the workflow does not glob for them).
 - `vendor/` — third-party browser code vendored (fetched, reviewed, and
   committed) rather than CDN-imported, because `provisioner.html` is the one
   page on the site that handles secrets and so loads no third-party script
