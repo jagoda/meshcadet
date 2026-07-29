@@ -2224,6 +2224,34 @@ mod tests {
     }
 
     #[test]
+    fn login_server_ts_through_the_real_double_and_decode_path_is_adopted() {
+        // End-to-end: unlike the tests above (which hand the pure
+        // `adopt_server_clock`/`trusted_wall_clock_secs` combinator
+        // constants directly), this one drives the FULL pipeline a real
+        // device runs — `RoomServerDouble::handle_login` produces the wire
+        // bytes, `decode_login_response_datagram` decodes them into a
+        // `RoomLoginOutcome`, and only THEN is `outcome.server_ts` fed to
+        // `adopt_server_clock` — proving the wire-decode-to-adoption path
+        // works, not just the classifier in isolation.
+        let (client, server) = make_pair();
+        let mut double = RoomServerDouble::new(server.clone(), b"admin-pw", b"guest-pw", false);
+        double.set_server_time(1_800_000_000);
+
+        let outcome = login_direct(&mut double, &client, &server, b"guest-pw", 1000);
+        assert_eq!(
+            outcome.server_ts, 1_800_000_000,
+            "the double's own clock, not the client's login timestamp"
+        );
+
+        let now_ms = 0;
+        let clock =
+            adopt_server_clock(None, /* gps_synced */ false, now_ms, outcome.server_ts);
+        let (secs, source) = trusted_wall_clock_secs(None, clock, now_ms);
+        assert_eq!(secs, Some(1_800_000_000));
+        assert_eq!(source, ClockSource::RoomServer);
+    }
+
+    #[test]
     fn a_post_succeeds_with_clock_synced_false_against_the_room_server_double() {
         // Acceptance: a post succeeds with `clock_synced == false` (against
         // the corrected `RoomServerDouble` — the post is stored and ACKed).
