@@ -38,10 +38,47 @@ fn redraw_scope_and_alloc_baseline() {
         "rendering a real frame should allocate at least once (line-buffer conversion, string building, etc.) — a zero count here means the harness measured nothing"
     );
 
+    // ── Settle the one-shot `init =>` transitions before sampling idle ─────
+    // `MascotBob.bob_y` and `Twinkle.twinkle_opacity` are each driven by an
+    // `animate` block on a property only the `init` handler ever assigns
+    // (motifs.slint:190-192, :217-219). An `animate` on an init-assigned
+    // property is a TIMED transition, not something that completes
+    // synchronously at construction — `PerfProfilePlatform::duration_since_
+    // start` (perf_profile.rs) measures real wall time from just before
+    // `PerfProfileUi::new()`, so whether an unslept frame1 lands before or
+    // after those transitions finish is an accident of how long scene
+    // construction + the frame0 full paint happened to take on this
+    // machine, not an invariant. Advance past the longest one (Twinkle's)
+    // in ticked increments so the settle is explicit rather than accidental.
+    // The +50ms margin on top of Twinkle's duration absorbs scheduler
+    // jitter right at the boundary between the settle loop's last sleep and
+    // the animation's actual completion instant.
+    const MASCOT_BOB_ANIMATION_MS: u64 = 450; // motifs.slint:191
+    const TWINKLE_ANIMATION_MS: u64 = 900; // motifs.slint:218
+    const INIT_ANIMATION_SETTLE_MS: u64 = TWINKLE_ANIMATION_MS + 50;
+    // Compile-time guard on the bound derivation above: if a motif with a
+    // longer `animate` duration is ever added to this scene, its
+    // motifs.slint duration must become the new basis, not silently keep
+    // Twinkle's.
+    const _: () = assert!(TWINKLE_ANIMATION_MS > MASCOT_BOB_ANIMATION_MS);
+
+    let mut settle_saw_dirty_tick = false;
+    let settle_deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(INIT_ANIMATION_SETTLE_MS);
+    while std::time::Instant::now() < settle_deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let s = scene.tick();
+        settle_saw_dirty_tick |= s.lines_touched > 0;
+    }
+    // Flush the transition's final settled-value frame (it may land exactly
+    // on the deadline, in which case the loop above already exited without
+    // painting it) before the frame the assertion below grades.
+    scene.tick();
+    eprintln!(
+        "  settle: observed a dirty tick while advancing past init animations: {settle_saw_dirty_tick}"
+    );
+
     // ── Frame 1: idle steady state, nothing changed — should be a no-op ────
-    // (Twinkle/MascotBob already settled after their one-shot `init =>`
-    // transition completed synchronously on construction; no `animate` is
-    // still in flight and nothing triggered.)
     let idle = scene.tick();
     print_stats("frame1 (idle, no property change)", idle);
     assert_eq!(
