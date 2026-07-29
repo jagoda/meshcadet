@@ -3664,12 +3664,24 @@ fn apply_room_login_outcome(
     adopted_server_clock: &mut Option<room_session::AdoptedServerClock>,
 ) {
     room.session.apply_login_outcome(outcome);
+    // Log only the FIRST transition into a room-server-adopted clock (`None`
+    // -> `Some`) — observability for "why does this device's room clock
+    // suddenly look right (or wrong)", without spamming a log line on every
+    // later login that merely advances an already-adopted clock forward.
+    let had_no_adopted_clock = adopted_server_clock.is_none();
     *adopted_server_clock = room_session::adopt_server_clock(
         *adopted_server_clock,
         gps_synced,
         now_ms,
         outcome.server_ts,
     );
+    if had_no_adopted_clock && adopted_server_clock.is_some() {
+        log::info!(
+            "room: adopted server_ts={} from 0x{:02x}'s login reply as trusted wall clock \
+             (no GPS sync)",
+            outcome.server_ts, room.hash,
+        );
+    }
     // A fresh login (boot OR stall-triggered relearn) mirrors the server's
     // own push_failures reset conditions — this session is presumed live
     // again, so the missed-ACK counter must not carry a stale count into it.
@@ -3939,13 +3951,25 @@ fn handle_room_push_frame(
             // weaker/continuous source than a once-per-login `server_ts`.
             // Same priority + monotonicity rule as the login path (see
             // `apply_room_login_outcome`'s doc): GPS still outranks it, and
-            // it can never regress the already-adopted clock.
+            // it can never regress the already-adopted clock. Log only the
+            // FIRST transition into an adopted clock (a login reply may
+            // never arrive in time to be first — a push is just as valid a
+            // seed) — see `apply_room_login_outcome`'s identical log gate
+            // for why later advances stay silent.
+            let had_no_adopted_clock = adopted_server_clock.is_none();
             *adopted_server_clock = room_session::adopt_server_clock(
                 *adopted_server_clock,
                 gps_synced,
                 now_ms,
                 outcome.post_ts,
             );
+            if had_no_adopted_clock && adopted_server_clock.is_some() {
+                log::info!(
+                    "room: adopted post_ts={} from 0x{:02x}'s push as trusted wall clock \
+                     (no GPS sync)",
+                    outcome.post_ts, room.hash,
+                );
+            }
             room_session::save_room_session(
                 nvs_partition,
                 room.hash,
