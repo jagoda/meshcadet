@@ -1673,6 +1673,18 @@ fn run() -> anyhow::Result<()> {
             log_tx_queue_eviction(txq.enqueue(&frame[..n]), "room login");
             room.login_sent = true;
             room.session.record_sent_timestamp(boot_ts);
+            // `meshcadet-room-ts-watermark-write-behind`: persist the
+            // advanced watermark now, not just on the next login
+            // reply/push/stall event — see that mission's doc for why
+            // leaving `last_room_ts` RAM-only between those rarer events
+            // lets a reboot resume below a value already used with the
+            // server.
+            room_session::save_room_session(
+                nvs_partition.clone(),
+                room.hash,
+                room.session_epoch,
+                &room.session,
+            );
             log::info!(
                 "room: queued flood login for 0x{:02x} (sync_since={})",
                 room.hash, room.session.sync_since,
@@ -1883,6 +1895,16 @@ fn run() -> anyhow::Result<()> {
                 );
                 log_tx_queue_eviction(txq.enqueue(&frame[..n]), "room re-flood login");
                 room.session.record_sent_timestamp(ts);
+                // `meshcadet-room-ts-watermark-write-behind`: same
+                // write-through as the boot login above — a reflood is
+                // exactly the "route was lost" case where losing the
+                // in-RAM-only watermark to a reboot matters most.
+                room_session::save_room_session(
+                    nvs_partition.clone(),
+                    room.hash,
+                    room.session_epoch,
+                    &room.session,
+                );
                 room.last_reflood_ms = now;
                 room.reflood_attempts = room.reflood_attempts.saturating_add(1);
                 log::info!(
@@ -1983,6 +2005,19 @@ fn run() -> anyhow::Result<()> {
                         &identity.pubkey,
                     ));
                     room.session.record_sent_timestamp(ts);
+                    // `meshcadet-room-ts-watermark-write-behind`: this is
+                    // the routine cadence — the ONE call site that used to
+                    // leave `last_room_ts` unpersisted for an entire healthy
+                    // room's remaining uptime (login reply, inbound push,
+                    // and stall-invalidation are all rarer than every
+                    // keep-alive). Same write-through as the two login send
+                    // sites above.
+                    room_session::save_room_session(
+                        nvs_partition.clone(),
+                        room.hash,
+                        room.session_epoch,
+                        &room.session,
+                    );
                     room.resync_pending = false;
                     log::info!(
                         "room: TX route-direct keep-alive for 0x{:02x} (ts={}, force_since={})",
