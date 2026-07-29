@@ -1354,23 +1354,51 @@ impl RoomSyncPhase {
     /// the full 5 minutes despite the system already knowing, within one
     /// ~30s relearn cycle, that its closer is stuck.
     ///
-    /// Deliberately sets a flag rather than force-closing the window
-    /// outright, and rather than back-dating `last_progress_ms` by
-    /// subtracting [`DRAIN_WINDOW_STALL_TIMEOUT_MS`] (which underflows to a
-    /// no-op via `saturating_sub` whenever `now_ms` is still smaller than
-    /// the timeout itself — always true soon after boot, exactly the
-    /// window this needs to cover): this type's whole contract is
-    /// "classify off session phase and a post's own arrival, never off a
-    /// bare timer or count" (see this type's own doc) — the NEXT post
-    /// received is what actually force-closes the window and fires the
-    /// aggregate (through the ordinary [`Self::on_post_received`] path,
-    /// which now also stalls immediately on this flag); a room that stays
-    /// quiet after this call stays suppressed forever, exactly as it did
-    /// before this method existed. A no-op if the window is already closed.
-    pub fn note_closer_failed(&mut self) {
-        if self.draining {
-            self.closer_failed = true;
+    /// **`meshcadet-room-post-still-no-notify-hil`'s correction:** the fix
+    /// above still deferred the actual force-close to "the NEXT post" —
+    /// fine as long as one eventually arrives, but the HIL capture that
+    /// motivates this correction sent exactly ONE post ("Test 6") and nothing
+    /// after it. That post had already been silently folded into
+    /// [`Self::drained_count`] (`RoomNotification::None`, correctly, since
+    /// the closer's failure hadn't been detected yet at the moment it
+    /// arrived) by the time this method ran a beat later — and with no
+    /// second post ever coming in to trigger [`Self::on_post_received`]'s
+    /// force-close branch, that one absorbed post sat folded into a pending
+    /// aggregate that could now never flush: badge/tone/blink lost, not
+    /// merely delayed. A backlog already known to be non-empty at the exact
+    /// moment its closer is confirmed dead has nothing left to wait for —
+    /// flush it right here instead of gambling on a "next post" that may
+    /// never come. If nothing has been absorbed yet (`drained_count == 0`),
+    /// there is nothing to flush and the prior behavior is unchanged: set
+    /// the flag and let the next post force-close through
+    /// [`Self::on_post_received`], exactly as before this correction.
+    ///
+    /// Deliberately sets a flag (in the nothing-to-flush case) rather than
+    /// back-dating `last_progress_ms` by subtracting
+    /// [`DRAIN_WINDOW_STALL_TIMEOUT_MS`] (which underflows to a no-op via
+    /// `saturating_sub` whenever `now_ms` is still smaller than the timeout
+    /// itself — always true soon after boot, exactly the window this needs
+    /// to cover). A no-op if the window is already closed.
+    pub fn note_closer_failed(&mut self) -> Option<RoomNotification> {
+        if !self.draining {
+            return None;
         }
+        self.closer_failed = true;
+        if self.drained_count == 0 {
+            // Nothing absorbed yet — nothing to announce. Leave the window
+            // open; the next post force-closes it via `on_post_received`,
+            // unchanged from before this correction.
+            return None;
+        }
+        // A backlog is already sitting folded into the pending aggregate,
+        // and the closer that was ever going to flush it is now confirmed
+        // dead: flush it now rather than deferring to a next post that may
+        // never arrive.
+        self.draining = false;
+        self.closer_failed = false;
+        let count = self.drained_count;
+        self.drained_count = 0;
+        Some(RoomNotification::Aggregate { count })
     }
 }
 
@@ -3328,11 +3356,20 @@ mod tests {
         // NEXT post force-close the window, without waiting out
         // `DRAIN_WINDOW_STALL_TIMEOUT_MS` from window-open.
         let mut phase = RoomSyncPhase::new_after_login(0);
-        // Nowhere near the stall bound yet.
-        phase.note_closer_failed();
+        // Nowhere near the stall bound yet, and nothing absorbed yet either
+        // (`drained_count == 0`) — nothing to flush immediately, so the call
+        // itself must still leave the window open; only the next post
+        // force-closes it. See `note_closer_failed_flushes_an_already_
+        // absorbed_backlog_immediately` for the `drained_count > 0` case.
+        assert_eq!(
+            phase.note_closer_failed(),
+            None,
+            "nothing has been absorbed yet — nothing to announce immediately"
+        );
         assert!(
             phase.is_draining(),
-            "the call itself must not force-close anything — only the next post does"
+            "the call itself must not force-close anything when nothing is pending — only the \
+             next post does"
         );
 
         let outcome = RoomPushOutcome {
@@ -3365,8 +3402,71 @@ mod tests {
             "nothing drained, nothing to announce"
         );
         assert!(!phase.is_draining());
-        phase.note_closer_failed();
+        assert_eq!(
+            phase.note_closer_failed(),
+            None,
+            "a window that is already closed has nothing to flush"
+        );
         assert!(!phase.is_draining(), "must not reopen a closed window");
+    }
+
+    /// `meshcadet-room-post-still-no-notify-hil`'s own defect, pinned at the
+    /// classifier level: a room's HIL capture sent exactly ONE post ("Test
+    /// 6") while the drain window was open, then no further post ever
+    /// arrived. That post was correctly folded in as `RoomNotification::None`
+    /// (the closer's failure hadn't been detected yet) — but once the closer
+    /// IS confirmed dead, deferring the flush to "the next post" (the prior
+    /// mission's fix) swallows that post's notification forever, because
+    /// there is no next post in this session. `note_closer_failed` must
+    /// flush the already-absorbed backlog immediately, right at the moment
+    /// the closer is confirmed dead — with no second post required at all.
+    #[test]
+    fn note_closer_failed_flushes_an_already_absorbed_backlog_immediately() {
+        let mut phase = RoomSyncPhase::new_after_login(0);
+        let outcome = RoomPushOutcome {
+            ack_hash: [0; 4],
+            post_ts: 0,
+            entry: Some(HistoryEntry {
+                sender_hash: 0,
+                msg_type: HistoryMsgType::Dm,
+                timestamp: 0,
+                text: [0; MAX_HISTORY_TEXT_LEN],
+                text_len: 0,
+            }),
+            author_pubkey_prefix: [0; 4],
+        };
+        // The one and only post of this session, folded silently in — the
+        // closer's failure is still unknown at this point, exactly as in
+        // the HIL capture.
+        assert_eq!(
+            phase.on_push_outcome(&outcome, 500),
+            RoomNotification::None,
+            "still draining, closer not yet known to have failed: silent, correct fold-in"
+        );
+        assert!(phase.is_draining());
+
+        // The closer is now confirmed dead (main.rs's keep-alive-stall
+        // invalidation branch) — and, critically, NO further post ever
+        // arrives in this session to pick up the deferred flush.
+        assert_eq!(
+            phase.note_closer_failed(),
+            Some(RoomNotification::Aggregate { count: 1 }),
+            "a backlog already absorbed when the closer is confirmed dead must flush right here \
+             — waiting for a next post that may never arrive would swallow this notification \
+             forever, exactly as HIL observed for \"Test 6\""
+        );
+        assert!(
+            !phase.is_draining(),
+            "the immediate flush must also close the window, restoring live parity from here on"
+        );
+
+        // A no-op on a second call: nothing left to flush, and the window
+        // must not reopen.
+        assert_eq!(
+            phase.note_closer_failed(),
+            None,
+            "the window is already closed and already flushed — nothing left to announce"
+        );
     }
 
     // ── Full integration: 32-post login backlog through the real double ────
@@ -3564,21 +3664,25 @@ mod tests {
     // short-circuits the blind stall bound ──────────────────────────────────
 
     /// `meshcadet-room-post-no-notification`'s own defect, reproduced end to
-    /// end and proven fixed. HIL signature: a room whose flood-routed LOGIN
-    /// keeps succeeding (repeated `login complete` logs on every relearn)
-    /// while its route-direct KEEP-ALIVE never gets ACKed cycles through
-    /// [`RoomKeepAliveStall`]'s `KEEP_ALIVE_STALL_THRESHOLD`-consecutive-miss
-    /// invalidation over and over — and because `sync_phase` never once
-    /// hears a keep-alive ACK, its `DRAIN_WINDOW_STALL_TIMEOUT_MS` clock has
-    /// no idea anything is wrong. Before this mission's fix, a post landing
-    /// long before that 5-minute bound elapsed still got silently folded
-    /// (`RoomNotification::None`) even with definitive, repeated proof in
-    /// hand that the closer was never going to arrive. After the fix
-    /// (`RoomSyncPhase::note_closer_failed`, wired at the exact point
-    /// `main.rs`'s scheduler detects the invalidation), the very next post
-    /// after that invalidation fires the notification surface instead —
-    /// this test asserts that consequence, not just the classifier's return
-    /// value in isolation (this mission's own explicit ask).
+    /// end and proven fixed, THEN carried forward through
+    /// `meshcadet-room-post-still-no-notify-hil`'s correction. HIL signature:
+    /// a room whose flood-routed LOGIN keeps succeeding (repeated `login
+    /// complete` logs on every relearn) while its route-direct KEEP-ALIVE
+    /// never gets ACKed cycles through [`RoomKeepAliveStall`]'s
+    /// `KEEP_ALIVE_STALL_THRESHOLD`-consecutive-miss invalidation over and
+    /// over — and because `sync_phase` never once hears a keep-alive ACK,
+    /// its `DRAIN_WINDOW_STALL_TIMEOUT_MS` clock has no idea anything is
+    /// wrong. A post landing long before that 5-minute bound elapsed still
+    /// got silently folded (`RoomNotification::None`) even with definitive,
+    /// repeated proof in hand that the closer was never going to arrive.
+    /// `note_closer_failed` (wired at the exact point `main.rs`'s scheduler
+    /// detects the invalidation) now flushes that already-absorbed post
+    /// immediately, right at invalidation time — not deferred to a next
+    /// post, which is what a follow-on HIL capture caught still swallowing a
+    /// lone "Test 6" post that had no successor. The relearn/resumed-
+    /// keep-alive/second-post tail below then proves the window really did
+    /// close: the second post gets full LIVE parity, not folded into a
+    /// second aggregate.
     #[test]
     fn keep_alive_invalidation_short_circuits_the_blind_stall_bound() {
         let (client, server) = make_pair();
@@ -3633,11 +3737,19 @@ mod tests {
         );
 
         // `main.rs`'s exact call site: the moment invalidation fires, feed
-        // it into the drain window too.
-        phase.note_closer_failed();
+        // it into the drain window too. A post is already sitting absorbed
+        // (`drained_count == 1`) at this exact moment, so the flush must
+        // fire right here — not deferred to a next post that, in the HIL
+        // capture this correction targets, never arrived at all.
+        assert_eq!(
+            phase.note_closer_failed(),
+            Some(RoomNotification::Aggregate { count: 1 }),
+            "a backlog already absorbed when the closer is confirmed dead must flush \
+             immediately, not wait on a next post that may never come"
+        );
         assert!(
-            phase.is_draining(),
-            "the window itself is not force-closed yet — only the NEXT post closes it"
+            !phase.is_draining(),
+            "the immediate flush must also close the window"
         );
 
         // Login keeps succeeding on relearn (this defect's whole HIL
@@ -3671,10 +3783,10 @@ mod tests {
             .expect("the resumed keep-alive must be accepted");
         decode_keep_alive_ack(&ka_ack).expect("resumed keep-alive ACK must decode");
 
-        // The very next post — far short of `DRAIN_WINDOW_STALL_TIMEOUT_MS`
-        // since window-open — must now fire the notification surface, not
-        // sit silently folded waiting out a bound with no idea the closer
-        // just proved itself dead.
+        // The window is already closed (flushed immediately above) — a
+        // further post now gets full LIVE parity, exactly like the channel
+        // path, proving the close genuinely took rather than merely
+        // suppressing the notification.
         double.seed_post(&other_author.pubkey, 2001, b"second, after invalidation");
         let mut wire2 = [0u8; 256];
         let n2 = double
@@ -3684,16 +3796,12 @@ mod tests {
             .expect("push must decode");
         assert_eq!(
             phase.on_push_outcome(&outcome2, 10_200),
-            RoomNotification::Aggregate { count: 2 },
-            "closer-failure evidence must fire the notification well before the blind \
-             5-minute stall bound would have — this is the consequence this mission's fix \
-             restores, not just a classifier return value in isolation"
+            RoomNotification::Live,
+            "the window closed at invalidation time already fired its one aggregate for the \
+             absorbed backlog — every post from here on gets full live parity, not a second \
+             aggregate"
         );
         assert!(!phase.is_draining());
-        // 10_200ms is nowhere near `DRAIN_WINDOW_STALL_TIMEOUT_MS`
-        // (300_000ms) measured from window-open (0) — the assertion above
-        // only passes because of the short-circuit, not a coincidental
-        // timeout.
     }
 
     // ── Full integration: a genuinely live post is never hash-filtered ──────
