@@ -438,7 +438,8 @@ pub fn room_tx_timestamp(trusted_wall_clock_secs: Option<u32>, last_room_ts: u32
 // (`firmware::room_session::delete_room_session`) on the OTHER thread, but
 // `main.rs`'s dispatcher loop built its `RoomRuntime` for this room ONCE at
 // boot and keeps re-persisting that room's in-memory `session` on every
-// login reply / inbound push / stall-invalidation
+// login/reflood/keep-alive send, login reply, inbound push, and
+// stall-invalidation
 // (`firmware::room_session::save_room_session`'s call sites). Left alone,
 // the very next one of those re-persists resurrects the blob the erase just
 // removed — the eraser and the resurrector are racing with no cross-thread

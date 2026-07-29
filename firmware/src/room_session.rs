@@ -36,8 +36,10 @@
 //! `admin_server`'s `ADD_ROOM`/`DEL_ROOM` arms call [`delete_room_session`]
 //! on their own thread, but `main.rs`'s dispatcher loop built its
 //! `RoomRuntime` for this room once at boot and keeps calling
-//! [`save_room_session`] for it afterward (login replies, inbound pushes,
-//! stall invalidation) — with no cross-thread channel telling that loop an
+//! [`save_room_session`] for it afterward — every login/reflood/keep-alive
+//! send that advances `last_room_ts` (`meshcadet-room-ts-watermark-write-
+//! behind`), plus login replies, inbound pushes, and stall invalidation —
+//! with no cross-thread channel telling that loop an
 //! erase just happened. Left alone, the next one of those saves resurrects
 //! the very blob the erase just removed. The `x{:02x}` epoch closes that:
 //! [`delete_room_session`] bumps it every time it runs; `RoomRuntime`
