@@ -1339,6 +1339,15 @@ fn run() -> anyhow::Result<()> {
     // `room_session::trusted_wall_clock_secs` (GPS always wins while
     // synced — see that function's doc).
     //
+    // Staying global is safe DESPITE the value flowing into every room's own
+    // `room_tx_timestamp` (`meshcadet-room-clock-plausibility-bounds`,
+    // Finding C): `adopt_server_clock` refuses any `server_ts`/`post_ts` at
+    // or above `room_session::ROOM_CLOCK_PLAUSIBILITY_CEILING_SECS` before it
+    // can ever become this shared clock, so one misconfigured or hostile
+    // room server can no longer ratchet every OTHER, correctly-clocked
+    // room's persisted `last_room_ts` (and so burn their replay ceilings) by
+    // handing this device an implausible reading.
+    //
     // Deliberately NOT `#[cfg(not(feature = "hil"))]`, unlike most other
     // room state: `on_receive` below threads it through unconditionally
     // (same shape as `room_runtime`/`nvs_partition`, both already compiled
