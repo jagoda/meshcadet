@@ -173,6 +173,92 @@ pub fn check(repo_root: &Path) -> Vec<String> {
     }
 }
 
+/// Marker for `main.rs`'s OTHER call site of `RoomSyncPhase::
+/// note_closer_failed` — the keep-alive-stall-invalidation branch inside the
+/// room keep-alive scheduler. Unlike `handle_room_push_frame`'s call site
+/// (scanned by [`check_source`] above), this one carries no post of its own;
+/// `meshcadet-room-post-still-no-notify-hil` taught `note_closer_failed`
+/// itself to return `Some(Aggregate { count })` directly whenever a backlog
+/// was already silently absorbed at the moment the closer is confirmed
+/// dead — a HIL capture ("Test 6") proved the alternative (deferring the
+/// flush to a next post that never arrived) swallows the notification
+/// forever, not merely delays it. This scanner pins that this call site's
+/// `if let Some(Aggregate)` body raises the same `UiEvent::RoomDrainComplete`
+/// [`check_source`] already pins for the per-post call site, so a future
+/// refactor of this branch can't silently drop it again.
+const CLOSER_FAILED_CALL_MARKER: &str = "note_closer_failed()";
+
+/// Scan already-read source text and return every contract violation for the
+/// [`CLOSER_FAILED_CALL_MARKER`] call site. Split from [`check_closer_failed_
+/// wiring`] so tests can drive it with synthetic sources, mirroring
+/// [`check_source`]'s own split.
+pub fn check_closer_failed_wiring_source(src: &str) -> Vec<String> {
+    let masked = tokenize(src).masked;
+    let chars: Vec<char> = masked.chars().collect();
+    let spans = brace_spans(&masked);
+
+    let call_hits = find_all(&chars, CLOSER_FAILED_CALL_MARKER);
+    let call_pos = match call_hits.len() {
+        1 => call_hits[0],
+        0 => {
+            return vec![format!(
+                "{MAIN_RS_REL_PATH}: no `{CLOSER_FAILED_CALL_MARKER}` call found — the \
+                 keep-alive-stall-invalidation call site was renamed, removed, or moved, or \
+                 this scanner needs updating"
+            )]
+        }
+        n => {
+            return vec![format!(
+                "{MAIN_RS_REL_PATH}: {n} occurrences of `{CLOSER_FAILED_CALL_MARKER}` \
+                 (expected exactly one) — this scanner cannot tell which is the call site"
+            )]
+        }
+    };
+    // Walk forward from the call (not backward from the pattern) — the
+    // `if let Some(RoomNotification::Aggregate { count })` pattern preceding
+    // this call has a brace of its own (`{ count }`) that a naive nearest-
+    // brace search could mistake for the body open; the call itself has no
+    // braces, so the first `{` found AFTER it is unambiguously the `if let`
+    // body (mirrors `check_source`'s identical `fat_arrow`-then-`{` walk).
+    let Some(body_open) = (call_pos..chars.len()).find(|&i| chars[i] == '{') else {
+        return vec![format!(
+            "{MAIN_RS_REL_PATH}: `{CLOSER_FAILED_CALL_MARKER}` has no braced `if let` body this \
+             scanner can delimit"
+        )];
+    };
+    let Some((bo, bc)) = innermost_span(&spans, body_open + 1).filter(|&(o, _)| o == body_open)
+    else {
+        return vec![format!(
+            "{MAIN_RS_REL_PATH}: could not brace-match the `{CLOSER_FAILED_CALL_MARKER}` `if \
+             let` body"
+        )];
+    };
+
+    let body = slice_chars(&masked, bo + 1, bc);
+    if body.contains(REQUIRED_EVENT) {
+        Vec::new()
+    } else {
+        vec![format!(
+            "{MAIN_RS_REL_PATH}: the `{CLOSER_FAILED_CALL_MARKER}` call site no longer raises \
+             `{REQUIRED_EVENT}` when it returns `Some(Aggregate)` — this reintroduces the \
+             meshcadet-room-post-still-no-notify-hil defect: a backlog already absorbed when \
+             the closer is confirmed dead is flushed internally (the classifier's own state \
+             flips to \"not draining\") but nobody is ever told — no badge, no tone, no blink"
+        )]
+    }
+}
+
+/// Read `firmware/src/main.rs` under `repo_root` and return every contract
+/// violation for the [`CLOSER_FAILED_CALL_MARKER`] call site. Empty vec ==
+/// the contract holds.
+pub fn check_closer_failed_wiring(repo_root: &Path) -> Vec<String> {
+    let path = repo_root.join(MAIN_RS_REL_PATH);
+    match fs::read_to_string(&path) {
+        Ok(src) => check_closer_failed_wiring_source(&src),
+        Err(e) => vec![format!("reading {}: {e}", path.display())],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,6 +372,101 @@ mod tests {
             }
         "#;
         let violations = check_source(synthetic);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("no longer raises `UiEvent::RoomDrainComplete`")),
+            "a comment-only mention must not satisfy the guard: {violations:?}"
+        );
+    }
+
+    // ── `note_closer_failed()`'s OWN call site (the keep-alive-stall-
+    // invalidation branch, no post of its own) ─────────────────────────────
+
+    /// The actual guard: the shipped `firmware/src/main.rs` raises
+    /// `UiEvent::RoomDrainComplete` from the `note_closer_failed()` call
+    /// site's `if let Some(Aggregate)` body too.
+    #[test]
+    fn closer_failed_wiring_holds() {
+        let violations = check_closer_failed_wiring(&crate::repo_root_from_manifest_dir());
+        assert!(
+            violations.is_empty(),
+            "closer-failed aggregate-notification wiring violated:\n  - {}",
+            violations.join("\n  - ")
+        );
+    }
+
+    const CLOSER_FAILED_WIRED_BASELINE: &str = r#"
+        fn main() {
+            if let Some(RoomNotification::Aggregate { count }) =
+                room.sync_phase.note_closer_failed()
+            {
+                if let Some(ref mut ui) = ui_opt {
+                    ui.post_event(UiEvent::RoomDrainComplete {
+                        room_hash: room.hash,
+                        count,
+                    });
+                }
+            }
+        }
+    "#;
+
+    #[test]
+    fn synthetic_closer_failed_wired_baseline_is_clean() {
+        assert!(
+            check_closer_failed_wiring_source(CLOSER_FAILED_WIRED_BASELINE).is_empty(),
+            "{:?}",
+            check_closer_failed_wiring_source(CLOSER_FAILED_WIRED_BASELINE)
+        );
+    }
+
+    /// Models the exact regression this guard exists to catch: the call
+    /// happens, the classifier correctly flips state, and nobody is told.
+    #[test]
+    fn synthetic_closer_failed_no_op_body_is_caught() {
+        let synthetic = r#"
+            fn main() {
+                if let Some(RoomNotification::Aggregate { count }) =
+                    room.sync_phase.note_closer_failed()
+                {
+                    // Never wired to the UI — the regression this scanner exists to catch.
+                }
+            }
+        "#;
+        let violations = check_closer_failed_wiring_source(synthetic);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("no longer raises `UiEvent::RoomDrainComplete`")),
+            "a no-op closer-failed body must be caught: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn closer_failed_missing_call_is_a_violation_not_a_silent_pass() {
+        let violations = check_closer_failed_wiring_source("fn main() {}");
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("no `note_closer_failed()` call found")),
+            "{violations:?}"
+        );
+    }
+
+    /// A comment mentioning the required event must not be mistaken for the
+    /// real call.
+    #[test]
+    fn closer_failed_comment_mentions_are_not_counted() {
+        let synthetic = r#"
+            fn main() {
+                if let Some(RoomNotification::Aggregate { count }) =
+                    room.sync_phase.note_closer_failed()
+                {
+                    // TODO: raise UiEvent::RoomDrainComplete here.
+                }
+            }
+        "#;
+        let violations = check_closer_failed_wiring_source(synthetic);
         assert!(
             violations
                 .iter()
