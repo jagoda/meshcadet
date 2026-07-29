@@ -2170,7 +2170,10 @@ mod tests {
         let mut blob = [0u8; PERSISTED_ROOM_SESSION_LEN];
         let n = encode_persisted_room_session(&state, &mut blob);
         let decoded = decode_persisted_room_session(&blob[..n]).unwrap();
-        assert_eq!(decoded.last_room_ts, ROOM_CLOCK_PLAUSIBILITY_CEILING_SECS - 1);
+        assert_eq!(
+            decoded.last_room_ts,
+            ROOM_CLOCK_PLAUSIBILITY_CEILING_SECS - 1
+        );
     }
 
     #[test]
@@ -2369,12 +2372,7 @@ mod tests {
         // (or hostile) room server must not be able to poison the ONE clock
         // every OTHER room's `record_sent_timestamp` ratchets off of.
         let now_ms = 0;
-        let refused = adopt_server_clock(
-            None,
-            false,
-            now_ms,
-            ROOM_CLOCK_PLAUSIBILITY_CEILING_SECS,
-        );
+        let refused = adopt_server_clock(None, false, now_ms, ROOM_CLOCK_PLAUSIBILITY_CEILING_SECS);
         assert_eq!(
             refused, None,
             "a far-future server_ts at the ceiling must not be adopted"
@@ -2411,8 +2409,12 @@ mod tests {
             .expect("a plausible first reading must adopt");
 
         let later_ms = 5_000;
-        let still_the_same =
-            adopt_server_clock(Some(clock), false, later_ms, ROOM_CLOCK_PLAUSIBILITY_CEILING_SECS);
+        let still_the_same = adopt_server_clock(
+            Some(clock),
+            false,
+            later_ms,
+            ROOM_CLOCK_PLAUSIBILITY_CEILING_SECS,
+        );
         assert_eq!(
             still_the_same,
             Some(clock),
