@@ -951,26 +951,70 @@ pub enum RoomNotification {
 
 /// Per-room session-phase tracker driving Phase D's notification
 /// classification — **by session phase, not post count or a timer** (the
-/// Objective's own non-negotiable: a count/timer heuristic misclassifies a
-/// live post that arrives during a slow drain). A sync-drain window opens
-/// the moment a room session starts (a fresh boot always needs to reconfirm
-/// whether backlog remains) and closes only when a keep-alive ACK's
-/// unsynced-count byte reports `0` — never on a post count reaching some
-/// threshold, never on a wall-clock timer.
+/// parent Objective's own non-negotiable: a count/timer heuristic
+/// misclassifies a live post that arrives during a slow-but-progressing
+/// drain). A sync-drain window opens the moment a room session starts (a
+/// fresh boot always needs to reconfirm whether backlog remains) and closes
+/// only when a keep-alive ACK's unsynced-count byte reports `0` — never on a
+/// post count reaching some threshold.
+///
+/// **`meshcadet-room-drain-window-never-closes-no-notify`'s correction:**
+/// the window's *normal* closer is still purely phase-driven, exactly as
+/// above — but that closer is a keep-alive ACK, and a keep-alive is only
+/// ever SENT once this client has a learned `out_path` (route-direct is a
+/// hard prerequisite — see [`encode_room_keep_alive_frame`]'s doc). A room
+/// whose login round-trip never completes (the server's PATH-return reply
+/// never lands — HIL capture, 2026-07-29: `out_path` still unlearned after
+/// repeated re-flood attempts, tens of seconds apart, with posts still
+/// arriving the whole time) never sends a single keep-alive, so the ONLY
+/// event that can ever close the window never happens — the window is open
+/// forever, not "bounded, seconds-scale" as `meshcadet-room-notification-
+/// parity` assumed. [`DRAIN_WINDOW_STALL_TIMEOUT_MS`] is the escape hatch:
+/// an elapsed-time bound checked ONLY against the time since the window
+/// opened or last showed genuine evidence the closing round-trip is alive (a
+/// keep-alive ACK — [`Self::on_keep_alive_ack`] — with ANY unsynced_count,
+/// not just `0`). A post landing while the bound is exceeded force-closes
+/// the window right there, folding itself into the flushed aggregate —
+/// this is deliberately NOT the same thing the parent's non-negotiable
+/// forbade: that was about misclassifying a post during backlog that IS
+/// draining (evidenced by keep-alive round-trips actually happening, however
+/// slowly); a keep-alive ACK — of any count — keeps resetting the bound, so
+/// a legitimately large, legitimately slow backlog is never force-closed as
+/// long as its closing mechanism is provably still alive. Only a round-trip
+/// that never even starts trips this.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RoomSyncPhase {
     draining: bool,
     drained_count: u32,
+    /// `uptime_ms()`-scale timestamp of window-open, or of the most recent
+    /// keep-alive ACK (any unsynced_count) — the last moment the window's
+    /// closing round-trip was proven alive. See this type's doc.
+    last_progress_ms: u64,
 }
+
+/// How long [`RoomSyncPhase`] tolerates a drain window with zero evidence
+/// its closing round-trip (a keep-alive ACK) is alive before force-closing
+/// it on the next post, rather than absorbing posts into a pending aggregate
+/// that may now never flush. Deliberately on the same scale as this
+/// firmware's other "give the reconnect machinery a real chance, then stop
+/// waiting" bounds — `ROOM_KEEP_ALIVE_INTERVAL_MS` (the routine cadence) and
+/// `ROOM_REFLOOD_BACKOFF_CEILING_MS` both top out at 5 minutes; by then a
+/// login round-trip that was ever going to complete on its own almost
+/// certainly already has (many re-flood attempts, at the tight draining
+/// cadence, will have gone out).
+pub const DRAIN_WINDOW_STALL_TIMEOUT_MS: u64 = 300_000;
 
 impl RoomSyncPhase {
     /// A fresh room session, right after login: the drain window starts
     /// open — the client cannot yet know whether it has any backlog until a
-    /// keep-alive ACK confirms zero.
-    pub const fn new_after_login() -> Self {
+    /// keep-alive ACK confirms zero. `now_ms` seeds [`Self::last_progress_ms`]
+    /// so [`DRAIN_WINDOW_STALL_TIMEOUT_MS`] is measured from window-open, not
+    /// from some caller-independent epoch.
+    pub const fn new_after_login(now_ms: u64) -> Self {
         Self {
             draining: true,
             drained_count: 0,
+            last_progress_ms: now_ms,
         }
     }
 
@@ -982,13 +1026,22 @@ impl RoomSyncPhase {
     /// Classify one genuinely-new incoming post (a dedup HIT must never
     /// reach this — see [`Self::on_push_outcome`], the call site this exists
     /// to keep in lockstep with dedup).
-    fn on_post_received(&mut self) -> RoomNotification {
-        if self.draining {
-            self.drained_count += 1;
-            RoomNotification::None
-        } else {
-            RoomNotification::Live
+    fn on_post_received(&mut self, now_ms: u64) -> RoomNotification {
+        if !self.draining {
+            return RoomNotification::Live;
         }
+        if now_ms.saturating_sub(self.last_progress_ms) >= DRAIN_WINDOW_STALL_TIMEOUT_MS {
+            // The closing round-trip has shown no sign of life for the
+            // whole stall timeout: stop waiting for it. Force-close right
+            // here, folding THIS post into the aggregate that finally
+            // flushes — see this type's doc.
+            self.draining = false;
+            let count = self.drained_count.saturating_add(1);
+            self.drained_count = 0;
+            return RoomNotification::Aggregate { count };
+        }
+        self.drained_count += 1;
+        RoomNotification::None
     }
 
     /// The single call site a caller's push handler should use: feeds a
@@ -998,12 +1051,13 @@ impl RoomSyncPhase {
     /// is not counted or classified at all: it must still be ACKed
     /// unconditionally (`handle_room_push`'s doc), but it must never inflate
     /// the drain aggregate's count or fire a live notification — a re-drain
-    /// after reboot must not duplicate history OR re-notify.
-    pub fn on_push_outcome(&mut self, outcome: &RoomPushOutcome) -> RoomNotification {
+    /// after reboot must not duplicate history OR re-notify. `now_ms` is
+    /// this call's `uptime_ms()`-scale timestamp — see [`Self::on_post_received`].
+    pub fn on_push_outcome(&mut self, outcome: &RoomPushOutcome, now_ms: u64) -> RoomNotification {
         if outcome.entry.is_none() {
             return RoomNotification::None;
         }
-        self.on_post_received()
+        self.on_post_received(now_ms)
     }
 
     /// Feed a keep-alive ACK's unsynced-count byte in. If the drain window
@@ -1011,9 +1065,21 @@ impl RoomSyncPhase {
     /// aggregate notification to fire — `None` if either the window was
     /// already closed, the count is still nonzero (still draining, however
     /// slowly), or the window closed with nothing actually drained (nothing
-    /// to announce).
-    pub fn on_keep_alive_ack(&mut self, unsynced_count: u8) -> Option<RoomNotification> {
-        if !self.draining || unsynced_count != 0 {
+    /// to announce). Any ACK received while still draining — regardless of
+    /// `unsynced_count` — is proof the closing round-trip is alive, so it
+    /// always resets [`DRAIN_WINDOW_STALL_TIMEOUT_MS`]'s clock
+    /// (`last_progress_ms = now_ms`), even on the `unsynced_count != 0`
+    /// branch that otherwise returns `None`.
+    pub fn on_keep_alive_ack(
+        &mut self,
+        unsynced_count: u8,
+        now_ms: u64,
+    ) -> Option<RoomNotification> {
+        if !self.draining {
+            return None;
+        }
+        self.last_progress_ms = now_ms;
+        if unsynced_count != 0 {
             return None;
         }
         self.draining = false;
@@ -2543,7 +2609,7 @@ mod tests {
 
     #[test]
     fn drain_of_32_posts_yields_exactly_one_aggregate_of_32() {
-        let mut phase = RoomSyncPhase::new_after_login();
+        let mut phase = RoomSyncPhase::new_after_login(0);
         for _ in 0..32 {
             let outcome = RoomPushOutcome {
                 ack_hash: [0; 4],
@@ -2557,22 +2623,22 @@ mod tests {
                 }),
                 author_pubkey_prefix: [0; 4],
             };
-            assert_eq!(phase.on_push_outcome(&outcome), RoomNotification::None);
+            assert_eq!(phase.on_push_outcome(&outcome, 0), RoomNotification::None);
         }
         assert_eq!(
-            phase.on_keep_alive_ack(0),
+            phase.on_keep_alive_ack(0, 0),
             Some(RoomNotification::Aggregate { count: 32 })
         );
         // Idempotent: a second unsynced=0 report with nothing new drained
         // fires nothing (the window is already closed).
-        assert_eq!(phase.on_keep_alive_ack(0), None);
+        assert_eq!(phase.on_keep_alive_ack(0, 0), None);
     }
 
     #[test]
     fn live_post_after_drain_closes_gets_full_parity() {
-        let mut phase = RoomSyncPhase::new_after_login();
+        let mut phase = RoomSyncPhase::new_after_login(0);
         assert_eq!(
-            phase.on_keep_alive_ack(0),
+            phase.on_keep_alive_ack(0, 0),
             None,
             "nothing drained: no aggregate"
         );
@@ -2590,7 +2656,7 @@ mod tests {
             }),
             author_pubkey_prefix: [0; 4],
         };
-        assert_eq!(phase.on_push_outcome(&outcome), RoomNotification::Live);
+        assert_eq!(phase.on_push_outcome(&outcome, 0), RoomNotification::Live);
     }
 
     #[test]
@@ -2600,8 +2666,10 @@ mod tests {
         // before this) while the drain window is still legitimately open
         // (no keep-alive has yet reported unsynced=0) — every single one
         // must still classify as None (folded into the eventual aggregate),
-        // never as a standalone Live notification.
-        let mut phase = RoomSyncPhase::new_after_login();
+        // never as a standalone Live notification. All well inside
+        // `DRAIN_WINDOW_STALL_TIMEOUT_MS`, so the stall escape hatch must
+        // not fire either.
+        let mut phase = RoomSyncPhase::new_after_login(0);
         let fresh_entry = || RoomPushOutcome {
             ack_hash: [0; 4],
             post_ts: 0,
@@ -2614,9 +2682,9 @@ mod tests {
             }),
             author_pubkey_prefix: [0; 4],
         };
-        for _ in 0..40 {
+        for i in 0..40 {
             assert_eq!(
-                phase.on_push_outcome(&fresh_entry()),
+                phase.on_push_outcome(&fresh_entry(), i * 1_000),
                 RoomNotification::None
             );
         }
@@ -2625,7 +2693,7 @@ mod tests {
             "40 posts in is still no reason to leave the drain phase — only a keep-alive ACK can"
         );
         assert_eq!(
-            phase.on_keep_alive_ack(0),
+            phase.on_keep_alive_ack(0, 40_000),
             Some(RoomNotification::Aggregate { count: 40 })
         );
     }
@@ -2635,28 +2703,132 @@ mod tests {
         // A replayed push (`entry: None`) must not inflate the drain
         // aggregate's count, and must not itself fire a notification —
         // a re-drain after reboot must not duplicate history OR re-notify.
-        let mut phase = RoomSyncPhase::new_after_login();
+        let mut phase = RoomSyncPhase::new_after_login(0);
         let dup = RoomPushOutcome {
             ack_hash: [0; 4],
             post_ts: 0,
             entry: None,
             author_pubkey_prefix: [0; 4],
         };
-        assert_eq!(phase.on_push_outcome(&dup), RoomNotification::None);
+        assert_eq!(phase.on_push_outcome(&dup, 0), RoomNotification::None);
         // Nothing was actually drained — closing the window now fires no
         // aggregate at all (count is 0).
-        assert_eq!(phase.on_keep_alive_ack(0), None);
+        assert_eq!(phase.on_keep_alive_ack(0, 0), None);
     }
 
     #[test]
     fn keep_alive_ack_with_nonzero_unsynced_count_keeps_draining() {
-        let mut phase = RoomSyncPhase::new_after_login();
+        let mut phase = RoomSyncPhase::new_after_login(0);
         assert_eq!(
-            phase.on_keep_alive_ack(5),
+            phase.on_keep_alive_ack(5, 0),
             None,
             "still draining: not yet 0"
         );
         assert!(phase.is_draining());
+    }
+
+    #[test]
+    fn keep_alive_ack_with_nonzero_count_resets_the_stall_clock() {
+        // A slow-but-genuinely-progressing drain: a keep-alive round-trip
+        // DOES complete, just with backlog still outstanding. That ACK must
+        // reset `DRAIN_WINDOW_STALL_TIMEOUT_MS`'s clock, so a post arriving
+        // just past the ORIGINAL window-open time — but well within the
+        // timeout measured from this fresh ACK — must still be silently
+        // folded, not force-closed.
+        let mut phase = RoomSyncPhase::new_after_login(0);
+        assert_eq!(
+            phase.on_keep_alive_ack(3, DRAIN_WINDOW_STALL_TIMEOUT_MS - 1),
+            None
+        );
+        assert!(phase.is_draining());
+
+        let outcome = RoomPushOutcome {
+            ack_hash: [0; 4],
+            post_ts: 0,
+            entry: Some(HistoryEntry {
+                sender_hash: 0,
+                msg_type: HistoryMsgType::Dm,
+                timestamp: 0,
+                text: [0; MAX_HISTORY_TEXT_LEN],
+                text_len: 0,
+            }),
+            author_pubkey_prefix: [0; 4],
+        };
+        assert_eq!(
+            phase.on_push_outcome(&outcome, DRAIN_WINDOW_STALL_TIMEOUT_MS + 1),
+            RoomNotification::None,
+            "the nonzero-count ACK reset the stall clock — this post is only 2ms past it, not \
+             past a fresh full timeout"
+        );
+    }
+
+    #[test]
+    fn post_after_stall_timeout_with_no_keep_alive_evidence_force_closes_and_notifies() {
+        // This mission's own defect, in miniature: the window's only normal
+        // closer (a keep-alive ACK) never arrives at all — modelling the HIL
+        // capture's `out_path` that never gets learned, so no keep-alive is
+        // ever even sent. A post landing once `DRAIN_WINDOW_STALL_TIMEOUT_MS`
+        // has elapsed since window-open, with zero keep-alive evidence in
+        // between, must force-close the window and notify for the whole
+        // backlog absorbed — not silently append forever.
+        let mut phase = RoomSyncPhase::new_after_login(0);
+        let entry = || {
+            Some(HistoryEntry {
+                sender_hash: 0,
+                msg_type: HistoryMsgType::Dm,
+                timestamp: 0,
+                text: [0; MAX_HISTORY_TEXT_LEN],
+                text_len: 0,
+            })
+        };
+
+        assert_eq!(
+            phase.on_push_outcome(
+                &RoomPushOutcome {
+                    ack_hash: [0; 4],
+                    post_ts: 0,
+                    entry: entry(),
+                    author_pubkey_prefix: [0; 4],
+                },
+                1_000,
+            ),
+            RoomNotification::None,
+            "well within the stall timeout: ordinary silent drain behaviour"
+        );
+
+        assert_eq!(
+            phase.on_push_outcome(
+                &RoomPushOutcome {
+                    ack_hash: [0; 4],
+                    post_ts: 0,
+                    entry: entry(),
+                    author_pubkey_prefix: [0; 4],
+                },
+                DRAIN_WINDOW_STALL_TIMEOUT_MS,
+            ),
+            RoomNotification::Aggregate { count: 2 },
+            "the round-trip that was supposed to close this window never completed — the stall \
+             timeout must force it closed and fire the notification surface for the whole \
+             backlog absorbed, not leave it appended with no badge/tone/blink forever"
+        );
+        assert!(
+            !phase.is_draining(),
+            "the forced close must leave the window closed, not reopen it"
+        );
+
+        assert_eq!(
+            phase.on_push_outcome(
+                &RoomPushOutcome {
+                    ack_hash: [0; 4],
+                    post_ts: 0,
+                    entry: entry(),
+                    author_pubkey_prefix: [0; 4],
+                },
+                DRAIN_WINDOW_STALL_TIMEOUT_MS + 5_000,
+            ),
+            RoomNotification::Live,
+            "after the forced close, every subsequent post gets full live parity"
+        );
     }
 
     // ── Full integration: 32-post login backlog through the real double ────
@@ -2686,7 +2858,7 @@ mod tests {
         let shared = client.ecdh_shared_secret(&server.pubkey);
         let conv_hash = server.pub_hash();
         let mut history: Vec<HistoryEntry> = Vec::new();
-        let mut phase = RoomSyncPhase::new_after_login();
+        let mut phase = RoomSyncPhase::new_after_login(0);
 
         loop {
             let mut wire = [0u8; 256];
@@ -2697,7 +2869,7 @@ mod tests {
                 handle_room_push(&shared, &wire[..n], &client.pubkey, conv_hash, &history)
                     .expect("push must decode");
             assert_eq!(
-                phase.on_push_outcome(&outcome),
+                phase.on_push_outcome(&outcome, 0),
                 RoomNotification::None,
                 "every post in the initial drain must be suppressed, not individually notified"
             );
@@ -2729,9 +2901,124 @@ mod tests {
         let unsynced = decode_keep_alive_ack(&ka_ack).unwrap().unsynced_count;
         assert_eq!(unsynced, 0, "everything was drained: nothing left unsynced");
         assert_eq!(
-            phase.on_keep_alive_ack(unsynced),
+            phase.on_keep_alive_ack(unsynced, 9_000),
             Some(RoomNotification::Aggregate { count: 32 }),
             "closing the drain window fires exactly ONE aggregate notification for all 32"
+        );
+    }
+
+    // ── Full integration: this mission's own defect, through the double ────
+
+    /// This mission's Acceptance bullet 1, end to end through the real wire
+    /// pipeline, in the manner of
+    /// `live_post_after_drain_through_the_double_is_never_filtered_by_room_hash`
+    /// above: a room post arrives while the drain window is open and the
+    /// keep-alive round-trip NEVER completes (the double never sees a
+    /// `handle_keep_alive` call for this session at all — modelling the HIL
+    /// capture's `out_path` that never gets learned, so no keep-alive is
+    /// ever even sent) — the post must still fire the notification surface
+    /// (badge + tone + blink) once `DRAIN_WINDOW_STALL_TIMEOUT_MS` elapses,
+    /// not sit silently appended forever.
+    #[test]
+    fn post_after_stall_timeout_through_the_double_fires_the_notification_surface() {
+        let (client, server) = make_pair();
+        let other_author = Identity::from_seed([0xB0u8; 32]);
+        let mut double = RoomServerDouble::new(server.clone(), b"admin-pw", b"guest-pw", false);
+        login_direct(&mut double, &client, &server, b"guest-pw", 1000);
+
+        let shared = client.ecdh_shared_secret(&server.pubkey);
+        let conv_hash = server.pub_hash();
+        let mut phase = RoomSyncPhase::new_after_login(0);
+        let mut history: Vec<HistoryEntry> = Vec::new();
+
+        #[allow(clippy::too_many_arguments)]
+        fn push_and_classify(
+            double: &mut RoomServerDouble,
+            client: &Identity,
+            author: &Identity,
+            shared: &[u8; 32],
+            conv_hash: u8,
+            phase: &mut RoomSyncPhase,
+            history: &mut Vec<HistoryEntry>,
+            ts: u32,
+            text: &[u8],
+            now_ms: u64,
+        ) -> RoomNotification {
+            double.seed_post(&author.pubkey, ts, text);
+            let mut wire = [0u8; 256];
+            let n = double
+                .push_next(&client.pubkey, &mut wire)
+                .expect("the seeded post must be deliverable");
+            let outcome = handle_room_push(shared, &wire[..n], &client.pubkey, conv_hash, history)
+                .expect("push must decode");
+            let notification = phase.on_push_outcome(&outcome, now_ms);
+            history.push(outcome.entry.expect("a fresh push must produce an entry"));
+            assert!(double.handle_ack(&client.pubkey, &outcome.ack_hash));
+            notification
+        }
+
+        // First post: well inside the stall timeout, no keep-alive round-trip
+        // has had a real chance to run yet — ordinary silent drain.
+        assert_eq!(
+            push_and_classify(
+                &mut double,
+                &client,
+                &other_author,
+                &shared,
+                conv_hash,
+                &mut phase,
+                &mut history,
+                2000,
+                b"first, still draining",
+                1_000,
+            ),
+            RoomNotification::None,
+            "well within the stall timeout: still silently folded into the pending aggregate"
+        );
+        assert!(phase.is_draining());
+
+        // No keep-alive is EVER exchanged over this session — `double` never
+        // receives a `handle_keep_alive` call, exactly like a room whose
+        // login round-trip never completes. A second post lands once the
+        // full stall timeout has elapsed since window-open with zero
+        // evidence of life in between.
+        assert_eq!(
+            push_and_classify(
+                &mut double,
+                &client,
+                &other_author,
+                &shared,
+                conv_hash,
+                &mut phase,
+                &mut history,
+                2001,
+                b"second, stall timeout elapsed",
+                DRAIN_WINDOW_STALL_TIMEOUT_MS,
+            ),
+            RoomNotification::Aggregate { count: 2 },
+            "the round-trip that was supposed to close this window never completed — the stall \
+             timeout must force it closed and fire the notification surface for the whole \
+             backlog absorbed, not leave it silently appended with no badge/tone/blink forever"
+        );
+        assert!(!phase.is_draining());
+
+        // Every post from here on is a genuinely live one, full parity with
+        // the channel path — same as `RoomPostLive`'s contract.
+        assert_eq!(
+            push_and_classify(
+                &mut double,
+                &client,
+                &other_author,
+                &shared,
+                conv_hash,
+                &mut phase,
+                &mut history,
+                2002,
+                b"third, now live",
+                DRAIN_WINDOW_STALL_TIMEOUT_MS + 5_000,
+            ),
+            RoomNotification::Live,
+            "after the forced close, every subsequent post must get full live parity"
         );
     }
 
@@ -2762,7 +3049,7 @@ mod tests {
 
         let shared = client.ecdh_shared_secret(&server.pubkey);
         let conv_hash = server.pub_hash();
-        let mut phase = RoomSyncPhase::new_after_login();
+        let mut phase = RoomSyncPhase::new_after_login(0);
 
         // Close the drain window immediately: no backlog was seeded, so the
         // very first keep-alive reports unsynced_count == 0.
@@ -2774,7 +3061,7 @@ mod tests {
         let unsynced = decode_keep_alive_ack(&ka_ack).unwrap().unsynced_count;
         assert_eq!(unsynced, 0, "nothing was ever seeded — no backlog to drain");
         assert_eq!(
-            phase.on_keep_alive_ack(unsynced),
+            phase.on_keep_alive_ack(unsynced, 0),
             None,
             "closing an empty drain window announces nothing (count == 0)"
         );
@@ -2791,7 +3078,7 @@ mod tests {
         let outcome = handle_room_push(&shared, &wire[..n], &client.pubkey, conv_hash, &history)
             .expect("push must decode");
         assert_eq!(
-            phase.on_push_outcome(&outcome),
+            phase.on_push_outcome(&outcome, 0),
             RoomNotification::Live,
             "channel_hash 0x{:02x} (server_seed 0x{server_seed:02x}): a live post after the \
              drain window closed must get full notification parity with a channel message, not \
