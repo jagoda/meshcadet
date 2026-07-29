@@ -31,6 +31,11 @@
 //!   `firmware/src/main.rs`, enumerated by shape rather than a fixed list,
 //!   is followed by a `save_room_session` for that same room (see
 //!   `xtask::room_watermark_persist`'s doc).
+//! - **verify-room-drain-window-periodic-reeval** — the room keep-alive
+//!   scheduler's periodic, event-independent drain-window re-evaluation
+//!   (`RoomSyncPhase::on_scheduler_tick`) is wired in unconditionally, before
+//!   the re-flood branch, and raises `UiEvent::RoomDrainComplete` on a
+//!   force-close (see `xtask::room_drain_window_periodic_reeval`'s doc).
 //!
 //! Both also run as `cargo test`s, which is what CI / every downstream change
 //! actually gates on; this binary exists for a quick manual re-check with a
@@ -196,6 +201,25 @@ fn main() -> ExitCode {
             watermark_persist.len()
         );
         for v in &watermark_persist {
+            eprintln!("  - {v}");
+        }
+    }
+
+    let periodic_reeval = xtask::room_drain_window_periodic_reeval::check(&repo_root);
+    if periodic_reeval.is_empty() {
+        println!(
+            "xtask verify-room-drain-window-periodic-reeval: OK — {}'s scheduler loop \
+             re-evaluates the drain-window stall bound on its own periodic tick and raises \
+             `UiEvent::RoomDrainComplete` on a force-close.",
+            xtask::room_drain_window_periodic_reeval::MAIN_RS_REL_PATH
+        );
+    } else {
+        ok = false;
+        eprintln!(
+            "xtask verify-room-drain-window-periodic-reeval: FAILED — {} violation(s):",
+            periodic_reeval.len()
+        );
+        for v in &periodic_reeval {
             eprintln!("  - {v}");
         }
     }

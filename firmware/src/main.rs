@@ -1958,6 +1958,33 @@ fn run() -> anyhow::Result<()> {
                 continue; // login not even queued yet this boot
             }
 
+            // Periodic, event-independent drain-window re-evaluation —
+            // `meshcadet-room-drain-window-out-path-never-learned-fix`. Runs
+            // every scheduler pass for every room, BEFORE either cadence
+            // branch below, regardless of `out_path_len`: a room whose
+            // `out_path` is never learned at all never sends a keep-alive,
+            // so neither `on_post_received` (needs a post to arrive) nor the
+            // keep-alive-stall detector's `note_closer_failed` (needs a
+            // learned route to ever tick) can re-evaluate
+            // `DRAIN_WINDOW_STALL_TIMEOUT_MS` on their own — a session that
+            // absorbs exactly one post and no successor would otherwise sit
+            // with that post's notification lost forever. See
+            // `room_session::RoomSyncPhase::on_scheduler_tick`'s doc for the
+            // full history of this failure mode.
+            if let Some(room_session::RoomNotification::Aggregate { count }) =
+                room.sync_phase.on_scheduler_tick(now)
+            {
+                log::info!(
+                    "room: 0x{:02x} drain window force-closed by the scheduler's own \
+                     periodic tick — firing one aggregate notification for {} post(s) \
+                     absorbed while draining",
+                    room.hash, count,
+                );
+                if let Some(ref mut ui) = ui_opt {
+                    ui.post_event(ui::UiEvent::RoomDrainComplete { room_hash: room.hash, count });
+                }
+            }
+
             if room.session.out_path_len == 0 {
                 // Decoupled reflood cadence — deliberately does NOT read
                 // `ROOM_DRAINING_KEEP_ALIVE_INTERVAL_MS`,

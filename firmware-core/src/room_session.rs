@@ -1303,6 +1303,31 @@ impl RoomSyncPhase {
         self.draining
     }
 
+    /// Whether the drain window has zero evidence its closing round-trip (a
+    /// keep-alive ACK) is alive: either [`Self::note_closer_failed`]'s
+    /// stronger, independent evidence already fired, or plain elapsed time
+    /// since window-open/last-progress has crossed
+    /// [`DRAIN_WINDOW_STALL_TIMEOUT_MS`]. Shared by every closer this bound
+    /// feeds — [`Self::on_post_received`] (event-triggered) and
+    /// [`Self::on_scheduler_tick`] (event-INDEPENDENT) — so the two can never
+    /// drift on what "stalled" means.
+    fn is_stalled(&self, now_ms: u64) -> bool {
+        self.closer_failed
+            || now_ms.saturating_sub(self.last_progress_ms) >= DRAIN_WINDOW_STALL_TIMEOUT_MS
+    }
+
+    /// Force-close an already-stalled window, folding `extra` (0 or 1) more
+    /// posts into the final aggregate on top of whatever `drained_count`
+    /// already held. Callers must have already confirmed [`Self::is_stalled`]
+    /// and `self.draining`.
+    fn force_close(&mut self, extra: u32) -> RoomNotification {
+        self.draining = false;
+        self.closer_failed = false;
+        let count = self.drained_count.saturating_add(extra);
+        self.drained_count = 0;
+        RoomNotification::Aggregate { count }
+    }
+
     /// Classify one genuinely-new incoming post (a dedup HIT must never
     /// reach this — see [`Self::on_push_outcome`], the call site this exists
     /// to keep in lockstep with dedup).
@@ -1310,22 +1335,49 @@ impl RoomSyncPhase {
         if !self.draining {
             return RoomNotification::Live;
         }
-        let stalled = self.closer_failed
-            || now_ms.saturating_sub(self.last_progress_ms) >= DRAIN_WINDOW_STALL_TIMEOUT_MS;
-        if stalled {
+        if self.is_stalled(now_ms) {
             // The closing round-trip has shown no sign of life for the
             // whole stall timeout — or independent evidence
             // ([`Self::note_closer_failed`]) already proved it dead sooner:
             // stop waiting for it. Force-close right here, folding THIS post
             // into the aggregate that finally flushes — see this type's doc.
-            self.draining = false;
-            self.closer_failed = false;
-            let count = self.drained_count.saturating_add(1);
-            self.drained_count = 0;
-            return RoomNotification::Aggregate { count };
+            return self.force_close(1);
         }
         self.drained_count += 1;
         RoomNotification::None
+    }
+
+    /// Periodic, EVENT-INDEPENDENT re-evaluation of the stall bound —
+    /// `meshcadet-room-drain-window-out-path-never-learned-fix`. Both
+    /// [`Self::on_post_received`] and [`Self::note_closer_failed`] are only
+    /// ever reached from the inside of a handler for some OTHER event (a
+    /// post arriving, a keep-alive-stall detection that itself needs a
+    /// learned `out_path` to run at all — see [`Self::note_closer_failed`]'s
+    /// doc). A session whose `out_path` is never learned sends no keep-alive
+    /// and, if it absorbs exactly one post with no successor, never re-hits
+    /// either closer again — the stall bound is checked once, at that one
+    /// post's arrival, and then never again for any reason.
+    ///
+    /// A caller (`firmware::main`'s dispatcher loop) invokes this on ITS OWN
+    /// cadence — every scheduler pass, independent of whether a post,
+    /// keep-alive, or anything else has happened — so a pending non-empty
+    /// backlog eventually force-closes and flushes even when nothing else
+    /// ever triggers it ("independent" must mean "re-evaluated on its own
+    /// periodic tick," not just "reachable from more event handlers").
+    ///
+    /// Returns `None` whenever there's nothing to report: the window is
+    /// already closed, still has live evidence of a working closer, or
+    /// stalled with nothing actually drained (nothing to announce — mirrors
+    /// [`Self::on_keep_alive_ack`]'s "`count == 0` never reaches the caller"
+    /// contract). Idempotent to call every tick regardless.
+    pub fn on_scheduler_tick(&mut self, now_ms: u64) -> Option<RoomNotification> {
+        if !self.draining || !self.is_stalled(now_ms) {
+            return None;
+        }
+        match self.force_close(0) {
+            RoomNotification::Aggregate { count: 0 } => None,
+            notification => Some(notification),
+        }
     }
 
     /// The single call site a caller's push handler should use: feeds a
@@ -1422,7 +1474,11 @@ impl RoomSyncPhase {
     /// never come. If nothing has been absorbed yet (`drained_count == 0`),
     /// there is nothing to flush and the prior behavior is unchanged: set
     /// the flag and let the next post force-close through
-    /// [`Self::on_post_received`], exactly as before this correction.
+    /// [`Self::on_post_received`] — or, if `out_path` is never learned at
+    /// all and no post ever arrives to force it, [`Self::on_scheduler_tick`]'s
+    /// periodic, event-independent re-evaluation
+    /// (`meshcadet-room-drain-window-out-path-never-learned-fix`) — exactly
+    /// as before this correction.
     ///
     /// Deliberately sets a flag (in the nothing-to-flush case) rather than
     /// back-dating `last_progress_ms` by subtracting
@@ -3465,6 +3521,156 @@ mod tests {
             ),
             RoomNotification::Live,
             "after the forced close, every subsequent post gets full live parity"
+        );
+    }
+
+    #[test]
+    fn scheduler_tick_flushes_a_single_absorbed_post_with_no_successor_ever_arriving() {
+        // `meshcadet-room-drain-window-out-path-never-learned-fix`'s own
+        // scenario: `out_path` is NEVER learned (no login round-trip
+        // completes), so no keep-alive is ever sent and
+        // `note_closer_failed` is never reachable either. The session
+        // absorbs exactly one post and then goes quiet forever — the ONLY
+        // thing left that can ever flush it is a periodic scheduler tick,
+        // never another post.
+        let mut phase = RoomSyncPhase::new_after_login(0);
+        let outcome = RoomPushOutcome {
+            ack_hash: [0; 4],
+            post_ts: 0,
+            entry: Some(HistoryEntry {
+                sender_hash: 0,
+                msg_type: HistoryMsgType::Dm,
+                timestamp: 0,
+                text: [0; MAX_HISTORY_TEXT_LEN],
+                text_len: 0,
+            }),
+            author_pubkey_prefix: [0; 4],
+        };
+        assert_eq!(
+            phase.on_push_outcome(&outcome, 1_000),
+            RoomNotification::None,
+            "the one post absorbed while draining, well within the stall bound"
+        );
+
+        // A tick well before the bound must not flush prematurely — this is
+        // NOT a bare timer/count heuristic, just an elapsed-time floor.
+        assert_eq!(
+            phase.on_scheduler_tick(DRAIN_WINDOW_STALL_TIMEOUT_MS / 2),
+            None,
+            "still within the stall bound — nothing to flush yet"
+        );
+        assert!(
+            phase.is_draining(),
+            "must still be draining before the bound elapses"
+        );
+
+        // No second post ever arrives — advance simulated time past the
+        // bound via the scheduler's own tick alone.
+        assert_eq!(
+            phase.on_scheduler_tick(DRAIN_WINDOW_STALL_TIMEOUT_MS),
+            Some(RoomNotification::Aggregate { count: 1 }),
+            "the scheduler's own periodic tick, independent of any post or keep-alive event, \
+             must force-close the window and flush the one post absorbed — this is the sibling \
+             `meshcadet-room-post-still-no-notify-hil` left open: neither `on_post_received` \
+             (needs a post) nor `note_closer_failed` (needs a learned `out_path`) can ever fire \
+             again for this session"
+        );
+        assert!(
+            !phase.is_draining(),
+            "the forced close must leave the window closed"
+        );
+
+        // Idempotent: a further tick after the window already closed raises
+        // nothing more.
+        assert_eq!(
+            phase.on_scheduler_tick(DRAIN_WINDOW_STALL_TIMEOUT_MS * 2),
+            None,
+            "the window is already closed — nothing left to announce"
+        );
+    }
+
+    #[test]
+    fn scheduler_tick_on_an_empty_backlog_closes_the_window_silently() {
+        // Mirrors `on_keep_alive_ack`'s "count == 0 never reaches the
+        // caller" contract: a stalled window with nothing ever absorbed
+        // must still close (so it doesn't sit "draining" forever), but must
+        // not manufacture a notification for zero posts.
+        let mut phase = RoomSyncPhase::new_after_login(0);
+        assert_eq!(
+            phase.on_scheduler_tick(DRAIN_WINDOW_STALL_TIMEOUT_MS),
+            None,
+            "nothing was ever absorbed — nothing to announce"
+        );
+        assert!(
+            !phase.is_draining(),
+            "the window must still close on a stalled tick even with an empty backlog"
+        );
+    }
+
+    #[test]
+    fn scheduler_tick_is_a_no_op_once_the_window_is_already_closed() {
+        let mut phase = RoomSyncPhase::new_after_login(0);
+        assert_eq!(phase.on_keep_alive_ack(0, 100), None);
+        assert!(!phase.is_draining());
+
+        assert_eq!(
+            phase.on_scheduler_tick(DRAIN_WINDOW_STALL_TIMEOUT_MS + 100),
+            None,
+            "a closed window has nothing left for a periodic tick to force-close"
+        );
+    }
+
+    #[test]
+    fn scheduler_tick_honours_note_closer_failed_the_same_as_a_post_would() {
+        // The stronger, independent evidence path composes with the
+        // periodic tick exactly like it already does with
+        // `on_post_received` — `note_closer_failed` just needs SOME
+        // closer to observe it eventually; the scheduler tick is one.
+        //
+        // `meshcadet-room-post-still-no-notify-hil` (landed ahead of this
+        // fix on `main`) made `note_closer_failed` itself flush a
+        // non-empty backlog immediately rather than deferring to the next
+        // closer — so here the composition point is that the scheduler
+        // tick, arriving after that immediate flush, is correctly a no-op
+        // (the window is already closed) rather than re-flushing or
+        // waiting out the full `DRAIN_WINDOW_STALL_TIMEOUT_MS`.
+        let mut phase = RoomSyncPhase::new_after_login(0);
+        let outcome = RoomPushOutcome {
+            ack_hash: [0; 4],
+            post_ts: 0,
+            entry: Some(HistoryEntry {
+                sender_hash: 0,
+                msg_type: HistoryMsgType::Dm,
+                timestamp: 0,
+                text: [0; MAX_HISTORY_TEXT_LEN],
+                text_len: 0,
+            }),
+            author_pubkey_prefix: [0; 4],
+        };
+        assert_eq!(
+            phase.on_push_outcome(&outcome, 1_000),
+            RoomNotification::None
+        );
+
+        // Nowhere near `DRAIN_WINDOW_STALL_TIMEOUT_MS` from window-open —
+        // only reachable at all because `note_closer_failed` fired, and it
+        // must flush right here rather than waiting for a tick.
+        assert_eq!(
+            phase.note_closer_failed(),
+            Some(RoomNotification::Aggregate { count: 1 }),
+            "closer-failure evidence over an already-nonempty backlog must force-close \
+             immediately, without waiting for a scheduler tick or the full \
+             DRAIN_WINDOW_STALL_TIMEOUT_MS to elapse from window-open"
+        );
+        assert!(
+            !phase.is_draining(),
+            "the immediate flush must leave the window closed"
+        );
+        assert_eq!(
+            phase.on_scheduler_tick(1_100),
+            None,
+            "the window is already closed — a scheduler tick arriving after the immediate \
+             flush must be a no-op, not a second flush"
         );
     }
 
