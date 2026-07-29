@@ -2021,6 +2021,16 @@ fn run() -> anyhow::Result<()> {
                 let invalidated = room.keep_alive_stall.on_tick(true, &mut room.session);
                 if invalidated {
                     room.pending_keep_alive_ack = None;
+                    // `meshcadet-room-post-no-notification`: this
+                    // invalidation IS the stronger evidence
+                    // `RoomSyncPhase::note_closer_failed`'s doc describes —
+                    // feed it in now rather than leaving the drain window's
+                    // independent 5-minute stall bound to find out the same
+                    // thing on its own, far later, with no reflood-backoff
+                    // escalation to justify the wait (this room's LOGIN
+                    // keeps succeeding, which is exactly the case that
+                    // resets the backoff to its floor every cycle).
+                    room.sync_phase.note_closer_failed();
                     log::warn!(
                         "room: 0x{:02x} exceeded {} consecutive missed keep-alive ACKs — \
                          invalidating out_path to force a relearn",
@@ -3929,10 +3939,49 @@ fn handle_room_push_frame(
                             text: display_text,
                         });
                     }
-                    room_session::RoomNotification::Aggregate { .. } => {
-                        // Never produced by `on_push_outcome` — only
-                        // `on_keep_alive_ack` (see `handle_ack`) does.
-                        // Unreachable here; no event to raise.
+                    room_session::RoomNotification::Aggregate { count } => {
+                        // `meshcadet-room-post-no-notification`'s defect,
+                        // caught by its own explicit ask ("assert the
+                        // consequence, not just the classifier's return
+                        // value"): this arm's own former comment claimed
+                        // `on_push_outcome` can never produce `Aggregate` —
+                        // false since `meshcadet-room-drain-window-never-
+                        // closes-no-notify` landed `RoomSyncPhase::
+                        // on_post_received`'s stall-timeout force-close
+                        // (reachable from THIS call site, `on_push_outcome`
+                        // -> `on_post_received`, not just from
+                        // `on_keep_alive_ack` above), and reachable again
+                        // now via `RoomSyncPhase::note_closer_failed`. Both
+                        // paths correctly flip the classifier's internal
+                        // state to "closed" — but until this fix, this arm
+                        // dropped the notification on the floor right here:
+                        // the drain window closed with nobody ever told.
+                        //
+                        // THIS post's own text has not reached the live UI
+                        // yet (unlike `handle_ack`'s keep-alive-triggered
+                        // close, which carries no post of its own — every
+                        // post it is closing for was already individually
+                        // appended via an earlier `RoomPostDrained`) — `count`
+                        // counts it in (`on_post_received`'s
+                        // `drained_count.saturating_add(1)`). Append it
+                        // silently first, exactly like the `None` arm above,
+                        // then fire the SAME single aggregate notification
+                        // `handle_ack`'s path fires — one badge/tone/blink
+                        // for the whole backlog just absorbed, never one per
+                        // post.
+                        log::info!(
+                            "room: 0x{:02x} drain window closed — firing one aggregate \
+                             notification for {} post(s) absorbed while draining",
+                            room.hash, count,
+                        );
+                        ui_events.push(ui::UiEvent::RoomPostDrained {
+                            room_hash: room.hash,
+                            text: display_text,
+                        });
+                        ui_events.push(ui::UiEvent::RoomDrainComplete {
+                            room_hash: room.hash,
+                            count,
+                        });
                     }
                 }
             }
