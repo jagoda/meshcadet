@@ -91,6 +91,11 @@ use crate::pin_menu;
 // `gps::GpsStatus` is a plain Copy struct (no hardware dependency) — used
 // here purely as a display-state type for the GPS status screen.
 use crate::gps;
+// `room_session::ClockSource` is likewise a plain Copy enum (`meshcadet-
+// room-clock-ux`) — used here purely as the cached display-state provenance
+// the GPS status screen's Time-sync row renders (`format_clock_source_
+// label`).
+use crate::room_session;
 // `battery::BatteryStatus` is likewise a plain Copy struct — used here purely
 // as a display-state type for the admin-menu battery row.
 use crate::battery;
@@ -265,10 +270,12 @@ pub enum UiEvent {
     /// A room post `on_send_message` queued was refused before reaching the
     /// radio — see `RoomPostSent`'s doc for why no optimistic bubble exists
     /// to retract here. `reason` is a short, non-alarming, user-facing
-    /// explanation (e.g. "clock not yet synced — cannot post to this room
-    /// yet"); `handle_event` renders it as a labelled system notice in the
-    /// same thread the user just tried to post to, rather than leaving the
-    /// tap looking like the app silently ignored it.
+    /// explanation (e.g. "clock has not advanced since this room's last
+    /// send — try again in a moment" — the one refusal reason left after
+    /// `meshcadet-room-clock-ux`; an unsynced clock no longer blocks
+    /// posting at all); `handle_event` renders it as a labelled system
+    /// notice in the same thread the user just tried to post to, rather
+    /// than leaving the tap looking like the app silently ignored it.
     RoomPostRefused {
         room_hash: u8,
         reason: String,
@@ -636,6 +643,17 @@ pub struct UiRuntime<'d> {
     /// upward live while the GpsStatus screen is open, and so a fresh screen
     /// opened later reflects the current snapshot immediately.
     gps_status: gps::GpsStatus,
+    /// Latest room-clock-provenance snapshot (`meshcadet-room-clock-ux`):
+    /// `(source, unix_secs, age_secs)`, refreshed every `main.rs`
+    /// dispatcher-loop iteration via [`Self::set_room_clock_source`].
+    /// Cached here for the same reason as `gps_status` immediately above —
+    /// so the Time-sync row's age ticks upward live while GpsStatus is open,
+    /// and so a freshly-opened screen reflects the current reading
+    /// immediately rather than the "Time sync" / "Not synced" boot default.
+    /// All three components are plain `Copy`/`PartialEq` types, so this
+    /// tuple supports the same "skip an identical push" early return
+    /// `set_gps_status` already uses.
+    room_clock: (room_session::ClockSource, Option<u32>, u32),
     /// Latest battery status snapshot (charge percentage + charging state),
     /// refreshed every `main.rs` dispatcher-loop iteration via
     /// [`Self::set_battery_status`]. Cached here for the same reason as
@@ -1000,6 +1018,7 @@ impl<'d> UiRuntime<'d> {
             deferred_message_view_nav_at_ms: None,
             pending_compose_seed: None,
             gps_status: gps::GpsStatus::never(),
+            room_clock: (room_session::ClockSource::None, None, 0),
             battery_status: battery::BatteryStatus::unknown(),
             // Matches `SignalTracker::new`'s own boot default (see that
             // constructor's doc) — device-just-booted, no repeater heard yet.
@@ -1324,6 +1343,34 @@ impl<'d> UiRuntime<'d> {
         self.gps_status = status;
         if let ActiveScreen::GpsStatus(ref scr) = self.active_screen {
             scr.set_status(&status);
+        }
+    }
+
+    /// Refresh the cached room-clock-provenance snapshot and, if the
+    /// GpsStatus screen is currently open, push it straight into the
+    /// Time-sync row — `meshcadet-room-clock-ux`'s Objective item 3.
+    /// `source`/`unix_secs`/`age_secs` are `main.rs`'s dispatcher-loop
+    /// values this same tick (`room_session::trusted_wall_clock_secs`'s
+    /// combined GPS-or-adopted-room-server reading), NOT raw `GpsStatus`
+    /// fields — see `screens::GpsStatusScreen::set_clock_source`'s doc for
+    /// why that distinction is the whole point of this method.
+    ///
+    /// Same "skip an identical push" early return as [`Self::set_gps_status`]
+    /// — cheap even on the common no-op path (a plain tuple of `Copy`
+    /// types).
+    pub fn set_room_clock_source(
+        &mut self,
+        source: room_session::ClockSource,
+        unix_secs: Option<u32>,
+        age_secs: u32,
+    ) {
+        let snapshot = (source, unix_secs, age_secs);
+        if snapshot == self.room_clock {
+            return;
+        }
+        self.room_clock = snapshot;
+        if let ActiveScreen::GpsStatus(ref scr) = self.active_screen {
+            scr.set_clock_source(source, unix_secs, age_secs);
         }
     }
 
@@ -2642,6 +2689,14 @@ impl<'d> UiRuntime<'d> {
         self.hide_active_screen();
         let screen = screens::GpsStatusScreen::new()?;
         screen.set_status(&self.gps_status);
+        // Seed the Time-sync row from the cached room-clock snapshot —
+        // `set_status` above deliberately does NOT touch this row anymore
+        // (see that method's doc); without this seed a freshly-opened
+        // screen would show the Slint markup's "Time sync" / "Not synced"
+        // boot default until the next dispatcher-loop push, even if a
+        // clock has been trusted for a while.
+        let (room_clock_source, room_clock_unix_secs, room_clock_age_secs) = self.room_clock;
+        screen.set_clock_source(room_clock_source, room_clock_unix_secs, room_clock_age_secs);
         // Seed the header's SignalMeter — see `navigate_to_contact_list`'s
         // identical seeding comment.
         screen.set_signal_level(level_to_bars(self.signal_level));

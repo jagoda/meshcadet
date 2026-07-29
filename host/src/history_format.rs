@@ -65,12 +65,20 @@ pub fn history_header(idx_width: usize) -> String {
 
 /// Render a stored `u32` unix-epoch-seconds value as a local, unambiguous,
 /// human-readable timestamp (ISO-8601-ish with a UTC offset), e.g.
-/// `2026-07-01 18:34:25 -04:00`.
+/// `2026-07-01 18:34:25 -04:00` — or `"unknown"` (never a computed epoch
+/// date) when `epoch_seconds` is [`protocol::history::TIMESTAMP_UNKNOWN`]:
+/// `meshcadet-room-clock-ux`'s fix for a room post's local outbound echo,
+/// which is written with that sentinel whenever no trusted wall clock was
+/// available at send time (the room-post wire nonce is never a valid stand-
+/// in — see `TIMESTAMP_UNKNOWN`'s own doc).
 ///
-/// Device timestamps are trusted as genuine epochs here — device-clock
-/// discipline (making that assumption actually hold) is a separate, deferred
-/// concern.
+/// Every OTHER (non-sentinel) device timestamp is trusted as a genuine epoch
+/// here — device-clock discipline for those (making that trust actually
+/// hold) is a separate, deferred concern.
 pub fn format_local_timestamp(epoch_seconds: u32) -> String {
+    if epoch_seconds == protocol::history::TIMESTAMP_UNKNOWN {
+        return "unknown".to_string();
+    }
     // Converting *from* an epoch instant is always unambiguous (unlike
     // constructing a datetime from local calendar fields, which can land in
     // a DST gap/overlap) — `Local` always resolves this to `Single`.
@@ -145,6 +153,16 @@ mod tests {
         );
     }
 
+    /// Acceptance (`meshcadet-room-clock-ux`): a history entry written with
+    /// no trusted clock (the `TIMESTAMP_UNKNOWN` sentinel) renders as
+    /// "unknown", never as a computed 1970-01-01 epoch date.
+    #[test]
+    fn format_local_timestamp_unknown_sentinel_renders_as_unknown() {
+        let s = format_local_timestamp(protocol::history::TIMESTAMP_UNKNOWN);
+        assert_eq!(s, "unknown");
+        assert!(!s.contains("1970"));
+    }
+
     #[test]
     fn format_local_timestamp_has_expected_shape() {
         // "YYYY-MM-DD HH:MM:SS +HH:MM" (or "-HH:MM") — 26 chars, space-
@@ -211,6 +229,26 @@ mod tests {
         assert_eq!(column_at(&line, dr_off, DIR_WIDTH), "RECV");
         assert_eq!(column_at(&line, fr_off, FROM_WIDTH), "0xAB");
         assert_eq!(&line[tx_off..], "hello");
+    }
+
+    /// Acceptance (`meshcadet-room-clock-ux`): the timestamp COLUMN of a
+    /// full rendered row also shows "unknown", not a fabricated epoch date,
+    /// for a sentinel-timestamped entry — the row-layout counterpart to
+    /// `format_local_timestamp_unknown_sentinel_renders_as_unknown` above.
+    #[test]
+    fn format_history_line_renders_unknown_timestamp_not_epoch_date() {
+        let entry = make_entry(
+            0x42,
+            HistoryMsgType::Dm,
+            protocol::history::TIMESTAMP_UNKNOWN,
+            b"hi",
+        );
+        let iw = idx_width(1);
+        let line = format_history_line(0, &entry, true, iw);
+        let (_, ts_off, _, _, _, _) = offsets(iw);
+        let ts_col = column_at(&line, ts_off, TIMESTAMP_WIDTH);
+        assert_eq!(ts_col, "unknown");
+        assert!(!ts_col.contains("1970"));
     }
 
     #[test]
