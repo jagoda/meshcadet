@@ -60,6 +60,15 @@ import path from "node:path";
 
 import { encodeFrame, encodeAddRoom, FRAME_ADD_ROOM, FRAME_RSP_OK, FRAME_RSP_ERROR } from "./codec.js";
 import { ProvisionerSession, DeviceError } from "./session.js";
+import {
+  makeFakePort,
+  installHostileGlobals,
+  spyOnConsole,
+  assertSecretNeverCaptured,
+  usesStorageApi,
+  extractFunctionBody,
+  countValueClears,
+} from "./secret-hygiene-test-helpers.mjs";
 
 let checks = 0;
 function ok(cond, label) {
@@ -70,116 +79,12 @@ function ok(cond, label) {
 const GUEST_PASSWORD = "sh1bboleth-guest-pw"; // the exact secret string every Part 1 check greps for
 
 // ── Part 1: session.js's addRoom, driven for real, against hostile globals ──
-
-function makeFakePort(onWrite) {
-  let controller;
-  const readable = new ReadableStream({
-    start(c) {
-      controller = c;
-    },
-  });
-  const writable = new WritableStream({
-    write(chunk) {
-      onWrite(chunk);
-    },
-  });
-  const port = {
-    readable,
-    writable,
-    async open() {},
-    async close() {
-      try {
-        controller.close();
-      } catch {
-        // Already closed — fine.
-      }
-    },
-  };
-  return { port, push: (bytes) => controller.enqueue(bytes) };
-}
-
-/**
- * Install `navigator`/`window` (same minimal shape session.smoke.test.mjs
- * uses), PLUS a `localStorage`/`sessionStorage` pair that throws on ANY
- * property access or assignment — not a spy that records calls, an actual
- * trap — so if `session.js`'s `addRoom` path (or anything it transitively
- * imports) ever so much as reads `localStorage.foo`, the test fails
- * immediately with a thrown error rather than relying on us remembering to
- * assert "it wasn't called".
- */
-function installHostileGlobals(port) {
-  Object.defineProperty(globalThis, "navigator", {
-    value: {
-      serial: {
-        async requestPort() {
-          return port;
-        },
-        addEventListener() {},
-      },
-    },
-    writable: true,
-    configurable: true,
-  });
-  globalThis.window = { isSecureContext: true };
-
-  const storageTrap = (label) =>
-    new Proxy(
-      {},
-      {
-        get() {
-          throw new Error(`guest-password-hygiene: ${label} was touched (get) — must never be touched at all`);
-        },
-        set() {
-          throw new Error(`guest-password-hygiene: ${label} was touched (set) — must never be touched at all`);
-        },
-      }
-    );
-  Object.defineProperty(globalThis, "localStorage", {
-    value: storageTrap("localStorage"),
-    writable: true,
-    configurable: true,
-  });
-  Object.defineProperty(globalThis, "sessionStorage", {
-    value: storageTrap("sessionStorage"),
-    writable: true,
-    configurable: true,
-  });
-}
-
-/** Wrap console.log/warn/error to capture every argument, restoring on `[Symbol.dispose]`-style manual restore(). */
-function spyOnConsole() {
-  const original = { log: console.log, warn: console.warn, error: console.error };
-  const captured = [];
-  for (const level of ["log", "warn", "error"]) {
-    console[level] = (...args) => {
-      captured.push(args);
-    };
-  }
-  return {
-    captured,
-    restore() {
-      console.log = original.log;
-      console.warn = original.warn;
-      console.error = original.error;
-    },
-  };
-}
+// (makeFakePort/installHostileGlobals/spyOnConsole/assertSecretNeverCaptured
+// are shared with admin-pin-hygiene.test.mjs/channel-secret-hygiene.test.mjs
+// — see secret-hygiene-test-helpers.mjs's own header.)
 
 function assertPasswordNeverCaptured(captured, label) {
-  for (const args of captured) {
-    for (const arg of args) {
-      const rendered = typeof arg === "string" ? arg : safeStringify(arg);
-      ok(!rendered.includes(GUEST_PASSWORD), `${label}: console output must never contain the guest password (got: ${rendered})`);
-    }
-  }
-}
-
-function safeStringify(value) {
-  try {
-    return JSON.stringify(value, (_key, v) => (v instanceof Error ? { message: v.message, stack: v.stack } : v));
-  } catch {
-    return String(value);
-  }
+  assertSecretNeverCaptured(ok, captured, GUEST_PASSWORD, "the guest password", label);
 }
 
 async function addRoomNeverTouchesStorageOrLogsThePassword() {
@@ -259,11 +164,6 @@ const siteDir = path.resolve(here, "..");
 const provisionerJs = readFileSync(path.join(siteDir, "provisioner.js"), "utf-8");
 const provisionerHtml = readFileSync(path.join(siteDir, "provisioner.html"), "utf-8");
 
-/** True if `source` contains an actual `identifier.`/`identifier[` API touch — not merely the word appearing inside prose/backticks. */
-function usesStorageApi(source, identifier) {
-  return new RegExp(`\\b${identifier}\\s*[.[]`).test(source);
-}
-
 ok(!usesStorageApi(provisionerJs, "localStorage"), "provisioner.js never calls the localStorage API");
 ok(!usesStorageApi(provisionerJs, "sessionStorage"), "provisioner.js never calls the sessionStorage API");
 ok(!usesStorageApi(provisionerHtml, "localStorage"), "provisioner.html never calls the localStorage API");
@@ -281,22 +181,8 @@ for (const [label, source] of [
   ok(!/history\s*\.\s*(push|replace)State/.test(source), `${label} never manipulates history state`);
 }
 
-/** Extract a top-level `async function <name>(...) { ... }` body by brace-balance scanning — good enough for this file's own straight-line functions (no template-literal braces inside the extracted range). */
-function extractFunctionBody(source, name) {
-  const sigMatch = source.match(new RegExp(`(?:async\\s+)?function\\s+${name}\\s*\\([^)]*\\)\\s*\\{`));
-  ok(sigMatch !== null, `found a "function ${name}(...)" declaration to extract`);
-  const start = sigMatch.index + sigMatch[0].length;
-  let depth = 1;
-  let i = start;
-  for (; i < source.length && depth > 0; i++) {
-    if (source[i] === "{") depth++;
-    else if (source[i] === "}") depth--;
-  }
-  return source.slice(start, i - 1);
-}
-
-const handleAddRoomBody = extractFunctionBody(provisionerJs, "handleAddRoom");
-const clearFormStatusesBody = extractFunctionBody(provisionerJs, "clearFormStatuses");
+const handleAddRoomBody = extractFunctionBody(ok, provisionerJs, "handleAddRoom");
+const clearFormStatusesBody = extractFunctionBody(ok, provisionerJs, "clearFormStatuses");
 
 // No console.* call in handleAddRoom may reference a password-carrying
 // identifier — every console.* line in this function must only ever
@@ -315,13 +201,13 @@ const clearFormStatusesBody = extractFunctionBody(provisionerJs, "clearFormStatu
 // statement; there must be at least 2 (one per path), matching what was
 // actually written (see provisioner.js's handleAddRoom).
 {
-  const clears = handleAddRoomBody.match(/addRoomPassword\.value\s*=\s*("|')("|')/g) || [];
-  ok(clears.length >= 2, `handleAddRoom clears addRoomPassword.value on at least 2 exit paths (found ${clears.length})`);
+  const clears = countValueClears(handleAddRoomBody, "addRoomPassword");
+  ok(clears >= 2, `handleAddRoom clears addRoomPassword.value on at least 2 exit paths (found ${clears})`);
 }
 
 // clearFormStatuses (the disconnect path — see provisioner.js's
 // window "pagehide"/handleDisconnect wiring) also scrubs it.
-ok(/addRoomPassword\.value\s*=\s*("|')("|')/.test(clearFormStatusesBody), "clearFormStatuses clears addRoomPassword.value on disconnect");
+ok(countValueClears(clearFormStatusesBody, "addRoomPassword") >= 1, "clearFormStatuses clears addRoomPassword.value on disconnect");
 
 // The room QR/URI builder used by this page (contact-uri.js's buildRoomUri)
 // is never handed anything that looks like the password field/variable —

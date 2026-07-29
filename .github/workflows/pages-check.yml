@@ -154,6 +154,18 @@ jobs:
         # header for why it's split from session.smoke.test.mjs this way.
         run: node site/provisioner/channel-secret-hygiene.test.mjs
 
+      - name: secret-hygiene-coverage — every type="password" field in provisioner.html has a matching hygiene test
+        # Closes a coverage gap: the three hygiene tests above were each added reactively,
+        # one field at a time, only after an incident noticed that field was
+        # uncovered — nothing previously asserted the SET of hygiene tests
+        # actually spans the SET of secret-carrying fields. This enumerates
+        # every type="password" <input> in provisioner.html and asserts its
+        # id is mentioned by at least one *-hygiene.test.mjs file, so a fourth
+        # secret field added without a matching hygiene test fails here
+        # immediately instead of waiting for the next security audit. See the
+        # test file's own header.
+        run: node site/provisioner/secret-hygiene-coverage.test.mjs
+
   codec-conformance:
     name: site/provisioner/codec.js matches protocol::provisioning byte-for-byte
     runs-on: ubuntu-latest
