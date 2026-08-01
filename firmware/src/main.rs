@@ -3890,7 +3890,30 @@ fn apply_room_login_outcome(
     // reply IS the reflood succeeding, so the next `!has_route()`
     // epoch (should one ever start again) begins fresh at the initial
     // backoff, not wherever this epoch's exponent left off.
-    room.reflood_attempts = 0;
+    //
+    // Gated on `out_path_len != 0` (a route is actually known POST-apply,
+    // i.e. after `apply_login_outcome` above) — never on "a reply arrived"
+    // alone. `apply_login_outcome` only writes `out_path`/`out_path_len`
+    // when `outcome.out_path` is `Some(..)` (the PATH-return leg); a direct
+    // `RESPONSE` datagram reply (`decode_login_response_datagram`) always
+    // decodes `out_path: None` and teaches no route
+    // (`RoomLoginOutcome::out_path`'s doc), so an unconditional reset here
+    // would let a session still stuck at `out_path_len == 0` clear its
+    // attempt counter anyway — the very next scheduler tick re-floods a
+    // full `ANON_REQ` login at the 30 s floor again, forever, with no
+    // escalation: the exact airtime/regulatory-duty-cycle defect this
+    // backoff exists to prevent (`room_reflood_interval_ms`'s doc). Not
+    // reachable against the vendored `simple_room_server` today — a flood
+    // `ANON_REQ` always gets a PATH-return back (`MyMesh.cpp`'s
+    // `onAnonDataRecv`, `packet->isRouteFlood()` branch) — because this
+    // client only ever floods its login (`encode_room_login_frame`'s doc);
+    // a bare direct-RESPONSE reply is reachable only via
+    // `handle_room_login_response`'s documented FUTURE re-login-over-a-
+    // known-route leg. This call site has no way to assume that stays true
+    // forever, and the guard costs nothing today.
+    if room.session.out_path_len != 0 {
+        room.reflood_attempts = 0;
+    }
     // The next keep-alive should re-affirm this login's `sync_since` via
     // `force_since` rather than the routine `0` — see `resync_pending`'s doc.
     room.resync_pending = true;

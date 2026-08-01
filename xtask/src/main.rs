@@ -36,6 +36,10 @@
 //!   (`RoomSyncPhase::on_scheduler_tick`) is wired in unconditionally, before
 //!   the re-flood branch, and raises `UiEvent::RoomDrainComplete` on a
 //!   force-close (see `xtask::room_drain_window_periodic_reeval`'s doc).
+//! - **verify-reflood-reset-requires-route** — `apply_room_login_outcome`
+//!   only resets the reflood backoff epoch when a route is actually known,
+//!   never on "a login reply arrived" alone (see
+//!   `xtask::room_reflood_reset_requires_route`'s doc).
 //!
 //! Both also run as `cargo test`s, which is what CI / every downstream change
 //! actually gates on; this binary exists for a quick manual re-check with a
@@ -220,6 +224,24 @@ fn main() -> ExitCode {
             periodic_reeval.len()
         );
         for v in &periodic_reeval {
+            eprintln!("  - {v}");
+        }
+    }
+
+    let reflood_reset_route_gated = xtask::room_reflood_reset_requires_route::check(&repo_root);
+    if reflood_reset_route_gated.is_empty() {
+        println!(
+            "xtask verify-reflood-reset-requires-route: OK — {}'s `apply_room_login_outcome` \
+             only resets the reflood backoff epoch when a route is actually known.",
+            xtask::room_reflood_reset_requires_route::MAIN_RS_REL_PATH
+        );
+    } else {
+        ok = false;
+        eprintln!(
+            "xtask verify-reflood-reset-requires-route: FAILED — {} violation(s):",
+            reflood_reset_route_gated.len()
+        );
+        for v in &reflood_reset_route_gated {
             eprintln!("  - {v}");
         }
     }
