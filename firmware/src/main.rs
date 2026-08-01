@@ -219,10 +219,18 @@ macro_rules! rx_diag {
     ($($arg:tt)*) => { log::debug!($($arg)*) }
 }
 
-// ── HIL test channel ──────────────────────────────────────────────────────────
-
-#[cfg(not(feature = "hil"))]
-const HIL_TEST_CHANNEL_SECRET: [u8; 32] = [0x6du8; 32]; // 'm' — meshcadet HIL channel
+// DEFECT FIX (`meshcadet-grptxt-rx-open-on-published-test-channel-secret`):
+// this file used to define a compiled-in `HIL_TEST_CHANNEL_SECRET` constant
+// (`[0x6d; 32]`, published in this repo and named as a dummy key in
+// SECURITY.md) and fall back to it whenever no channel was provisioned —
+// so a contacts-only device still computed a real, on-air channel hash
+// under a secret any outsider could compute from the public source, and
+// both transmitted and accepted GRP_TXT on it. The fallback is gone;
+// `ProvisionedConfig::resolve_channel_secret` returns `None` instead, and
+// every TX/RX call site treats `None` as "no channel — GRP_TXT
+// unreachable", not "substitute a placeholder secret". There is
+// deliberately no replacement constant here: removing it (rather than
+// randomizing it) is what closes the defect class instead of just hiding it.
 
 #[cfg(feature = "hil")]
 const TX_INTERVAL_MS: u64 = 30_000;
@@ -1255,46 +1263,42 @@ fn run() -> anyhow::Result<()> {
     let channel_secret_buf: [u8; 32] = hil_config::HIL_CHANNEL_SECRET;
     #[cfg(feature = "hil")]
     let channel_key_len: usize = hil_config::HIL_CHANNEL_KEY_LEN;
+    #[cfg(feature = "hil")]
+    let channel_secret_owned: Option<([u8; 32], usize)> =
+        Some((channel_secret_buf, channel_key_len));
 
     // Production: the on-air channel is the PROVISIONED primary channel,
     // resolved key_len-aware (16-byte 128-bit or 32-byte 256-bit secret).
     //
     // DEFECT FIX:
     // this path previously fell through to the compiled-in HIL_TEST_CHANNEL_SECRET
-    // ([0x6d;32]), so a provisioned device transmitted AND received GRP_TXT on a
-    // hardcoded test channel instead of the real provisioned channel. Outbound
-    // channel messages carried the wrong channel_hash/MAC (companions ignored
-    // them) and inbound channel packets were dropped on the channel-hash gate in
-    // `handle_grp_txt` — channel TX *and* RX silently broken in both directions,
-    // while DMs kept working because the DM path resolves the provisioned contact
-    // pubkey via `policy`. The provisioned channel was loaded into the UI list and
-    // moved into the admin_server thread, but never wired to the dispatcher's
-    // TX/RX crypto. Snapshot it here at boot (consistent with the UI channel list,
-    // which is also a boot snapshot; a channel change requires a reboot to take
-    // effect on air).
+    // ([0x6d;32]) whenever no channel was provisioned, so a contacts-only
+    // device still computed a real, on-air channel hash under that
+    // published, guessable secret and both transmitted AND accepted GRP_TXT
+    // on it (`meshcadet-grptxt-rx-open-on-published-test-channel-secret`) —
+    // any outsider could compute the same hash and inject attributed channel
+    // text into a device that never provisioned a channel at all (ADR-0001
+    // §2: "no public channels — none supported at all").
+    //
+    // FIX: `resolve_channel_secret` returns `None` when `channel_count == 0`;
+    // `channel_secret` below is `Option<&[u8]>` and every TX/RX call site
+    // (`on_receive`'s `GrpTxt` arm, `handle_grp_txt`, the `SendGroupMsg` UI
+    // command) is gated on `Some` — `None` makes GRP_TXT TX/RX unreachable,
+    // it does not fall back to a placeholder secret. Snapshot it here at
+    // boot (consistent with the UI channel list, which is also a boot
+    // snapshot; a channel change requires a reboot to take effect on air).
     #[cfg(not(feature = "hil"))]
-    let (channel_secret_buf, channel_key_len): ([u8; 32], usize) = {
-        let cnt = provisioned_config.channel_count as usize;
-        match provisioned_config
-            .primary_channel()
-            .or_else(|| provisioned_config.channels[..cnt].first())
-        {
-            // key_len is 16 (128-bit) or 32 (256-bit); clamp defensively so a
-            // malformed NVS blob can never panic the slice below.
-            Some(ch) => (ch.secret, if ch.key_len == 16 { 16 } else { 32 }),
-            // No channel provisioned: harmless placeholder — no channel traffic
-            // is expected (or accepted) without a configured channel.
-            None => (HIL_TEST_CHANNEL_SECRET, 32),
-        }
-    };
+    let channel_secret_owned: Option<([u8; 32], usize)> =
+        provisioned_config.resolve_channel_secret();
 
-    let channel_secret: &[u8] = &channel_secret_buf[..channel_key_len];
+    let channel_secret: Option<&[u8]> =
+        channel_secret_owned.as_ref().map(|(buf, len)| &buf[..*len]);
 
-    // Production diagnosability: if no channel is provisioned the channel_secret
-    // above is only a placeholder, so the `channel hash=0x..` line below reads as
-    // a normal hash while GRP_TXT TX/RX is effectively dead. Make that explicit.
+    // Production diagnosability: make the zero-channel case explicit rather
+    // than silent (the `channel hash=0x..`/`channel: none provisioned` log
+    // line below already distinguishes the two cases).
     #[cfg(not(feature = "hil"))]
-    if provisioned_config.channel_count == 0 {
+    if channel_secret.is_none() {
         log::warn!(
             "no channel provisioned — channel (GRP_TXT) messaging is disabled; \
              provision a channel via the admin CLI to enable it"
@@ -1322,11 +1326,17 @@ fn run() -> anyhow::Result<()> {
 
     #[cfg(feature = "hil")]
     log::info!("peer pub_hash=0x{:02x}", peer_pubkey[0]);
-    log::info!(
-        "channel hash=0x{:02x}, policy contacts={}",
-        channel_hash_var(channel_secret),
-        policy.contact_count(),
-    );
+    match channel_secret {
+        Some(secret) => log::info!(
+            "channel hash=0x{:02x}, policy contacts={}",
+            channel_hash_var(secret),
+            policy.contact_count(),
+        ),
+        None => log::info!(
+            "channel: none provisioned, policy contacts={}",
+            policy.contact_count(),
+        ),
+    }
 
     // Per-boot random base for outbound message timestamps (anti-replay).
     // MUTABLE: the dispatcher loop below rebases this to the real GPS-synced
@@ -2621,7 +2631,19 @@ fn run() -> anyhow::Result<()> {
                             }
                         }
                     }
+                    // No channel provisioned (`channel_secret == None`): drop
+                    // any UI-initiated group send outright rather than
+                    // computing a hash against a placeholder secret — see
+                    // `meshcadet-grptxt-rx-open-on-published-test-channel-secret`.
+                    ui::UiCommand::SendGroupMsg { channel_hash, text: _ } if channel_secret.is_none() => {
+                        log::warn!(
+                            "UI send GRP_TXT: no channel provisioned — dropped (channel_hash=0x{:02x})",
+                            channel_hash,
+                        );
+                    }
                     ui::UiCommand::SendGroupMsg { channel_hash, text } => {
+                        let channel_secret = channel_secret
+                            .expect("guarded by the no-channel arm above");
                         // Only transmit on the provisioned channel; silently drop mismatches.
                         let expected_ch = channel_hash_var(channel_secret);
                         if channel_hash != expected_ch {
@@ -3171,7 +3193,7 @@ fn on_receive(
     frame: &[u8],
     our_id: &Identity,
     policy: &PolicyFilter,
-    channel_secret: &[u8],
+    channel_secret: Option<&[u8]>,
     pending_ack: &mut Option<PendingAck>,
     txq: &mut TxQueue,
     gps_snapshot: Option<(i32, i32, u32)>,
@@ -4436,8 +4458,20 @@ fn handle_path_return(
     }
 }
 
-/// Decode + log an inbound GRP_TXT under the HIL test-channel secret.
-fn handle_grp_txt(payload: &[u8], channel_secret: &[u8], ui_events: &mut Vec<ui::UiEvent>) {
+/// Decode + log an inbound GRP_TXT under the provisioned channel secret.
+///
+/// `channel_secret` is `None` whenever no channel is provisioned
+/// (`ProvisionedConfig::resolve_channel_secret` returned `None` at boot) —
+/// this is the RX-side half of the fix for
+/// `meshcadet-grptxt-rx-open-on-published-test-channel-secret`: a
+/// contacts-only device must accept NO GRP_TXT at all, so this returns
+/// before touching the payload rather than falling back to a placeholder
+/// secret (as `firmware/src/main.rs`'s boot sequence used to).
+fn handle_grp_txt(payload: &[u8], channel_secret: Option<&[u8]>, ui_events: &mut Vec<ui::UiEvent>) {
+    let Some(channel_secret) = channel_secret else {
+        rx_diag!("RX GRP_TXT: no channel provisioned — dropped");
+        return;
+    };
     if payload.is_empty() {
         rx_diag!("RX GRP_TXT: empty payload");
         return;

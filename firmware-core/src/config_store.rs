@@ -409,6 +409,32 @@ impl ProvisionedConfig {
         self.channels[..count].iter().find(|ch| ch.primary)
     }
 
+    /// Resolve the on-air channel secret + significant key length (16 or 32
+    /// bytes) that GRP_TXT TX/RX should use, or `None` if no channel is
+    /// provisioned at all.
+    ///
+    /// Prefers [`Self::primary_channel`]; falls back to the first
+    /// provisioned channel if none is flagged primary. `key_len` is clamped
+    /// to 16 or 32 defensively, so a malformed NVS blob can never yield a
+    /// length a caller could use to panic a slice.
+    ///
+    /// DEFECT FIX (`meshcadet-grptxt-rx-open-on-published-test-channel-secret`):
+    /// the caller used to substitute a compiled-in placeholder secret
+    /// (`HIL_TEST_CHANNEL_SECRET`, `[0x6d; 32]`) when this returned `None`,
+    /// so a contacts-only device (`channel_count == 0`) still computed a
+    /// real, on-air channel hash and both transmitted and accepted GRP_TXT
+    /// on that hardcoded, published-in-this-repo secret — any outsider could
+    /// compute the same hash and inject attributed channel text into a
+    /// device that never provisioned a channel (ADR-0001 §2: "no public
+    /// channels — none supported at all"). `None` here MUST make GRP_TXT
+    /// TX/RX unreachable, never fall back to a placeholder.
+    pub fn resolve_channel_secret(&self) -> Option<([u8; 32], usize)> {
+        let count = self.channel_count as usize;
+        self.primary_channel()
+            .or_else(|| self.channels[..count].first())
+            .map(|ch| (ch.secret, if ch.key_len == 16 { 16 } else { 32 }))
+    }
+
     /// Insert or update a channel, keyed on its `secret` (the channel's
     /// cryptographic identity — the on-air `channel_hash` derives from the
     /// secret, so the secret IS the channel; the name is just a mutable label).
@@ -1066,6 +1092,60 @@ mod tests {
         assert_eq!(extra.permission(), RoomPermission::ReadWrite);
         assert_eq!(extra.out_path_len, 2);
         assert_eq!(&extra.out_path[..2], &[0xAA, 0xBB]);
+    }
+
+    // ── resolve_channel_secret ───────────────────────────────────────────────
+    //
+    // REGRESSION (`meshcadet-grptxt-rx-open-on-published-test-channel-secret`):
+    // `firmware/src/main.rs` used to fall back to a compiled-in placeholder
+    // secret (`HIL_TEST_CHANNEL_SECRET`, `[0x6d; 32]`) whenever no channel was
+    // provisioned, so a contacts-only device still accepted (and could send)
+    // GRP_TXT under that published, guessable secret. `resolve_channel_secret`
+    // is the fix: it returns `None` for a zero-channel config, and the caller
+    // MUST treat `None` as "GRP_TXT disabled", never substitute a placeholder.
+
+    #[test]
+    fn resolve_channel_secret_is_none_for_a_zero_channel_config() {
+        let cfg = ProvisionedConfig::empty();
+        assert_eq!(cfg.channel_count, 0);
+        assert_eq!(
+            cfg.resolve_channel_secret(),
+            None,
+            "a device with no provisioned channel must resolve no channel secret at all — \
+             GRP_TXT TX/RX must be unreachable, not fall back to a placeholder"
+        );
+    }
+
+    #[test]
+    fn resolve_channel_secret_returns_the_sole_provisioned_channel() {
+        let mut cfg = ProvisionedConfig::empty();
+        cfg.upsert_channel(channel(0x22, false, b"family")).unwrap();
+        assert_eq!(cfg.resolve_channel_secret(), Some(([0x22u8; 32], 32)),);
+    }
+
+    #[test]
+    fn resolve_channel_secret_prefers_the_primary_channel() {
+        let mut cfg = ProvisionedConfig::empty();
+        cfg.upsert_channel(channel(0x11, false, b"first")).unwrap();
+        cfg.upsert_channel(channel(0x22, true, b"primary")).unwrap();
+        assert_eq!(
+            cfg.resolve_channel_secret(),
+            Some(([0x22u8; 32], 32)),
+            "the primary-flagged channel must win over insertion order"
+        );
+    }
+
+    #[test]
+    fn resolve_channel_secret_clamps_128_bit_key_len() {
+        let mut cfg = ProvisionedConfig::empty();
+        let mut ch = channel(0x33, false, b"short-key");
+        ch.key_len = 16;
+        cfg.upsert_channel(ch).unwrap();
+        assert_eq!(
+            cfg.resolve_channel_secret(),
+            Some(([0x33u8; 32], 16)),
+            "a 128-bit channel must resolve key_len=16, not the full 32-byte buffer"
+        );
     }
 
     #[test]
