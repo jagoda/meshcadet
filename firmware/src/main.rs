@@ -2468,7 +2468,13 @@ fn run() -> anyhow::Result<()> {
                         // under `hil`.
                         #[cfg(not(feature = "hil"))]
                         for ev in &ui_events {
-                            if let ui::UiEvent::DmAcked { to_hash } = ev {
+                            // `is_channel` is irrelevant here: a room post's
+                            // ack persists as `HistoryMsgType::Dm` too (see
+                            // `SendRoomPost`'s own `append_history` call —
+                            // rooms mirror a DM's history representation),
+                            // so this persist step is correct for both
+                            // shapes `DmAcked` now carries.
+                            if let ui::UiEvent::DmAcked { to_hash, is_channel: _ } = ev {
                                 let mut guard =
                                     HISTORY.lock().expect("HISTORY mutex should not be poisoned");
                                 if let Some(hs) = guard.as_mut() {
@@ -3650,10 +3656,13 @@ fn handle_req(
 /// logged-and-dropped (`main.rs`'s `ACK received (no pending DM)` line) —
 /// the delivery check never flipped.
 ///
-/// On a match, clears `pending_post_ack` and raises `UiEvent::DmAcked` (mirrors
-/// `DmAcked`'s "flip the sent-message checkmark", reusing that same UiEvent
-/// since a room's posts render through the exact same hash-keyed message
-/// view a DM's do — see `room_message_view.rs`'s module doc). Room
+/// On a match, clears `pending_post_ack` and raises `UiEvent::DmAcked` with
+/// `is_channel: true` (mirrors `DmAcked`'s "flip the sent-message checkmark",
+/// reusing that same UiEvent since a room's posts render through the exact
+/// same hash-keyed message view a DM's do — see `room_message_view.rs`'s
+/// module doc; `is_channel: true` is what lets the live-redraw guard in
+/// `UiRuntime::handle_event` find the room's currently-open MessageView
+/// rather than silently no-op — see `UiEvent::DmAcked`'s own doc). Room
 /// *keep-alive* ACKs are NOT matched here: a keep-alive is sent route-direct
 /// over an already-learned path (`room_session::encode_room_direct_prefix`'s
 /// doc), so its reply is always a bare `Ack`, never a PATH-return — that
@@ -3669,7 +3678,7 @@ fn match_room_post_ack(
         if room.pending_post_ack == Some(got) {
             room.pending_post_ack = None;
             log::info!("RX room post ACK for 0x{:02x}: matched", room.hash);
-            ui_events.push(ui::UiEvent::DmAcked { to_hash: room.hash });
+            ui_events.push(ui::UiEvent::DmAcked { to_hash: room.hash, is_channel: true });
             return true;
         }
     }
@@ -3768,7 +3777,7 @@ fn match_pending_ack(got: [u8; 4], pending_ack: &mut Option<PendingAck>, ui_even
                 "ACK received: matches last-sent DM (ack_hash={}, to_hash=0x{:02x})",
                 hex4(&got), expected.to_hash,
             );
-            ui_events.push(ui::UiEvent::DmAcked { to_hash: expected.to_hash });
+            ui_events.push(ui::UiEvent::DmAcked { to_hash: expected.to_hash, is_channel: false });
             *pending_ack = None;
         }
         Some(expected) => {
@@ -4602,7 +4611,14 @@ mod tests {
         assert!(pending.is_none(), "a matched ack must clear pending_ack");
         assert_eq!(ui_events.len(), 1, "a matched ack must raise exactly one UI event");
         match &ui_events[0] {
-            ui::UiEvent::DmAcked { to_hash } => assert_eq!(*to_hash, 0x42),
+            ui::UiEvent::DmAcked { to_hash, is_channel } => {
+                assert_eq!(*to_hash, 0x42);
+                // A genuine DM ack must NOT claim `is_channel: true` — that
+                // flag is what `UiRuntime::handle_event` uses to find the
+                // right open `MessageView` to redraw (see the variant's
+                // doc); getting it wrong is this mission's whole defect.
+                assert!(!is_channel, "a DM ack must raise DmAcked with is_channel: false");
+            }
             other => panic!("expected DmAcked, got {:?}", other),
         }
     }
@@ -4645,7 +4661,10 @@ mod tests {
         assert!(pending.is_none(), "a prefix-matched 6-byte ack must clear pending_ack");
         assert_eq!(ui_events.len(), 1, "a prefix-matched 6-byte ack must raise exactly one UI event");
         match &ui_events[0] {
-            ui::UiEvent::DmAcked { to_hash } => assert_eq!(*to_hash, 0x42),
+            ui::UiEvent::DmAcked { to_hash, is_channel } => {
+                assert_eq!(*to_hash, 0x42);
+                assert!(!is_channel, "a DM ack must raise DmAcked with is_channel: false");
+            }
             other => panic!("expected DmAcked, got {:?}", other),
         }
     }
@@ -4775,7 +4794,16 @@ mod tests {
         assert!(rooms[0].pending_post_ack.is_none(), "a matched ack must clear pending_post_ack");
         assert_eq!(ui_events.len(), 1, "a matched room post ack must raise exactly one UI event");
         match &ui_events[0] {
-            ui::UiEvent::DmAcked { to_hash } => assert_eq!(*to_hash, 0x99),
+            ui::UiEvent::DmAcked { to_hash, is_channel } => {
+                assert_eq!(*to_hash, 0x99);
+                // Regression guard for `meshcadet-room-ack-check-no-live-
+                // redraw`: a room post's ack must set `is_channel: true` or
+                // `UiRuntime::handle_event`'s live-redraw guard silently
+                // skips the currently-open room view (fixed only by
+                // re-navigating), because rooms open their `MessageView` as
+                // `(room_hash, is_channel: true)`.
+                assert!(is_channel, "a room post ack must raise DmAcked with is_channel: true");
+            }
             other => panic!("expected DmAcked, got {:?}", other),
         }
     }
@@ -4818,7 +4846,10 @@ mod tests {
         assert!(pending_dm.is_some(), "the unrelated DM pending ack must be untouched");
         assert_eq!(ui_events.len(), 1);
         match &ui_events[0] {
-            ui::UiEvent::DmAcked { to_hash } => assert_eq!(*to_hash, 0x99),
+            ui::UiEvent::DmAcked { to_hash, is_channel } => {
+                assert_eq!(*to_hash, 0x99);
+                assert!(is_channel, "a room post ack must raise DmAcked with is_channel: true");
+            }
             other => panic!("expected DmAcked, got {:?}", other),
         }
     }
