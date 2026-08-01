@@ -109,13 +109,17 @@ jobs:
         # Rust module's own tests do. See the test file's own header.
         run: node site/provisioner/history-format.test.mjs
 
-      - name: csp — every page carries its Content-Security-Policy and provisioner.js's QR import stays local
+      - name: csp — every page carries its Content-Security-Policy and provisioner.js's QR / flash.js's esptool-js imports stay local
         # meshcadet-channel-secret-leak-security-audit finding B3: GitHub
         # Pages can't set response headers, so each site/*.html page's CSP
         # <meta> tag is the only enforcement mechanism — and provisioner.js
         # (the one page handling secrets) must never regress back to loading
-        # a third-party script origin. See the test file's own header for
-        # why this is a static-source assertion, not a driven-browser test.
+        # a third-party script origin. Also covers
+        # meshcadet-flasher-cdn-import-unpinned-integrity: flash.js (writes
+        # firmware to an attached ESP32 over WebSerial) must never regress
+        # back to CDN-importing esptool-js either. See the test file's own
+        # header for why this is a static-source assertion, not a
+        # driven-browser test.
         run: node site/csp.test.mjs
 
       - name: guest-password-hygiene — the room guest password never reaches storage/console/URL and is cleared on disconnect

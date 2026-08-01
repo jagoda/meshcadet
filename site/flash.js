@@ -42,13 +42,22 @@
 // directly by the browser, no bundler.
 
 // esptool-js: the ONLY flash-mechanism dependency this page has (ADR-0011 —
-// esp-web-tools is no longer imported at all). Pinned to an ESM bundle with
-// no unresolved bare imports (verified by fetching and inspecting it —
+// esp-web-tools is no longer imported at all). Vendored locally at
+// ./vendor/esptool-js.js (version 0.5.7) rather than CDN-imported
+// (meshcadet-outsider-boundary-security-review finding F6 /
+// meshcadet-flasher-cdn-import-unpinned-integrity): this page's entire
+// function is writing firmware to an attached ESP32 over WebSerial, so code
+// substituted in by a compromised CDN edge/DNS — which a version pin in a
+// URL does nothing to prevent — yields total device compromise, not just a
+// broken page. See site/vendor/esptool-js.js's own header for provenance/
+// license/upgrade instructions (same vendoring pattern provisioner.js
+// already uses for `qrcode`, see site/vendor/qrcode.js). ES module with no
+// unresolved bare imports (verified by fetching and inspecting it —
 // esp-web-tools' own default CDN import path is NOT similarly self-
 // contained; see ADR-0011's Context for the live-verified failure mode that
-// finding closes off). Bundle exports `ESPLoader`/`Transport`, the same two
+// finding closes off). Exports `ESPLoader`/`Transport`, the same two
 // classes esp-web-tools' own src/flash.ts drives internally.
-import { ESPLoader, Transport } from "https://unpkg.com/esptool-js@0.5.7/bundle.js";
+import { ESPLoader, Transport } from "./vendor/esptool-js.js";
 import { isValidUpdateMeta } from "./upgrade-gate.js";
 import { resolveFreshInstallParts } from "./flash-manifest.js";
 import { ui8ToBstr } from "./flash-image-encoding.js";

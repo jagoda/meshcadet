@@ -54,7 +54,12 @@ all three in sync.
   preserves device identity/config/history). Both paths drive a shared
   hand-rolled `esptool-js` flow (no `esp-web-tools`/`<esp-web-install-button>`
   dependency at all — see ADR-0011) plus a shared page-level status bar +
-  expandable console. `flash.js` fetches
+  expandable console. `esptool-js` is vendored locally (`vendor/esptool-js.js`,
+  not CDN-imported — see that file's own header and `flash.js`'s header for
+  why: meshcadet-flasher-cdn-import-unpinned-integrity, same rationale as
+  `provisioner.js`'s `qrcode` vendoring below), since this page's entire
+  function is writing firmware to an attached device over WebSerial and a
+  compromised CDN edge/DNS there means total device compromise. `flash.js` fetches
   `api.github.com/repos/jagoda/meshcadet/releases` client-side to populate
   the version dropdown (shared by both paths), then writes either
   `firmware/<tag>/manifest.json`'s merged-image parts (Fresh, shape-checked
@@ -192,9 +197,9 @@ all three in sync.
   WASM) — vendored locally at `vendor/qrcode.js` rather than CDN-imported,
   because this is the one page on the site that handles secrets (channel
   secret, admin PIN, room guest password); see that file's own header and
-  `vendor/qrcode-LICENSE.txt` for provenance/license, and contrast
-  `flash.html`, which has no secrets to protect and still CDN-imports
-  esp-web-tools/esptool-js; and **Format B**, the device's signed self-advert card
+  `vendor/qrcode-LICENSE.txt` for provenance/license (`flash.html`'s
+  `esptool-js` dependency is vendored the same way, at `vendor/esptool-js.js`
+  — see the `flash.html` bullet above); and **Format B**, the device's signed self-advert card
   fetched fresh over Web Serial every read (`session.queryAdvert()`) and
   rendered as a copyable `meshcore://<hex>` string (`cardToUri`) for
   `meshcore-cli import-contact`. Format B's fetch is non-fatal on failure
@@ -252,12 +257,18 @@ all three in sync.
   run by `pages-check.yml`'s `check` job (each hygiene/coverage test file
   gets its own explicit `run:` step — the workflow does not glob for them).
 - `vendor/` — third-party browser code vendored (fetched, reviewed, and
-  committed) rather than CDN-imported, because `provisioner.html` is the one
-  page on the site that handles secrets and so loads no third-party script
-  origin at all (see `provisioner.html`'s Content-Security-Policy meta tag
-  and `provisioner.js`'s own header). `qrcode.js` is the only entry today —
+  committed) rather than CDN-imported, so that no page on this site loads a
+  third-party script origin at all — the security bar `provisioner.html`
+  first established (it's the one page that handles secrets — see its
+  Content-Security-Policy meta tag and `provisioner.js`'s own header)
+  extended to `flash.html` too, since a compromised CDN there yields total
+  device compromise, not just a broken page (meshcadet-flasher-cdn-import-
+  unpinned-integrity). Two entries: `qrcode.js` (used by `provisioner.js` —
   see its own header for provenance/upgrade instructions and
-  `qrcode-LICENSE.txt` for the MIT license texts it carries.
+  `qrcode-LICENSE.txt` for the MIT license texts it carries) and
+  `esptool-js.js` (used by `flash.js` — see its own header for provenance/
+  upgrade instructions and `esptool-js-LICENSE.txt` for the Apache-2.0/MIT
+  license texts it carries).
 - `styles.css` — one stylesheet, no build step. Color tokens at the top
   mirror `firmware/src/ui/theme.slint`'s `Theme` global 1:1, so the site and
   the on-device UI read as the same product. Keep them in sync if the
@@ -305,18 +316,22 @@ all three in sync.
   available — meshcadet-channel-secret-leak-security-audit finding B3). Each
   page's policy is scoped to what it actually loads, not copy-pasted:
   `index.html` has no script and no fetch of its own, so it's `default-src
-  'self'` and nothing more; `flash.html` CDN-imports `esptool-js` and fetches
-  `api.github.com` + same-origin `firmware/`, so it adds `script-src 'self'
-  https://unpkg.com; connect-src 'self' https://api.github.com` on top of the
-  same `default-src 'self'` baseline; `provisioner.html` is the one page that
-  handles secrets and, after `vendor/qrcode.js` above, loads no third-party
-  script and issues no fetch of any kind, so it adds `connect-src 'none'` —
-  the tightest policy on the site, on the page that most needs it. If you add
-  a new page or a new external resource to an existing one, update that
-  page's policy to match rather than loosening it site-wide — `csp.test.mjs`
-  (run by `pages-check.yml`'s `check` job) statically asserts every page's
-  exact policy and that `provisioner.js`'s QR import stays a local relative
-  path, so a silent regression fails CI rather than shipping.
+  'self'` and nothing more; `flash.html` fetches `api.github.com` +
+  same-origin `firmware/`, so it adds `connect-src 'self'
+  https://api.github.com` on top of the same `default-src 'self'` baseline —
+  its `esptool-js` dependency is vendored (`vendor/esptool-js.js`, not
+  CDN-imported — see the `flash.html` + `flash.js` bullet above and
+  meshcadet-flasher-cdn-import-unpinned-integrity), so `script-src` needs no
+  override; `provisioner.html` is the one page that handles secrets and,
+  after `vendor/qrcode.js` above, loads no third-party script and issues no
+  fetch of any kind, so it adds `connect-src 'none'` — the tightest policy on
+  the site, on the page that most needs it. If you add a new page or a new
+  external resource to an existing one, update that page's policy to match
+  rather than loosening it site-wide — `csp.test.mjs` (run by
+  `pages-check.yml`'s `check` job) statically asserts every page's exact
+  policy and that `provisioner.js`'s QR import and `flash.js`'s `esptool-js`
+  import both stay local relative paths, so a silent regression fails CI
+  rather than shipping.
 
 ## Local preview
 
