@@ -127,6 +127,12 @@ mod provisioning_server;
 // Rotating history store (NVS-backed, per-slot write design) — production only.
 #[cfg(not(feature = "hil"))]
 mod history_store;
+// Persisted per-contact inbound replay guard (`handle_dm`'s anti-replay
+// gate) — production only, same HIL exemption as `identity_store` /
+// `history_store` above (HIL is a bench rig, not exposed to the outsider
+// threat model this store defends against).
+#[cfg(not(feature = "hil"))]
+mod inbound_replay_store;
 mod radio;
 // Room-server client session — the pure decode/ACK/dedup state machine lives
 // in `firmware_core::room_session` (re-exported); this file additionally
@@ -3238,7 +3244,10 @@ fn on_receive(
                     return;
                 }
             }
-            handle_dm(payload, our_id, policy, txq, gps_snapshot, now_ms, tx_epoch_base, ui_events)
+            handle_dm(
+                payload, our_id, policy, txq, gps_snapshot, now_ms, tx_epoch_base, ui_events,
+                nvs_partition.clone(),
+            )
         }
         x if x == PayloadType::Req as u8 => {
             handle_req(payload, our_id, policy, txq, gps_snapshot, battery_snapshot)
@@ -3382,6 +3391,7 @@ fn append_history(
     }
 }
 
+#[cfg_attr(feature = "hil", allow(unused_variables))]
 fn handle_dm(
     payload: &[u8],
     our_id: &Identity,
@@ -3391,6 +3401,7 @@ fn handle_dm(
     now_ms: u64,
     tx_epoch_base: u32,
     ui_events: &mut Vec<ui::UiEvent>,
+    nvs_partition: EspDefaultNvsPartition,
 ) {
     let raw_dest = payload.get(0).copied().unwrap_or(0);
     let raw_src  = payload.get(1).copied().unwrap_or(0);
@@ -3435,6 +3446,36 @@ fn handle_dm(
 
             let text_str = core::str::from_utf8(text).unwrap_or("<invalid utf8>");
             log::info!("RX DM from 0x{:02x} ts={}: \"{}\"", raw_src, ts, text_str);
+
+            // ── Inbound replay gate (F3, meshcadet-outsider-boundary-security-review) ──
+            // `ack` is this frame's content fingerprint (ts + type + text +
+            // sender pubkey) — the SAME value the "ACK the DM" section below
+            // computes for the wire ACK, hoisted here so it can also gate
+            // replay acceptance; see `firmware_core::inbound_replay`'s module
+            // doc for the full persisted-high-water-mark + content-ring rule
+            // and its documented residual trade-off. Production builds only
+            // — HIL is a bench rig, not exposed to this threat model, and
+            // never touches NVS for anything else either (see
+            // `inbound_replay_store`'s module doc).
+            let ack = compute_ack_hash(ts, type_byte, text, contact_pubkey);
+            #[cfg(not(feature = "hil"))]
+            {
+                let mut replay_state =
+                    inbound_replay_store::load_inbound_replay_state(nvs_partition.clone(), raw_src);
+                if !inbound_replay_store::check_and_record_inbound(&mut replay_state, ts, ack) {
+                    rx_diag!(
+                        "RX DM: rejected as a replay — src_hash 0x{:02x} ts={} ack={} \
+                         (already accepted; no ACK, no history, no UI event, no telemetry reply)",
+                        raw_src, ts, hex4(&ack),
+                    );
+                    return;
+                }
+                inbound_replay_store::save_inbound_replay_state(
+                    nvs_partition.clone(),
+                    raw_src,
+                    &replay_state,
+                );
+            }
 
             // ── Persist to rotating history ───────────────────────────────────
             // Inbound entries are trivially "delivered" (acked=true) — there
@@ -3502,8 +3543,9 @@ fn handle_dm(
 
             // ── ACK the DM ───────────────────────────────────────────────────
             // ACK is always sent for any successfully decrypted DM from a known
-            // contact (telemetry or plain text).  Keyed on originator's pubkey.
-            let ack = compute_ack_hash(ts, type_byte, text, contact_pubkey);
+            // contact (telemetry or plain text). Keyed on originator's pubkey.
+            // `ack` was already computed above (also the replay gate's content
+            // fingerprint) — reused here rather than recomputed.
             let mut ack_frame = [0u8; 8];
             let n = build_ack_frame(&ack, &mut ack_frame);
             log_tx_queue_eviction(txq.enqueue(&ack_frame[..n]), "DM ACK");
