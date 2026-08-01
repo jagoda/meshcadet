@@ -3965,6 +3965,20 @@ fn handle_room_login_response(
         );
         return;
     };
+    // A direct login-reply RESPONSE is addressed to one specific member via
+    // `dest_hash = payload[0]`, but any device in radio range that
+    // provisioned this room still gets this frame handed to `on_receive`
+    // and routes it here on `src_hash` alone — see
+    // `room_session::is_room_frame_for_us`'s doc. Filter on `dest_hash`
+    // before decoding so another member's login reply doesn't cost a decode
+    // attempt that's guaranteed to fail the MAC and log a misleading WARN.
+    if !room_session::is_room_frame_for_us(payload, our_id.pub_hash()) {
+        rx_diag!(
+            "RX RESPONSE: room login reply not for us — dest=0x{:02x} != our=0x{:02x} (room 0x{:02x})",
+            payload.first().copied().unwrap_or(0), our_id.pub_hash(), room.hash,
+        );
+        return;
+    }
     let shared = our_id.ecdh_shared_secret(&room.pubkey);
     match room_session::decode_login_response_datagram(&shared, payload) {
         Ok(outcome) => apply_room_login_outcome(
@@ -4011,9 +4025,10 @@ fn handle_room_login_response(
 /// robust to a `recent` that's been reseeded from prefixed, persisted
 /// history after a reboot).
 ///
-/// Returns `true` if the frame was handled here (decoded as a push, or
-/// rejected as malformed), `false` if the caller must fall through to
-/// `handle_dm` instead — the latter fires only on
+/// Returns `true` if the frame was handled here (decoded as a push,
+/// rejected as malformed, or recognised as another member's copy of a push
+/// via a `dest_hash` mismatch — see below), `false` if the caller must fall
+/// through to `handle_dm` instead — the latter fires only on
 /// `RoomSessionError::Room(RoomCodecError::NotSignedPlain)`: the 1-byte
 /// `src_hash` routing in the caller is a 1-in-256 collision away from
 /// misrouting a genuine plain DM from an ordinary contact into this
@@ -4034,6 +4049,20 @@ fn handle_room_push_frame(
     gps_synced: bool,
     adopted_server_clock: &mut Option<room_session::AdoptedServerClock>,
 ) -> bool {
+    // `on_receive` routes here on `src_hash` (`payload[1] == room.hash`)
+    // alone, so every OTHER member's copy of the same push also reaches this
+    // device — see `room_session::is_room_frame_for_us`'s doc. Filter on
+    // `dest_hash` before attempting a decode at all, so this ordinary room
+    // chatter doesn't cost a wasted decode + a misleading
+    // `decode error: MacMismatch` WARN that reads like our own session is
+    // broken.
+    if !room_session::is_room_frame_for_us(payload, our_id.pub_hash()) {
+        rx_diag!(
+            "RX room push from 0x{:02x}: not for us — dest=0x{:02x} != our=0x{:02x}",
+            room.hash, payload.first().copied().unwrap_or(0), our_id.pub_hash(),
+        );
+        return true;
+    }
     let shared = our_id.ecdh_shared_secret(&room.pubkey);
     match room_session::handle_room_push(
         &shared,
