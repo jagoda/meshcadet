@@ -331,7 +331,7 @@ struct RoomRuntime {
     #[cfg_attr(feature = "hil", allow(dead_code))]
     last_keep_alive_ms: u64,
     /// Wall-clock ms this room last sent a RE-FLOOD login attempt via the
-    /// `out_path_len == 0` branch — `0` initially, doubling as that branch's
+    /// `!session.has_route()` branch — `0` initially, doubling as that branch's
     /// own "never yet" sentinel, exactly like `last_keep_alive_ms`'s.
     /// `meshcadet-room-reflood-login-backoff`'s fix (FINDING B): kept
     /// deliberately SEPARATE from `last_keep_alive_ms` so the reflood
@@ -438,7 +438,8 @@ const ROOM_KEEP_ALIVE_INTERVAL_MS: u64 = 300_000;
 /// drained. 10 s is short enough that a user notices no meaningful lag, but
 /// long enough to give the boot-time flood login (`room_session::
 /// encode_room_login_frame`) a realistic chance to route-return before this
-/// tick's `out_path_len == 0` branch would otherwise re-flood it again.
+/// tick's re-flood branch (`!session.has_route()`) would otherwise
+/// re-flood it again.
 #[cfg(not(feature = "hil"))]
 const ROOM_FIRST_KEEP_ALIVE_DELAY_MS: u64 = 10_000;
 
@@ -452,7 +453,7 @@ const ROOM_FIRST_KEEP_ALIVE_DELAY_MS: u64 = 10_000;
 const ROOM_DRAINING_KEEP_ALIVE_INTERVAL_MS: u64 = 15_000;
 
 /// `meshcadet-room-reflood-login-backoff` fix (FINDING B): the
-/// `out_path_len == 0` re-flood-login branch's OWN cadence — deliberately
+/// `!session.has_route()` re-flood-login branch's OWN cadence — deliberately
 /// NOT [`ROOM_DRAINING_KEEP_ALIVE_INTERVAL_MS`]. That constant gates the
 /// route-direct keep-alive/drain-window poll only; letting the reflood
 /// branch share it meant a room whose server never answers (offline,
@@ -495,6 +496,22 @@ const _: () = assert!(
     ROOM_FIRST_KEEP_ALIVE_DELAY_MS
         + room_session::KEEP_ALIVE_STALL_THRESHOLD as u64 * ROOM_DRAINING_KEEP_ALIVE_INTERVAL_MS
         > ROOM_REFLOOD_INITIAL_BACKOFF_MS
+);
+
+// `DRAIN_SUPPRESSION_CEILING_MS`'s size is justified against THIS cadence
+// (see that constant's doc: 4x the draining keep-alive interval, so three
+// consecutive missed round-trips still fall inside the ceiling and a
+// genuinely progressing drain is never truncated by it in practice). The
+// constant lives in `firmware_core`, the cadence lives here, and neither
+// crate can see the other's rationale — so pin the relationship itself. If
+// this fires, either re-derive the ceiling for the new cadence or accept
+// that a healthy drain will now sometimes be force-flushed mid-backlog;
+// don't just bump a number past the assertion.
+#[cfg(not(feature = "hil"))]
+const _: () = assert!(
+    room_session::DRAIN_SUPPRESSION_CEILING_MS >= 3 * ROOM_DRAINING_KEEP_ALIVE_INTERVAL_MS
+        && room_session::DRAIN_SUPPRESSION_CEILING_MS
+            < room_session::DRAIN_WINDOW_STALL_TIMEOUT_MS
 );
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -1940,7 +1957,7 @@ fn run() -> anyhow::Result<()> {
         // cycle defect, not merely a battery one. See
         // `room_session::room_reflood_interval_ms`'s doc for the full
         // rationale.
-        //   - `out_path_len == 0`: no learned route — re-flood the login on
+        //   - `!has_route()`: no learned route — re-flood the login on
         //     its OWN, backed-off cadence (`room_reflood_interval_ms`),
         //     never on the drain/routine cadence below.
         //   - otherwise: route-direct keep-alive on the pre-existing
@@ -1985,7 +2002,17 @@ fn run() -> anyhow::Result<()> {
                 }
             }
 
-            if room.session.out_path_len == 0 {
+            // `has_route()`, never `out_path_len == 0`
+            // (`meshcadet-room-notify-suppression-full-enumeration-fix`): a
+            // ZERO-HOP learned route — the room server is this device's
+            // direct radio neighbour, the ordinary bench topology — is a
+            // real, usable route whose `out_path_len` is legitimately 0.
+            // Reading the hop count as "no route" made this branch fire
+            // forever on such a room, so no keep-alive was ever sent, so the
+            // drain window's normal closer never ran and every inbound post
+            // was silently absorbed. See
+            // `room_session::PersistedRoomSession::route_known`'s doc.
+            if !room.session.has_route() {
                 // Decoupled reflood cadence — deliberately does NOT read
                 // `ROOM_DRAINING_KEEP_ALIVE_INTERVAL_MS`,
                 // `room.sync_phase.is_draining()`, or
@@ -3860,7 +3887,7 @@ fn apply_room_login_outcome(
     room.keep_alive_stall.reset();
     // A successful login reply is one of the reflood backoff's two reset
     // conditions (`room_session::room_reflood_interval_ms`'s doc) — this
-    // reply IS the reflood succeeding, so the next `out_path_len == 0`
+    // reply IS the reflood succeeding, so the next `!has_route()`
     // epoch (should one ever start again) begins fresh at the initial
     // backoff, not wherever this epoch's exponent left off.
     room.reflood_attempts = 0;
@@ -3873,16 +3900,38 @@ fn apply_room_login_outcome(
         room.session_epoch,
         &room.session,
     );
-    log::info!(
-        "room: login complete for 0x{:02x}: permissions={:?}{}",
-        room.hash,
-        room.session.permission(),
-        if outcome.out_path.is_some() {
-            " (learned out_path)"
-        } else {
-            ""
-        },
-    );
+    // Report the HOP COUNT, not just "learned a path"
+    // (`meshcadet-room-notify-suppression-full-enumeration-fix`): the case
+    // that hid for five missions was a reply teaching a ZERO-HOP route (a
+    // direct-neighbour server), which logged identically to a multi-hop one
+    // while behaving like no route at all. A log that cannot distinguish
+    // them cannot be used to diagnose them — this line is what a HIL capture
+    // greps for.
+    match outcome.out_path {
+        Some((_, hops)) => log::info!(
+            "room: login complete for 0x{:02x}: permissions={:?} (learned out_path, {} hop(s){})",
+            room.hash,
+            room.session.permission(),
+            hops,
+            if hops == 0 {
+                " — server is a direct radio neighbour; keep-alives go route-direct with an \
+                 empty path"
+            } else {
+                ""
+            },
+        ),
+        None => log::info!(
+            "room: login complete for 0x{:02x}: permissions={:?} (no path taught by this \
+             reply; route {})",
+            room.hash,
+            room.session.permission(),
+            if room.session.has_route() {
+                "already known"
+            } else {
+                "still UNKNOWN — the re-flood branch stays active"
+            },
+        ),
+    }
     ui_events.push(ui::UiEvent::RoomPermissionUpdated {
         room_hash: room.hash,
         can_post: room.session.permission().can_post(),

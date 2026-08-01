@@ -29,12 +29,12 @@
 //! `RoomSyncPhase::on_scheduler_tick` is the fix — a periodic,
 //! event-independent re-evaluation — but it is only a real fix if
 //! `firmware::main`'s scheduler loop actually CALLS it on every pass, for
-//! every logged-in room, BEFORE the `out_path_len == 0` branch (that branch
+//! every logged-in room, BEFORE the `!room.session.has_route()` branch (that branch
 //! always `continue`s, so any call placed after it would never run for the
 //! exact case this mission fixes — a route that is never learned). This
 //! scanner pins both:
 //!   - `room.sync_phase.on_scheduler_tick(...)` is called inside the
-//!     scheduler loop, textually BEFORE the `out_path_len == 0` branch's own
+//!     scheduler loop, textually BEFORE the `!room.session.has_route()` branch's own
 //!     condition (i.e. unconditionally reached every pass, not nested inside
 //!     either cadence branch).
 //!   - the `Some(RoomNotification::Aggregate { .. })` arm that call feeds
@@ -136,7 +136,7 @@ pub fn check_source(src: &str) -> Vec<String> {
 
     let mut violations = Vec::new();
 
-    let branch_needle = "out_path_len == 0";
+    let branch_needle = "!room.session.has_route()";
     let branch_hits: Vec<usize> = find_all(&chars[lo..lc], branch_needle)
         .into_iter()
         .map(|rel| lo + rel)
@@ -145,14 +145,14 @@ pub fn check_source(src: &str) -> Vec<String> {
         1 => branch_hits[0],
         0 => {
             violations.push(format!(
-                "{MAIN_RS_REL_PATH}: could not locate the `out_path_len == 0` re-flood branch \
+                "{MAIN_RS_REL_PATH}: could not locate the `!room.session.has_route()` re-flood branch \
                  inside the scheduler loop"
             ));
             return violations;
         }
         n => {
             violations.push(format!(
-                "{MAIN_RS_REL_PATH}: {n} occurrences of `out_path_len == 0` inside the \
+                "{MAIN_RS_REL_PATH}: {n} occurrences of `!room.session.has_route()` inside the \
                  scheduler loop (expected exactly one) — this scanner cannot tell which is the \
                  re-flood branch"
             ));
@@ -188,10 +188,10 @@ pub fn check_source(src: &str) -> Vec<String> {
 
     if tick_pos >= branch_cond_pos {
         violations.push(format!(
-            "{MAIN_RS_REL_PATH}: `{TICK_CALL}` is called AFTER the `out_path_len == 0` check — \
+            "{MAIN_RS_REL_PATH}: `{TICK_CALL}` is called AFTER the `!room.session.has_route()` check — \
              that branch always `continue`s, so a call placed after it never runs for a room \
              whose `out_path` is never learned, which is exactly the case this mission fixes. \
-             The call must precede the `out_path_len == 0` branch so it runs unconditionally, \
+             The call must precede the `!room.session.has_route()` branch so it runs unconditionally, \
              every scheduler pass, for every logged-in room"
         ));
     }
@@ -270,7 +270,7 @@ mod tests {
                 }
             }
 
-            if room.session.out_path_len == 0 {
+            if !room.session.has_route() {
                 let interval = room_session::room_reflood_interval_ms(
                     room.reflood_attempts,
                     ROOM_REFLOOD_INITIAL_BACKOFF_MS,
@@ -301,7 +301,7 @@ mod tests {
                     continue;
                 }
 
-                if room.session.out_path_len == 0 {
+                if !room.session.has_route() {
                     let interval = room_session::room_reflood_interval_ms(
                         room.reflood_attempts,
                         ROOM_REFLOOD_INITIAL_BACKOFF_MS,
@@ -321,7 +321,7 @@ mod tests {
         assert!(
             violations
                 .iter()
-                .any(|v| v.contains("called AFTER the `out_path_len == 0` check")),
+                .any(|v| v.contains("called AFTER the `!room.session.has_route()` check")),
             "{violations:?}"
         );
     }
@@ -342,7 +342,7 @@ mod tests {
                     // Dropped on the floor — never reaches the UI.
                 }
 
-                if room.session.out_path_len == 0 {
+                if !room.session.has_route() {
                     continue;
                 }
             }
@@ -363,7 +363,7 @@ mod tests {
                 if !room.login_sent {
                     continue;
                 }
-                if room.session.out_path_len == 0 {
+                if !room.session.has_route() {
                     continue;
                 }
             }
@@ -404,7 +404,7 @@ mod tests {
                     // TODO: raise UiEvent::RoomDrainComplete here.
                 }
 
-                if room.session.out_path_len == 0 {
+                if !room.session.has_route() {
                     continue;
                 }
             }

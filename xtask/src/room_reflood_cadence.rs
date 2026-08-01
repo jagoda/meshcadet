@@ -16,7 +16,7 @@
 //! FINDING B of `meshcadet-room-reflood-login-backoff`'s Objective: the room
 //! keep-alive scheduler's `for room in room_runtime.iter_mut()` loop has TWO
 //! branches that must gate on TWO INDEPENDENT cadences —
-//!   - `out_path_len == 0` (no learned route): must gate on
+//!   - `!room.session.has_route()` (no learned route): must gate on
 //!     `room_session::room_reflood_interval_ms`'s own, backed-off cadence,
 //!     and must NEVER reference `ROOM_DRAINING_KEEP_ALIVE_INTERVAL_MS`,
 //!     `room_session::room_keep_alive_interval_ms`, or `is_draining`.
@@ -39,6 +39,21 @@
 //! written for, and had no reason to notice an unrelated branch quietly
 //! shared its gate. This scanner pins the two branches structurally apart
 //! so a future change can't silently re-couple them again.
+//!
+//! # The second invariant, added 2026-08-01
+//!
+//! `meshcadet-room-notify-suppression-full-enumeration-fix`: the re-flood
+//! branch's condition must be `!room.session.has_route()` and the scheduler
+//! loop must not test `out_path_len == 0` for route-known-ness ANYWHERE.
+//! Those two are not synonyms: a ZERO-HOP learned route (the room server is
+//! a direct radio neighbour — the ordinary bench topology) has
+//! `out_path_len == 0` and is perfectly usable. Reading the hop count as "no
+//! route" made such a room re-flood its login forever and never send a
+//! single keep-alive, so `RoomSyncPhase`'s only closer could never run and
+//! every inbound post was silently absorbed — the fifth recurrence of
+//! "renders but never notifies". The behavioural half is pinned by
+//! `firmware_core::room_session`'s own zero-hop tests; this scanner pins
+//! that `firmware::main` never reintroduces the conflated sentinel.
 //!
 //! # Scope and honest limits
 //!
@@ -142,7 +157,23 @@ pub fn check_source(src: &str) -> Vec<String> {
 
     let mut violations = Vec::new();
 
-    let branch_needle = "out_path_len == 0";
+    // `meshcadet-room-notify-suppression-full-enumeration-fix`: the loop must
+    // not decide "is a route known?" from the HOP COUNT anywhere — a zero-hop
+    // route is a learned route. See this module's second invariant.
+    let loop_body = slice_chars(&masked, lo + 1, lc);
+    if loop_body.contains("out_path_len == 0") || loop_body.contains("out_path_len > 0") {
+        violations.push(format!(
+            "{MAIN_RS_REL_PATH}: the scheduler loop tests `out_path_len` for route-known-ness — \
+             that sentinel is exactly the defect this guard exists to prevent: a ZERO-HOP route \
+             (a direct-neighbour room server, the ordinary bench topology) is a learned route \
+             whose `out_path_len` is legitimately 0. Reading it as 'no route' re-floods the \
+             login forever, so no keep-alive is ever sent, so the drain window's only closer \
+             never runs and inbound posts are silently absorbed. Use \
+             `room.session.has_route()`"
+        ));
+    }
+
+    let branch_needle = "!room.session.has_route()";
     let branch_hits: Vec<usize> = find_all(&chars[lo..lc], branch_needle)
         .into_iter()
         .map(|rel| lo + rel)
@@ -151,14 +182,14 @@ pub fn check_source(src: &str) -> Vec<String> {
         1 => branch_hits[0],
         0 => {
             violations.push(format!(
-                "{MAIN_RS_REL_PATH}: could not locate the `out_path_len == 0` re-flood branch \
+                "{MAIN_RS_REL_PATH}: could not locate the `!room.session.has_route()` re-flood branch \
                  inside the scheduler loop"
             ));
             return violations;
         }
         n => {
             violations.push(format!(
-                "{MAIN_RS_REL_PATH}: {n} occurrences of `out_path_len == 0` inside the \
+                "{MAIN_RS_REL_PATH}: {n} occurrences of `!room.session.has_route()` inside the \
                  scheduler loop (expected exactly one) — this scanner cannot tell which is the \
                  re-flood branch"
             ));
@@ -167,13 +198,13 @@ pub fn check_source(src: &str) -> Vec<String> {
     };
     let Some(branch_open) = next_open_brace(&chars[..lc], branch_cond_pos) else {
         violations.push(format!(
-            "{MAIN_RS_REL_PATH}: `out_path_len == 0` has no braced body this scanner can delimit"
+            "{MAIN_RS_REL_PATH}: `!room.session.has_route()` has no braced body this scanner can delimit"
         ));
         return violations;
     };
     let Some((bo, bc)) = brace_body(&spans, branch_open) else {
         violations.push(format!(
-            "{MAIN_RS_REL_PATH}: could not brace-match the `out_path_len == 0` re-flood branch"
+            "{MAIN_RS_REL_PATH}: could not brace-match the `!room.session.has_route()` re-flood branch"
         ));
         return violations;
     };
@@ -187,7 +218,7 @@ pub fn check_source(src: &str) -> Vec<String> {
 
     if !reflood_body.contains("room_reflood_interval_ms") {
         violations.push(format!(
-            "{MAIN_RS_REL_PATH}: the `out_path_len == 0` re-flood branch no longer gates on \
+            "{MAIN_RS_REL_PATH}: the `!room.session.has_route()` re-flood branch no longer gates on \
              `room_session::room_reflood_interval_ms` — it must use its own decoupled, \
              backed-off cadence, not an ungated (or re-coupled) reflood"
         ));
@@ -197,7 +228,7 @@ pub fn check_source(src: &str) -> Vec<String> {
         || reflood_body.contains("is_draining")
     {
         violations.push(format!(
-            "{MAIN_RS_REL_PATH}: the `out_path_len == 0` re-flood branch references the \
+            "{MAIN_RS_REL_PATH}: the `!room.session.has_route()` re-flood branch references the \
              drain/routine keep-alive cadence (`ROOM_DRAINING_KEEP_ALIVE_INTERVAL_MS` / \
              `room_keep_alive_interval_ms` / `is_draining`) — this is FINDING B's exact \
              regression: an offline room server would again be re-flooded every 15s forever, \
@@ -256,7 +287,7 @@ mod tests {
             if !room.login_sent {
                 continue;
             }
-            if room.session.out_path_len == 0 {
+            if !room.session.has_route() {
                 let interval = room_session::room_reflood_interval_ms(
                     room.reflood_attempts,
                     ROOM_REFLOOD_INITIAL_BACKOFF_MS,
@@ -290,6 +321,81 @@ mod tests {
         );
     }
 
+    /// Models the fifth-recurrence defect
+    /// (`meshcadet-room-notify-suppression-full-enumeration-fix`): the
+    /// re-flood branch decides "no route" from the HOP COUNT, so a zero-hop
+    /// (direct-neighbour) room server re-floods forever and never sends the
+    /// keep-alive that is the drain window's only closer.
+    #[test]
+    fn synthetic_out_path_len_sentinel_regression_is_caught() {
+        let synthetic = r#"
+            for room in room_runtime.iter_mut() {
+                if !room.login_sent {
+                    continue;
+                }
+                if room.session.out_path_len == 0 {
+                    let interval = room_session::room_reflood_interval_ms(
+                        room.reflood_attempts,
+                        ROOM_REFLOOD_INITIAL_BACKOFF_MS,
+                        ROOM_REFLOOD_BACKOFF_CEILING_MS,
+                    );
+                    continue;
+                }
+                let interval = room_session::room_keep_alive_interval_ms(
+                    room.last_keep_alive_ms,
+                    room.sync_phase.is_draining(),
+                    ROOM_FIRST_KEEP_ALIVE_DELAY_MS,
+                    ROOM_DRAINING_KEEP_ALIVE_INTERVAL_MS,
+                    ROOM_KEEP_ALIVE_INTERVAL_MS,
+                );
+            }
+        "#;
+        let violations = check_source(synthetic);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("tests `out_path_len` for route-known-ness")),
+            "{violations:?}"
+        );
+    }
+
+    /// The same conflation written the other way round — a positive test
+    /// for "has a route" — is the identical defect and must also be caught.
+    #[test]
+    fn synthetic_inverted_out_path_len_sentinel_is_caught() {
+        let synthetic = r#"
+            for room in room_runtime.iter_mut() {
+                if !room.login_sent {
+                    continue;
+                }
+                if !room.session.has_route() {
+                    let interval = room_session::room_reflood_interval_ms(
+                        room.reflood_attempts,
+                        ROOM_REFLOOD_INITIAL_BACKOFF_MS,
+                        ROOM_REFLOOD_BACKOFF_CEILING_MS,
+                    );
+                    continue;
+                }
+                if room.session.out_path_len > 0 {
+                    let interval = room_session::room_keep_alive_interval_ms(
+                        room.last_keep_alive_ms,
+                        room.sync_phase.is_draining(),
+                        ROOM_FIRST_KEEP_ALIVE_DELAY_MS,
+                        ROOM_DRAINING_KEEP_ALIVE_INTERVAL_MS,
+                        ROOM_KEEP_ALIVE_INTERVAL_MS,
+                    );
+                }
+            }
+        "#;
+        let violations = check_source(synthetic);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("tests `out_path_len` for route-known-ness")),
+            "{violations:?}"
+        );
+    }
+
     #[test]
     fn synthetic_recoupled_regression_is_caught() {
         // Models the EXACT pre-fix defect: the re-flood branch shares the
@@ -310,7 +416,7 @@ mod tests {
                     continue;
                 }
                 room.last_keep_alive_ms = now;
-                if room.session.out_path_len == 0 {
+                if !room.session.has_route() {
                     txq.enqueue(&frame[..n]);
                     continue;
                 }
@@ -339,7 +445,7 @@ mod tests {
                 if !room.login_sent {
                     continue;
                 }
-                if room.session.out_path_len == 0 {
+                if !room.session.has_route() {
                     let interval = room_session::room_reflood_interval_ms(
                         room.reflood_attempts,
                         ROOM_REFLOOD_INITIAL_BACKOFF_MS,
@@ -378,7 +484,7 @@ mod tests {
                 if !room.login_sent {
                     continue;
                 }
-                if room.session.out_path_len == 0 {
+                if !room.session.has_route() {
                     txq.enqueue(&frame[..n]);
                     continue;
                 }
@@ -421,7 +527,7 @@ mod tests {
                 if !room.login_sent {
                     continue;
                 }
-                if room.session.out_path_len == 0 {
+                if !room.session.has_route() {
                     // Deliberately NOT `ROOM_DRAINING_KEEP_ALIVE_INTERVAL_MS` /
                     // `room_keep_alive_interval_ms` / `is_draining` — see doc.
                     let interval = room_session::room_reflood_interval_ms(
