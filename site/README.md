@@ -328,10 +328,14 @@ all three in sync.
   the site, on the page that most needs it. If you add a new page or a new
   external resource to an existing one, update that page's policy to match
   rather than loosening it site-wide — `csp.test.mjs` (run by
-  `pages-check.yml`'s `check` job) statically asserts every page's exact
-  policy and that `provisioner.js`'s QR import and `flash.js`'s `esptool-js`
-  import both stay local relative paths, so a silent regression fails CI
-  rather than shipping.
+  `pages-check.yml`'s `check` job) statically asserts each existing page's
+  exact `default-src`/`connect-src` policy, plus — enumerated across every
+  `site/*.html` and every JS file reachable from each page's `<script
+  type="module">` entry point, not hand-listed per page/script — that no
+  page's `script-src` (or `default-src` fallback) ever allows a third-party
+  origin and no reachable local JS file ever imports an absolute
+  `http(s)://` URL, so a silent regression (or a fresh CDN import into a new
+  page or script) fails CI automatically rather than shipping.
 
 ## Local preview
 
