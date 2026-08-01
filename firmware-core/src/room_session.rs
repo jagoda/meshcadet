@@ -321,6 +321,48 @@ pub struct PersistedRoomSession {
     /// `meshcadet-room-clock-plausibility-bounds`) — see that function's doc
     /// for why forcing it down is self-harm, not repair.
     pub last_room_ts: u32,
+    /// Whether this session has learned a route to the room server AT ALL —
+    /// a strictly different question from how many hops that route has.
+    ///
+    /// **`meshcadet-room-notify-suppression-full-enumeration-fix`'s root
+    /// cause.** `out_path_len == 0` used to answer both questions at once,
+    /// and they are not the same: a PATH-return whose `path_byte_count` is
+    /// `0` (`protocol::codec::decode_path_return_plaintext` — `hop_count`
+    /// comes straight off the `path_len` byte and `0` is legal) is a room
+    /// server that is this device's DIRECT RADIO NEIGHBOUR. That is a fully
+    /// learned, fully usable route-direct target — MeshCore encodes it as
+    /// `RouteType::Direct` with a 0-hop `path_len`, exactly what
+    /// [`encode_room_direct_prefix`] now emits — yet it lands in
+    /// `out_path_len` as `0`, indistinguishable from "nothing learned yet".
+    ///
+    /// The HIL capture that pinned it (2026-08-01): the room server sat on
+    /// the bench next to the device, so every login reply taught a zero-hop
+    /// path. `firmware::main`'s scheduler read `out_path_len == 0` as "no
+    /// route", took the re-flood branch on every pass — the log's
+    /// `login complete ... (learned out_path)` immediately followed by
+    /// `has no learned out_path — re-flooding login (attempt 1 ...)`, forever,
+    /// at the 30 s initial backoff (the backoff epoch resets on every
+    /// successful login, so it never escalated) — and therefore NEVER SENT A
+    /// SINGLE KEEP-ALIVE. A keep-alive ACK is [`RoomSyncPhase`]'s normal
+    /// closer, and [`RoomKeepAliveStall`] (the input to
+    /// [`RoomSyncPhase::note_closer_failed`]) only ticks when keep-alives are
+    /// actually sent, so BOTH event-driven closers were structurally
+    /// unreachable and every inbound post was silently absorbed.
+    ///
+    /// **Deliberately RAM-only** — [`encode_persisted_room_session`] does not
+    /// write it and the on-flash blob format is unchanged. A reboot re-seeds
+    /// it from `out_path_len > 0` ([`decode_persisted_room_session`],
+    /// [`Self::from_room_extra`]), so a device that had learned a zero-hop
+    /// route comes back up believing it has none, re-floods ONE login, and
+    /// relearns it from the reply seconds later — the same flood login every
+    /// boot already sends unconditionally. Persisting it instead would mean
+    /// growing the blob, and the one spare length
+    /// ([`PERSISTED_ROOM_SESSION_LEN`]) is already spent on the retired
+    /// guard-era trust byte: a `PRE_SYNC_GUARD_LEN + 1` blob is ambiguous
+    /// between the two, and misreading a guard-era `1` as "route known" on a
+    /// session with no route would send route-direct keep-alives into the
+    /// void. A one-login relearn is much cheaper than that migration hazard.
+    pub route_known: bool,
 }
 
 impl PersistedRoomSession {
@@ -333,6 +375,7 @@ impl PersistedRoomSession {
         out_path: [0u8; MAX_PATH_SIZE],
         out_path_len: 0,
         last_room_ts: 0,
+        route_known: false,
     };
 
     /// Snapshot the provisioning-time seed a `RoomExtra` carries (used as the
@@ -345,6 +388,12 @@ impl PersistedRoomSession {
             out_path: extra.out_path,
             out_path_len: extra.out_path_len,
             last_room_ts: 0,
+            // `RoomExtra` carries the same overloaded sentinel this struct
+            // just retired, and no flag of its own — so a provisioning-time
+            // seed can only ever claim a route it can prove by hop count.
+            // See [`Self::route_known`]'s doc: the cost is one re-flood
+            // login, which the boot login sends anyway.
+            route_known: extra.out_path_len > 0,
         }
     }
 
@@ -353,13 +402,39 @@ impl PersistedRoomSession {
         RoomPermission::from_u8(self.permissions)
     }
 
+    /// Whether this session has a learned route to the room server — the
+    /// ONE question callers gating route-direct traffic (a keep-alive) or
+    /// the re-flood-login branch should ever ask. **Never test
+    /// `out_path_len == 0` for this**: a zero-hop route is a learned route
+    /// (see [`Self::route_known`]'s doc for the HIL defect that came of
+    /// conflating them; `xtask::room_route_known_gate` pins it structurally).
+    pub fn has_route(&self) -> bool {
+        self.route_known
+    }
+
+    /// Forget this session's learned route, so the caller's next scheduler
+    /// pass takes the re-flood-login branch and relearns one from scratch.
+    /// Clears BOTH halves of the route state — the flag and the hop bytes —
+    /// so the two can never disagree.
+    pub fn invalidate_route(&mut self) {
+        self.route_known = false;
+        self.out_path_len = 0;
+    }
+
     /// Apply a login outcome's learned fields — mirrors [`apply_login_outcome`]
     /// for callers persisting through this standalone struct.
+    ///
+    /// A reply that taught a route marks this session route-known even when
+    /// that route is zero hops (`path_byte_count == 0`, a direct-neighbour
+    /// server) — see [`Self::route_known`]'s doc. A direct `RESPONSE` reply
+    /// teaches no path (`out_path: None`) and so leaves both halves of the
+    /// route state exactly as they were.
     pub fn apply_login_outcome(&mut self, outcome: &RoomLoginOutcome) {
         self.permissions = outcome.permissions as u8;
         if let Some((path, path_byte_count)) = outcome.out_path {
             self.out_path = path;
             self.out_path_len = path_byte_count.min(u8::MAX as usize) as u8;
+            self.route_known = true;
         }
     }
 
@@ -761,6 +836,11 @@ pub fn decode_persisted_room_session(blob: &[u8]) -> Option<PersistedRoomSession
         out_path,
         out_path_len,
         last_room_ts,
+        // Not on the wire — the blob format is deliberately unchanged. A
+        // resumed session can only claim a route it can prove by hop count;
+        // a zero-hop one is relearned by the boot login's reply seconds
+        // later. See `PersistedRoomSession::route_known`'s doc.
+        route_known: out_path_len > 0,
     })
 }
 
@@ -1012,18 +1092,25 @@ pub fn encode_room_post_checked(
 /// (`MyMesh.cpp:536`, `packet->isRouteDirect()`). `out_path` is 1-byte-hash
 /// encoded (matches [`RoomLoginOutcome::out_path`]/[`RoomExtra::out_path`]'s
 /// own convention — the path a `decode_path_return` PATH-return taught this
-/// client). Returns `None` if `out_path` is empty (nothing learned yet — the
-/// caller must re-flood the `ANON_REQ` login to relearn it instead, per this
-/// module's `encode_room_login_frame`) or longer than 63 hops (`PathLen`'s
-/// own range).
+/// client). Returns `None` only if `out_path` is longer than 63 hops
+/// (`PathLen`'s own range).
+///
+/// **An EMPTY `out_path` is a valid route, not a missing one**
+/// (`meshcadet-room-notify-suppression-full-enumeration-fix`): a zero-hop
+/// path means the room server is this device's direct radio neighbour, and
+/// `RouteType::Direct` with a 0-hop `path_len` is precisely how MeshCore
+/// addresses one — the same shape this module's own flood frames already
+/// emit for their (differently-routed) 0-hop `path_len` byte. This function
+/// used to reject it as "nothing learned yet", which is a question it cannot
+/// answer from the path bytes alone; the caller owns that gate now
+/// ([`PersistedRoomSession::has_route`]) and must still re-flood the
+/// `ANON_REQ` login to relearn a route it does not have, per this module's
+/// `encode_room_login_frame`.
 pub fn encode_room_direct_prefix(
     payload_type: PayloadType,
     out_path: &[u8],
     out: &mut [u8],
 ) -> Option<usize> {
-    if out_path.is_empty() {
-        return None;
-    }
     let path_len = PathLen::new(1, u8::try_from(out_path.len()).ok()?)?;
     out[0] = Header::new(RouteType::Direct, payload_type).0;
     out[1] = path_len.0;
@@ -1038,11 +1125,15 @@ pub fn encode_room_direct_prefix(
 pub const MAX_KEEP_ALIVE_FRAME_LEN: usize = 2 + MAX_PATH_SIZE + 20;
 
 /// Encode a full route-direct keep-alive frame — Phase C's periodic
-/// liveness/backlog-depth probe. Returns `None` (writes nothing) if
-/// `out_path` is empty: **route-direct is a hard prerequisite**
-/// (`encode_room_direct_prefix`'s doc) — a caller that gets `None` here must
-/// re-flood the login instead of ever attempting a flood-routed keep-alive
-/// (the server ignores one outright, `MyMesh.cpp:536`).
+/// liveness/backlog-depth probe. **Route-direct is a hard prerequisite**
+/// (`encode_room_direct_prefix`'s doc): this frame is never flood-routed,
+/// because the server ignores a flooded keep-alive outright
+/// (`MyMesh.cpp:536`). Returns `None` (writes nothing) only on an
+/// out-of-range path (over 63 hops) — an EMPTY `out_path` encodes fine, as a
+/// 0-hop direct frame to a neighbouring server; whether a route is known at
+/// all is the caller's gate ([`PersistedRoomSession::has_route`]), not this
+/// encoder's, and a caller with no route must re-flood the login instead of
+/// calling here.
 ///
 /// `force_since`, passed straight through to [`encode_keep_alive`], recovers
 /// a stalled sync by force-updating the server's view of this client's
@@ -1075,7 +1166,7 @@ pub fn encode_room_keep_alive_frame(
 // is no ACK-timeout handler and no failure counter anywhere upstream of this
 // module, so a repeater/topology change that leaves the persisted `out_path`
 // stale-but-nonzero keeps getting route-directed down a dead route forever.
-// The `out_path_len == 0` re-flood-login branch this scheduler already has
+// The `!has_route()` re-flood-login branch this scheduler already has
 // (`encode_room_login_frame`'s doc) never fires, and the session stalls
 // until reboot — corroborated by this module's own "a client that fails to
 // ACK stalls its own sync permanently" doc and the M1 checkpoint's "stalled
@@ -1111,7 +1202,7 @@ pub fn encode_room_keep_alive_frame(
 /// spuriously invalidate `out_path` under the draining cadence.
 ///
 /// This is now a bounded, self-healing cost rather than an unbounded one:
-/// the `out_path_len == 0` re-flood-login branch this invalidation falls
+/// the `!has_route()` re-flood-login branch this invalidation falls
 /// through to no longer shares the draining cadence at all (see
 /// [`room_reflood_interval_ms`]'s doc for FINDING B, the SEV1 this mission
 /// actually fixes) — a spurious invalidation costs exactly one extra flood
@@ -1165,16 +1256,22 @@ impl RoomKeepAliveStall {
     /// counter untouched.
     ///
     /// Returns `true` the moment the miss streak reaches
-    /// [`KEEP_ALIVE_STALL_THRESHOLD`] — at which point `session.out_path_len`
-    /// has ALREADY been zeroed and the counter reset to 0 (a clean slate for
-    /// whatever session the relearn produces next) — `false` otherwise.
+    /// [`KEEP_ALIVE_STALL_THRESHOLD`] — at which point the session's route
+    /// has ALREADY been invalidated ([`PersistedRoomSession::invalidate_route`])
+    /// and the counter reset to 0 (a clean slate for whatever session the
+    /// relearn produces next) — `false` otherwise.
     pub fn on_tick(&mut self, ack_outstanding: bool, session: &mut PersistedRoomSession) -> bool {
         if !ack_outstanding {
             return false;
         }
         self.missed = self.missed.saturating_add(1);
         if self.missed >= KEEP_ALIVE_STALL_THRESHOLD {
-            session.out_path_len = 0;
+            // Both halves of the route state, never just the hop bytes: on a
+            // zero-hop route those bytes are ALREADY empty, so zeroing them
+            // alone would leave `has_route()` stuck true and the caller's
+            // re-flood branch permanently unreachable — see
+            // `PersistedRoomSession::route_known`'s doc.
+            session.invalidate_route();
             self.missed = 0;
             true
         } else {
@@ -1252,6 +1349,30 @@ pub enum RoomNotification {
 /// re-flood attempts will have gone out by 5 minutes" justification does
 /// not hold for this failure mode and how the fix folds the stronger
 /// signal in.
+///
+/// **`meshcadet-room-notify-suppression-full-enumeration-fix`'s correction —
+/// the design one.** Every bound above is measured against the CLOSER's
+/// health, and every one of them is reset by evidence the closer is alive.
+/// That makes the user-visible guarantee — "how long can a post I can already
+/// see on screen sit with no badge, tone or blink?" — conditional on a
+/// mechanism the user never sees, and four prior missions each closed exactly
+/// one way that mechanism can fail while the next one out reproduced the
+/// identical symptom. Two arms survived them all:
+///   1. No keep-alive is EVER sent (the zero-hop-route defect —
+///      [`PersistedRoomSession::route_known`]), so neither
+///      [`Self::on_keep_alive_ack`] nor [`Self::note_closer_failed`] can ever
+///      run and the post waits out the full blind
+///      [`DRAIN_WINDOW_STALL_TIMEOUT_MS`] — 5 minutes, the HIL symptom.
+///   2. The closer is perfectly HEALTHY and the window still never closes: a
+///      server that keeps ACKing a nonzero `unsynced_count` resets
+///      `last_progress_ms` on every ACK, so [`Self::is_stalled`] never trips
+///      and suppression is unbounded — with no defect in the closer at all.
+///
+/// [`DRAIN_SUPPRESSION_CEILING_MS`] is the answer to both, and to the class:
+/// a hard wall-clock ceiling measured from the FIRST post this window
+/// suppressed, that NOTHING resets — not an ACK, not a login, not a relearn.
+/// It makes the notification guarantee unconditional on the closer, which is
+/// what "stop adding a fifth closer" has to mean in code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RoomSyncPhase {
     draining: bool,
@@ -1269,6 +1390,18 @@ pub struct RoomSyncPhase {
     /// `saturating_sub` would silently floor at `0` and fail to force an
     /// early close — a flag has no such underflow.
     closer_failed: bool,
+    /// `uptime_ms()`-scale timestamp of the FIRST post this open window
+    /// suppressed (the `drained_count` 0 -> 1 transition), or `None` while
+    /// nothing has been absorbed yet.
+    ///
+    /// The anchor for [`DRAIN_SUPPRESSION_CEILING_MS`], and deliberately the
+    /// one piece of this struct's state that NOTHING resets while the window
+    /// stays open — not [`Self::on_keep_alive_ack`] (the arm that makes a
+    /// healthy-closer session suppress forever), not a relearn, not a
+    /// re-login. It is cleared only when the window actually closes, i.e.
+    /// when the aggregate it is bounding has been fired (or there was
+    /// nothing to fire). See this type's doc.
+    first_suppressed_ms: Option<u64>,
 }
 
 /// How long [`RoomSyncPhase`] tolerates a drain window with zero evidence
@@ -1283,6 +1416,35 @@ pub struct RoomSyncPhase {
 /// cadence, will have gone out).
 pub const DRAIN_WINDOW_STALL_TIMEOUT_MS: u64 = 300_000;
 
+/// The hard ceiling on how long a post that has already been rendered can sit
+/// with NO badge, tone or blink — measured from the first post the open drain
+/// window suppressed ([`RoomSyncPhase::first_suppressed_ms`]), and reset by
+/// nothing at all.
+///
+/// This is the answer to "is the drain-window design itself the defect?"
+/// (`meshcadet-room-notify-suppression-full-enumeration-fix`, open question
+/// 4) after four single-trigger fixes to that design failed on hardware. It
+/// is NOT a fifth closer for [`DRAIN_WINDOW_STALL_TIMEOUT_MS`]: that bound
+/// and its three closers all ask "is the round-trip that would close this
+/// window still alive?", and every one of them is reset by evidence that it
+/// is. This one never asks. Suppression is a UX optimisation — fold a
+/// post-login backlog into one notification instead of N — and an
+/// optimisation may not cost correctness beyond a fixed, provable bound. Past
+/// this bound the aggregate fires with whatever it has and the window closes;
+/// anything still arriving afterwards is classified [`RoomNotification::Live`],
+/// i.e. the worst case degrades to exactly the channel path's behaviour.
+///
+/// **Size (60 s).** Four times `firmware::main`'s
+/// `ROOM_DRAINING_KEEP_ALIVE_INTERVAL_MS` (15 s), the cadence at which a
+/// healthy draining session polls its own closer — so three consecutive
+/// missed keep-alive round-trips still fall inside it and a genuinely
+/// progressing drain is never truncated by it in practice. Well below
+/// [`DRAIN_WINDOW_STALL_TIMEOUT_MS`] (5 min), which stays exactly as it was
+/// for the closer-health question it actually answers. `firmware::main` holds
+/// a compile-time assertion tying it to that 15 s cadence, so a future
+/// cadence change cannot silently invalidate this rationale.
+pub const DRAIN_SUPPRESSION_CEILING_MS: u64 = 60_000;
+
 impl RoomSyncPhase {
     /// A fresh room session, right after login: the drain window starts
     /// open — the client cannot yet know whether it has any backlog until a
@@ -1295,6 +1457,7 @@ impl RoomSyncPhase {
             drained_count: 0,
             last_progress_ms: now_ms,
             closer_failed: false,
+            first_suppressed_ms: None,
         }
     }
 
@@ -1307,25 +1470,56 @@ impl RoomSyncPhase {
     /// keep-alive ACK) is alive: either [`Self::note_closer_failed`]'s
     /// stronger, independent evidence already fired, or plain elapsed time
     /// since window-open/last-progress has crossed
-    /// [`DRAIN_WINDOW_STALL_TIMEOUT_MS`]. Shared by every closer this bound
-    /// feeds — [`Self::on_post_received`] (event-triggered) and
-    /// [`Self::on_scheduler_tick`] (event-INDEPENDENT) — so the two can never
-    /// drift on what "stalled" means.
+    /// [`DRAIN_WINDOW_STALL_TIMEOUT_MS`].
     fn is_stalled(&self, now_ms: u64) -> bool {
         self.closer_failed
             || now_ms.saturating_sub(self.last_progress_ms) >= DRAIN_WINDOW_STALL_TIMEOUT_MS
     }
 
-    /// Force-close an already-stalled window, folding `extra` (0 or 1) more
-    /// posts into the final aggregate on top of whatever `drained_count`
-    /// already held. Callers must have already confirmed [`Self::is_stalled`]
-    /// and `self.draining`.
-    fn force_close(&mut self, extra: u32) -> RoomNotification {
+    /// Whether the window has held a suppressed post longer than
+    /// [`DRAIN_SUPPRESSION_CEILING_MS`] — the closer-independent half of
+    /// [`Self::must_close`]. `false` while nothing has been suppressed yet:
+    /// an idle open window costs the user nothing and has nothing to flush.
+    fn suppressed_too_long(&self, now_ms: u64) -> bool {
+        match self.first_suppressed_ms {
+            Some(first) => now_ms.saturating_sub(first) >= DRAIN_SUPPRESSION_CEILING_MS,
+            None => false,
+        }
+    }
+
+    /// Whether this window must close NOW: either its closer is provably
+    /// dead ([`Self::is_stalled`]) or it has suppressed a post for longer
+    /// than the user-facing ceiling allows ([`Self::suppressed_too_long`]).
+    /// Shared by every closer these bounds feed —
+    /// [`Self::on_post_received`] (event-triggered) and
+    /// [`Self::on_scheduler_tick`] (event-INDEPENDENT) — so the two can never
+    /// drift on what "must close" means.
+    fn must_close(&self, now_ms: u64) -> bool {
+        self.is_stalled(now_ms) || self.suppressed_too_long(now_ms)
+    }
+
+    /// Close the window and take whatever the pending aggregate holds, plus
+    /// `extra` (0 or 1) more posts. The ONE place any of the three closers'
+    /// state is torn down, so no future closer can forget a field: the
+    /// window shuts, both closer-health flags clear, and the suppression
+    /// ceiling's anchor is released for the next window.
+    fn take_aggregate(&mut self, extra: u32) -> u32 {
         self.draining = false;
         self.closer_failed = false;
+        self.first_suppressed_ms = None;
         let count = self.drained_count.saturating_add(extra);
         self.drained_count = 0;
-        RoomNotification::Aggregate { count }
+        count
+    }
+
+    /// Force-close a window that [`Self::must_close`] says can wait no
+    /// longer, folding `extra` (0 or 1) more posts into the final aggregate
+    /// on top of whatever `drained_count` already held. Callers must have
+    /// already confirmed `self.draining`.
+    fn force_close(&mut self, extra: u32) -> RoomNotification {
+        RoomNotification::Aggregate {
+            count: self.take_aggregate(extra),
+        }
     }
 
     /// Classify one genuinely-new incoming post (a dedup HIT must never
@@ -1335,19 +1529,28 @@ impl RoomSyncPhase {
         if !self.draining {
             return RoomNotification::Live;
         }
-        if self.is_stalled(now_ms) {
+        if self.must_close(now_ms) {
             // The closing round-trip has shown no sign of life for the
             // whole stall timeout — or independent evidence
-            // ([`Self::note_closer_failed`]) already proved it dead sooner:
-            // stop waiting for it. Force-close right here, folding THIS post
-            // into the aggregate that finally flushes — see this type's doc.
+            // ([`Self::note_closer_failed`]) already proved it dead sooner,
+            // or an earlier post has now been suppressed past
+            // [`DRAIN_SUPPRESSION_CEILING_MS`]: stop waiting. Force-close
+            // right here, folding THIS post into the aggregate that finally
+            // flushes — see this type's doc.
             return self.force_close(1);
+        }
+        // First post this window suppresses: start the ceiling's clock. Only
+        // ever set on the 0 -> 1 transition, and never reset while the
+        // window stays open — that is the whole point of the bound.
+        if self.first_suppressed_ms.is_none() {
+            self.first_suppressed_ms = Some(now_ms);
         }
         self.drained_count += 1;
         RoomNotification::None
     }
 
-    /// Periodic, EVENT-INDEPENDENT re-evaluation of the stall bound —
+    /// Periodic, EVENT-INDEPENDENT re-evaluation of both bounds
+    /// ([`Self::must_close`]) —
     /// `meshcadet-room-drain-window-out-path-never-learned-fix`. Both
     /// [`Self::on_post_received`] and [`Self::note_closer_failed`] are only
     /// ever reached from the inside of a handler for some OTHER event (a
@@ -1365,13 +1568,19 @@ impl RoomSyncPhase {
     /// ever triggers it ("independent" must mean "re-evaluated on its own
     /// periodic tick," not just "reachable from more event handlers").
     ///
+    /// It is also the ONLY closer that can honour
+    /// [`DRAIN_SUPPRESSION_CEILING_MS`] on the case that ceiling exists for —
+    /// a single suppressed post with no successor — since every other closer
+    /// needs an event that failure mode is defined by never producing.
+    ///
     /// Returns `None` whenever there's nothing to report: the window is
-    /// already closed, still has live evidence of a working closer, or
-    /// stalled with nothing actually drained (nothing to announce — mirrors
-    /// [`Self::on_keep_alive_ack`]'s "`count == 0` never reaches the caller"
-    /// contract). Idempotent to call every tick regardless.
+    /// already closed, still has live evidence of a working closer and
+    /// nothing suppressed too long, or closed with nothing actually drained
+    /// (nothing to announce — mirrors [`Self::on_keep_alive_ack`]'s
+    /// "`count == 0` never reaches the caller" contract). Idempotent to call
+    /// every tick regardless.
     pub fn on_scheduler_tick(&mut self, now_ms: u64) -> Option<RoomNotification> {
-        if !self.draining || !self.is_stalled(now_ms) {
+        if !self.draining || !self.must_close(now_ms) {
             return None;
         }
         match self.force_close(0) {
@@ -1409,6 +1618,13 @@ impl RoomSyncPhase {
     /// clears any pending [`Self::note_closer_failed`] flag: a keep-alive
     /// ACK that actually arrived directly contradicts whatever earlier
     /// evidence claimed the closer was dead.
+    ///
+    /// It does NOT touch [`Self::first_suppressed_ms`], deliberately: proof
+    /// that the closer is alive is not proof that the user has been told
+    /// anything, and a server that keeps ACKing a nonzero `unsynced_count`
+    /// forever is exactly how a HEALTHY closer suppresses a post
+    /// indefinitely. [`DRAIN_SUPPRESSION_CEILING_MS`] is the bound on that
+    /// arm and nothing here may reset it.
     pub fn on_keep_alive_ack(
         &mut self,
         unsynced_count: u8,
@@ -1422,13 +1638,9 @@ impl RoomSyncPhase {
         if unsynced_count != 0 {
             return None;
         }
-        self.draining = false;
-        let count = self.drained_count;
-        self.drained_count = 0;
-        if count > 0 {
-            Some(RoomNotification::Aggregate { count })
-        } else {
-            None
+        match self.take_aggregate(0) {
+            0 => None,
+            count => Some(RoomNotification::Aggregate { count }),
         }
     }
 
@@ -1501,11 +1713,9 @@ impl RoomSyncPhase {
         // and the closer that was ever going to flush it is now confirmed
         // dead: flush it now rather than deferring to a next post that may
         // never arrive.
-        self.draining = false;
-        self.closer_failed = false;
-        let count = self.drained_count;
-        self.drained_count = 0;
-        Some(RoomNotification::Aggregate { count })
+        Some(RoomNotification::Aggregate {
+            count: self.take_aggregate(0),
+        })
     }
 }
 
@@ -1555,7 +1765,7 @@ pub fn room_keep_alive_interval_ms(
     }
 }
 
-/// Cadence for `firmware::main`'s `out_path_len == 0` re-flood-login
+/// Cadence for `firmware::main`'s `!has_route()` re-flood-login
 /// branch — **deliberately decoupled** from [`room_keep_alive_interval_ms`]
 /// above. `meshcadet-room-reflood-login-backoff`'s FINDING B (this
 /// function's whole reason to exist): that gate is
@@ -1715,6 +1925,137 @@ mod tests {
         let (path, len) = outcome.out_path.expect("PATH-return must teach a route");
         assert_eq!(len, 1);
         assert_eq!(path[0], 0xAB);
+    }
+
+    /// **The HIL defect of `meshcadet-room-notify-suppression-full-
+    /// enumeration-fix`, at its source.** A room server that is this
+    /// device's direct radio neighbour returns a PATH with ZERO hops — a
+    /// fully legal `path_len` byte (`protocol::codec::
+    /// decode_path_return_plaintext`'s `hop_count` is simply `0`) and a
+    /// fully usable route-direct target. It lands in `out_path_len` as `0`,
+    /// which used to be indistinguishable from "no route learned yet": the
+    /// scheduler re-flooded the login forever, never sent a keep-alive, and
+    /// so the drain window's only closer never ran and every inbound post
+    /// was silently absorbed.
+    #[test]
+    fn zero_hop_path_return_is_a_learned_route_not_an_unlearned_one() {
+        let (client, server) = make_pair();
+        let shared = client.ecdh_shared_secret(&server.pubkey);
+
+        let mut response = [0u8; 13];
+        response[4] = protocol::room::RESP_SERVER_LOGIN_OK;
+        response[7] = RoomPermission::ReadWrite as u8;
+
+        let mut inner = [0u8; 32];
+        inner[0] = 0x00; // path_len: 1-byte hashes, ZERO hops — direct neighbour
+        inner[1] = 0x01; // extra_type = PAYLOAD_TYPE_RESPONSE
+        inner[2..15].copy_from_slice(&response);
+
+        let mut wire = [0u8; 256];
+        let n = protocol::codec::encode_dm_payload(
+            &shared,
+            client.pub_hash(),
+            server.pub_hash(),
+            &inner[..15],
+            &mut wire,
+        );
+
+        let outcome = decode_login_path_return(&shared, &wire[..n]).unwrap();
+        let (_, len) = outcome
+            .out_path
+            .expect("a zero-hop PATH-return still TEACHES a route");
+        assert_eq!(len, 0, "zero hops is the whole point of this case");
+
+        let mut session = PersistedRoomSession::EMPTY;
+        assert!(!session.has_route(), "nothing learned before the login");
+        session.apply_login_outcome(&outcome);
+
+        assert!(
+            session.has_route(),
+            "a zero-hop reply taught a route: the scheduler must take the keep-alive branch, \
+             not re-flood the login forever"
+        );
+        assert_eq!(
+            session.out_path_len, 0,
+            "and the hop count really is 0 — which is exactly why it cannot double as the \
+             'no route' sentinel"
+        );
+
+        // The consequence that actually matters: a keep-alive — the drain
+        // window's only normal closer — can now be built for this session.
+        let mut frame = [0u8; MAX_KEEP_ALIVE_FRAME_LEN];
+        assert!(
+            encode_room_keep_alive_frame(
+                &shared,
+                server.pub_hash(),
+                client.pub_hash(),
+                &session.out_path[..session.out_path_len as usize],
+                5_000,
+                0,
+                &mut frame,
+            )
+            .is_some(),
+            "the closer must be reachable for a direct-neighbour room server"
+        );
+    }
+
+    /// The other half of the same invariant: invalidating a route must clear
+    /// BOTH halves. On a zero-hop route the hop bytes are already empty, so
+    /// zeroing them alone would leave `has_route()` stuck true and the
+    /// re-flood branch permanently unreachable — a route that can never be
+    /// relearned is the mirror image of one that can never be recognised.
+    #[test]
+    fn keep_alive_stall_invalidation_clears_a_zero_hop_route_too() {
+        let mut session = PersistedRoomSession::EMPTY;
+        session.apply_login_outcome(&RoomLoginOutcome {
+            permissions: RoomPermission::ReadWrite,
+            out_path: Some(([0u8; MAX_PATH_SIZE], 0)),
+            server_ts: 0,
+        });
+        assert!(session.has_route());
+
+        let mut stall = RoomKeepAliveStall::new();
+        assert!(!stall.on_tick(true, &mut session), "one miss is tolerated");
+        assert!(
+            session.has_route(),
+            "one miss must not invalidate the route"
+        );
+        assert!(
+            stall.on_tick(true, &mut session),
+            "the second consecutive miss invalidates"
+        );
+        assert!(
+            !session.has_route(),
+            "invalidation must make the re-flood branch reachable again"
+        );
+    }
+
+    /// `route_known` is RAM-only by design — the on-flash blob format is
+    /// unchanged, so a resumed session can only claim a route it can prove
+    /// by hop count. A zero-hop route is therefore forgotten across a
+    /// reboot and relearned from the boot login's reply seconds later. This
+    /// pins the deliberate asymmetry so nobody "fixes" it into a blob-length
+    /// change that collides with the retired guard-era trust byte.
+    #[test]
+    fn a_zero_hop_route_is_not_persisted_and_resumes_as_unlearned() {
+        let mut session = PersistedRoomSession::EMPTY;
+        session.apply_login_outcome(&RoomLoginOutcome {
+            permissions: RoomPermission::ReadWrite,
+            out_path: Some(([0u8; MAX_PATH_SIZE], 0)),
+            server_ts: 0,
+        });
+        assert!(session.has_route());
+
+        let mut blob = [0u8; PERSISTED_ROOM_SESSION_LEN];
+        let n = encode_persisted_room_session(&session, &mut blob);
+        assert_eq!(n, PRE_SYNC_GUARD_LEN, "blob format must be unchanged");
+
+        let resumed = decode_persisted_room_session(&blob[..n]).unwrap();
+        assert!(
+            !resumed.has_route(),
+            "a resumed zero-hop session re-floods ONE login and relearns — cheaper than a \
+             blob-length migration that is ambiguous with the guard-era trust byte"
+        );
     }
 
     #[test]
@@ -2162,6 +2503,7 @@ mod tests {
             out_path,
             out_path_len: 2,
             last_room_ts: 1_800_000_000, // plausible wall-clock reading
+            route_known: true,
         };
 
         let mut blob = [0u8; PERSISTED_ROOM_SESSION_LEN];
@@ -2194,6 +2536,7 @@ mod tests {
             out_path,
             out_path_len: 1,
             last_room_ts: 1_700_000_000,
+            route_known: true,
         };
         let mut blob = [0u8; PERSISTED_ROOM_SESSION_LEN];
         encode_persisted_room_session(&state, &mut blob); // writes PRE_SYNC_GUARD_LEN bytes
@@ -2226,6 +2569,7 @@ mod tests {
             out_path,
             out_path_len: 1,
             last_room_ts: 0xFFFF_0000, // ~year 2554: absurdly far in the future
+            route_known: true,
         };
         let mut blob = [0u8; PERSISTED_ROOM_SESSION_LEN];
         let n = encode_persisted_room_session(&poisoned, &mut blob);
@@ -2250,6 +2594,7 @@ mod tests {
             out_path: [0u8; MAX_PATH_SIZE],
             out_path_len: 0,
             last_room_ts: ROOM_CLOCK_PLAUSIBILITY_CEILING_SECS - 1,
+            route_known: false,
         };
         let mut blob = [0u8; PERSISTED_ROOM_SESSION_LEN];
         let n = encode_persisted_room_session(&state, &mut blob);
@@ -2725,6 +3070,7 @@ mod tests {
                 out_path: [0xAAu8; MAX_PATH_SIZE],
                 out_path_len: 4,
                 last_room_ts: 0,
+                route_known: true,
             }),
             epoch: 0,
         };
@@ -2909,13 +3255,35 @@ mod tests {
 
     // ── Phase C: route-direct keep-alive framing ────────────────────────────
 
+    /// `meshcadet-room-notify-suppression-full-enumeration-fix`: an empty
+    /// `out_path` is a ZERO-HOP route (the room server is a direct radio
+    /// neighbour), not a missing one. This test previously asserted the
+    /// opposite — that conflation is the defect: it made a bench-topology
+    /// room permanently un-keep-alive-able, so the drain window's only
+    /// closer never ran and inbound posts were silently absorbed.
     #[test]
-    fn encode_room_direct_prefix_refuses_empty_out_path() {
+    fn encode_room_direct_prefix_encodes_a_zero_hop_route() {
         let mut out = [0u8; 8];
+        let n = encode_room_direct_prefix(PayloadType::Req, &[], &mut out)
+            .expect("a zero-hop route is a learned route and must encode");
+        assert_eq!(n, 2, "header + path_len byte, no path bytes");
+        let header = Header(out[0]);
         assert_eq!(
-            encode_room_direct_prefix(PayloadType::Req, &[], &mut out),
+            header.route_type(),
+            Some(RouteType::Direct),
+            "a zero-hop route is still route-direct — MyMesh.cpp:536 ignores a flooded keep-alive"
+        );
+        assert_eq!(header.payload_type(), Some(PayloadType::Req));
+        assert_eq!(PathLen(out[1]).hop_count(), 0);
+    }
+
+    #[test]
+    fn encode_room_direct_prefix_refuses_an_over_long_path() {
+        let mut out = [0u8; 128];
+        assert_eq!(
+            encode_room_direct_prefix(PayloadType::Req, &[0u8; 64], &mut out),
             None,
-            "no learned route: caller must re-flood the login instead"
+            "64 hops exceeds PathLen's 63-hop range — the one remaining refusal"
         );
     }
 
@@ -2961,22 +3329,40 @@ mod tests {
         );
     }
 
+    /// The HIL topology (`meshcadet-room-notify-suppression-full-enumeration-
+    /// fix`): the room server is the device's direct radio neighbour, so its
+    /// PATH-return teaches a zero-hop route. A keep-alive over that route
+    /// must encode AND be accepted — this is the frame whose absence left
+    /// the drain window with no closer at all.
     #[test]
-    fn encode_room_keep_alive_frame_none_without_a_learned_path() {
+    fn encode_room_keep_alive_frame_over_a_zero_hop_route() {
         let (client, server) = make_pair();
         let shared = client.ecdh_shared_secret(&server.pubkey);
         let mut out = [0u8; MAX_KEEP_ALIVE_FRAME_LEN];
+        let n = encode_room_keep_alive_frame(
+            &shared,
+            server.pub_hash(),
+            client.pub_hash(),
+            &[], // zero-hop: server is a direct neighbour
+            5000,
+            0,
+            &mut out,
+        )
+        .expect("a zero-hop route must produce a keep-alive frame");
+
+        assert_eq!(Header(out[0]).route_type(), Some(RouteType::Direct));
+        assert_eq!(PathLen(out[1]).hop_count(), 0);
+
+        // Same round trip as the multi-hop test above, with the 2-byte
+        // (header + path_len, no path bytes) prefix peeled instead of 4.
+        let mut double = RoomServerDouble::new(server.clone(), b"admin-pw", b"guest-pw", false);
+        login_direct(&mut double, &client, &server, b"guest-pw", 1000);
+        let ack = double
+            .handle_keep_alive(&client.pubkey, &out[2..n])
+            .expect("a zero-hop-routed keep-alive must be accepted");
         assert_eq!(
-            encode_room_keep_alive_frame(
-                &shared,
-                server.pub_hash(),
-                client.pub_hash(),
-                &[],
-                5000,
-                0,
-                &mut out,
-            ),
-            None
+            decode_keep_alive_ack(&ack).unwrap().ack_hash,
+            keep_alive_ack_hash(5000, 0, &client.pubkey)
         );
     }
 
@@ -3224,9 +3610,14 @@ mod tests {
             session.out_path_len, 0,
             "out_path must be zeroed on stall detection"
         );
+        assert!(
+            !session.has_route(),
+            "and the session must no longer consider a route known — the hop count alone \
+             cannot say that (a zero-hop route is a real route)"
+        );
         assert_eq!(stall.missed(), 0);
 
-        // Relearn: `out_path_len == 0` routes `firmware::main`'s scheduler
+        // Relearn: `!has_route()` routes `firmware::main`'s scheduler
         // to re-flood the login. The double's simplified login helper
         // always claims `sync_since=0` in its ANON_REQ (unlike production
         // firmware, which sends the real persisted watermark) —
@@ -3234,9 +3625,17 @@ mod tests {
         // own view of `sync_since` regresses on relogin, which is exactly
         // the case `force_since` exists to correct.
         let relearn = login_direct(&mut double, &client, &server, b"guest-pw", 4000);
-        session.apply_login_outcome(&relearn);
-        session.out_path[..3].copy_from_slice(&[0x11, 0x22, 0x33]); // a NEW (changed) path
-        session.out_path_len = 3;
+        // Teach a NEW (changed) path through the real API rather than
+        // poking the fields, so `out_path_len` and `route_known` cannot
+        // drift into a state the firmware can never actually be in.
+        let mut new_path = [0u8; MAX_PATH_SIZE];
+        new_path[..3].copy_from_slice(&[0x11, 0x22, 0x33]);
+        session.apply_login_outcome(&RoomLoginOutcome {
+            permissions: relearn.permissions,
+            out_path: Some((new_path, 3)),
+            server_ts: relearn.server_ts,
+        });
+        assert!(session.has_route(), "the relearn taught a route again");
         stall.reset();
         assert_eq!(
             double.client_sync_since(&client.pubkey),
@@ -3554,10 +3953,14 @@ mod tests {
 
         // A tick well before the bound must not flush prematurely — this is
         // NOT a bare timer/count heuristic, just an elapsed-time floor.
+        // (`meshcadet-room-notify-suppression-full-enumeration-fix` retimed
+        // this: with a post already suppressed, the binding bound is now
+        // `DRAIN_SUPPRESSION_CEILING_MS` from THAT post, not the looser
+        // closer-health `DRAIN_WINDOW_STALL_TIMEOUT_MS` from window-open.)
         assert_eq!(
-            phase.on_scheduler_tick(DRAIN_WINDOW_STALL_TIMEOUT_MS / 2),
+            phase.on_scheduler_tick(1_000 + DRAIN_SUPPRESSION_CEILING_MS / 2),
             None,
-            "still within the stall bound — nothing to flush yet"
+            "still within the suppression ceiling — nothing to flush yet"
         );
         assert!(
             phase.is_draining(),
@@ -3567,7 +3970,7 @@ mod tests {
         // No second post ever arrives — advance simulated time past the
         // bound via the scheduler's own tick alone.
         assert_eq!(
-            phase.on_scheduler_tick(DRAIN_WINDOW_STALL_TIMEOUT_MS),
+            phase.on_scheduler_tick(1_000 + DRAIN_SUPPRESSION_CEILING_MS),
             Some(RoomNotification::Aggregate { count: 1 }),
             "the scheduler's own periodic tick, independent of any post or keep-alive event, \
              must force-close the window and flush the one post absorbed — this is the sibling \
@@ -3586,6 +3989,173 @@ mod tests {
             phase.on_scheduler_tick(DRAIN_WINDOW_STALL_TIMEOUT_MS * 2),
             None,
             "the window is already closed — nothing left to announce"
+        );
+    }
+
+    // ── The suppression ceiling: bounded regardless of the closer ───────────
+
+    /// Builds the push outcome the ceiling tests feed in — a genuinely new
+    /// post (not a dedup hit), which is all `RoomSyncPhase` looks at.
+    fn new_post() -> RoomPushOutcome {
+        RoomPushOutcome {
+            ack_hash: [0; 4],
+            post_ts: 0,
+            entry: Some(HistoryEntry {
+                sender_hash: 0,
+                msg_type: HistoryMsgType::Dm,
+                timestamp: 0,
+                text: [0; MAX_HISTORY_TEXT_LEN],
+                text_len: 0,
+            }),
+            author_pubkey_prefix: [0; 4],
+        }
+    }
+
+    /// **The HIL capture this mission was opened on, replayed at the
+    /// classifier.** Boot login at t≈7.7 s teaches a zero-hop route that the
+    /// firmware misread as no route; no keep-alive is therefore ever sent,
+    /// so `on_keep_alive_ack` and `note_closer_failed` are both structurally
+    /// unreachable; the tester's single post lands at t=68 s and nothing
+    /// follows it. Before `DRAIN_SUPPRESSION_CEILING_MS` the earliest
+    /// possible badge/tone/blink was `DRAIN_WINDOW_STALL_TIMEOUT_MS`
+    /// (5 minutes) after window-open — which is what the tester experienced
+    /// as "it never notifies".
+    #[test]
+    fn hil_capture_single_post_notifies_within_the_suppression_ceiling() {
+        let window_open_ms = 7_734;
+        let post_ms = 67_964;
+        let mut phase = RoomSyncPhase::new_after_login(window_open_ms);
+
+        assert_eq!(
+            phase.on_push_outcome(&new_post(), post_ms),
+            RoomNotification::None,
+            "the first post of an open drain window is still folded in — aggregation is not \
+             what broke; never flushing is"
+        );
+
+        // Nothing else ever happens: no post, no keep-alive, no login. Only
+        // the scheduler's own tick runs.
+        let mut fired_at = None;
+        let mut now = post_ms;
+        while now <= window_open_ms + DRAIN_WINDOW_STALL_TIMEOUT_MS {
+            if let Some(n) = phase.on_scheduler_tick(now) {
+                fired_at = Some((now, n));
+                break;
+            }
+            now += 1_000; // the dispatcher loop ticks far faster than this
+        }
+
+        let (fired_ms, notification) =
+            fired_at.expect("the aggregate must fire without any closer event at all");
+        assert_eq!(
+            notification,
+            RoomNotification::Aggregate { count: 1 },
+            "exactly one aggregate for the one post absorbed"
+        );
+        assert!(
+            fired_ms - post_ms <= DRAIN_SUPPRESSION_CEILING_MS + 1_000,
+            "the post must notify within the ceiling of its own arrival ({} ms), not {} ms later",
+            DRAIN_SUPPRESSION_CEILING_MS,
+            fired_ms - post_ms,
+        );
+        assert!(
+            fired_ms < window_open_ms + DRAIN_WINDOW_STALL_TIMEOUT_MS,
+            "and strictly sooner than the old closer-health bound, which is what made this \
+             read as 'never notifies' on hardware"
+        );
+    }
+
+    /// The arm no closer fix could ever have reached: the closer is
+    /// perfectly HEALTHY. A server whose keep-alive ACKs keep reporting a
+    /// nonzero `unsynced_count` resets `last_progress_ms` on every ACK, so
+    /// `is_stalled` never trips, `note_closer_failed` never fires, and
+    /// suppression was unbounded — with nothing broken anywhere.
+    #[test]
+    fn a_healthy_closer_that_never_reports_zero_still_flushes_at_the_ceiling() {
+        let mut phase = RoomSyncPhase::new_after_login(0);
+        assert_eq!(
+            phase.on_push_outcome(&new_post(), 1_000),
+            RoomNotification::None
+        );
+
+        // Keep-alive ACKs land right on schedule, every one of them proving
+        // the closer alive and resetting the stall clock — including one
+        // moments before the ceiling expires.
+        for t in [15_000u64, 30_000, 45_000, 60_500] {
+            assert_eq!(
+                phase.on_keep_alive_ack(3, t),
+                None,
+                "a nonzero unsynced_count does not close the window (unchanged)"
+            );
+            assert!(phase.is_draining(), "still legitimately draining at {t}");
+        }
+
+        assert_eq!(
+            phase.on_scheduler_tick(1_000 + DRAIN_SUPPRESSION_CEILING_MS),
+            Some(RoomNotification::Aggregate { count: 1 }),
+            "the ceiling is anchored to the first SUPPRESSED POST and reset by nothing — an \
+             ACK 500 ms earlier must not buy the window another 5 minutes of silence"
+        );
+    }
+
+    /// The ceiling bounds SUPPRESSION, not the window: an open window that
+    /// has never absorbed anything is costing the user nothing, so it must
+    /// keep waiting for its real closer rather than force-closing on a
+    /// timer. (This is what keeps the fix from degenerating into the bare
+    /// "count/timer heuristic" the parent Objective forbade.)
+    #[test]
+    fn an_idle_window_with_nothing_suppressed_is_not_force_closed_by_the_ceiling() {
+        let mut phase = RoomSyncPhase::new_after_login(0);
+        assert_eq!(
+            phase.on_scheduler_tick(DRAIN_SUPPRESSION_CEILING_MS * 3),
+            None,
+            "nothing absorbed: nothing to announce and no reason to stop waiting"
+        );
+        assert!(
+            phase.is_draining(),
+            "the window stays open for its real closer"
+        );
+
+        // And a post arriving long after that still gets the ordinary
+        // aggregation treatment, with its own fresh ceiling.
+        let late = DRAIN_SUPPRESSION_CEILING_MS * 3;
+        assert_eq!(
+            phase.on_push_outcome(&new_post(), late),
+            RoomNotification::None
+        );
+        assert_eq!(
+            phase.on_scheduler_tick(late + DRAIN_SUPPRESSION_CEILING_MS - 1),
+            None,
+            "the ceiling runs from THIS post, not from window-open"
+        );
+        assert_eq!(
+            phase.on_scheduler_tick(late + DRAIN_SUPPRESSION_CEILING_MS),
+            Some(RoomNotification::Aggregate { count: 1 })
+        );
+    }
+
+    /// A genuinely progressing drain is unaffected: the backlog's own
+    /// keep-alive ACK closes the window first, well inside the ceiling, and
+    /// fires ONE aggregate for the whole backlog — the aggregation behaviour
+    /// the ceiling must not disturb.
+    #[test]
+    fn a_normal_drain_still_closes_on_its_keep_alive_ack_inside_the_ceiling() {
+        let mut phase = RoomSyncPhase::new_after_login(0);
+        for t in [1_000u64, 2_000, 3_000] {
+            assert_eq!(
+                phase.on_push_outcome(&new_post(), t),
+                RoomNotification::None
+            );
+        }
+        assert_eq!(
+            phase.on_keep_alive_ack(0, 15_000),
+            Some(RoomNotification::Aggregate { count: 3 }),
+            "one aggregate for the whole backlog, exactly as before this mission"
+        );
+        assert_eq!(
+            phase.on_push_outcome(&new_post(), 16_000),
+            RoomNotification::Live,
+            "and posts after the close get full live parity"
         );
     }
 
