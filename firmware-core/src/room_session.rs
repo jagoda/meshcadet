@@ -685,7 +685,7 @@ pub fn adopt_server_clock(
 // notion of wall time — so a `sync_since` already ahead of what the server
 // itself just admitted as "now" can never again be exceeded by any future
 // post: the server has nothing left to push, forever, not just slowly. This
-// is the "zero posts delivered, indefinitely" shape the Commander reported,
+// is the "zero posts delivered, indefinitely" shape that was reported,
 // independent of the separate keep-alive-cadence defect
 // (`RoomSyncPhase::note_relogin`'s doc) that Lead A traced instead.
 //

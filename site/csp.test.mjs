@@ -9,9 +9,9 @@
 // absolute http(s):// URL.
 //
 // The script-src/import checks below are a DOMAIN-ENUMERATION coverage
-// test, not a per-instance one — see
-// flight-manuals/library/coverage-must-enumerate-the-set.md. This file used
-// to hand-enumerate one ok()/notOk() block per page/script, added
+// test, not a per-instance one — asserting coverage over the whole set of
+// pages/scripts, not just the ones a past incident happened to name. This
+// file used to hand-enumerate one ok()/notOk() block per page/script, added
 // reactively each time a CDN import was found and fixed (qrcode.js into
 // provisioner.js, then esptool-js into flash.js): nothing asserted that the
 // SET of checks spanned the SET of pages/scripts, so a third CDN import
