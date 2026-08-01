@@ -935,6 +935,30 @@ pub fn is_room_push_misroute(e: &RoomSessionError) -> bool {
     matches!(e, RoomSessionError::Room(RoomCodecError::NotSignedPlain))
 }
 
+/// True if a room frame's `dest_hash` (`payload[0]`) addresses `our_pub_hash`.
+///
+/// A room server delivers each post/login-reply to every member as a
+/// *separate*, per-recipient-encrypted DM: `dest_hash` names the intended
+/// recipient, and the ciphertext is under a shared secret unique to that
+/// `(server, member)` pair. `firmware/src/main.rs::on_receive` routes an
+/// inbound TXT_MSG/RESPONSE into the room path by `src_hash` (the room's own
+/// hash) alone, so every OTHER member's copy of the same post/reply also
+/// reaches this device. Decoding one of those with our own shared secret is
+/// not a corruption — it is guaranteed to fail the MAC, because the frame
+/// was never encrypted for us. Callers
+/// (`handle_room_push_frame`/`handle_room_login_response`) should check this
+/// BEFORE attempting a decode, so a not-for-us frame costs neither the
+/// wasted decode nor a misleading `MacMismatch` WARN that reads like our own
+/// session is broken; log it at diag level and treat the frame as handled
+/// instead.
+///
+/// An empty payload — no `dest_hash` byte at all — reads as `0`, which
+/// mismatches every real `pub_hash` other than the vanishingly unlikely
+/// `0x00`, so it correctly returns `false` (not for us) rather than panicking.
+pub fn is_room_frame_for_us(payload: &[u8], our_pub_hash: u8) -> bool {
+    payload.first().copied().unwrap_or(0) == our_pub_hash
+}
+
 /// Resolve a room post's sender label for the `"<name>: "` display prefix —
 /// the pure half of the sender-render-parity fix (see
 /// [`RoomPushOutcome::author_pubkey_prefix`]'s doc for why a room push
@@ -3144,6 +3168,27 @@ mod tests {
             CodecError::TruncatedPayload
         )));
         assert!(!is_room_push_misroute(&RoomSessionError::NotLoginReply));
+    }
+
+    /// REGRESSION: a room push/login-reply addressed to another member (a
+    /// `dest_hash` mismatch) must classify as not-for-us so
+    /// `firmware/src/main.rs::handle_room_push_frame`/
+    /// `handle_room_login_response` never attempt a decode that is
+    /// guaranteed to fail the MAC and log a misleading WARN — see
+    /// `is_room_frame_for_us`'s doc.
+    #[test]
+    fn is_room_frame_for_us_matches_only_our_dest_hash() {
+        assert!(is_room_frame_for_us(&[0x42, 0x99, 0, 0], 0x42));
+        assert!(!is_room_frame_for_us(&[0x43, 0x99, 0, 0], 0x42));
+    }
+
+    #[test]
+    fn is_room_frame_for_us_treats_an_empty_payload_as_not_for_us() {
+        // No `dest_hash` byte at all reads as `0`, which mismatches every
+        // `our_pub_hash` other than the vanishingly unlikely `0x00` — must
+        // not panic, and must not be treated as addressed to us.
+        assert!(!is_room_frame_for_us(&[], 0x42));
+        assert!(is_room_frame_for_us(&[], 0x00));
     }
 
     // ── Sender-render parity: room_post_sender_label ────────────────────────
