@@ -1304,6 +1304,39 @@ impl RoomKeepAliveStall {
     }
 }
 
+/// Whether `firmware::main`'s keep-alive scheduler tick may encode and send
+/// a NEW keep-alive this tick — which, on success, overwrites
+/// `RoomRuntime::pending_keep_alive_ack` with the new frame's expected
+/// `ack_hash`.
+///
+/// `ack_outstanding` is `room.pending_keep_alive_ack.is_some()` at the top
+/// of this tick: a PRIOR keep-alive whose ack has not yet arrived. Sending
+/// (and thus overwriting) while that is still `true` — the pre-fix
+/// behaviour — discards the prior keep-alive's expected `ack_hash` before a
+/// legitimately late (but still valid) reply can possibly match it: the
+/// single `Option<[u8; 4]>` slot can only ever remember ONE expected hash,
+/// so the moment it is overwritten, an inbound ACK for the frame it
+/// replaced falls through every room's `pending_keep_alive_ack` check in
+/// `handle_ack` and logs as an unmatched "ACK received (no pending DM)"
+/// instead of resetting [`RoomKeepAliveStall`] and (if it carries a
+/// nonzero-to-zero unsynced-count transition) closing Phase D's drain
+/// window.
+///
+/// This must NOT be conflated with [`RoomKeepAliveStall::on_tick`]'s own
+/// miss-counting: that call still happens unconditionally on every tick
+/// while `ack_outstanding` — it is what eventually invalidates the route
+/// after [`KEEP_ALIVE_STALL_THRESHOLD`] consecutive misses, at which point
+/// the caller's `out_path` is already zeroed and it `continue`s straight to
+/// the re-flood branch, never reaching this decision at all in that same
+/// tick. This function governs only the OTHER, still-tolerated case: one
+/// (or more, up to the threshold) miss(es) that have NOT yet invalidated
+/// the route — the scheduler should simply wait for the outstanding ack (or
+/// for the stall detector to give up on it), not clobber it with a second
+/// in-flight request.
+pub fn keep_alive_tick_should_send(ack_outstanding: bool) -> bool {
+    !ack_outstanding
+}
+
 // ── Notification-suppression parity: Phase D ────────────────────────────────
 
 /// What a caller should do about one incoming room post, per
@@ -2051,6 +2084,28 @@ mod tests {
         assert!(
             !session.has_route(),
             "invalidation must make the re-flood branch reachable again"
+        );
+    }
+
+    /// The regression this mission fixes: a still-outstanding prior ack
+    /// must NOT be overwritten by a fresh keep-alive send while the miss
+    /// streak is still within `RoomKeepAliveStall`'s tolerance — see
+    /// `keep_alive_tick_should_send`'s doc for the mechanism.
+    #[test]
+    fn keep_alive_tick_should_send_waits_while_prior_ack_outstanding() {
+        assert!(
+            !keep_alive_tick_should_send(true),
+            "a still-outstanding prior ack must block a new send this tick"
+        );
+    }
+
+    /// The routine case: nothing outstanding (either none sent yet, or the
+    /// prior keep-alive was ACKed in time) — the scheduler is free to send.
+    #[test]
+    fn keep_alive_tick_should_send_proceeds_when_nothing_outstanding() {
+        assert!(
+            keep_alive_tick_should_send(false),
+            "with no ack outstanding the scheduler must be free to send"
         );
     }
 

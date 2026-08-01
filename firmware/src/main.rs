@@ -2087,7 +2087,7 @@ fn run() -> anyhow::Result<()> {
             let ts = room_session::room_tx_timestamp(room_wall_clock_secs, room.session.last_room_ts);
             let shared = identity.ecdh_shared_secret(&room.pubkey);
 
-            // Reconnect-stall detector: BEFORE overwriting
+            // Reconnect-stall detector: BEFORE possibly overwriting
             // `pending_keep_alive_ack` below, a still-`Some` value left over
             // from the PRIOR tick means that keep-alive was never ACKed —
             // feed it to `RoomKeepAliveStall`, which counts consecutive
@@ -2100,6 +2100,11 @@ fn run() -> anyhow::Result<()> {
             // immediate, same as the pre-fix same-tick fallthrough was).
             // See `firmware_core::room_session::RoomKeepAliveStall`'s doc
             // for the full "why N misses, why zero out_path" rationale.
+            // Short of that threshold, the overwrite below is now GUARDED
+            // (`keep_alive_tick_should_send`, just past this block) — a
+            // still-outstanding-but-tolerated miss must not discard the
+            // prior keep-alive's expected `ack_hash` before a legitimately
+            // late reply can still match it.
             let ack_outstanding = room.pending_keep_alive_ack.is_some();
             if ack_outstanding {
                 let invalidated = room.keep_alive_stall.on_tick(true, &mut room.session);
@@ -2164,6 +2169,21 @@ fn run() -> anyhow::Result<()> {
                         room.hash, room.keep_alive_stall.missed(), room_session::KEEP_ALIVE_STALL_THRESHOLD,
                     );
                 }
+            }
+            // `meshcadet-room-keepalive-ack-overwritten-before-reply-window`:
+            // the miss streak is still within `RoomKeepAliveStall`'s
+            // tolerance (or nothing was outstanding at all) — but a still-
+            // outstanding prior ack must NOT be clobbered by a fresh send.
+            // `room.pending_keep_alive_ack` is a single `Option<[u8; 4]>`
+            // slot; encoding-and-sending a new keep-alive below overwrites
+            // it with the NEW frame's expected hash, discarding the PRIOR
+            // one before a legitimately late (but still valid) reply can
+            // possibly match it — the exact defect this mission fixes. Wait
+            // for the outstanding ack (or for `RoomKeepAliveStall` to give
+            // up on it above) instead. See
+            // `room_session::keep_alive_tick_should_send`'s doc.
+            if !room_session::keep_alive_tick_should_send(ack_outstanding) {
+                continue;
             }
 
             // Resumed keep-alive after a (re)login: force_since re-affirms
