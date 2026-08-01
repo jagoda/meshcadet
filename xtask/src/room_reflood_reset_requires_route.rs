@@ -21,24 +21,43 @@
 //! `room.reflood_attempts` on EVERY login reply unconditionally — including
 //! a direct `RESPONSE` datagram reply, which `decode_login_response_datagram`
 //! always decodes with `out_path: None` (it teaches no route). A session
-//! stuck at `out_path_len == 0` that receives such a reply would clear its
+//! stuck with no route that receives such a reply would clear its
 //! attempt counter anyway, so the very next scheduler tick re-floods a full
 //! `ANON_REQ` login at the 30 s floor again — forever, with no escalation:
 //! the exact airtime/regulatory-duty-cycle defect
 //! `meshcadet-room-reflood-login-backoff` introduced this backoff to
-//! prevent. The fix: only reset `reflood_attempts` when `out_path_len != 0`
-//! (a route is actually known) AFTER `apply_login_outcome` has run.
+//! prevent. The fix: only reset `reflood_attempts` when a route is actually
+//! known (`PersistedRoomSession::has_route()`) AFTER `apply_login_outcome`
+//! has run.
+//!
+//! **`out_path_len != 0` is REJECTED, not merely "not preferred"**
+//! (`meshcadet-room-messages-no-longer-received-regression`, a real HIL
+//! regression this exact gate caused): `out_path_len == 0` is legitimately
+//! ambiguous between "no route known at all" and "a learned ZERO-HOP
+//! route" — the room server is this device's direct radio neighbour, the
+//! ordinary bench topology — exactly the conflation
+//! `meshcadet-room-notify-suppression-full-enumeration-fix` already fixed
+//! for the re-flood branch itself (`firmware/src/main.rs`'s `!has_route()`
+//! gate, and `PersistedRoomSession::has_route`'s doc: "**Never test
+//! `out_path_len == 0` for this**"). Gating THIS reset on `out_path_len !=
+//! 0` reintroduces that exact conflation one call site over: a zero-hop
+//! room's `reflood_attempts` counter never resets on any successful
+//! (re)login, so every later stall-triggered relogin cycle doubles the
+//! backoff instead of resetting it, escalating an ordinary, recoverable
+//! reconnect blip into an ever-lengthening outage. This scanner used to
+//! accept `out_path_len` as a valid gate (the exact shape of that
+//! regression); it no longer does.
 //!
 //! # Scope and honest limits
 //!
 //! Structural, not behavioural: it checks that the `room.reflood_attempts =
 //! 0` statement inside `apply_room_login_outcome` sits inside a braced block
-//! whose own `if` condition mentions `out_path_len` (or a future
-//! `has_route()`-shaped rename) — not that the guard's runtime semantics are
-//! correct, which is a plain boolean firmware-core's own reflood-cadence
-//! tests already pin. It fails loud (a reported violation, never a silent
-//! skip) if `apply_room_login_outcome` or the reset statement can't be
-//! located at all, per this crate's "parse gap = NO-GO" doctrine.
+//! whose own `if` condition mentions `has_route(` — not that the guard's
+//! runtime semantics are correct, which is a plain boolean firmware-core's
+//! own reflood-cadence tests already pin. It fails loud (a reported
+//! violation, never a silent skip) if `apply_room_login_outcome` or the
+//! reset statement can't be located at all, per this crate's "parse gap =
+//! NO-GO" doctrine.
 
 use std::fs;
 use std::path::Path;
@@ -167,14 +186,25 @@ pub fn check_source(src: &str) -> Vec<String> {
     }
 
     let cond = guard_condition_text(&chars, io);
-    if !cond.contains("out_path_len") && !cond.contains("has_route") {
-        violations.push(format!(
-            "{MAIN_RS_REL_PATH}: `{RESET_NEEDLE}` is gated on `{}`, which does not reference \
-             `out_path_len` or `has_route(..)` — this scanner cannot confirm the reset is \
-             actually gated on the session having a learned route rather than some unrelated \
-             condition",
-            cond.trim(),
-        ));
+    if !cond.contains("has_route") {
+        if cond.contains("out_path_len") {
+            violations.push(format!(
+                "{MAIN_RS_REL_PATH}: `{RESET_NEEDLE}` is gated on `{}` — `out_path_len != 0` is \
+                 the exact `meshcadet-room-messages-no-longer-received-regression` shape: \
+                 `out_path_len == 0` is also the value a legitimately-learned ZERO-HOP route \
+                 (the room server as a direct radio neighbour) leaves behind, so this gate never \
+                 resets `reflood_attempts` for that (ordinary bench) topology. Use \
+                 `room.session.has_route()` instead — see this module's doc",
+                cond.trim(),
+            ));
+        } else {
+            violations.push(format!(
+                "{MAIN_RS_REL_PATH}: `{RESET_NEEDLE}` is gated on `{}`, which does not reference \
+                 `has_route(..)` — this scanner cannot confirm the reset is actually gated on \
+                 the session having a learned route rather than some unrelated condition",
+                cond.trim(),
+            ));
+        }
     }
 
     violations
@@ -213,7 +243,7 @@ mod tests {
         ) {
             room.session.apply_login_outcome(outcome);
             room.keep_alive_stall.reset();
-            if room.session.out_path_len != 0 {
+            if room.session.has_route() {
                 room.reflood_attempts = 0;
             }
             room.resync_pending = true;
@@ -226,6 +256,38 @@ mod tests {
             check_source(GATED_BASELINE).is_empty(),
             "{:?}",
             check_source(GATED_BASELINE)
+        );
+    }
+
+    #[test]
+    fn synthetic_out_path_len_sentinel_is_caught() {
+        // REGRESSION GUARD for `meshcadet-room-messages-no-longer-received-
+        // regression`: `out_path_len != 0` is not a "less preferred" gate —
+        // it is the exact shape of a real HIL regression (a zero-hop room,
+        // the ordinary bench topology, never resets `reflood_attempts` on
+        // any successful login) and must be REJECTED, not merely accepted
+        // alongside `has_route()`. This is the pre-fix shape
+        // `meshcadet-room-reflood-backoff-resets-without-a-learned-route`
+        // itself shipped and this scanner used to wave through.
+        let synthetic = r#"
+            fn apply_room_login_outcome(
+                room: &mut RoomRuntime,
+                outcome: &room_session::RoomLoginOutcome,
+            ) {
+                room.session.apply_login_outcome(outcome);
+                room.keep_alive_stall.reset();
+                if room.session.out_path_len != 0 {
+                    room.reflood_attempts = 0;
+                }
+                room.resync_pending = true;
+            }
+        "#;
+        let violations = check_source(synthetic);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("`meshcadet-room-messages-no-longer-received-regression`")),
+            "the `out_path_len != 0` sentinel must be rejected, not accepted: {violations:?}"
         );
     }
 
@@ -273,7 +335,7 @@ mod tests {
         assert!(
             violations
                 .iter()
-                .any(|v| v.contains("does not reference `out_path_len` or `has_route(..)`")),
+                .any(|v| v.contains("does not reference `has_route(..)`")),
             "a reset gated on something other than route-known-ness must be caught: \
              {violations:?}"
         );
@@ -323,9 +385,10 @@ mod tests {
                 outcome: &room_session::RoomLoginOutcome,
             ) {
                 room.session.apply_login_outcome(outcome);
-                // Previously `room.reflood_attempts = 0` unconditionally —
-                // see the mission doc for why that was wrong.
-                if room.session.out_path_len != 0 {
+                // Previously `room.reflood_attempts = 0` unconditionally, and
+                // later gated on `out_path_len != 0` — see the mission doc
+                // for why both were wrong.
+                if room.session.has_route() {
                     room.reflood_attempts = 0;
                 }
             }
