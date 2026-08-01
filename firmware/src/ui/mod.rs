@@ -141,7 +141,8 @@ pub enum UiEvent {
         channel_hash: u8,
         text: String,
     },
-    /// An outbound DM was acknowledged.
+    /// An outbound DM — or, per `is_channel` below, an outbound room post —
+    /// was acknowledged.
     ///
     /// `handle_event` below flips the last unacked outbound `MessageRecord`
     /// to `acked: true`, refreshing the ✓→✓✓ indicator. Raised by
@@ -151,8 +152,23 @@ pub enum UiEvent {
     /// `to_hash` this variant needs (previously `pending_ack` was a
     /// bare `[u8; 4]` with no `to_hash`, so a matching ACK was logged but
     /// never reached this handler).
+    ///
+    /// `main.rs::match_room_post_ack` raises this SAME variant for a room
+    /// post's ACK (`room_message_view.rs`'s module doc: a room's posts render
+    /// through the exact same hash-keyed message view a DM's do), which is
+    /// why this needs `is_channel` at all: `self.messages` is keyed by hash
+    /// alone so `mark_last_unacked_outbound` doesn't care, but
+    /// `refresh_message_view_for`'s live-redraw guard checks the full
+    /// `(hash, is_channel)` pair against `self.active_convo` — a room's
+    /// entry is `(room_hash, true)` (rooms render as `is_channel: true`, see
+    /// e.g. `RoomPostSent`'s doc below), so passing a hardcoded `false` here
+    /// for a room-post ack silently failed that comparison and skipped the
+    /// redraw: the model updated, the currently-visible view did not,
+    /// exactly the "navigate away and back fixes it" symptom this field
+    /// exists to close. A genuine DM ack passes `false`.
     DmAcked {
         to_hash: u8,
+        is_channel: bool,
     },
     /// An outbound channel/group message was implicitly acknowledged.
     ///
@@ -2197,12 +2213,16 @@ impl<'d> UiRuntime<'d> {
                 }
                 self.refresh_message_view_for(room_hash, true);
             }
-            UiEvent::DmAcked { to_hash } => {
-                // Mark the last outbound message to this contact as acked.
+            UiEvent::DmAcked { to_hash, is_channel } => {
+                // Mark the last outbound message to this contact (or room —
+                // see the variant's doc) as acked.
                 mark_last_unacked_outbound(&mut self.messages, to_hash);
                 self.notif.fire(NotifEvent::DmAcked, now_ms, self.screen_asleep);
-                // Refresh the live MessageView so the ✓→✓✓ indicator updates immediately.
-                self.refresh_message_view_for(to_hash, false);
+                // Refresh the live MessageView so the ✓→✓✓ indicator updates
+                // immediately. Must pass the SAME `is_channel` the view was
+                // opened with (`self.active_convo`'s pair) or this is a
+                // silent no-op — see the variant's doc.
+                self.refresh_message_view_for(to_hash, is_channel);
             }
             UiEvent::ChannelAcked { channel_hash } => {
                 // Mark the last outbound message to this channel as acked —
