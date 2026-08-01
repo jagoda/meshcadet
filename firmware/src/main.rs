@@ -3922,27 +3922,30 @@ fn apply_room_login_outcome(
     // epoch (should one ever start again) begins fresh at the initial
     // backoff, not wherever this epoch's exponent left off.
     //
-    // Gated on `out_path_len != 0` (a route is actually known POST-apply,
-    // i.e. after `apply_login_outcome` above) — never on "a reply arrived"
-    // alone. `apply_login_outcome` only writes `out_path`/`out_path_len`
-    // when `outcome.out_path` is `Some(..)` (the PATH-return leg); a direct
-    // `RESPONSE` datagram reply (`decode_login_response_datagram`) always
-    // decodes `out_path: None` and teaches no route
-    // (`RoomLoginOutcome::out_path`'s doc), so an unconditional reset here
-    // would let a session still stuck at `out_path_len == 0` clear its
-    // attempt counter anyway — the very next scheduler tick re-floods a
-    // full `ANON_REQ` login at the 30 s floor again, forever, with no
-    // escalation: the exact airtime/regulatory-duty-cycle defect this
-    // backoff exists to prevent (`room_reflood_interval_ms`'s doc). Not
-    // reachable against the vendored `simple_room_server` today — a flood
-    // `ANON_REQ` always gets a PATH-return back (`MyMesh.cpp`'s
-    // `onAnonDataRecv`, `packet->isRouteFlood()` branch) — because this
-    // client only ever floods its login (`encode_room_login_frame`'s doc);
-    // a bare direct-RESPONSE reply is reachable only via
-    // `handle_room_login_response`'s documented FUTURE re-login-over-a-
-    // known-route leg. This call site has no way to assume that stays true
-    // forever, and the guard costs nothing today.
-    if room.session.out_path_len != 0 {
+    // Gated on `has_route()`, never `out_path_len != 0`
+    // (`meshcadet-room-messages-no-longer-received-regression`, reverting
+    // `meshcadet-room-reflood-backoff-resets-without-a-learned-route`'s own
+    // mistake): `out_path_len == 0` is legitimately ambiguous between "no
+    // route known" and "a learned ZERO-HOP route" (the room server is this
+    // device's direct radio neighbour — the ordinary bench topology, and
+    // exactly the same conflation `meshcadet-room-notify-suppression-full-
+    // enumeration-fix` already fixed for the re-flood branch itself, see
+    // `PersistedRoomSession::has_route`'s doc and the log match 37 lines
+    // below THIS SAME FUNCTION, which already asks `has_route()` for the
+    // identical question). Testing `out_path_len != 0` here meant a
+    // zero-hop room's `reflood_attempts` counter was NEVER reset back to
+    // the 30 s floor on any successful (re)login — including the very
+    // first one — so every later stall-triggered relogin cycle doubled the
+    // backoff instead of resetting it, escalating an ordinary, recoverable
+    // reconnect blip into an ever-lengthening outage that starved the
+    // session of any stable connected window long enough to complete a
+    // post push-and-ACK round trip. `has_route()` is `true` for a taught
+    // route of ANY hop count (`PersistedRoomSession::apply_login_outcome`
+    // sets it unconditionally whenever `outcome.out_path` is `Some(..)`,
+    // zero hops included) and stays `false` for the direct-`RESPONSE` leg
+    // that teaches no path at all — the exact distinction this reset
+    // needs, with no separate reachability caveat required.
+    if room.session.has_route() {
         room.reflood_attempts = 0;
     }
     // The next keep-alive should re-affirm this login's `sync_since` via
