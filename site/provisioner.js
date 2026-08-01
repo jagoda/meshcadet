@@ -95,10 +95,26 @@ const addChannelButton = document.getElementById("add-channel-button");
 const addChannelStatus = document.getElementById("add-channel-status");
 const genChannel128Button = document.getElementById("gen-channel-128-button");
 const genChannel256Button = document.getElementById("gen-channel-256-button");
+const channelSecretRevealButton = document.getElementById("channel-secret-reveal-button");
+const channelSecretCopyButton = document.getElementById("channel-secret-copy-button");
+const channelSecretAck = document.getElementById("channel-secret-ack");
+const channelSecretAckCheckbox = document.getElementById("channel-secret-ack-checkbox");
 const delChannelForm = document.getElementById("del-channel-form");
 const delChannelSecret = document.getElementById("del-channel-secret");
 const delChannelButton = document.getElementById("del-channel-button");
 const delChannelStatus = document.getElementById("del-channel-status");
+
+// Tracks whether the CURRENT contents of `add-channel-secret` have actually
+// been SEEN by the operator (revealed in cleartext via the Show toggle) or
+// successfully copied to the clipboard, since the field was last generated
+// or hand-edited. `add-channel-secret` is `type="password"` by default
+// (provisioner.html), so a generated secret can otherwise sit there, never
+// looked at, while the operator clicks "Add channel" straight away — and
+// because del-channel needs the exact secret (the channels table only shows
+// a 1-byte hash, provisioner.html "Remove channel"), that channel then
+// becomes permanently unremovable. `handleAddChannel` below gates on this
+// flag; see `setChannelSecretConfirmed`.
+let channelSecretConfirmed = false;
 
 const roomsPanel = document.getElementById("rooms-panel");
 const roomsTableBody = document.getElementById("rooms-table-body");
@@ -201,6 +217,13 @@ if (!ProvisionerSession.isSupported() || !ProvisionerSession.isSecureContext()) 
   });
   genChannel128Button.addEventListener("click", () => handleGenerateChannelSecret(16));
   genChannel256Button.addEventListener("click", () => handleGenerateChannelSecret(32));
+  channelSecretRevealButton.addEventListener("click", handleToggleChannelSecretVisibility);
+  channelSecretCopyButton.addEventListener("click", handleCopyChannelSecret);
+  // Any hand-edit (typing or paste) invalidates a prior reveal/copy: the
+  // operator may be looking at a DIFFERENT value now than the one they last
+  // saved. `.value =` assignments (handleGenerateChannelSecret, form.reset())
+  // don't dispatch "input", so this fires only on genuine user edits.
+  addChannelSecret.addEventListener("input", () => setChannelSecretConfirmed(false));
   addRoomForm.addEventListener("submit", (event) => {
     event.preventDefault();
     handleAddRoom();
@@ -329,6 +352,7 @@ function clearFormStatuses() {
   addRoomPassword.value = "";
   addChannelSecret.value = "";
   delChannelSecret.value = "";
+  resetChannelSecretUi();
   roomQrBlock.hidden = true;
   roomQrUri.textContent = "";
   pendingTranscript = null;
@@ -629,6 +653,58 @@ function handleGenerateChannelSecret(bytesLen) {
   addChannelSecret.value = bytesToHex(raw);
   addChannelStatus.textContent =
     "Generated locally — copy this secret somewhere safe now; it's the only way to remove this channel later.";
+  // The new value is only "seen" if the field is already revealed
+  // (type=text) — otherwise it's sitting behind the password mask and the
+  // operator hasn't actually looked at it yet.
+  setChannelSecretConfirmed(addChannelSecret.type === "text");
+}
+
+/**
+ * Records whether the operator has actually seen (Show toggle) or copied
+ * the current `add-channel-secret` value. When true, hides/resets the
+ * "haven't saved this" acknowledgement gate — see `handleAddChannel`.
+ */
+function setChannelSecretConfirmed(confirmed) {
+  channelSecretConfirmed = confirmed;
+  if (confirmed) {
+    channelSecretAck.hidden = true;
+    channelSecretAckCheckbox.checked = false;
+  }
+}
+
+/** Reset the reveal toggle, confirmation flag, and acknowledgement gate — shared by handleAddChannel's exit paths and clearFormStatuses (disconnect). */
+function resetChannelSecretUi() {
+  setChannelSecretConfirmed(false);
+  addChannelSecret.type = "password";
+  channelSecretRevealButton.textContent = "Show";
+  channelSecretRevealButton.setAttribute("aria-pressed", "false");
+}
+
+/** Toggle `add-channel-secret` between masked (password) and cleartext (text) display. Revealing it counts as the operator having seen it (see `setChannelSecretConfirmed`); hiding it again does not un-confirm — they already looked. */
+function handleToggleChannelSecretVisibility() {
+  const revealing = addChannelSecret.type === "password";
+  addChannelSecret.type = revealing ? "text" : "password";
+  channelSecretRevealButton.textContent = revealing ? "Hide" : "Show";
+  channelSecretRevealButton.setAttribute("aria-pressed", String(revealing));
+  if (revealing) {
+    setChannelSecretConfirmed(true);
+  }
+}
+
+/** Copy `add-channel-secret`'s current value to the clipboard — same pattern (and graceful fallback) as `handleCopyCardUri` above. A successful copy counts as the operator having saved it. */
+async function handleCopyChannelSecret() {
+  const text = addChannelSecret.value;
+  if (!text) {
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(text);
+    addChannelStatus.textContent = "Secret copied to clipboard.";
+    setChannelSecretConfirmed(true);
+  } catch (err) {
+    console.error("MeshCadet provisioner: clipboard write failed", err);
+    addChannelStatus.textContent = "Couldn't copy automatically — click Show and copy the secret manually.";
+  }
 }
 
 async function handleAddChannel() {
@@ -637,18 +713,32 @@ async function handleAddChannel() {
     addChannelStatus.textContent = secretResult.error;
     return;
   }
+  // Require an explicit acknowledgement before submitting a secret the
+  // operator never actually looked at or copied — see `channelSecretConfirmed`'s
+  // doc comment for why this matters (an unremovable channel otherwise).
+  if (!channelSecretConfirmed) {
+    channelSecretAck.hidden = false;
+    if (!channelSecretAckCheckbox.checked) {
+      addChannelStatus.textContent =
+        "This secret hasn't been shown or copied yet — click Show or Copy secret to save it, or check the box below to add anyway.";
+      channelSecretAckCheckbox.focus();
+      return;
+    }
+  }
   await withButtonDisabled(addChannelButton, async () => {
     addChannelStatus.textContent = "Adding channel…";
     try {
       await session.addChannel(secretResult.bytes, secretResult.keyLen, addChannelPrimary.checked, addChannelName.value);
       addChannelStatus.textContent = "Channel added.";
       addChannelForm.reset();
+      resetChannelSecretUi();
       await refreshLists();
     } catch (err) {
       // Clear here too: a failed submit is not a reason to leave a secret
       // sitting in the DOM any longer than the successful path (form.reset())
       // would.
       addChannelSecret.value = "";
+      resetChannelSecretUi();
       reportWriteError(addChannelStatus, "add channel", err);
     }
   });

@@ -219,13 +219,28 @@
             <div class="cta-row">
               <button id="gen-channel-128-button" class="btn btn-ghost" type="button">Generate 128-bit</button>
               <button id="gen-channel-256-button" class="btn btn-ghost" type="button">Generate 256-bit</button>
+              <button id="channel-secret-reveal-button" class="btn btn-ghost" type="button" aria-pressed="false">Show</button>
+              <button id="channel-secret-copy-button" class="btn btn-ghost" type="button">Copy secret</button>
             </div>
             <p class="muted">
               Generated locally with <code>crypto.getRandomValues</code> — the
               secret is filled into the field above and never leaves this
-              browser. Copy it somewhere safe before adding: it is the only
+              browser. Use <strong>Show</strong> or <strong>Copy secret</strong>
+              above to save it somewhere safe before adding: it is the only
               way to remove this channel later.
             </p>
+            <div id="channel-secret-ack" class="warn-box" hidden>
+              <p>
+                <strong>This secret hasn't been shown or copied yet.</strong>
+                The channel list above only shows a 1-byte hash — without your
+                own saved copy of this secret, this channel can never be
+                removed later.
+              </p>
+              <label class="checkbox-label">
+                <input id="channel-secret-ack-checkbox" type="checkbox" />
+                I understand I haven't saved this secret and won't be able to remove this channel later.
+              </label>
+            </div>
             <label class="version-label" for="add-channel-name">Name</label>
             <input id="add-channel-name" class="text-input" type="text" placeholder="family" maxlength="64" />
             <label class="checkbox-label">

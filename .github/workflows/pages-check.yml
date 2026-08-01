@@ -162,6 +162,19 @@ jobs:
         # header for why it's split from session.smoke.test.mjs this way.
         run: node site/provisioner/channel-secret-hygiene.test.mjs
 
+      - name: channel-secret-recoverability — a generated channel secret has a Show toggle + Copy button and an explicit ack gate before an unconfirmed one is added
+        # Regression coverage for meshcadet-provisioner-channel-secret-uncopyable:
+        # a generated secret used to land in a type="password" field with no
+        # way to reveal or copy it, so an operator could add a channel
+        # without ever having saved its secret — and because del-channel
+        # needs the exact secret (the channels table only shows a 1-byte
+        # hash), that channel was then permanently unremovable. Statically
+        # asserts the Show/Copy affordances exist and are wired up, and that
+        # handleAddChannel gates on an explicit checkbox acknowledgement
+        # whenever the current secret was never revealed or copied. See the
+        # test file's own header.
+        run: node site/provisioner/channel-secret-recoverability.test.mjs
+
       - name: secret-hygiene-coverage — every type="password" field in provisioner.html has a matching hygiene test
         # Closes a coverage gap: the three hygiene tests above were each added reactively,
         # one field at a time, only after an incident noticed that field was
