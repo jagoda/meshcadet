@@ -673,6 +673,80 @@ pub fn adopt_server_clock(
     })
 }
 
+// ── sync_since vs. the server's own clock: a RELATIVE plausibility bound ────
+//
+// `meshcadet-room-inbound-still-dead-after-two-fixes`, Lead B. Two independent
+// HIL captures on `b04e53b` (containing both prior room fixes) show a
+// provisioned room stuck at `sync_since=1785586431` (persisted, survives
+// reflash) while the SAME login reply's `server_ts=1715781356` gets adopted
+// as the trusted wall clock — an ≈808-day (≈69.8M-second) gap. `sync_since`
+// is compared directly against `post_ts`, a value the room SERVER stamps
+// with its own clock (`MyMesh.cpp:41-51`), never against this device's own
+// notion of wall time — so a `sync_since` already ahead of what the server
+// itself just admitted as "now" can never again be exceeded by any future
+// post: the server has nothing left to push, forever, not just slowly. This
+// is the "zero posts delivered, indefinitely" shape that was reported,
+// independent of the separate keep-alive-cadence defect
+// (`RoomSyncPhase::note_relogin`'s doc) that Lead A traced instead.
+//
+// `ROOM_CLOCK_PLAUSIBILITY_CEILING_SECS` (above) answers a DIFFERENT
+// question — "is this server_ts plausible in isolation" (is it before
+// 2100) — and 1715781356 (2024-05) passes that check easily. The gap here
+// only shows up when `sync_since` is compared AGAINST the server's own
+// reading, which is exactly why `decode_persisted_room_session`'s "leave an
+// implausible `last_room_ts` alone" stance (Finding F) does NOT transfer to
+// `sync_since`: `last_room_ts` is a self-referential anti-replay nonce (no
+// harm if client and server already silently agree on an absurd shared
+// value), but `sync_since` is a content watermark checked against posts the
+// server can only ever stamp with ITS OWN clock — an unrepaired gap here
+// does not cost "cosmetic accuracy", it costs "this room can never receive
+// another post."
+
+/// How far (in seconds) a room's persisted `sync_since` watermark may sit
+/// AHEAD of a freshly-observed room-server clock reading before the gap is
+/// treated as an unrecoverable clock regression rather than ordinary
+/// propagation/processing skew. Generous relative to any realistic skew
+/// (seconds, at most low minutes even for a room server that just
+/// rebooted mid-session) and far below the multi-day-to-multi-year gap this
+/// bound actually exists to catch — see the section doc above.
+pub const SYNC_SINCE_SERVER_CLOCK_SLACK_SECS: u32 = 86_400; // 1 day
+
+/// The smallest legal non-`0` rewind value: `0` is [`encode_keep_alive`]'s
+/// own wire sentinel for "leave `sync_since` untouched" (see that
+/// function's doc), so a rewind that means "start over from the very
+/// beginning" cannot literally be encoded as `0` — `1` is functionally
+/// identical for a `u32` Unix-seconds watermark (no room server predates
+/// 1970 by more than a second).
+pub const SYNC_SINCE_REWIND_FLOOR: u32 = 1;
+
+/// Whether this room's persisted `sync_since` has fallen out of reach of the
+/// room server's own clock — see the section doc above for the mechanism
+/// and why this must be repaired, unlike `last_room_ts`. `server_ts` is the
+/// RAW reading straight off a login reply or push (not gated on whether it
+/// was actually adopted as the device's trusted clock — `sync_since` must
+/// be reconciled against THIS SPECIFIC SERVER's clock domain regardless of
+/// GPS/adoption state elsewhere on the device).
+///
+/// Returns `Some(`[`SYNC_SINCE_REWIND_FLOOR`]`)` — forcing a full resync —
+/// the moment `sync_since` is more than
+/// [`SYNC_SINCE_SERVER_CLOCK_SLACK_SECS`] ahead of `server_ts`. `None`
+/// (leave `sync_since` exactly as it is) otherwise: `server_ts` unset/absurd
+/// (nothing trustworthy to compare against — mirrors [`adopt_server_clock`]'s
+/// own implausibility gate), `sync_since` legitimately behind or within
+/// slack of `server_ts`, or `sync_since` already at the floor.
+pub fn reconcile_sync_since(sync_since: u32, server_ts: u32) -> Option<u32> {
+    if server_ts == 0 || server_ts >= ROOM_CLOCK_PLAUSIBILITY_CEILING_SECS {
+        return None;
+    }
+    if sync_since <= server_ts.saturating_add(SYNC_SINCE_SERVER_CLOCK_SLACK_SECS) {
+        return None;
+    }
+    if sync_since == SYNC_SINCE_REWIND_FLOOR {
+        return None;
+    }
+    Some(SYNC_SINCE_REWIND_FLOOR)
+}
+
 /// The single wall-clock reading (and its provenance) in effect right now,
 /// combining GPS and an adopted room-server clock per this mission's
 /// priority rule: GPS wins whenever it is synced; the adopted server clock
@@ -1516,6 +1590,60 @@ impl RoomSyncPhase {
             closer_failed: false,
             first_suppressed_ms: None,
         }
+    }
+
+    /// Reopen the drain window on a COMPLETED login — boot's first login and
+    /// every later stall-triggered relearn alike. Equivalent to
+    /// [`Self::new_after_login`] (a completed login is, semantically, always
+    /// "we don't yet know whether this session is caught up" — the exact
+    /// condition that constructor already encodes).
+    ///
+    /// **The bug this closes
+    /// (`meshcadet-room-inbound-still-dead-after-two-fixes`, the mechanism
+    /// behind Lead A).** Before this method existed, `RoomSyncPhase` was
+    /// constructed via [`Self::new_after_login`] exactly ONCE, at
+    /// `firmware::main`'s `RoomRuntime` construction (boot), and never
+    /// again. `firmware::main`'s keep-alive scheduler reads
+    /// [`Self::is_draining`] to choose between the tight
+    /// `ROOM_DRAINING_KEEP_ALIVE_INTERVAL_MS` (15 s) cadence and the
+    /// 5-minute `ROOM_KEEP_ALIVE_INTERVAL_MS` routine cadence
+    /// (`room_keep_alive_interval_ms`). Two consecutive missed keep-alive
+    /// round trips invalidate the route
+    /// (`RoomKeepAliveStall::on_tick`) and call [`Self::note_closer_failed`],
+    /// which the very NEXT `on_scheduler_tick` — fired unconditionally on
+    /// every main-loop pass, ~5 ms apart, well before the relearn this same
+    /// invalidation triggers can even complete — force-closes via
+    /// [`Self::must_close`]/[`Self::is_stalled`] treating `closer_failed` as
+    /// an immediate (not merely elapsed-time) signal. `draining` therefore
+    /// flips to `false` within one scheduler tick of the FIRST reconnect
+    /// cycle of a session's uptime, and — with nothing left to ever call
+    /// [`Self::new_after_login`] again — stays `false` for the rest of that
+    /// boot, even once the very next login succeeds seconds later. The
+    /// keep-alive cadence silently balloons from 15 s to 5 min at that
+    /// point, which is why two independent HIL captures
+    /// (`b04e53b` and its predecessor `f12cab1`) each show exactly ONE
+    /// scheduled keep-alive send in their ~80-90 s capture windows despite a
+    /// completed relearn partway through: the very next send was due at the
+    /// (still-15 s-cadenced) 15-second mark, but the collapse had already
+    /// silently rescheduled it 5 minutes out. The "ACK received (no pending
+    /// DM)" log lines both captures show are the FIRST (only) keep-alive's
+    /// legitimately late reply, arriving after
+    /// `RoomKeepAliveStall::on_tick`'s invalidation had already cleared
+    /// `RoomRuntime::pending_keep_alive_ack` to `None` — not a hash-mismatch
+    /// bug in [`crate::room_session`]'s ACK computation, which this method's
+    /// regression coverage rules out directly.
+    ///
+    /// This is safe to call unconditionally on every completed login
+    /// (`firmware::main::apply_room_login_outcome`'s call site does): the
+    /// very first boot login just re-derives the same `draining: true` state
+    /// `RoomRuntime`'s construction already seeded (a no-op difference in
+    /// `last_progress_ms`'s anchor), and any progress a since-closed window
+    /// had already accumulated (`drained_count`) has already been flushed by
+    /// whichever closer force-closed it (`Self::note_closer_failed`'s or
+    /// `Self::on_scheduler_tick`'s `take_aggregate` call) before a relogin
+    /// can ever complete — there is nothing left to lose by reopening.
+    pub const fn note_relogin(&mut self, now_ms: u64) {
+        *self = Self::new_after_login(now_ms);
     }
 
     /// Whether the drain window is currently open.
@@ -2928,6 +3056,76 @@ mod tests {
             Some(clock),
             "an implausible later reading must leave an already-adopted clock untouched"
         );
+    }
+
+    // ── `sync_since` vs. the server's own clock (Lead B,
+    // `meshcadet-room-inbound-still-dead-after-two-fixes`) ─────────────────
+
+    #[test]
+    fn reconcile_sync_since_rewinds_the_exact_captured_gap() {
+        // The actual values off the `b04e53b` HIL capture: a persisted
+        // `sync_since` that survives reflash, ~808 days ahead of the SAME
+        // login reply's `server_ts`. Before this fix, nothing ever compared
+        // these two values — the drain starved forever.
+        let sync_since = 1_785_586_431;
+        let server_ts = 1_715_781_356;
+        assert_eq!(
+            reconcile_sync_since(sync_since, server_ts),
+            Some(SYNC_SINCE_REWIND_FLOOR),
+            "an 808-day-ahead sync_since must be rewound to the smallest legal \
+             non-zero force_since, forcing a full resync"
+        );
+    }
+
+    #[test]
+    fn reconcile_sync_since_leaves_ordinary_lag_and_skew_alone() {
+        // sync_since legitimately BEHIND the server's clock (the ordinary,
+        // healthy case: there is a real backlog to drain) must never be
+        // touched.
+        assert_eq!(reconcile_sync_since(100, 100_000), None);
+
+        // sync_since exactly equal to the server's clock, and a few minutes
+        // ahead (ordinary propagation/processing skew) — both within
+        // `SYNC_SINCE_SERVER_CLOCK_SLACK_SECS` — must also be left alone.
+        assert_eq!(reconcile_sync_since(100_000, 100_000), None);
+        assert_eq!(reconcile_sync_since(100_000 + 300, 100_000), None);
+        assert_eq!(
+            reconcile_sync_since(100_000 + SYNC_SINCE_SERVER_CLOCK_SLACK_SECS, 100_000),
+            None,
+            "exactly at the slack boundary must still be tolerated"
+        );
+    }
+
+    #[test]
+    fn reconcile_sync_since_trips_just_past_the_slack_boundary() {
+        assert_eq!(
+            reconcile_sync_since(100_000 + SYNC_SINCE_SERVER_CLOCK_SLACK_SECS + 1, 100_000),
+            Some(SYNC_SINCE_REWIND_FLOOR),
+            "one second past the slack boundary must rewind"
+        );
+    }
+
+    #[test]
+    fn reconcile_sync_since_ignores_an_unset_or_implausible_server_ts() {
+        // `server_ts == 0` (no genuine reading yet) must never force a
+        // rewind of an otherwise-legitimate sync_since.
+        assert_eq!(reconcile_sync_since(1_785_586_431, 0), None);
+        // An implausible (far-future) server_ts is exactly the case
+        // `adopt_server_clock` already refuses to adopt — nothing
+        // trustworthy to compare against here either.
+        assert_eq!(
+            reconcile_sync_since(1_785_586_431, ROOM_CLOCK_PLAUSIBILITY_CEILING_SECS),
+            None
+        );
+    }
+
+    #[test]
+    fn reconcile_sync_since_is_idempotent_once_already_at_the_floor() {
+        // A device that already rewound must not keep re-rewinding forever
+        // (defensive — `sync_since` at the floor is never itself "ahead" of
+        // a plausible server_ts in the first place, but this pins the
+        // no-op explicitly).
+        assert_eq!(reconcile_sync_since(SYNC_SINCE_REWIND_FLOOR, 0), None);
     }
 
     #[test]
@@ -4403,6 +4601,97 @@ mod tests {
             "a window that is already closed has nothing to flush"
         );
         assert!(!phase.is_draining(), "must not reopen a closed window");
+    }
+
+    // ── Keep-alive cadence collapse (Lead A's real mechanism,
+    // `meshcadet-room-inbound-still-dead-after-two-fixes`) ─────────────────
+
+    #[test]
+    fn keep_alive_stall_relogin_reopens_the_drain_window_for_polling_cadence() {
+        // Reproduces the exact sequence both `f12cab1` and `b04e53b` HIL
+        // captures show: two consecutive missed keep-alive round trips
+        // invalidate the route and report the closer dead
+        // (`RoomKeepAliveStall::on_tick` -> `note_closer_failed`), and the
+        // very next scheduler tick — fired on every main-loop pass,
+        // independent of the event above — force-closes the drain window.
+        let mut phase = RoomSyncPhase::new_after_login(0);
+        assert!(phase.is_draining());
+
+        // Nothing absorbed yet in this reproduction, so `note_closer_failed`
+        // itself reports nothing to flush (mirrors `firmware::main`'s
+        // invalidation branch, which carries no post of its own).
+        assert_eq!(phase.note_closer_failed(), None);
+
+        // `firmware::main`'s `on_scheduler_tick` call runs BEFORE the
+        // has_route()/reflood-vs-keep-alive branch, every single pass —
+        // this is the very next one, a few ms later.
+        assert_eq!(phase.on_scheduler_tick(1), None);
+        assert!(
+            !phase.is_draining(),
+            "the window force-closes within one tick of the closer being confirmed dead — this \
+             is the pre-existing, correct notification behaviour, not itself the bug"
+        );
+
+        // Without `note_relogin`, `is_draining()` stays `false` forever —
+        // even though the relearn this same invalidation triggered succeeds
+        // moments later — silently collapsing `firmware::main`'s keep-alive
+        // cadence from the 15 s draining interval to the 5-minute routine
+        // one for the rest of the device's uptime. The fix: a completed
+        // login (boot OR relearn) must reopen the window.
+        phase.note_relogin(2);
+        assert!(
+            phase.is_draining(),
+            "a completed (re)login must reopen the drain window so the keep-alive scheduler \
+             resumes polling at the tight cadence instead of the 5-minute one"
+        );
+    }
+
+    #[test]
+    fn keep_alive_cadence_survives_a_relogin_end_to_end() {
+        // End-to-end with the actual scheduler cadence selector
+        // (`room_keep_alive_interval_ms`) and firmware::main's real
+        // constants, proving the user-visible consequence of the collapse
+        // above: without the fix, the very next scheduler-interval lookup
+        // after a relearn silently falls back to the 5-minute routine
+        // cadence with zero evidence the session is caught up.
+        const FIRST_DELAY_MS: u64 = 10_000;
+        const DRAINING_INTERVAL_MS: u64 = 15_000;
+        const ROUTINE_INTERVAL_MS: u64 = 300_000;
+
+        let mut phase = RoomSyncPhase::new_after_login(0);
+        phase.note_closer_failed();
+        phase.on_scheduler_tick(1);
+        assert!(
+            !phase.is_draining(),
+            "collapsed, mirroring the HIL captures"
+        );
+
+        let collapsed_interval = room_keep_alive_interval_ms(
+            42_376, // a nonzero `last_keep_alive_ms` — not the first-ever tick
+            phase.is_draining(),
+            FIRST_DELAY_MS,
+            DRAINING_INTERVAL_MS,
+            ROUTINE_INTERVAL_MS,
+        );
+        assert_eq!(
+            collapsed_interval, ROUTINE_INTERVAL_MS,
+            "before the fix: a relearn in progress is polled on the 5-minute cadence"
+        );
+
+        // The fix: `apply_room_login_outcome` calls `note_relogin` the
+        // moment the relearn's login reply lands.
+        phase.note_relogin(43_326);
+        let recovered_interval = room_keep_alive_interval_ms(
+            42_376,
+            phase.is_draining(),
+            FIRST_DELAY_MS,
+            DRAINING_INTERVAL_MS,
+            ROUTINE_INTERVAL_MS,
+        );
+        assert_eq!(
+            recovered_interval, DRAINING_INTERVAL_MS,
+            "after the fix: a relearn's completed login restores the tight polling cadence"
+        );
     }
 
     /// `meshcadet-room-post-still-no-notify-hil`'s own defect, pinned at the

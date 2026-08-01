@@ -3978,6 +3978,34 @@ fn apply_room_login_outcome(
     // own push_failures reset conditions — this session is presumed live
     // again, so the missed-ACK counter must not carry a stale count into it.
     room.keep_alive_stall.reset();
+    // `meshcadet-room-inbound-still-dead-after-two-fixes`, the mechanism
+    // behind Lead A: a stall-triggered relearn's `RoomKeepAliveStall`
+    // invalidation calls `RoomSyncPhase::note_closer_failed`, which the very
+    // next scheduler tick force-closes (`is_draining() -> false`) — and
+    // nothing ever reopened it, so the keep-alive scheduler's cadence
+    // (`room_keep_alive_interval_ms`) silently collapsed from the 15 s
+    // draining interval to the 5-minute routine one for the rest of this
+    // boot, EVERY time a route ever needed relearning, even though THIS
+    // login just completed and the session's caught-up state is unknown
+    // again. See `RoomSyncPhase::note_relogin`'s doc for the full mechanism
+    // and the two HIL captures that pin it.
+    room.sync_phase.note_relogin(now_ms);
+    // `meshcadet-room-inbound-still-dead-after-two-fixes`, Lead B: a
+    // `sync_since` already ahead of what THIS login reply's `server_ts` just
+    // admitted as the room server's own "now" can never again be exceeded
+    // by any future post — the server has nothing left to push, forever.
+    // See `room_session::reconcile_sync_since`'s doc for the mechanism and
+    // the exact captured values this reproduces.
+    if let Some(rewound) =
+        room_session::reconcile_sync_since(room.session.sync_since, outcome.server_ts)
+    {
+        log::warn!(
+            "room: 0x{:02x} sync_since={} is unreachably far ahead of server_ts={} — \
+             rewinding to {} to force a full resync",
+            room.hash, room.session.sync_since, outcome.server_ts, rewound,
+        );
+        room.session.sync_since = rewound;
+    }
     // A successful login reply is one of the reflood backoff's two reset
     // conditions (`room_session::room_reflood_interval_ms`'s doc) — this
     // reply IS the reflood succeeding, so the next `!has_route()`

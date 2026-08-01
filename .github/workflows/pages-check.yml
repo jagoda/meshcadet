@@ -122,9 +122,8 @@ jobs:
         # JS file reachable from each page's module entry point, so a third
         # CDN-import instance into a new page or script fails CI
         # automatically. See the test file's own header for why this is a
-        # static-source assertion, not a driven-browser test, and
-        # flight-manuals/library/coverage-must-enumerate-the-set.md for why
-        # it's shaped as domain enumeration.
+        # static-source assertion, not a driven-browser test, and for why
+        # it's shaped as domain enumeration rather than a per-instance check.
         run: node site/csp.test.mjs
 
       - name: guest-password-hygiene — the room guest password never reaches storage/console/URL and is cleared on disconnect
