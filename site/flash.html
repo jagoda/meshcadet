@@ -8,16 +8,19 @@
 
   <!-- GitHub Pages cannot set response headers, so the Content-Security-
        Policy lives here instead (meshcadet-channel-secret-leak-security-audit
-       finding B3). This page's own external dependencies are named
-       explicitly rather than opened up wholesale: `script-src` allows
-       unpkg.com only for the pinned esptool-js bundle flash.js imports (see
-       that file's own header — ADR-0011), and `connect-src` allows
-       api.github.com only for the release-list fetch (flash.js's
-       `RELEASES_API`); every other fetch flash.js makes is same-origin
-       (`firmware/...`), already covered by 'self'. See site/README.md
-       "Conventions" for why this page's policy differs from
-       index.html/provisioner.html's. -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://unpkg.com; connect-src 'self' https://api.github.com; base-uri 'self'; object-src 'none'; form-action 'self'" />
+       finding B3). This page's own external dependency is named explicitly
+       rather than opened up wholesale: `connect-src` allows api.github.com
+       only for the release-list fetch (flash.js's `RELEASES_API`); every
+       other fetch flash.js makes is same-origin (`firmware/...`), already
+       covered by 'self'. `script-src` needs no third-party origin at all —
+       esptool-js is vendored locally (vendor/esptool-js.js, not
+       CDN-imported — see that file's header, and flash.js's own header for
+       why: meshcadet-outsider-boundary-security-review finding F6 /
+       meshcadet-flasher-cdn-import-unpinned-integrity), so default-src
+       'self' alone covers it, same as provisioner.html's QR library. See
+       site/README.md "Conventions" for why this page's policy still differs
+       from index.html/provisioner.html's (the connect-src allowance). -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' https://api.github.com; base-uri 'self'; object-src 'none'; form-action 'self'" />
 
   <!-- All paths below are relative (no leading "/") — this is a GitHub Pages
        PROJECT site served under /meshcadet/, not a root site. A root-rooted

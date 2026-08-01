@@ -4,7 +4,11 @@
 // headers, so this is the only enforcement mechanism available), and
 // provisioner.js — the one page handling secrets (channel secret, admin
 // PIN, room guest password) — must never regress back to loading a
-// third-party script origin.
+// third-party script origin. Also covers the
+// meshcadet-flasher-cdn-import-unpinned-integrity fix (outsider-boundary
+// finding F6): flash.js — the page that writes firmware to an attached
+// ESP32 over WebSerial — must never regress back to CDN-importing
+// esptool-js either.
 //
 // This is deliberately a static source-text assertion (same pattern as
 // site/provisioner/*-hygiene.test.mjs), not a driven-browser test: it
@@ -66,7 +70,9 @@ function directiveGrants(csp, directive, values) {
   ok(!/connect-src|script-src/.test(csp), "index.html has no script-src/connect-src override (none needed — it loads no script)");
 }
 
-// ── flash.html: named allowances for its two real external dependencies ──
+// ── flash.html: one named allowance left (the release-list fetch); esptool-js
+//    is vendored, so script-src needs no third-party origin (meshcadet-
+//    flasher-cdn-import-unpinned-integrity) ──
 
 {
   const html = readSite("flash.html");
@@ -74,12 +80,12 @@ function directiveGrants(csp, directive, values) {
   ok(csp !== null, "flash.html carries a Content-Security-Policy meta tag");
   ok(directiveGrants(csp, "default-src", ["'self'"]), "flash.html: default-src is exactly 'self'");
   ok(
-    directiveGrants(csp, "script-src", ["'self'", "https://unpkg.com"]),
-    "flash.html: script-src allows 'self' and https://unpkg.com (esptool-js — see ADR-0011) and nothing else"
-  );
-  ok(
     directiveGrants(csp, "connect-src", ["'self'", "https://api.github.com"]),
     "flash.html: connect-src allows 'self' and https://api.github.com (the release-list fetch) and nothing else"
+  );
+  ok(
+    !/script-src/.test(csp),
+    "flash.html has no script-src override — default-src 'self' alone must cover it (esptool-js is vendored, no third-party script origin)"
   );
 }
 
@@ -114,6 +120,26 @@ function directiveGrants(csp, directive, values) {
   const vendored = readSite("vendor/qrcode.js");
   const bareImports = vendored.match(/^\s*import\b/gm) || [];
   ok(bareImports.length === 0, "site/vendor/qrcode.js has no import statements of its own (fully self-contained)");
+}
+
+// ── flash.js: the esptool-js import must stay a local, relative import
+//    (meshcadet-flasher-cdn-import-unpinned-integrity) ──
+
+{
+  const js = readSite("flash.js");
+  const importLine = js.match(/^import \{ ESPLoader, Transport \} from "([^"]+)";$/m);
+  ok(importLine !== null, "flash.js imports ESPLoader/Transport from a single, greppable import statement");
+  const specifier = importLine[1];
+  ok(specifier.startsWith("./"), "flash.js's esptool-js import is a local relative path, not a CDN URL");
+  notOk(/^https?:\/\//.test(specifier), "flash.js's esptool-js import is not an absolute http(s) URL");
+}
+
+// ── site/vendor/esptool-js.js: the vendored file itself must have no unresolved imports ──
+
+{
+  const vendored = readSite("vendor/esptool-js.js");
+  const bareImports = vendored.match(/^\s*import\b/gm) || [];
+  ok(bareImports.length === 0, "site/vendor/esptool-js.js has no import statements of its own (fully self-contained)");
 }
 
 console.log(`csp.test: OK — ${checks} check(s) passed.`);
