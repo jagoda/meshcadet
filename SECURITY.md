@@ -151,6 +151,19 @@ auditing this codebase:
   DM key material is long-lived once provisioned; compromise of a channel
   secret compromises all messages encrypted under it, past and future, until
   it is rotated.
+- **Inbound DM replay guard is bounded, not absolute.** Each allowlisted
+  contact gets a persisted high-water timestamp mark plus a 16-entry ring of
+  recently-accepted content fingerprints (`firmware-core/src/inbound_replay.rs`),
+  closing the two previously-open windows (a global 128-slot RAM-only dedup
+  ring that any device reboot cleared, and that any 128 intervening frames —
+  including unrelated flood-relay noise — aged out). A captured DM can still
+  be successfully replayed if **more than 16 further messages from that exact
+  same contact** are accepted in between the capture and the replay attempt —
+  the wire protocol has no per-message nonce/freshness proof (see the
+  AES-128-ECB limitation above), so a bounded content-fingerprint window is
+  the best available guarantee without risking false lockouts of a contact
+  whose own device reboots (see that module's doc for why an unconditional
+  `ts <= last_ts` reject is unsafe).
 
 None of the example values in this repository's documentation, tests, or
 source are real cryptographic material — provisioning examples in the

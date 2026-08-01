@@ -498,6 +498,15 @@ fn handle_frame(
                             config.contact_count -= 1;
                             log::info!("admin_server: DEL_CONTACT pub_hash=0x{:02x}", d.pubkey[0]);
                             persist_or_rollback(config, nvs_partition, out, ConfigKind::Contact)?;
+                            // Erase this contact's inbound replay-guard state
+                            // too — otherwise a future contact that happens
+                            // to collide on the same pub_hash byte would
+                            // silently inherit a stale high-water mark/ring
+                            // (see `inbound_replay_store::delete_inbound_replay_state`'s doc).
+                            crate::inbound_replay_store::delete_inbound_replay_state(
+                                nvs_partition.clone(),
+                                d.pubkey[0],
+                            );
                         }
                         None => return send_error(out, err::CONTACT_NOT_FOUND, b"contact not found"),
                     }
