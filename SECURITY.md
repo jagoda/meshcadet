@@ -40,10 +40,11 @@ what this reporting channel is and is not:
   that actually came from an allowlisted contact or channel.
 - The allowlist policy itself. The **design goal** is that unapproved
   contacts cannot reach the device and that the device is not
-  discoverable / addable by strangers on the mesh. This is the objective the
+  addable by strangers on the mesh. This is the objective the
   allowlist policy is built toward — it is a best-effort risk-reduction goal,
   **not a guarantee**; see the [Disclaimer](#disclaimer--no-warranty-and-no-guarantee-of-safety)
-  below.
+  below. **The "not discoverable" half of this goal does not hold once a
+  `role=room` contact is provisioned** — see "Known limitations" below.
 
 ### Trust boundaries
 
@@ -106,6 +107,42 @@ auditing this codebase:
   property of the MeshCore wire protocol itself, not a MeshCadet-specific
   weakness, and MeshCadet cannot change it without breaking interop with the
   rest of the mesh.
+- **Inherited protocol-level limitation: 2-byte truncated HMAC.** The same
+  Encrypt-then-MAC integrity check (ADR-0001 §1) truncates its HMAC-SHA256
+  tag to **2 bytes**, so a forged/random MAC is accepted 1 time in 65536.
+  An accepted frame reaches `handle_dm`'s unconditional per-known-contact
+  ACK (`firmware/src/main.rs:3506`) regardless of whether the plaintext it
+  decrypts to makes sense, so ~2^16 forged frames (~3.3 hours of continuous
+  SF7 transmission) is enough to elicit at least one ACK — a presence
+  oracle ("is a device with this contact's shared secret currently
+  listening and powered on") that needs **no prior packet capture and no
+  allowlist membership**, only knowledge of an allowlisted contact's
+  identity (itself leaked by the room-login gap above, or by ordinary
+  social/physical exposure of a contact's pubkey). This is a property of
+  the MeshCore wire protocol's fixed 2-byte MAC truncation, not a
+  MeshCadet-specific weakness, and MeshCadet cannot widen it without
+  breaking interop. *Consider, as a future mitigation (not yet
+  implemented): per-`src_hash` ACK rate limiting, so a forgery sweep cannot
+  harvest ACKs faster than a legitimate, occasional DM would.*
+- **Room contacts leak the device's own identity pubkey in the clear.**
+  Once an admin provisions a `role=room` contact (ADR-0001 §2, "Qualified
+  2026-08-01"), MeshCadet's room login (`encode_anon_req_login`,
+  `protocol/src/room.rs:174`) must carry the device's full 32-byte Ed25519
+  identity pubkey outside the ciphertext — the room server has no prior
+  session to address the client by hash, so the protocol gives it no other
+  way to identify the sender. That frame is flood-routed mesh-wide at boot
+  and on every reflood tick, so any node on the mesh can read the device's
+  identity pubkey without holding the room's guest password or being on
+  the device's allowlist. This qualifies (does not retract) the "not
+  discoverable" design goal above: it holds until the first room contact
+  is provisioned, and does not hold afterward. It does **not** affect the
+  "not addable" half — leaking the identity pubkey does not let a stranger
+  get added as a contact; the allowlist gate is untouched. This is
+  protocol-mandated (MeshCore's `ANON_REQ` login framing) and not fixable
+  without breaking room-login interop. *Consider, as a future mitigation
+  (not yet implemented): surfacing this trade-off in the host CLI's
+  `add-room` provisioning output, so an admin adding a room contact sees
+  the discoverability cost at the moment they accept it.*
 - **Physical USB possession is the sole provisioning authentication
   factor.** By design (see "Trust boundaries" above) — there is no
   secondary factor (password, hardware key, etc.) gating the host CLI's

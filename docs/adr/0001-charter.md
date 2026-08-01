@@ -4,7 +4,12 @@
   target bumped from a v1.15.0-only lock to **MeshCore v1.16, with backward
   compatibility to v1.15 where possible**, and §2 extended to admit
   `role=room` provisioned contacts (MeshCore Room Server support). See
-  "Amendment (2026-07-25)" below for the full record.
+  "Amendment (2026-07-25)" below for the full record. **Qualified
+  2026-08-01:** §2's room-amendment claim that the no-advert/no-discovery
+  posture is "unchanged" for room contacts is corrected — the no-*discovery*
+  half does not hold once a room contact is provisioned (identity pubkey
+  leaks in the clear via room login); see the "Qualified 2026-08-01" note
+  under §2 below.
 - **Deciders:** Project maintainer design conversation
 - **Supersedes:** —
 - **Canonical source:** This ADR is the authoritative in-repo record of the
@@ -84,9 +89,24 @@ in the design conversation and must survive across future work sessions.
   out-of-band way as any other contact — but adds distinct invariants:
   - **Out-of-band acquisition only.** A room contact's pubkey, name, and
     guest password are admin-provisioned over the USB provisioning link,
-    exactly like any other contact. **Never advert-acquired, never
-    discovered** — the no-advert / no-discovery posture above is unchanged
-    and applies to room contacts too.
+    exactly like any other contact. **Never advert-acquired** — MeshCadet
+    still never sends a MeshCore `ADVERT` packet, room or no room.
+    **Qualified 2026-08-01 (outsider-boundary security review):**
+    the no-*discovery* half of this claim does NOT hold once a room contact
+    is provisioned. `encode_anon_req_login`
+    (`protocol/src/room.rs:174`) must carry the caller's full 32-byte
+    Ed25519 identity pubkey in the clear, outside the ciphertext — a room
+    login has no prior session for the server to address the client by
+    hash, so the protocol has no other way to identify the sender. That
+    login frame is flood-routed mesh-wide at boot and on every reflood
+    tick, so any node sniffing the mesh can read the device's identity
+    pubkey without holding the room's guest password or being on the
+    device's own allowlist. This is protocol-mandated (MeshCore's
+    `ANON_REQ` framing) and not fixable without breaking room-login
+    interop. The **addable** half of the invariant is unaffected — leaking
+    the identity pubkey does not let a stranger get added as a contact; the
+    allowlist gate (§2 above) is untouched. See `SECURITY.md`, "Known
+    limitations", for the user-facing writeup.
   - **Client-only.** MeshCadet joins, reads, and posts to a room at
     guest-password level. It never *is* a room server: it exposes no ACL or
     admin surface, and sends no `TXT_TYPE_CLI_DATA`.
@@ -222,8 +242,11 @@ written into §2 above:
 
 - Room servers are acquired **out-of-band only** — admin-provisioned over
   the USB provisioning link, carrying pubkey + name + guest password. Never
-  advert-acquired, never discovered; the no-advert / no-discovery posture in
-  §2 is unchanged.
+  advert-acquired; the no-advert posture in §2 is unchanged. The
+  no-*discovery* posture, however, does NOT survive room provisioning
+  unqualified — see the "Qualified 2026-08-01" note under §2 above:
+  `encode_anon_req_login` leaks the device's own identity pubkey in the
+  clear, mesh-wide, on every room login/reflood.
 - MeshCadet is a room **client** only: join, read, post at guest-password
   level. It never *is* a room server, exposes no ACL or admin surface, and
   sends no `TXT_TYPE_CLI_DATA`.

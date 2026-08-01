@@ -174,8 +174,10 @@ pub fn mac_then_decrypt_var(
         return Err(MacError);
     }
     let expected_mac = hmac_sha256_2(hmac_key, ciphertext);
-    // Constant-time comparison (prevent timing attacks on MAC)
-    if mac_slice[0] != expected_mac[0] || mac_slice[1] != expected_mac[1] {
+    // Constant-time comparison (prevent timing attacks on MAC): branchless
+    // XOR-OR, not `!=` with `||`, which short-circuits on the first byte and
+    // would leak byte-0 correctness via early-exit timing.
+    if ((mac_slice[0] ^ expected_mac[0]) | (mac_slice[1] ^ expected_mac[1])) != 0 {
         return Err(MacError);
     }
     Ok(aes128_ecb_decrypt(aes_key, ciphertext, out))
