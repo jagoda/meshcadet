@@ -191,13 +191,21 @@ static const unsigned long UI_EXTRA_CPS[] = {
  * in the emoji-picker grid. `xtask::font_table_count_mismatches` enforces
  * `protocol::emoji::EMOJI_TABLE ⊆ (EMOJI_CPS ∪ RENDER_EXTRA_CPS)` in code.
  *
- * Seed set (phase 5 of the meshcadet-emoji-coverage campaign — a MEASURING
- * mission, not the full curation pass): the 14 codepoints recon confirmed
- * missing from the pre-upgrade face, plus enough of the same "faces &
- * emotions first" D3 priority order to produce a representative flash/
- * build-time sample. Growing this table to the campaign's full target is
- * `meshcadet-emoji-render-set-curation`'s job, against the SAME D3 criteria
- * frozen above — this seed is not itself the target set. */
+ * Curated to the campaign's confirmed 600-entry target by
+ * `meshcadet-emoji-render-set-curation` (D3 criteria frozen above). Source:
+ * Unicode CLDR emoji ordering + the fully-qualified, single-codepoint subset
+ * of `emoji-test.txt` (v17.0), filtered by the exclusion/inclusion rules
+ * above, deduplicated against `EMOJI_CPS`/`UI_EXTRA_CPS`, checked against
+ * this build's actual `NotoEmoji-Regular.ttf` cmap coverage (a small number
+ * of very recent (Unicode 15/16) additions the bundled font doesn't yet
+ * cover were skipped rather than shipped as guaranteed-blank glyphs), and
+ * ordered by the D3 priority list. The budget (600) was reached before the
+ * candidate pool was exhausted — the priority order determined the cut:
+ * faces/hands/people/animals/plants/food/most of activities are fully
+ * represented; travel & places is only partially represented (11 of a much
+ * larger available pool), and everyday objects/weather/symbols were not
+ * reached at all. The first 50 entries below (phase 5's measuring seed,
+ * kept verbatim) are followed by the additional 550. */
 static const unsigned long RENDER_EXTRA_CPS[] = {
     /* Faces & emotions — the 14 confirmed missing from the pre-upgrade face */
     0x1F914, /* 🤔 thinking face */
@@ -255,8 +263,614 @@ static const unsigned long RENDER_EXTRA_CPS[] = {
     0x1F368, /* 🍨 ice cream */
     /* Weather */
     0x2614,  /* ☔ umbrella with rain drops */
+    /* ── The 550 entries below were added by
+     * meshcadet-emoji-render-set-curation to reach the campaign's confirmed
+     * 600-entry target (see this array's module doc above for method). ── */
+    /* Smileys & Emotion / face-smiling */
+    0x1F603, /* 😃 grinning face with big eyes */
+    0x1F604, /* 😄 grinning face with smiling eyes */
+    0x1F923, /* 🤣 rolling on the floor laughing */
+    /* Smileys & Emotion / face-affection */
+    0x1F617, /* 😗 kissing face */
+    0x1F61A, /* 😚 kissing face with closed eyes */
+    0x1F619, /* 😙 kissing face with smiling eyes */
+    0x1F972, /* 🥲 smiling face with tear */
+    /* Smileys & Emotion / face-tongue */
+    0x1F61B, /* 😛 face with tongue */
+    0x1F61D, /* 😝 squinting face with tongue */
+    0x1F911, /* 🤑 money-mouth face */
+    /* Smileys & Emotion / face-hand */
+    0x1F92D, /* 🤭 face with hand over mouth */
+    0x1FAE2, /* 🫢 face with open eyes and hand over mouth */
+    0x1FAE3, /* 🫣 face with peeking eye */
+    0x1F92B, /* 🤫 shushing face */
+    0x1FAE1, /* 🫡 saluting face */
+    /* Smileys & Emotion / face-neutral-skeptical */
+    0x1F910, /* 🤐 zipper-mouth face */
+    0x1F610, /* 😐 neutral face */
+    0x1F611, /* 😑 expressionless face */
+    0x1F636, /* 😶 face without mouth */
+    0x1FAE5, /* 🫥 dotted line face */
+    0x1F60F, /* 😏 smirking face */
+    0x1F612, /* 😒 unamused face */
+    0x1F925, /* 🤥 lying face */
+    0x1FAE8, /* 🫨 shaking face */
+    /* Smileys & Emotion / face-sleepy */
+    0x1F62A, /* 😪 sleepy face */
+    0x1F924, /* 🤤 drooling face */
+    /* Smileys & Emotion / face-unwell */
+    0x1F637, /* 😷 face with medical mask */
+    0x1F912, /* 🤒 face with thermometer */
+    0x1F915, /* 🤕 face with head-bandage */
+    0x1F922, /* 🤢 nauseated face */
+    0x1F92E, /* 🤮 face vomiting */
+    0x1F927, /* 🤧 sneezing face */
+    0x1F975, /* 🥵 hot face */
+    0x1F976, /* 🥶 cold face */
+    0x1F974, /* 🥴 woozy face */
+    0x1F635, /* 😵 face with crossed-out eyes */
+    /* Smileys & Emotion / face-hat */
+    0x1F920, /* 🤠 cowboy hat face */
+    0x1F978, /* 🥸 disguised face */
+    /* Smileys & Emotion / face-concerned */
+    0x1FAE4, /* 🫤 face with diagonal mouth */
+    0x1F61F, /* 😟 worried face */
+    0x1F641, /* 🙁 slightly frowning face */
+    0x1F62E, /* 😮 face with open mouth */
+    0x1F62F, /* 😯 hushed face */
+    0x1F633, /* 😳 flushed face */
+    0x1F979, /* 🥹 face holding back tears */
+    0x1F626, /* 😦 frowning face with open mouth */
+    0x1F627, /* 😧 anguished face */
+    0x1F628, /* 😨 fearful face */
+    0x1F630, /* 😰 anxious face with sweat */
+    0x1F625, /* 😥 sad but relieved face */
+    0x1F631, /* 😱 face screaming in fear */
+    0x1F616, /* 😖 confounded face */
+    0x1F623, /* 😣 persevering face */
+    0x1F61E, /* 😞 disappointed face */
+    0x1F613, /* 😓 downcast face with sweat */
+    0x1F629, /* 😩 weary face */
+    0x1F62B, /* 😫 tired face */
+    /* Smileys & Emotion / face-negative */
+    0x1F624, /* 😤 face with steam from nose */
+    0x1F621, /* 😡 enraged face */
+    0x1F620, /* 😠 angry face */
+    0x1F92C, /* 🤬 face with symbols on mouth */
+    0x1F608, /* 😈 smiling face with horns */
+    0x1F47F, /* 👿 angry face with horns */
+    0x1F480, /* 💀 skull */
+    /* Smileys & Emotion / face-costume */
+    0x1F4A9, /* 💩 pile of poo */
+    0x1F479, /* 👹 ogre */
+    0x1F47A, /* 👺 goblin */
+    0x1F47B, /* 👻 ghost */
+    0x1F47D, /* 👽 alien */
+    0x1F47E, /* 👾 alien monster */
+    0x1F916, /* 🤖 robot */
+    /* Smileys & Emotion / cat-face */
+    0x1F63A, /* 😺 grinning cat */
+    0x1F638, /* 😸 grinning cat with smiling eyes */
+    0x1F639, /* 😹 cat with tears of joy */
+    0x1F63B, /* 😻 smiling cat with heart-eyes */
+    0x1F63C, /* 😼 cat with wry smile */
+    0x1F63D, /* 😽 kissing cat */
+    0x1F640, /* 🙀 weary cat */
+    0x1F63F, /* 😿 crying cat */
+    0x1F63E, /* 😾 pouting cat */
+    /* Smileys & Emotion / monkey-face */
+    0x1F648, /* 🙈 see-no-evil monkey */
+    0x1F649, /* 🙉 hear-no-evil monkey */
+    0x1F64A, /* 🙊 speak-no-evil monkey */
+    /* Smileys & Emotion / heart */
+    0x1F48C, /* 💌 love letter */
+    0x1F498, /* 💘 heart with arrow */
+    0x1F49D, /* 💝 heart with ribbon */
+    0x1F496, /* 💖 sparkling heart */
+    0x1F497, /* 💗 growing heart */
+    0x1F493, /* 💓 beating heart */
+    0x1F49E, /* 💞 revolving hearts */
+    0x1F495, /* 💕 two hearts */
+    0x1F49F, /* 💟 heart decoration */
+    0x1F494, /* 💔 broken heart */
+    0x1FA77, /* 🩷 pink heart */
+    0x1FA75, /* 🩵 light blue heart */
+    0x1F90E, /* 🤎 brown heart */
+    0x1FA76, /* 🩶 grey heart */
+    /* Smileys & Emotion / emotion */
+    0x1F48B, /* 💋 kiss mark */
+    0x1F4AF, /* 💯 hundred points */
+    0x1F4A2, /* 💢 anger symbol */
+    0x1F4A5, /* 💥 collision */
+    0x1F4AB, /* 💫 dizzy */
+    0x1F4A6, /* 💦 sweat droplets */
+    0x1F4A8, /* 💨 dashing away */
+    0x1F4AC, /* 💬 speech balloon */
+    0x1F4AD, /* 💭 thought balloon */
+    /* People & Body / hand-fingers-open */
+    0x1F91A, /* 🤚 raised back of hand */
+    0x270B, /* ✋ raised hand */
+    0x1F596, /* 🖖 vulcan salute */
+    0x1FAF1, /* 🫱 rightwards hand */
+    0x1FAF2, /* 🫲 leftwards hand */
+    0x1FAF3, /* 🫳 palm down hand */
+    0x1FAF4, /* 🫴 palm up hand */
+    0x1FAF7, /* 🫷 leftwards pushing hand */
+    0x1FAF8, /* 🫸 rightwards pushing hand */
+    /* People & Body / hand-fingers-partial */
+    0x1F90C, /* 🤌 pinched fingers */
+    0x1F90F, /* 🤏 pinching hand */
+    0x1F91E, /* 🤞 crossed fingers */
+    0x1FAF0, /* 🫰 hand with index finger and thumb crossed */
+    0x1F91F, /* 🤟 love-you gesture */
+    0x1F918, /* 🤘 sign of the horns */
+    0x1F919, /* 🤙 call me hand */
+    /* People & Body / hand-single-finger */
+    0x1F448, /* 👈 backhand index pointing left */
+    0x1F449, /* 👉 backhand index pointing right */
+    0x1F447, /* 👇 backhand index pointing down */
+    0x1FAF5, /* 🫵 index pointing at the viewer */
+    /* People & Body / hand-fingers-closed */
+    0x1F44E, /* 👎 thumbs down */
+    0x1F44A, /* 👊 oncoming fist */
+    0x1F91B, /* 🤛 left-facing fist */
+    0x1F91C, /* 🤜 right-facing fist */
+    /* People & Body / hands */
+    0x1F64C, /* 🙌 raising hands */
+    0x1FAF6, /* 🫶 heart hands */
+    0x1F450, /* 👐 open hands */
+    0x1F932, /* 🤲 palms up together */
+    0x1F91D, /* 🤝 handshake */
+    /* People & Body / hand-prop */
+    0x1F485, /* 💅 nail polish */
+    0x1F933, /* 🤳 selfie */
+    /* People & Body / body-parts */
+    0x1F4AA, /* 💪 flexed biceps */
+    0x1F9BE, /* 🦾 mechanical arm */
+    0x1F9BF, /* 🦿 mechanical leg */
+    0x1F9B5, /* 🦵 leg */
+    0x1F9B6, /* 🦶 foot */
+    0x1F442, /* 👂 ear */
+    0x1F9BB, /* 🦻 ear with hearing aid */
+    0x1F443, /* 👃 nose */
+    0x1F9E0, /* 🧠 brain */
+    0x1F9B7, /* 🦷 tooth */
+    0x1F9B4, /* 🦴 bone */
+    0x1F440, /* 👀 eyes */
+    0x1F445, /* 👅 tongue */
+    0x1F444, /* 👄 mouth */
+    /* People & Body / person */
+    0x1F476, /* 👶 baby */
+    0x1F466, /* 👦 boy */
+    0x1F467, /* 👧 girl */
+    0x1F9D1, /* 🧑 person */
+    0x1F471, /* 👱 person: blond hair */
+    0x1F468, /* 👨 man */
+    0x1F9D4, /* 🧔 person: beard */
+    0x1F469, /* 👩 woman */
+    0x1F9D3, /* 🧓 older person */
+    0x1F474, /* 👴 old man */
+    0x1F475, /* 👵 old woman */
+    /* People & Body / person-gesture */
+    0x1F64D, /* 🙍 person frowning */
+    0x1F64E, /* 🙎 person pouting */
+    0x1F645, /* 🙅 person gesturing NO */
+    0x1F646, /* 🙆 person gesturing OK */
+    0x1F481, /* 💁 person tipping hand */
+    0x1F64B, /* 🙋 person raising hand */
+    0x1F9CF, /* 🧏 deaf person */
+    0x1F647, /* 🙇 person bowing */
+    0x1F926, /* 🤦 person facepalming */
+    0x1F937, /* 🤷 person shrugging */
+    /* People & Body / person-role */
+    0x1F46E, /* 👮 police officer */
+    0x1F482, /* 💂 guard */
+    0x1F977, /* 🥷 ninja */
+    0x1F477, /* 👷 construction worker */
+    0x1FAC5, /* 🫅 person with crown */
+    0x1F934, /* 🤴 prince */
+    0x1F478, /* 👸 princess */
+    0x1F935, /* 🤵 person in tuxedo */
+    0x1F470, /* 👰 person with veil */
+    0x1F930, /* 🤰 pregnant woman */
+    0x1FAC3, /* 🫃 pregnant man */
+    0x1FAC4, /* 🫄 pregnant person */
+    /* People & Body / person-fantasy */
+    0x1F47C, /* 👼 baby angel */
+    0x1F385, /* 🎅 Santa Claus */
+    0x1F936, /* 🤶 Mrs. Claus */
+    0x1F9B8, /* 🦸 superhero */
+    0x1F9B9, /* 🦹 supervillain */
+    0x1F9D9, /* 🧙 mage */
+    0x1F9DA, /* 🧚 fairy */
+    0x1F9DB, /* 🧛 vampire */
+    0x1F9DC, /* 🧜 merperson */
+    0x1F9DD, /* 🧝 elf */
+    0x1F9DE, /* 🧞 genie */
+    0x1F9DF, /* 🧟 zombie */
+    0x1F9CC, /* 🧌 troll */
+    /* People & Body / person-activity */
+    0x1F486, /* 💆 person getting massage */
+    0x1F487, /* 💇 person getting haircut */
+    0x1F6B6, /* 🚶 person walking */
+    0x1F9CD, /* 🧍 person standing */
+    0x1F9CE, /* 🧎 person kneeling */
+    0x1F3C3, /* 🏃 person running */
+    0x1F483, /* 💃 woman dancing */
+    0x1F57A, /* 🕺 man dancing */
+    0x1F46F, /* 👯 people with bunny ears */
+    0x1F9D6, /* 🧖 person in steamy room */
+    0x1F9D7, /* 🧗 person climbing */
+    /* People & Body / person-sport */
+    0x1F93A, /* 🤺 person fencing */
+    0x1F3C7, /* 🏇 horse racing */
+    0x1F3C2, /* 🏂 snowboarder */
+    0x1F3C4, /* 🏄 person surfing */
+    0x1F6A3, /* 🚣 person rowing boat */
+    0x1F3CA, /* 🏊 person swimming */
+    0x1F6B4, /* 🚴 person biking */
+    0x1F6B5, /* 🚵 person mountain biking */
+    0x1F938, /* 🤸 person cartwheeling */
+    0x1F93C, /* 🤼 people wrestling */
+    0x1F93D, /* 🤽 person playing water polo */
+    0x1F93E, /* 🤾 person playing handball */
+    0x1F939, /* 🤹 person juggling */
+    /* People & Body / person-resting */
+    0x1F9D8, /* 🧘 person in lotus position */
+    0x1F6C0, /* 🛀 person taking bath */
+    0x1F6CC, /* 🛌 person in bed */
+    /* People & Body / family */
+    0x1F46D, /* 👭 women holding hands */
+    0x1F46B, /* 👫 woman and man holding hands */
+    0x1F46C, /* 👬 men holding hands */
+    0x1F48F, /* 💏 kiss */
+    0x1F491, /* 💑 couple with heart */
+    /* People & Body / person-symbol */
+    0x1F464, /* 👤 bust in silhouette */
+    0x1F465, /* 👥 busts in silhouette */
+    0x1FAC2, /* 🫂 people hugging */
+    0x1F46A, /* 👪 family */
+    0x1F463, /* 👣 footprints */
+    /* Animals & Nature / animal-mammal */
+    0x1F435, /* 🐵 monkey face */
+    0x1F412, /* 🐒 monkey */
+    0x1F98D, /* 🦍 gorilla */
+    0x1F9A7, /* 🦧 orangutan */
+    0x1F415, /* 🐕 dog */
+    0x1F9AE, /* 🦮 guide dog */
+    0x1F429, /* 🐩 poodle */
+    0x1F43A, /* 🐺 wolf */
+    0x1F99D, /* 🦝 raccoon */
+    0x1F408, /* 🐈 cat */
+    0x1F405, /* 🐅 tiger */
+    0x1F406, /* 🐆 leopard */
+    0x1F434, /* 🐴 horse face */
+    0x1FACE, /* 🫎 moose */
+    0x1FACF, /* 🫏 donkey */
+    0x1F40E, /* 🐎 horse */
+    0x1F993, /* 🦓 zebra */
+    0x1F98C, /* 🦌 deer */
+    0x1F9AC, /* 🦬 bison */
+    0x1F402, /* 🐂 ox */
+    0x1F403, /* 🐃 water buffalo */
+    0x1F404, /* 🐄 cow */
+    0x1F416, /* 🐖 pig */
+    0x1F417, /* 🐗 boar */
+    0x1F43D, /* 🐽 pig nose */
+    0x1F40F, /* 🐏 ram */
+    0x1F411, /* 🐑 ewe */
+    0x1F410, /* 🐐 goat */
+    0x1F42A, /* 🐪 camel */
+    0x1F42B, /* 🐫 two-hump camel */
+    0x1F999, /* 🦙 llama */
+    0x1F992, /* 🦒 giraffe */
+    0x1F418, /* 🐘 elephant */
+    0x1F9A3, /* 🦣 mammoth */
+    0x1F98F, /* 🦏 rhinoceros */
+    0x1F99B, /* 🦛 hippopotamus */
+    0x1F42D, /* 🐭 mouse face */
+    0x1F401, /* 🐁 mouse */
+    0x1F400, /* 🐀 rat */
+    0x1F439, /* 🐹 hamster */
+    0x1F407, /* 🐇 rabbit */
+    0x1F9AB, /* 🦫 beaver */
+    0x1F994, /* 🦔 hedgehog */
+    0x1F987, /* 🦇 bat */
+    0x1F43B, /* 🐻 bear */
+    0x1F9A5, /* 🦥 sloth */
+    0x1F9A6, /* 🦦 otter */
+    0x1F9A8, /* 🦨 skunk */
+    0x1F998, /* 🦘 kangaroo */
+    0x1F9A1, /* 🦡 badger */
+    0x1F43E, /* 🐾 paw prints */
+    /* Animals & Nature / animal-bird */
+    0x1F983, /* 🦃 turkey */
+    0x1F414, /* 🐔 chicken */
+    0x1F413, /* 🐓 rooster */
+    0x1F423, /* 🐣 hatching chick */
+    0x1F424, /* 🐤 baby chick */
+    0x1F425, /* 🐥 front-facing baby chick */
+    0x1F426, /* 🐦 bird */
+    0x1F427, /* 🐧 penguin */
+    0x1F985, /* 🦅 eagle */
+    0x1F986, /* 🦆 duck */
+    0x1F9A2, /* 🦢 swan */
+    0x1F989, /* 🦉 owl */
+    0x1F9A4, /* 🦤 dodo */
+    0x1FAB6, /* 🪶 feather */
+    0x1F9A9, /* 🦩 flamingo */
+    0x1F99A, /* 🦚 peacock */
+    0x1F99C, /* 🦜 parrot */
+    0x1FABD, /* 🪽 wing */
+    0x1FABF, /* 🪿 goose */
+    /* Animals & Nature / animal-reptile */
+    0x1F40A, /* 🐊 crocodile */
+    0x1F422, /* 🐢 turtle */
+    0x1F98E, /* 🦎 lizard */
+    0x1F40D, /* 🐍 snake */
+    0x1F432, /* 🐲 dragon face */
+    0x1F409, /* 🐉 dragon */
+    0x1F995, /* 🦕 sauropod */
+    0x1F996, /* 🦖 T-Rex */
+    /* Animals & Nature / animal-marine */
+    0x1F433, /* 🐳 spouting whale */
+    0x1F40B, /* 🐋 whale */
+    0x1F42C, /* 🐬 dolphin */
+    0x1F9AD, /* 🦭 seal */
+    0x1F41F, /* 🐟 fish */
+    0x1F420, /* 🐠 tropical fish */
+    0x1F421, /* 🐡 blowfish */
+    0x1F988, /* 🦈 shark */
+    0x1F419, /* 🐙 octopus */
+    0x1F41A, /* 🐚 spiral shell */
+    0x1FAB8, /* 🪸 coral */
+    0x1FABC, /* 🪼 jellyfish */
+    0x1F980, /* 🦀 crab */
+    0x1F99E, /* 🦞 lobster */
+    0x1F990, /* 🦐 shrimp */
+    0x1F991, /* 🦑 squid */
+    0x1F9AA, /* 🦪 oyster */
+    /* Animals & Nature / animal-bug */
+    0x1F40C, /* 🐌 snail */
+    0x1F98B, /* 🦋 butterfly */
+    0x1F41B, /* 🐛 bug */
+    0x1F41C, /* 🐜 ant */
+    0x1F41D, /* 🐝 honeybee */
+    0x1FAB2, /* 🪲 beetle */
+    0x1F41E, /* 🐞 lady beetle */
+    0x1F997, /* 🦗 cricket */
+    0x1FAB3, /* 🪳 cockroach */
+    0x1F982, /* 🦂 scorpion */
+    0x1F99F, /* 🦟 mosquito */
+    0x1FAB0, /* 🪰 fly */
+    0x1FAB1, /* 🪱 worm */
+    0x1F9A0, /* 🦠 microbe */
+    /* Animals & Nature / plant-flower */
+    0x1F490, /* 💐 bouquet */
+    0x1F4AE, /* 💮 white flower */
+    0x1FAB7, /* 🪷 lotus */
+    0x1F339, /* 🌹 rose */
+    0x1F940, /* 🥀 wilted flower */
+    0x1F33A, /* 🌺 hibiscus */
+    0x1F33B, /* 🌻 sunflower */
+    0x1F33C, /* 🌼 blossom */
+    0x1F337, /* 🌷 tulip */
+    0x1FABB, /* 🪻 hyacinth */
+    /* Animals & Nature / plant-other */
+    0x1F331, /* 🌱 seedling */
+    0x1FAB4, /* 🪴 potted plant */
+    0x1F333, /* 🌳 deciduous tree */
+    0x1F334, /* 🌴 palm tree */
+    0x1F335, /* 🌵 cactus */
+    0x1F33E, /* 🌾 sheaf of rice */
+    0x1F33F, /* 🌿 herb */
+    0x1F340, /* 🍀 four leaf clover */
+    0x1F341, /* 🍁 maple leaf */
+    0x1F342, /* 🍂 fallen leaf */
+    0x1FAB9, /* 🪹 empty nest */
+    0x1FABA, /* 🪺 nest with eggs */
+    0x1F344, /* 🍄 mushroom */
+    /* Food & Drink / food-fruit */
+    0x1F348, /* 🍈 melon */
+    0x1F349, /* 🍉 watermelon */
+    0x1F34A, /* 🍊 tangerine */
+    0x1F34B, /* 🍋 lemon */
+    0x1F34D, /* 🍍 pineapple */
+    0x1F96D, /* 🥭 mango */
+    0x1F34F, /* 🍏 green apple */
+    0x1F350, /* 🍐 pear */
+    0x1F352, /* 🍒 cherries */
+    0x1F353, /* 🍓 strawberry */
+    0x1FAD0, /* 🫐 blueberries */
+    0x1F95D, /* 🥝 kiwi fruit */
+    0x1F345, /* 🍅 tomato */
+    0x1FAD2, /* 🫒 olive */
+    0x1F965, /* 🥥 coconut */
+    /* Food & Drink / food-vegetable */
+    0x1F951, /* 🥑 avocado */
+    0x1F954, /* 🥔 potato */
+    0x1F955, /* 🥕 carrot */
+    0x1F33D, /* 🌽 ear of corn */
+    0x1FAD1, /* 🫑 bell pepper */
+    0x1F952, /* 🥒 cucumber */
+    0x1F96C, /* 🥬 leafy green */
+    0x1F966, /* 🥦 broccoli */
+    0x1F9C4, /* 🧄 garlic */
+    0x1F9C5, /* 🧅 onion */
+    0x1F95C, /* 🥜 peanuts */
+    0x1FAD8, /* 🫘 beans */
+    0x1F330, /* 🌰 chestnut */
+    0x1FADA, /* 🫚 ginger root */
+    0x1FADB, /* 🫛 pea pod */
+    /* Food & Drink / food-prepared */
+    0x1F35E, /* 🍞 bread */
+    0x1F950, /* 🥐 croissant */
+    0x1F956, /* 🥖 baguette bread */
+    0x1FAD3, /* 🫓 flatbread */
+    0x1F968, /* 🥨 pretzel */
+    0x1F96F, /* 🥯 bagel */
+    0x1F95E, /* 🥞 pancakes */
+    0x1F9C7, /* 🧇 waffle */
+    0x1F9C0, /* 🧀 cheese wedge */
+    0x1F356, /* 🍖 meat on bone */
+    0x1F357, /* 🍗 poultry leg */
+    0x1F969, /* 🥩 cut of meat */
+    0x1F953, /* 🥓 bacon */
+    0x1F354, /* 🍔 hamburger */
+    0x1F35F, /* 🍟 french fries */
+    0x1F32D, /* 🌭 hot dog */
+    0x1F96A, /* 🥪 sandwich */
+    0x1F32E, /* 🌮 taco */
+    0x1F32F, /* 🌯 burrito */
+    0x1FAD4, /* 🫔 tamale */
+    0x1F959, /* 🥙 stuffed flatbread */
+    0x1F9C6, /* 🧆 falafel */
+    0x1F95A, /* 🥚 egg */
+    0x1F373, /* 🍳 cooking */
+    0x1F958, /* 🥘 shallow pan of food */
+    0x1F372, /* 🍲 pot of food */
+    0x1FAD5, /* 🫕 fondue */
+    0x1F963, /* 🥣 bowl with spoon */
+    0x1F957, /* 🥗 green salad */
+    0x1F37F, /* 🍿 popcorn */
+    0x1F9C8, /* 🧈 butter */
+    0x1F9C2, /* 🧂 salt */
+    0x1F96B, /* 🥫 canned food */
+    /* Food & Drink / food-asian */
+    0x1F371, /* 🍱 bento box */
+    0x1F358, /* 🍘 rice cracker */
+    0x1F359, /* 🍙 rice ball */
+    0x1F35A, /* 🍚 cooked rice */
+    0x1F35B, /* 🍛 curry rice */
+    0x1F35C, /* 🍜 steaming bowl */
+    0x1F35D, /* 🍝 spaghetti */
+    0x1F360, /* 🍠 roasted sweet potato */
+    0x1F362, /* 🍢 oden */
+    0x1F363, /* 🍣 sushi */
+    0x1F364, /* 🍤 fried shrimp */
+    0x1F365, /* 🍥 fish cake with swirl */
+    0x1F96E, /* 🥮 moon cake */
+    0x1F361, /* 🍡 dango */
+    0x1F95F, /* 🥟 dumpling */
+    0x1F960, /* 🥠 fortune cookie */
+    0x1F961, /* 🥡 takeout box */
+    /* Food & Drink / food-sweet */
+    0x1F366, /* 🍦 soft ice cream */
+    0x1F367, /* 🍧 shaved ice */
+    0x1F370, /* 🍰 shortcake */
+    0x1F9C1, /* 🧁 cupcake */
+    0x1F967, /* 🥧 pie */
+    0x1F36B, /* 🍫 chocolate bar */
+    0x1F36C, /* 🍬 candy */
+    0x1F36D, /* 🍭 lollipop */
+    0x1F36E, /* 🍮 custard */
+    0x1F36F, /* 🍯 honey pot */
+    /* Food & Drink / drink */
+    0x1F37C, /* 🍼 baby bottle */
+    0x1F95B, /* 🥛 glass of milk */
+    0x2615, /* ☕ hot beverage */
+    0x1FAD6, /* 🫖 teapot */
+    0x1F375, /* 🍵 teacup without handle */
+    0x1FAD7, /* 🫗 pouring liquid */
+    0x1F964, /* 🥤 cup with straw */
+    0x1F9CB, /* 🧋 bubble tea */
+    0x1F9C3, /* 🧃 beverage box */
+    0x1F9C9, /* 🧉 mate */
+    0x1F9CA, /* 🧊 ice */
+    /* Food & Drink / dishware */
+    0x1F962, /* 🥢 chopsticks */
+    0x1F374, /* 🍴 fork and knife */
+    0x1F944, /* 🥄 spoon */
+    0x1FAD9, /* 🫙 jar */
+    0x1F3FA, /* 🏺 amphora */
+    /* Activities / event */
+    0x1F383, /* 🎃 jack-o-lantern */
+    0x1F384, /* 🎄 Christmas tree */
+    0x1F386, /* 🎆 fireworks */
+    0x1F387, /* 🎇 sparkler */
+    0x1F9E8, /* 🧨 firecracker */
+    0x1F388, /* 🎈 balloon */
+    0x1F389, /* 🎉 party popper */
+    0x1F38A, /* 🎊 confetti ball */
+    0x1F38B, /* 🎋 tanabata tree */
+    0x1F38D, /* 🎍 pine decoration */
+    0x1F38E, /* 🎎 Japanese dolls */
+    0x1F38F, /* 🎏 carp streamer */
+    0x1F390, /* 🎐 wind chime */
+    0x1F391, /* 🎑 moon viewing ceremony */
+    0x1F9E7, /* 🧧 red envelope */
+    0x1F380, /* 🎀 ribbon */
+    0x1F381, /* 🎁 wrapped gift */
+    0x1F3AB, /* 🎫 ticket */
+    /* Activities / award-medal */
+    0x1F3C6, /* 🏆 trophy */
+    0x1F3C5, /* 🏅 sports medal */
+    0x1F947, /* 🥇 1st place medal */
+    0x1F948, /* 🥈 2nd place medal */
+    0x1F949, /* 🥉 3rd place medal */
+    /* Activities / sport */
+    0x26BE, /* ⚾ baseball */
+    0x1F94E, /* 🥎 softball */
+    0x1F3C0, /* 🏀 basketball */
+    0x1F3D0, /* 🏐 volleyball */
+    0x1F3C8, /* 🏈 american football */
+    0x1F3C9, /* 🏉 rugby football */
+    0x1F3BE, /* 🎾 tennis */
+    0x1F94F, /* 🥏 flying disc */
+    0x1F3B3, /* 🎳 bowling */
+    0x1F3CF, /* 🏏 cricket game */
+    0x1F3D1, /* 🏑 field hockey */
+    0x1F3D2, /* 🏒 ice hockey */
+    0x1F94D, /* 🥍 lacrosse */
+    0x1F3D3, /* 🏓 ping pong */
+    0x1F3F8, /* 🏸 badminton */
+    0x1F94A, /* 🥊 boxing glove */
+    0x1F94B, /* 🥋 martial arts uniform */
+    0x1F945, /* 🥅 goal net */
+    0x26F3, /* ⛳ flag in hole */
+    0x1F3A3, /* 🎣 fishing pole */
+    0x1F93F, /* 🤿 diving mask */
+    0x1F3BD, /* 🎽 running shirt */
+    0x1F3BF, /* 🎿 skis */
+    0x1F6F7, /* 🛷 sled */
+    0x1F94C, /* 🥌 curling stone */
+    /* Activities / game */
+    0x1F3AF, /* 🎯 bullseye */
+    0x1FA80, /* 🪀 yo-yo */
+    0x1FA81, /* 🪁 kite */
+    0x1F3B1, /* 🎱 pool 8 ball */
+    0x1F52E, /* 🔮 crystal ball */
+    0x1FA84, /* 🪄 magic wand */
+    0x1F3B2, /* 🎲 game die */
+    0x1F9E9, /* 🧩 puzzle piece */
+    0x1F9F8, /* 🧸 teddy bear */
+    0x1FA85, /* 🪅 piñata */
+    0x1FAA9, /* 🪩 mirror ball */
+    0x1FA86, /* 🪆 nesting dolls */
+    0x1F004, /* 🀄 mahjong red dragon */
+    /* Activities / arts & crafts */
+    0x1F3AD, /* 🎭 performing arts */
+    0x1F3A8, /* 🎨 artist palette */
+    0x1F9F5, /* 🧵 thread */
+    0x1FAA1, /* 🪡 sewing needle */
+    0x1F9F6, /* 🧶 yarn */
+    0x1FAA2, /* 🪢 knot */
+    /* Travel & Places / place-map */
+    0x1F30D, /* 🌍 globe showing Europe-Africa */
+    0x1F30E, /* 🌎 globe showing Americas */
+    0x1F30F, /* 🌏 globe showing Asia-Australia */
+    0x1F310, /* 🌐 globe with meridians */
+    0x1F5FE, /* 🗾 map of Japan */
+    0x1F9ED, /* 🧭 compass */
+    /* Travel & Places / place-geographic */
+    0x1F30B, /* 🌋 volcano */
+    0x1F5FB, /* 🗻 mount fuji */
+    /* Travel & Places / place-building */
+    0x1F9F1, /* 🧱 brick */
+    0x1FAA8, /* 🪨 rock */
+    0x1FAB5, /* 🪵 wood */
 };
-#define N_RENDER_EXTRA 50
+#define N_RENDER_EXTRA 600
 
 /* BMP symbols used in the UI.  Preferred from the Latin font (DejaVu); a symbol
  * the Latin face lacks falls back to the emoji face (see render_glyph).  These
