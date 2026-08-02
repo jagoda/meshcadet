@@ -86,12 +86,16 @@ this doc + the Dockerfile's `ARG` defaults together in one PR.
 
 ## Verifying the provenance attestation
 
-Every release is attested via `actions/attest-build-provenance` over the six
+Every release is attested via `actions/attest-build-provenance` over the nine
 published assets (`meshcadet-vX.Y.Z-merged.bin`, `meshcadet-vX.Y.Z-app.bin`,
 `manifest.json`, `manifest-update.json`, `update-meta.json`, `SHA256SUMS` —
 see `docs/adr/0008-nondestructive-update-artifacts.md` for the three assets
 added alongside the original merged-image/`manifest.json`/`SHA256SUMS` set
-ADR-0004 §7/§8 established). Verify a downloaded asset against GitHub's
+ADR-0004 §7/§8 established — plus `NOTICE`, `NotoEmoji-LICENSE.txt`, and
+`DejaVuSans-LICENSE.txt`, attached so the SIL OFL 1.1 condition-2 obligation
+that already applied to the git tree also travels with the redistributed
+binaries — see `docs/licensing/DEPENDENCY-AUDIT.md` "Bundled font assets").
+Verify a downloaded asset against GitHub's
 attestation transparency log with the `gh` CLI:
 
 ```sh

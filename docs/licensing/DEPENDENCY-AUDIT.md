@@ -5,6 +5,13 @@
   (Rust crates + Slint only — bundled font binaries were not in scope of that pass).
   "Bundled font assets" §1 (Noto Emoji) refreshed 2026-08-02 for the upstream font-asset
   upgrade — coverage-neutral, license terms unchanged (OFL 1.1); see that entry for detail.
+  **2026-08-02:** the remaining gap noted in §1 below — the license text living in the git
+  tree but not traveling with the *published release binaries* — is now closed:
+  `.github/workflows/release.yml`'s `release` job attaches `NOTICE`,
+  `firmware/assets/NotoEmoji-LICENSE.txt`, and `docs/licensing/DejaVuSans-LICENSE.txt` to
+  every GitHub Release alongside the firmware images, covering the OFL 1.1 condition-2 and
+  Bitstream-Vera-license redistribution obligations for the shipped binaries, not just the
+  repo. See `docs/release-reproducibility.md` for the updated (nine-asset) list.
 - **Result: PASS.** Every dependency in both Cargo graphs is compatible with shipping
   MeshCadet under **GPLv3** (`LICENSE` at repo root). No dependency forces a different
   outcome and none needs to be swapped out or re-licensed.
@@ -146,6 +153,20 @@ licensing. Checked here for completeness:
    are recorded in `NOTICE` and `docs/licensing/DejaVuSans-LICENSE.txt` out
    of the same redistribution-compliance caution as (1), even though no
    DejaVu font file itself needs to (or does) travel in this git tree.
+
+**2026-08-02 — release-binary redistribution gap closed.** (1) and (2) above
+established that the license text lives in this git tree; neither closed the
+separate question of whether it travels with the *shipped release binaries*
+(the merged/app firmware images `.github/workflows/release.yml` uploads to
+each GitHub Release), which is what OFL 1.1 condition (2) actually requires
+of a redistributed copy. It did not, until now: the `release` job's "Copy
+OFL/attribution files for release attachment" step attaches `NOTICE`,
+`firmware/assets/NotoEmoji-LICENSE.txt`, and
+`docs/licensing/DejaVuSans-LICENSE.txt` to every published Release alongside
+the firmware images (covered by the same `SHA256SUMS` and provenance
+attestation as the binaries themselves) — closing the gap. This does not
+reopen or change the OFL<->GPLv3 embedding analysis above; it is a packaging
+fix, not a licensing-conclusion change.
 
 ## Conclusion
 
