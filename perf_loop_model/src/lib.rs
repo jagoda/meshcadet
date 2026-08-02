@@ -83,7 +83,7 @@
 //!   (worst-for-UI-starvation) modelling choice.
 //! - **Real per-transaction SPI command overhead** beyond the analytically
 //!   computed CAD-symbol time (`sim::CAD_ACTIVE_MS`) — `docs/perf/ui-perf-
-//!   baseline.md` §4's ~13 µs/line figure is the 40 MHz DISPLAY bus, not
+//!   baseline.md` §4's ~128 µs/line figure is the 40 MHz DISPLAY bus, not
 //!   the 8 MHz radio bus, so it is not reused here; the unknown remainder
 //!   is `params::LoopModelParams::cad_spi_overhead`, a swept range.
 //! - **Packet loss / retry storms / CAD-busy collisions** under real RF
