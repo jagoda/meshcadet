@@ -43,13 +43,7 @@ pub fn render_archive_entry(block: &ReportBlock) -> String {
     out.push_str(&format!("build_ref: {}\n", block.build_ref));
     out.push_str(&format!("capture_date: {}\n", block.capture_date));
     out.push_str(&format!("section: {}\n", block.section));
-    out.push_str(&format!(
-        "payload_bytes: {}\n",
-        block
-            .payload_bytes
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "n/a".to_string())
-    ));
+    out.push_str(&format!("payload_bytes: {}\n", payload_bytes_field(block)));
     out.push_str(&format!("ui_load: {}\n", ui_load_field(block)));
     out.push_str(&format!(
         "peer_present: {}\n",
@@ -73,6 +67,19 @@ fn ui_load_field(block: &ReportBlock) -> &'static str {
         UiLoad::Navigating => "navigating",
         UiLoad::NotApplicable => "n/a",
     }
+}
+
+/// The header/index text for `payload_bytes` — `n/a` or the bare integer,
+/// the same shape §9 itself uses (NOT [`crate::report_block::ReportBlock::
+/// archive_stem`]'s compact `10B`/`na` filename shape — that one needs to
+/// be filesystem-friendly and unambiguous in a `--`-joined stem; this one
+/// needs to round-trip back through [`crate::report_block::parse_report_
+/// blocks`]).
+fn payload_bytes_field(block: &ReportBlock) -> String {
+    block
+        .payload_bytes
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "n/a".to_string())
 }
 
 /// Write `block`'s archive entry into `dir` (creating it if needed) and
@@ -111,10 +118,7 @@ fn append_index_row(dir: &Path, block: &ReportBlock) -> io::Result<()> {
         "| {} | {} | {} | {} | {} | {} | {} |\n",
         block.build_ref,
         block.section,
-        block
-            .payload_bytes
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "n/a".to_string()),
+        payload_bytes_field(block),
         ui_load_field(block),
         block.capture_date,
         block.section.closes_predicates().join(", "),
