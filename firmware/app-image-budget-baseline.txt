@@ -15,14 +15,55 @@
 # campaign's worth of flash-budget decisions (see
 # meshcadet-emoji-font-upgrade-checkpoint-20260802-140922469).
 #
-# CURRENT baseline — last measured 2026-08-02 at commit 1abad3e (the
-# checkpoint's own direct release-build measurement; confirmed still current
-# at the commit that added this file, since `git diff 1abad3e..HEAD --
-# firmware/ firmware-core/ protocol/` is empty — no firmware-affecting
-# commit landed in between):
+# METHOD — read this before comparing this number against any other
+# app-image figure in the campaign record. This value is the byte count of
+# the `esptool elf2image` output, i.e. exactly what
+# measure-app-image-size.sh prints. That is NOT the same quantity as the
+# sum of loadable `PT_LOAD` `FileSiz` from `xtensa-esp32s3-elf-readelf -lW`,
+# which is how the milestone-2 gate and the render-set-contract mission
+# reported their figures. Measured on one identical ELF at commit cd08085,
+# the two differ by -1.61% (elf2image 3,360,432 B vs. PT_LOAD sum
+# 3,415,374 B) — elf2image omits segments that need no flash backing. The
+# gap is under the +-5% drift threshold on its own, but it is roughly a
+# third of the whole drift budget, so do NOT seed this file from a
+# readelf-derived number: always take it from measure-app-image-size.sh (or
+# verify-partition-budget's own "measured" line).
 #
-#   5,083,402 B (4.85 MiB) of the 6 MiB (6,291,456 B) `factory` partition,
-#   1,208,054 B (1.15 MiB) headroom.
+# The first version of this file got exactly that wrong: it carried
+# 5,083,402 B, which was the milestone-2 gate's readelf-derived figure,
+# while documenting it as "produced by measure-app-image-size.sh".
+#
+# CURRENT baseline — measured 2026-08-02 at commit cd08085 (a direct
+# `xtensa-esp32s3-espidf` release build + elf2image, by
+# meshcadet-emoji-coverage-flash-budget-recompute-20260802-161907805):
+#
+#   3,360,432 B (3.20 MiB) of the 6 MiB (6,291,456 B) `factory` partition,
+#   2,931,024 B (2.80 MiB) headroom — 53.4% used.
+#
+# Why it moved -33.9% from the previous 5,083,402 B entry: that entry was
+# measured at 1abad3e, and FOUR firmware-affecting merges landed after it
+# (#134 ui_task split, #135 the 7x-embedded-backdrop dedupe, #136 the
+# render-set contract's 50 seed codepoints, #137 this guard itself). The
+# dominant term is #135, which recovered 6 redundant copies of a
+# 300,480-byte backdrop = -1,802,880 B. Reconciliation against the same
+# readelf method the old value used: 5,083,402 -> 3,415,374 = -1,668,028 B
+# observed, vs. -1,802,880 (dedupe) + 94,768 (#136) = -1,708,112 predicted;
+# the +40,084 B residual is #134 plus sdkconfig changes.
+#
+# NOTE: the previous entry's own comment asserted it was "confirmed still
+# current ... since `git diff 1abad3e..HEAD -- firmware/ ...` is empty".
+# That was true on the branch that wrote it and false on `main` within
+# hours — the branch simply predated those four merges. A staleness claim
+# pinned to the author's own branch tip is not a staleness claim about
+# main; this guard's whole point is that only a fresh build settles it.
+#
+# Expect a few bytes of run-to-run noise even on an unchanged tree: two
+# consecutive builds at cd08085 measured 3,360,432 B and 3,360,448 B (16 B
+# apart). measure-app-image-size.sh deliberately skips the release build's
+# SOURCE_DATE_EPOCH / --remap-path-prefix reproducibility flags (see its
+# header), so byte-exact equality is not expected — which is precisely why
+# this guard has a +-5% band rather than an equality check. Do not chase a
+# sub-kilobyte delta.
 #
 # Bump this value ONLY after `verify-partition-budget` reports a drift you've
 # confirmed is a real, intentional change to the app image (new UI assets,
@@ -31,4 +72,4 @@
 # running firmware/scripts/measure-app-image-size.sh (or reading
 # `verify-partition-budget`'s own "measured" line), never by hand-editing
 # this number from a guess or a stale report.
-5083402
+3360432
