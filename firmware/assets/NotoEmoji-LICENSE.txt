@@ -1,8 +1,10 @@
-Copyright 2013 Google Inc. All Rights Reserved.
+Copyright 2013 Google LLC
 (embedded copyright notice of the bundled NotoEmoji-Regular.ttf, per its
-'name' table; current upstream distributions of this font attribute it to
-"Google LLC" — the 2017 Google Inc. -> Google LLC entity rename, same
-copyright holder)
+'name' table — pulled 2026-08-02 from the google/fonts repo, ofl/notoemoji,
+`NotoEmoji[wght].ttf`, Version 3.002. The name-table copyright already
+reads "Google LLC" on this vintage — the 2017 Google Inc. -> Google LLC
+entity rename, same copyright holder, that the previously-bundled 2013-era
+build still carried as "Google Inc.")
 
 This Font Software is licensed under the SIL Open Font License, Version 1.1.
 This license is copied below, and is also available with a FAQ at:

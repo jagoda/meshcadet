@@ -137,8 +137,11 @@ Bundled/embedded font assets
 combined bitmap font, baked into the firmware binary, from two source fonts:
 
 Noto Emoji
-  File:       firmware/assets/NotoEmoji-Regular.ttf (bundled in this repo)
-  Copyright:  Copyright 2013 Google Inc. All Rights Reserved.
+  File:       firmware/assets/NotoEmoji-Regular.ttf (bundled in this repo;
+              pulled 2026-08-02 from google/fonts, ofl/notoemoji,
+              `NotoEmoji[wght].ttf` Version 3.002 — a variable font;
+              FreeType renders its default (wght=400, "Regular") instance)
+  Copyright:  Copyright 2013 Google LLC.
   License:    SIL Open Font License, Version 1.1 (OFL 1.1) — full text
               accompanies the font at
               firmware/assets/NotoEmoji-LICENSE.txt, per the OFL's own
