@@ -379,6 +379,12 @@ impl Dio1Wait for GpioDio1Wait<'_> {
         if self.dio1.set_interrupt_type(InterruptType::HighLevel).is_err()
             || self.dio1.enable_interrupt().is_err()
         {
+            // Observability: this path is otherwise silent — without a log
+            // line, a real ISR-service exhaustion in the field is
+            // indistinguishable from the interrupt-driven path ever having
+            // run at all, since the fallback's OWN behaviour (bounded,
+            // correct) gives no external signal that it fired.
+            log::warn!("radio: DIO1 interrupt arm failed — falling back to spin-poll for this wait");
             return Self::spin_poll_fallback(&mut self.dio1, timeout_ms);
         }
         let ticks = TickType::new_millis(timeout_ms as u64).ticks();
