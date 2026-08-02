@@ -46,9 +46,21 @@
 # pure logic (no Slint/esp-idf types involved) and pins it against the SAME
 # fixture values firmware's own tests use. See `docs/perf/ui-perf-
 # baseline.md` for the full methodology + ledger.
+#
+# `perf_loop_model` is the host-native discrete-event model of the firmware
+# dispatcher superloop (`meshcadet-perf-rearchitecture` campaign, M0 — no
+# device, no HIL, no QEMU, per the campaign's 2026-08-02 no-host-native
+# ruling). It drives the REAL `firmware-core::dispatcher` state machines
+# (`lora_airtime_ms`, `TxQueue`, `AirtimeBudget`) through the dispatcher
+# loop's documented per-iteration phase order, with every un-measured
+# ESP32-S3 constant (GPS/battery poll cost, SPI command overhead, `ui.step()`
+# cost) entered as a cited sensitivity range rather than an invented point
+# estimate. See `perf_loop_model/src/lib.rs` for the full design doc and
+# `docs/perf/perf-loop-model-baseline.md` for the committed SIMULATED
+# baseline.
 [workspace]
 resolver = "2"
-members = ["protocol", "firmware-core", "host", "xtask", "ui_sim", "ui_perf"]
+members = ["protocol", "firmware-core", "host", "xtask", "ui_sim", "ui_perf", "perf_loop_model"]
 
 [workspace.package]
 edition = "2021"

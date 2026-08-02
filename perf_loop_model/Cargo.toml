@@ -1,0 +1,28 @@
+[package]
+name = "perf_loop_model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = """
+Host-native discrete-event model of the firmware dispatcher superloop —
+`meshcadet-perf-rearchitecture` campaign, M0. Drives the REAL
+firmware-core::dispatcher state machines (lora_airtime_ms, TxQueue,
+AirtimeBudget) through the dispatcher loop's documented per-iteration phase
+order, both for today's single-superloop topology and the proposed M1
+core-split topology, with every un-measured ESP32-S3 constant entered as a
+cited sensitivity range rather than an invented point estimate. See
+src/lib.rs for the full design doc.
+"""
+
+[[bin]]
+name = "loop_model_report"
+path = "src/bin/loop_model_report.rs"
+
+[dependencies]
+# The real dispatcher state machines this model calls rather than
+# reimplements — see `src/lib.rs`'s "Why this measurement is representative"
+# section. No `version` field: nothing in this repo's toolchain runs `cargo
+# package`/`cargo publish` (see root `Cargo.toml`'s
+# `[workspace.dependencies].protocol` doc comment for why that matters).
+firmware-core = { path = "../firmware-core" }
