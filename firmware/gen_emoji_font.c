@@ -7,8 +7,10 @@
  *   - A small set of BMP symbols used by the UI (‹ › ✏ ✓ ✕ ⚙ ⌫ −) from the
  *     Latin font (with emoji-face fallback for any the Latin font lacks)
  *   - 40 curated picker emoji + a curated set of UI-chrome emoji, including
- *     📤 😀 🔐 📍, from NotoEmoji-Regular.ttf (see `UI_EXTRA_CPS` below for
- *     the full, current list — this header enumerates examples, not an
+ *     📤 😀 🔐 📍, + a render-only set (rasterised so inbound messages
+ *     display correctly, never offered in the picker), from
+ *     NotoEmoji-Regular.ttf (see `UI_EXTRA_CPS`/`RENDER_EXTRA_CPS` below for
+ *     the full, current lists — this header enumerates examples, not an
  *     exhaustive count)
  *
  * Why one combined font, registered globally, at every UI size:
@@ -29,6 +31,64 @@
  *
  * Build:
  *   gcc -O2 gen_emoji_font.c $(pkg-config --cflags --libs freetype2) -o gen_emoji_font
+ *
+ * ── The picker/render split (FROZEN CONTRACT — meshcadet-emoji-coverage D1) ──
+ *
+ * The renderable set is no longer required to equal the picker set. Two
+ * codepoint tables feed the emoji face now:
+ *   - `EMOJI_CPS`        — the picker's 40 curated entries. MUST stay in
+ *                          lockstep (same codepoints) with
+ *                          `protocol::emoji::EMOJI_TABLE` — this is the one
+ *                          half of the sync invariant that is still equality.
+ *   - `RENDER_EXTRA_CPS` — render-only codepoints: rasterised into this font
+ *                          so INBOUND messages display correctly, but never
+ *                          offered in the picker grid and never listed in
+ *                          `protocol::emoji::EMOJI_TABLE`.
+ *
+ * The sync invariant this file has always documented — "EMOJI_CPS must match
+ * protocol::emoji::EMOJI_TABLE" — is therefore relaxed from EQUALITY to
+ * CONTAINMENT:
+ *
+ *     protocol::emoji::EMOJI_TABLE ⊆ (EMOJI_CPS ∪ RENDER_EXTRA_CPS)
+ *
+ * Every picker entry must still resolve to a rasterised glyph (that part
+ * never changes — a picker entry with no glyph is still a build-breaking
+ * bug), but a rasterised glyph no longer implies a picker entry. This is
+ * what makes growing the picker flash-free: reusing an already-rasterised
+ * render-only glyph costs only the new `EmojiEntry`'s `&'static str`
+ * shortcode/label bytes, not a fresh bitmap. `xtask::font_table_count_mismatches`
+ * enforces the containment half in code (see its doc comment); this file
+ * enforces the "every registered codepoint has a glyph" half via
+ * `g_missing_glyph_count` below, same as always.
+ *
+ * `RENDER_EXTRA_CPS` curation criteria (D3 — frozen; downstream missions that
+ * grow this table draw from THESE criteria, not their own judgment):
+ *   - Source of truth: Unicode CLDR emoji ordering + the fully-qualified,
+ *     single-codepoint subset of `emoji-test.txt`.
+ *   - EXCLUDE anything structurally unrenderable by this pipeline —
+ *     `EmojiEntry.codepoint`/this file's `CharEntry.cp` is a single scalar
+ *     and the renderer does no grapheme clustering: ZWJ `U+200D` sequences,
+ *     regional-indicator flag pairs, keycap sequences, skin-tone modifiers
+ *     `U+1F3FB..FF`, and anything whose only correct presentation needs VS16
+ *     `U+FE0F`.
+ *   - EXCLUDE by content bar (tightened for "kid appropriate"): weapons,
+ *     violence/gore, alcohol, tobacco, drugs, gambling, adult/suggestive,
+ *     medical/injury, offensive gestures, religious and political symbols,
+ *     and anything culture-specific or ambiguous to a child.
+ *   - INCLUDE, in rough priority order: faces & emotions (the largest single
+ *     win), non-offensive hands, single-codepoint people/roles, animals,
+ *     plants & nature, food & drink (non-alcoholic), activities & sports,
+ *     travel & places, everyday objects, weather, symbols (hearts, stars,
+ *     checks, music).
+ *   - The target count is a ceiling for budgeting, not a quota.
+ *
+ * Do NOT change (D2 — frozen): `EMOJI_SIZES`/`PIXEL_SIZES` stay exactly as
+ * they are (see their own doc comments below for why a per-table size split
+ * was considered and rejected, and why `EMOJI_SIZES` must not shrink).
+ *
+ * This is part of a multi-phase emoji-coverage expansion; see the phase
+ * notes below (and D1-D3 above) for the decisions carried forward from
+ * earlier phases.
  */
 
 #include <stdio.h>
@@ -42,10 +102,18 @@
 
 /* ── Curated emoji codepoints (40 total) ─────────────────────────────── */
 /*
- * SYNC INVARIANT: these codepoints MUST match EMOJI_TABLE in
- * protocol/src/emoji.rs.  If emoji are added or removed from that table,
- * update this array AND the N_EMOJI_TABLE define below.  A divergence
- * compiles silently but the added emoji will render blank on-device.
+ * SYNC INVARIANT (CONTAINMENT, not equality — see the picker/render split
+ * contract at the top of this file): every codepoint in `protocol::emoji::
+ * EMOJI_TABLE` must appear SOMEWHERE in `EMOJI_CPS ∪ RENDER_EXTRA_CPS`.
+ * Historically this array WAS exactly `protocol::emoji::EMOJI_TABLE`'s
+ * codepoints (hence "40 total" above), and adding a picker entry meant
+ * adding it here. That is still ONE valid way to add a picker entry, but
+ * NOT the only one as of D1: a picker entry can instead be grown out of an
+ * already-rasterised `RENDER_EXTRA_CPS` codepoint at zero flash cost (no
+ * new bitmap needed) — update `N_EMOJI_TABLE` below only if you add here.
+ * `xtask::emoji_table_subset_mismatches` enforces the containment in code;
+ * a divergence otherwise compiles silently but the added emoji renders
+ * blank on-device.
  */
 static const unsigned long EMOJI_CPS[] = {
     /* Faces */
@@ -116,6 +184,80 @@ static const unsigned long UI_EXTRA_CPS[] = {
 };
 #define N_UI_EXTRA 9
 
+/* Render-only codepoints (D1 — see the frozen picker/render split contract
+ * at the top of this file). These rasterise INTO this font so inbound
+ * messages display correctly, but are deliberately NOT in `EMOJI_CPS` (the
+ * picker set) and NOT in `protocol::emoji::EMOJI_TABLE` — they never appear
+ * in the emoji-picker grid. `xtask::font_table_count_mismatches` enforces
+ * `protocol::emoji::EMOJI_TABLE ⊆ (EMOJI_CPS ∪ RENDER_EXTRA_CPS)` in code.
+ *
+ * Seed set (phase 5 of the meshcadet-emoji-coverage campaign — a MEASURING
+ * mission, not the full curation pass): the 14 codepoints recon confirmed
+ * missing from the pre-upgrade face, plus enough of the same "faces &
+ * emotions first" D3 priority order to produce a representative flash/
+ * build-time sample. Growing this table to the campaign's full target is
+ * `meshcadet-emoji-render-set-curation`'s job, against the SAME D3 criteria
+ * frozen above — this seed is not itself the target set. */
+static const unsigned long RENDER_EXTRA_CPS[] = {
+    /* Faces & emotions — the 14 confirmed missing from the pre-upgrade face */
+    0x1F914, /* 🤔 thinking face */
+    0x1F917, /* 🤗 hugging face */
+    0x1F644, /* 🙄 face with rolling eyes */
+    0x1F929, /* 🤩 star-struck */
+    0x1F97A, /* 🥺 pleading face */
+    0x1F970, /* 🥰 smiling face with hearts */
+    0x1F92F, /* 🤯 exploding head */
+    0x1F921, /* 🤡 clown face */
+    0x1F9E1, /* 🧡 orange heart */
+    0x1F92A, /* 🤪 zany face */
+    0x1F971, /* 🥱 yawning face */
+    0x1F984, /* 🦄 unicorn face */
+    0x1F9D2, /* 🧒 child */
+    0x1FAE0, /* 🫠 melting face */
+    /* Faces & emotions — additional high-frequency entries */
+    0x1F60D, /* 😍 heart eyes */
+    0x1F60B, /* 😋 savoring food (yum) */
+    0x1F642, /* 🙂 slightly smiling face */
+    0x1F643, /* 🙃 upside-down face */
+    0x1F605, /* 😅 grinning face with sweat */
+    0x1F606, /* 😆 grinning squinting face */
+    0x1F62D, /* 😭 loudly crying face */
+    0x1F928, /* 🤨 face with raised eyebrow */
+    0x1F9D0, /* 🧐 face with monocle */
+    0x1F913, /* 🤓 nerd face */
+    0x1F60C, /* 😌 relieved face */
+    0x1F614, /* 😔 pensive face */
+    0x1F973, /* 🥳 partying face */
+    0x1F607, /* 😇 smiling face with halo */
+    0x1F62C, /* 😬 grimacing face */
+    /* Hearts (non-offensive symbols) */
+    0x1F49B, /* 💛 yellow heart */
+    0x1F49A, /* 💚 green heart */
+    0x1F499, /* 💙 blue heart */
+    0x1F49C, /* 💜 purple heart */
+    0x1F5A4, /* 🖤 black heart */
+    0x1F90D, /* 🤍 white heart */
+    /* Animals */
+    0x1F43C, /* 🐼 panda face */
+    0x1F98A, /* 🦊 fox face */
+    0x1F42F, /* 🐯 tiger face */
+    0x1F981, /* 🦁 lion face */
+    0x1F42E, /* 🐮 cow face */
+    0x1F437, /* 🐷 pig face */
+    0x1F438, /* 🐸 frog face */
+    0x1F428, /* 🐨 koala */
+    /* Food & drink (non-alcoholic) */
+    0x1F34E, /* 🍎 red apple */
+    0x1F34C, /* 🍌 banana */
+    0x1F347, /* 🍇 grapes */
+    0x1F369, /* 🍩 doughnut */
+    0x1F36A, /* 🍪 cookie */
+    0x1F368, /* 🍨 ice cream */
+    /* Weather */
+    0x2614,  /* ☔ umbrella with rain drops */
+};
+#define N_RENDER_EXTRA 50
+
 /* BMP symbols used in the UI.  Preferred from the Latin font (DejaVu); a symbol
  * the Latin face lacks falls back to the emoji face (see render_glyph).  These
  * are rasterised at ALL PIXEL_SIZES (from_emoji = 0). */
@@ -171,11 +313,11 @@ static const int PIXEL_SIZES[] = {8, 9, 10, 11, 13, 14, 15, 16, 18, 20, 22, 28};
  *   18 px — emoji-picker toggle (😀)                            [compose.rs]
  *   20 px — emoji-picker grid cells, 🔐 PIN icon               [compose/pin_entry]
  * Timestamp/unread fields (9/10 px) are Rust-formatted numerics and never carry
- * emoji, so emoji are omitted there.  Rasterising the 42 emoji at every size —
- * especially 22/28 px (header chevrons / titles, never emoji) — wastes ~78 KB of
- * flash, so emoji are emitted as empty glyphs outside this set (they still hold a
- * char-map slot but carry no bitmap).  Latin + BMP symbols are rasterised at ALL
- * sizes above.
+ * emoji, so emoji are omitted there.  Rasterising all EMOJI_CPS + UI_EXTRA_CPS +
+ * RENDER_EXTRA_CPS entries at every size — especially 22/28 px (header chevrons
+ * / titles, never emoji) — would waste flash for zero benefit, so emoji are
+ * emitted as empty glyphs outside this set (they still hold a char-map slot but
+ * carry no bitmap).  Latin + BMP symbols are rasterised at ALL sizes above.
  *
  * SYNC INVARIANT: if an emoji is ever shown at a new font-size, add that size
  * here AND to PIXEL_SIZES, or the emoji renders blank at that size.
@@ -188,8 +330,9 @@ static const int PIXEL_SIZES[] = {8, 9, 10, 11, 13, 14, 15, 16, 18, 20, 22, 28};
  * gap named no longer uses it — but this list intentionally still omits 28px
  * for the reason below, in case some future screen needs a 28px emoji.
  * Adding 28px now — before any screen actually needs a 28px EMOJI glyph —
- * would rasterise all ~49 curated emoji at a 13th size for zero current
- * benefit (~KB of flash per the note above). The host glyph-coverage harness
+ * would rasterise every EMOJI_CPS/UI_EXTRA_CPS/RENDER_EXTRA_CPS entry at a
+ * 13th size for zero current benefit (real flash cost, per the note above).
+ * The host glyph-coverage harness
  * (`xtask`) carries a matching, equally-narrow, equally-commented allowlist
  * entry for this one pair so it does not mask any OTHER future gap. */
 static const int EMOJI_SIZES[] = {11, 13, 14, 16, 18, 20};
@@ -197,7 +340,7 @@ static const int EMOJI_SIZES[] = {11, 13, 14, 16, 18, 20};
 
 /* ── Character table (sorted by codepoint for binary search) ─────────── */
 #define N_ASCII 95  /* U+0020..U+007E */
-#define N_MAX_CHARS (N_ASCII + N_BMP_SYMBOLS + N_EMOJI_TABLE + N_UI_EXTRA)
+#define N_MAX_CHARS (N_ASCII + N_BMP_SYMBOLS + N_EMOJI_TABLE + N_UI_EXTRA + N_RENDER_EXTRA)
 
 typedef struct {
     unsigned long cp;
@@ -492,6 +635,12 @@ int main(int argc, char **argv)
     /* Extra UI emoji */
     for (int i = 0; i < N_UI_EXTRA; i++) {
         chars[n_chars].cp = UI_EXTRA_CPS[i];
+        chars[n_chars].from_emoji = 1;
+        n_chars++;
+    }
+    /* Render-only extra emoji (D1 — not in the picker, not in EMOJI_TABLE) */
+    for (int i = 0; i < N_RENDER_EXTRA; i++) {
+        chars[n_chars].cp = RENDER_EXTRA_CPS[i];
         chars[n_chars].from_emoji = 1;
         n_chars++;
     }

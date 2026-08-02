@@ -42,9 +42,28 @@
 //! (e.g. a contact's nickname, an incoming message body, or the 📍 telemetry
 //! line assembled in a formatter elsewhere) — that content is unbounded
 //! Unicode and is not what "freeze the icon inventory" can promise to cover;
-//! `protocol::emoji::EMOJI_TABLE`'s own SYNC INVARIANT with `EMOJI_CPS`
-//! covers the one bounded, enumerable case of dynamic content (the 40-entry
-//! curated picker set).
+//! [`emoji_table_subset_mismatches`]'s subset check covers the one bounded,
+//! enumerable case of dynamic content (the picker set).
+//!
+//! # The picker/render split (meshcadet-emoji-coverage D1)
+//!
+//! `protocol::emoji::EMOJI_TABLE` (the picker) is no longer required to
+//! EQUAL `gen_emoji_font.c`'s `EMOJI_CPS` (the historical convention this
+//! module doc used to describe) — it only needs to be a SUBSET of the full
+//! renderable set, which is `EMOJI_CPS ∪ RENDER_EXTRA_CPS`:
+//!
+//! ```text
+//! protocol::emoji::EMOJI_TABLE ⊆ (EMOJI_CPS ∪ RENDER_EXTRA_CPS)
+//! ```
+//!
+//! [`emoji_table_subset_mismatches`] enforces this directly: it imports the
+//! REAL `protocol::emoji::EMOJI_TABLE` constant (not a static count proxy)
+//! and checks every one of its codepoints against the union of `EMOJI_CPS`
+//! and `RENDER_EXTRA_CPS` parsed out of `gen_emoji_font.c`. A picker entry
+//! whose codepoint has no rasterised glyph anywhere in that union is a
+//! build-breaking bug — it renders BLANK on-device — same failure mode this
+//! whole module exists to catch, just for the one dynamic-content case that
+//! IS bounded and enumerable.
 //!
 //! # Design: simple, auditable, fails loud on ambiguity
 //!
@@ -72,6 +91,11 @@ use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// The real picker table — imported, not re-derived, so the subset check in
+/// [`emoji_table_subset_mismatches`] verifies against the actual compiled
+/// data rather than a hand-maintained count proxy.
+use protocol::emoji::EMOJI_TABLE;
 
 /// Provisioning-codec golden-vector generator — see `golden`'s module doc.
 pub mod golden;
@@ -180,6 +204,12 @@ struct FontTables {
     bmp_symbols: HashSet<u32>,
     emoji_cps: HashSet<u32>,
     ui_extra_cps: HashSet<u32>,
+    /// D1's render-only tier — rasterised, but never in the picker
+    /// (`protocol::emoji::EMOJI_TABLE`). Counts as registered/emoji-class
+    /// for [`check`]'s purposes exactly like `ui_extra_cps`: a screen's
+    /// static Slint literal using one of these codepoints is still a valid,
+    /// rasterised glyph, not an unregistered-codepoint violation.
+    render_extra_cps: HashSet<u32>,
     pixel_sizes: HashSet<u32>,
     emoji_sizes: HashSet<u32>,
 }
@@ -190,6 +220,7 @@ impl FontTables {
             || self.bmp_symbols.contains(&cp)
             || self.emoji_cps.contains(&cp)
             || self.ui_extra_cps.contains(&cp)
+            || self.render_extra_cps.contains(&cp)
     }
 
     /// EMOJI-class = drawn from the emoji face, gated by `EMOJI_SIZES` — as
@@ -197,7 +228,9 @@ impl FontTables {
     /// `PIXEL_SIZES` entry once registered (see `gen_emoji_font.c`'s
     /// `EMOJI_SIZES` doc comment).
     fn is_emoji_class(&self, cp: u32) -> bool {
-        self.emoji_cps.contains(&cp) || self.ui_extra_cps.contains(&cp)
+        self.emoji_cps.contains(&cp)
+            || self.ui_extra_cps.contains(&cp)
+            || self.render_extra_cps.contains(&cp)
     }
 }
 
@@ -237,13 +270,23 @@ enum NumberKind {
     Dec,
 }
 
-/// The 5 hand-paired (`#define` count, sibling array) pairs `gen_emoji_font.c`
+/// The 6 hand-paired (`#define` count, sibling array) pairs `gen_emoji_font.c`
 /// requires callers to keep in sync manually (see the module doc's "Level 1"
 /// motivation for this check: the C generator's `for (i = 0; i < N_*; i++)`
 /// loops trust these counts blindly — a stale one is UB, not a compile error).
+///
+/// This is orthogonal to the picker/render SUBSET check the module doc
+/// describes: `N_EMOJI_TABLE` here is `gen_emoji_font.c`'s OWN internal
+/// `#define` for `EMOJI_CPS`'s element count (a C array-bound safety check),
+/// not `protocol::emoji::EMOJI_TABLE`'s length — the identical name is a
+/// long-standing, unfortunate coincidence between the two files' vocabulary.
+/// Both checks are still needed: this one guards against C UB from a stale
+/// count; [`emoji_table_subset_mismatches`] (below) guards against a picker
+/// entry with no rasterised glyph anywhere in the font.
 const COUNT_PAIRS: &[(&str, &str, NumberKind)] = &[
     ("N_EMOJI_TABLE", "EMOJI_CPS", NumberKind::Hex),
     ("N_UI_EXTRA", "UI_EXTRA_CPS", NumberKind::Hex),
+    ("N_RENDER_EXTRA", "RENDER_EXTRA_CPS", NumberKind::Hex),
     ("N_BMP_SYMBOLS", "BMP_SYMBOLS", NumberKind::Hex),
     ("N_SIZES", "PIXEL_SIZES", NumberKind::Dec),
     ("N_EMOJI_SIZES", "EMOJI_SIZES", NumberKind::Dec),
@@ -264,9 +307,14 @@ fn extract_define_value(masked: &str, name: &str) -> Option<i64> {
     re.captures(masked)?.get(1)?.as_str().parse().ok()
 }
 
-/// Check all 5 `#define N_*` / sibling-array pairs in `gen_emoji_font.c` for
+/// Check all 6 `#define N_*` / sibling-array pairs in `gen_emoji_font.c` for
 /// count parity, returning a human-readable mismatch description per pair
-/// that disagrees (empty = all 5 pairs agree).
+/// that disagrees (empty = all 6 pairs agree).
+///
+/// This is orthogonal to [`emoji_table_subset_mismatches`] below — see
+/// [`COUNT_PAIRS`]'s own doc for why both checks are independently needed
+/// despite the confusingly similar naming between `gen_emoji_font.c`'s
+/// `N_EMOJI_TABLE` `#define` and `protocol::emoji::EMOJI_TABLE`.
 ///
 /// CRITICAL: array bodies here MUST be counted over `tokenize(&src).masked`,
 /// not raw source. `gen_emoji_font.c`'s array bodies carry codepoint hex
@@ -307,6 +355,65 @@ pub fn font_table_count_mismatches(gen_emoji_font_c: &Path) -> Vec<String> {
     mismatches
 }
 
+/// Returns one violation string per `picker` entry whose codepoint is absent
+/// from `render_set` — the pure containment check behind the picker/render
+/// SUBSET invariant (module doc: `protocol::emoji::EMOJI_TABLE ⊆ (EMOJI_CPS
+/// ∪ RENDER_EXTRA_CPS)`). Kept free of any file I/O so it has its own fast,
+/// synthetic-data unit tests independent of the live repo's current tables —
+/// see [`emoji_table_subset_mismatches`] for the file-reading entry point
+/// that feeds it the REAL `protocol::emoji::EMOJI_TABLE`.
+fn picker_subset_violations(picker: &[(u32, &str)], render_set: &HashSet<u32>) -> Vec<String> {
+    picker
+        .iter()
+        .filter(|(cp, _)| !render_set.contains(cp))
+        .map(|(cp, label)| {
+            format!(
+                "protocol::emoji::EMOJI_TABLE entry {label:?} (U+{cp:04X}) is not present in \
+                 gen_emoji_font.c's EMOJI_CPS or RENDER_EXTRA_CPS — the picker set must be a \
+                 subset of the renderable set (EMOJI_TABLE ⊆ EMOJI_CPS ∪ RENDER_EXTRA_CPS); \
+                 this entry would render BLANK on-device"
+            )
+        })
+        .collect()
+}
+
+/// Check the picker/render SUBSET invariant (module doc, D1): every
+/// `protocol::emoji::EMOJI_TABLE` codepoint must be present in
+/// `gen_emoji_font.c`'s `EMOJI_CPS ∪ RENDER_EXTRA_CPS`. Returns one
+/// human-readable violation per picker entry that fails containment (empty
+/// = the invariant holds).
+///
+/// This REPLACES the old, weaker, count-only proxy for this relationship
+/// (`font_table_count_mismatches`'s `N_EMOJI_TABLE == len(EMOJI_CPS)` pair
+/// only ever verified two NUMBERS agreed — never that the picker's actual
+/// codepoints were among the rasterised ones, and it could not express
+/// "subset" at all, only "equal count"). This function imports the REAL
+/// `protocol::emoji::EMOJI_TABLE` constant and checks codepoint identity
+/// directly against the C file's tables.
+///
+/// Same masked-text requirement as [`font_table_count_mismatches`] and for
+/// the same reason: a codepoint mentioned only in a `// BUG FIX` comment
+/// (documenting one swapped OUT of `EMOJI_CPS`) must not be mistaken for a
+/// registered, rasterised codepoint.
+pub fn emoji_table_subset_mismatches(gen_emoji_font_c: &Path) -> Vec<String> {
+    let src = fs::read_to_string(gen_emoji_font_c)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", gen_emoji_font_c.display()));
+    let masked = tokenize(&src).masked;
+
+    let render_set: HashSet<u32> = extract_hex_numbers(&extract_array(&masked, "EMOJI_CPS"))
+        .into_iter()
+        .chain(extract_hex_numbers(&extract_array(
+            &masked,
+            "RENDER_EXTRA_CPS",
+        )))
+        .collect();
+    let picker: Vec<(u32, &str)> = EMOJI_TABLE
+        .iter()
+        .map(|e| (e.codepoint as u32, e.shortcode))
+        .collect();
+    picker_subset_violations(&picker, &render_set)
+}
+
 fn parse_font_tables(gen_emoji_font_c: &Path) -> FontTables {
     let src = fs::read_to_string(gen_emoji_font_c)
         .unwrap_or_else(|e| panic!("reading {}: {e}", gen_emoji_font_c.display()));
@@ -318,6 +425,9 @@ fn parse_font_tables(gen_emoji_font_c: &Path) -> FontTables {
             .into_iter()
             .collect(),
         ui_extra_cps: extract_hex_numbers(&extract_array(&src, "UI_EXTRA_CPS"))
+            .into_iter()
+            .collect(),
+        render_extra_cps: extract_hex_numbers(&extract_array(&src, "RENDER_EXTRA_CPS"))
             .into_iter()
             .collect(),
         pixel_sizes: extract_dec_numbers(&extract_array(&src, "PIXEL_SIZES"))
@@ -887,6 +997,10 @@ static const unsigned long UI_EXTRA_CPS[] = {
     0x1F4E4,
 };
 #define N_UI_EXTRA 1
+static const unsigned long RENDER_EXTRA_CPS[] = {
+    0x1F602,
+};
+#define N_RENDER_EXTRA 1
 static const unsigned long BMP_SYMBOLS[] = {
     0x2039,
 };
@@ -916,6 +1030,102 @@ static const int EMOJI_SIZES[] = {11};
         assert!(mismatches[0].contains("2 element(s)"));
     }
 
+    // ── Picker/render subset guard (D1) ─────────────────────────────────────
+
+    /// Pass case (pure logic, synthetic data): every picker codepoint is
+    /// present somewhere in the render set (split across `EMOJI_CPS` and
+    /// `RENDER_EXTRA_CPS`, exercising the union half of the check too).
+    #[test]
+    fn picker_subset_violations_pass_case() {
+        let picker = [(0x1F600u32, "grin"), (0x1F914u32, "think")];
+        let render_set: HashSet<u32> = [0x1F600, 0x1F914, 0x1F4FB].into_iter().collect();
+        let violations = picker_subset_violations(&picker, &render_set);
+        assert!(
+            violations.is_empty(),
+            "expected no violations, got: {violations:?}"
+        );
+    }
+
+    /// Violation case (pure logic, synthetic data): a picker entry whose
+    /// codepoint is in NEITHER `EMOJI_CPS` nor `RENDER_EXTRA_CPS` must be
+    /// caught by name, and a satisfied entry must not spuriously appear.
+    #[test]
+    fn picker_subset_violations_violation_case() {
+        let picker = [(0x1F600u32, "grin"), (0x1F999u32, "orphan")];
+        let render_set: HashSet<u32> = [0x1F600].into_iter().collect();
+        let violations = picker_subset_violations(&picker, &render_set);
+        assert_eq!(
+            violations.len(),
+            1,
+            "expected exactly one violation, got: {violations:?}"
+        );
+        assert!(violations[0].contains("orphan"));
+        assert!(violations[0].contains("U+1F999"));
+        assert!(violations[0].contains("BLANK"));
+    }
+
+    /// Pass case (integration, live repo): `protocol::emoji::EMOJI_TABLE`'s
+    /// real codepoints are all present in `gen_emoji_font.c`'s real
+    /// `EMOJI_CPS ∪ RENDER_EXTRA_CPS` — the actual guard wired into
+    /// `xtask verify-font-table-counts` / `cargo test`, not just the pure
+    /// logic behind it.
+    #[test]
+    fn emoji_table_subset_check_passes_on_live_repo() {
+        let violations = emoji_table_subset_mismatches(
+            &repo_root_from_manifest_dir().join("firmware/gen_emoji_font.c"),
+        );
+        assert!(
+            violations.is_empty(),
+            "\npicker/render subset check found {} violation(s):\n{}\n",
+            violations.len(),
+            violations
+                .iter()
+                .map(|v| format!("  - {v}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// Violation case (integration, synthetic fixture): a `gen_emoji_font.c`
+    /// whose `EMOJI_CPS`/`RENDER_EXTRA_CPS` are missing a real
+    /// `protocol::emoji::EMOJI_TABLE` codepoint must be caught by the
+    /// file-reading entry point, not just by the pure logic in isolation —
+    /// and a codepoint mentioned only in a `// BUG FIX` comment must not be
+    /// mistaken for a registered one (same masking requirement as the
+    /// count-parity check above).
+    #[test]
+    fn emoji_table_subset_check_detects_missing_picker_codepoint() {
+        // protocol::emoji::EMOJI_TABLE's first entry is U+1F60A (smile,
+        // shortcode "smile") — omit it from both render arrays here.
+        const FIXTURE: &str = r#"
+static const unsigned long EMOJI_CPS[] = {
+    // BUG FIX: 0x1F60A mentioned only in this comment must not count as registered
+    0x1F602, 0x1F609,
+};
+static const unsigned long RENDER_EXTRA_CPS[] = {
+    0x1F914,
+};
+"#;
+        let dir = std::env::temp_dir().join(format!(
+            "xtask-subset-fixture-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gen_emoji_font.c");
+        fs::write(&path, FIXTURE).unwrap();
+        let violations = emoji_table_subset_mismatches(&path);
+        cleanup_fixture(&dir);
+
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("\"smile\"") && v.contains("U+1F60A")),
+            "expected a violation naming the missing \"smile\" (U+1F60A) picker entry, got: \
+             {violations:?}"
+        );
+    }
+
     #[test]
     fn font_tables_parse_known_entries() {
         let tables =
@@ -935,6 +1145,16 @@ static const int EMOJI_SIZES[] = {11};
         );
         assert!(tables.emoji_sizes.contains(&14));
         assert!(!tables.emoji_sizes.contains(&28));
+        assert!(
+            tables.is_registered(0x1F914) && tables.is_emoji_class(0x1F914),
+            "🤔 (thinking face) is a RENDER_EXTRA_CPS entry — registered and emoji-class, but \
+             NOT a picker entry (see the D1 subset-invariant tests)"
+        );
+        assert!(
+            !EMOJI_TABLE.iter().any(|e| e.codepoint as u32 == 0x1F914),
+            "🤔 must stay OUT of the picker (protocol::emoji::EMOJI_TABLE) — it's the D1 \
+             render-only proof: rasterised, never offered in the picker grid"
+        );
     }
 
     #[test]

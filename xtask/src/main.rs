@@ -11,6 +11,10 @@
 //! - **verify-font-table-counts** — each `gen_emoji_font.c` `#define N_*`
 //!   matches its paired array's real element count (see
 //!   `xtask::font_table_count_mismatches`'s doc).
+//! - **verify-emoji-render-subset** — every `protocol::emoji::EMOJI_TABLE`
+//!   (picker) codepoint is present in `gen_emoji_font.c`'s renderable set,
+//!   `EMOJI_CPS ∪ RENDER_EXTRA_CPS` (see `xtask::emoji_table_subset_mismatches`'s
+//!   doc and the crate's module doc, "The picker/render split").
 //! - **verify-room-session-erase** — `admin_server.rs`'s `ADD_ROOM`/`DEL_ROOM`
 //!   arms erase the room's dedicated NVS session store (see
 //!   `xtask::room_session_erase`'s doc).
@@ -98,6 +102,24 @@ fn main() -> ExitCode {
         );
         for m in &count_mismatches {
             eprintln!("  - {m}");
+        }
+    }
+
+    let subset_mismatches =
+        xtask::emoji_table_subset_mismatches(&repo_root.join("firmware/gen_emoji_font.c"));
+    if subset_mismatches.is_empty() {
+        println!(
+            "xtask verify-emoji-render-subset: OK — every protocol::emoji::EMOJI_TABLE codepoint \
+             is present in gen_emoji_font.c's EMOJI_CPS ∪ RENDER_EXTRA_CPS."
+        );
+    } else {
+        ok = false;
+        eprintln!(
+            "xtask verify-emoji-render-subset: FAILED — {} violation(s):",
+            subset_mismatches.len()
+        );
+        for v in &subset_mismatches {
+            eprintln!("  - {v}");
         }
     }
 
