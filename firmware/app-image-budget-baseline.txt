@@ -1,0 +1,34 @@
+# MeshCadet firmware app-image size baseline — see
+# xtask/src/partition_budget.rs and firmware/partitions.csv's `factory`
+# partition comment.
+#
+# The single non-comment line below is the app-image size in BYTES, as
+# produced by firmware/scripts/measure-app-image-size.sh (a release build +
+# `esptool elf2image`, same artifact firmware/release-container/build.sh
+# publishes as the app-only update artifact). `cargo run -p xtask --bin
+# xtask -- verify-partition-budget` recomputes this figure fresh from a real
+# build every time it runs and fails loudly if it has drifted more than 5%
+# from the value below — see that check's module doc for why this exists:
+# firmware/partitions.csv used to carry the equivalent number as hand-written
+# "measured" prose in a comment, which had no recompute trigger and silently
+# decayed 2.72 MB stale as the tree grew, undetected across an entire
+# campaign's worth of flash-budget decisions (see
+# meshcadet-emoji-font-upgrade-checkpoint-20260802-140922469).
+#
+# CURRENT baseline — last measured 2026-08-02 at commit 1abad3e (the
+# checkpoint's own direct release-build measurement; confirmed still current
+# at the commit that added this file, since `git diff 1abad3e..HEAD --
+# firmware/ firmware-core/ protocol/` is empty — no firmware-affecting
+# commit landed in between):
+#
+#   5,083,402 B (4.85 MiB) of the 6 MiB (6,291,456 B) `factory` partition,
+#   1,208,054 B (1.15 MiB) headroom.
+#
+# Bump this value ONLY after `verify-partition-budget` reports a drift you've
+# confirmed is a real, intentional change to the app image (new UI assets,
+# new glyph coverage, a dependency upgrade, etc.) — never to silence a
+# failure without reading why it moved. Derive the new value by actually
+# running firmware/scripts/measure-app-image-size.sh (or reading
+# `verify-partition-budget`'s own "measured" line), never by hand-editing
+# this number from a guess or a stale report.
+5083402

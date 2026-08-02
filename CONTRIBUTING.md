@@ -35,9 +35,12 @@ host-native workspace, plus a dedicated `firmware` job that installs the
 `esp`/Xtensa cross-toolchain + ESP-IDF sysroot and runs
 `cd firmware && bash check-all-features.sh` — the same command described
 below, now run by CI on every PR instead of only by a human before landing
-firmware changes. `firmware` is a separate job (not folded into `test`/
-`clippy`) precisely so a transient Espressif-toolchain hiccup can never block
-the fast host lane; see the workflow file's own header comment for the full
+firmware changes — followed by `cargo run -p xtask --bin xtask --
+verify-partition-budget` (a fresh release build's app-image size, diffed
+against the committed flash-budget baseline; see "Flash-budget changes"
+below). `firmware` is a separate job (not folded into `test`/ `clippy`)
+precisely so a transient Espressif-toolchain hiccup can never block the fast
+host lane; see the workflow file's own header comment for the full
 rationale.
 
 ## Building and testing
@@ -61,6 +64,32 @@ cd firmware && bash check-all-features.sh
 Firmware logic that can be tested on the host is usually a good candidate for
 porting into `ui_perf` or `ui_sim` as pure functions (see those crates'
 `README.md` for the pattern) rather than trusting an on-device-only test.
+
+### Flash-budget changes: recompute, never re-read a comment
+
+Any plan or PR that budgets against the firmware app image's flash headroom
+(new UI assets, new glyph/font coverage, a dependency upgrade that touches
+`firmware/`) **must** run the partition-budget guard before locking a
+decision to a size figure:
+
+```sh
+cargo run -p xtask --bin xtask -- verify-partition-budget
+```
+
+This recomputes the actual app-image size from a fresh release build and
+diffs it against the committed baseline
+(`firmware/app-image-budget-baseline.txt`), failing loudly past a 5% drift.
+It requires the `esp` cross-toolchain (same prerequisites as
+`check-all-features.sh`) and runs as its own step in
+`.github/workflows/ci.yml`'s `firmware` job on every push — but a
+multi-phase campaign that budgets several decisions against the flash
+headroom in advance of any single PR should still run it directly at
+planning time, not wait for the next push's CI result. `firmware/partitions.csv`'s
+`factory` partition comment used to carry this figure as hand-written
+"measured" prose with no recompute trigger; it decayed 2.72 MB stale,
+undetected, before an entire campaign had budgeted every phase-5/6 decision
+against it — see `xtask/src/partition_budget.rs`'s module doc for the full
+incident.
 
 ### Testing UI changes without hardware
 
