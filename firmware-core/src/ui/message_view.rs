@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Message thread view screen — pure comet-on-notify predicate, the
 //! plain-data message-row type, the model-builder that assembles it from
-//! stored conversation history, and the @mention wrap/render glue around
-//! `protocol::mention`.
+//! stored conversation history, the @mention wrap/render glue around
+//! `protocol::mention`, and the inbound emoji-normalization glue around
+//! `protocol::emoji::normalize_inbound`.
 //!
 //! The `slint::slint!{}` view and the `MessageViewScreen` Rust wrapper stay
 //! in `firmware/src/ui/screens/message_view.rs` (the wrapper depends on
@@ -115,6 +116,26 @@ pub fn render_mentions(body: &str, self_name: &str, known: &[&str]) -> (String, 
     (display, tier as i32)
 }
 
+/// Normalize `text` for display via `protocol::emoji::normalize_inbound`
+/// (drops VS16, drops skin-tone modifiers, collapses ZWJ sequences to their
+/// lead scalar — see that function's doc for why: the on-device bitmap font
+/// has no per-glyph fallback and no grapheme clustering, so an un-normalized
+/// VS16-suffixed emoji like Android's ❤️ renders as a heart plus a visible
+/// blank cell). The RECEIVE/RENDER-side half of this crate's normalization
+/// story — mirrors [`wrap_outgoing_mentions`]'s buffer-then-fallback shape.
+/// The output is never longer than the input (normalization only drops
+/// scalars), so the fallback path below is unreachable in practice; it
+/// exists purely so a pathological future input degrades to "unnormalized"
+/// rather than panicking, matching every other buffer-based call site in
+/// this module.
+fn normalize_emoji_for_display(text: &str) -> String {
+    let mut out = [0u8; 512];
+    match protocol::emoji::normalize_inbound(text.as_bytes(), &mut out) {
+        Some(n) => String::from_utf8_lossy(&out[..n]).into_owned(),
+        None => text.to_string(),
+    }
+}
+
 /// Build the MessageView model rows from stored message records.
 ///
 /// For received channel messages (`is_channel && !m.is_ours`), the stored
@@ -135,6 +156,14 @@ pub fn render_mentions(body: &str, self_name: &str, known: &[&str]) -> (String, 
 /// brackets-hidden `@name` display string, and to compute `mention_tier`.
 /// Applied uniformly to sent and received messages (a self-composed mention
 /// highlights too) — mentions are not channel-scoped.
+///
+/// Finally, [`normalize_emoji_for_display`] strips VS16/skin-tone/ZWJ from
+/// the flattened text — also applied uniformly to sent and received
+/// messages, same rationale as mentions: this node's own composed text
+/// never carries these combining characters (`EMOJI_TABLE`/
+/// `expand_shortcodes` only ever emit bare codepoints), so normalizing it
+/// too is a no-op, not a behavior change, and keeps every `MessageItem`
+/// flowing through the one code path this module's doc promises.
 pub fn build_message_items(
     records: &[super::MessageRecord],
     is_channel: bool,
@@ -156,6 +185,7 @@ pub fn build_message_items(
                 (String::new(), m.text.clone())
             };
             let (text, mention_tier) = render_mentions(&body, self_name, known);
+            let text = normalize_emoji_for_display(&text);
             MessageItem {
                 text,
                 from_name,
@@ -455,5 +485,90 @@ mod tests {
         );
         assert_eq!(items[0].text, "hi @Alice it's Bob");
         assert_eq!(items[0].mention_tier, 1);
+    }
+
+    // ── inbound emoji normalization glue ────────────────────────────────
+    //
+    // Regression guard: `build_message_items` must strip VS16/skin-tone/ZWJ
+    // from the DISPLAYED text — the live defect this mission fixes (Android
+    // sends `U+2764 U+FE0F` for ❤️, which renders as a heart plus a
+    // trailing blank cell on the on-device bitmap font otherwise). See
+    // `protocol::emoji::normalize_inbound`'s doc for the underlying
+    // mechanism.
+
+    #[test]
+    fn build_message_items_strips_vs16_from_received_dm() {
+        let records = vec![MessageRecord {
+            text: "nice catch \u{2764}\u{FE0F}".into(),
+            is_ours: false,
+            acked: false,
+            ts_ms: 0,
+        }];
+        let items = build_message_items(&records, /* is_channel */ false, "Self", &[]);
+        assert_eq!(items[0].text, "nice catch \u{2764}");
+    }
+
+    #[test]
+    fn build_message_items_strips_skin_tone_modifier_from_received_channel_message() {
+        // 👍🏽 = U+1F44D U+1F3FD. Also exercises the sender-prefix split
+        // ahead of normalization, in one pass.
+        let records = vec![MessageRecord {
+            text: "Alice: \u{1F44D}\u{1F3FD} nice".into(),
+            is_ours: false,
+            acked: false,
+            ts_ms: 0,
+        }];
+        let items = build_message_items(&records, /* is_channel */ true, "Self", &[]);
+        assert_eq!(items[0].from_name, "Alice");
+        assert_eq!(items[0].text, "\u{1F44D} nice");
+    }
+
+    #[test]
+    fn build_message_items_collapses_zwj_family_sequence_to_lead_glyph() {
+        let records = vec![MessageRecord {
+            text: "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} home safe".into(),
+            is_ours: false,
+            acked: false,
+            ts_ms: 0,
+        }];
+        let items = build_message_items(&records, /* is_channel */ false, "Self", &[]);
+        assert_eq!(items[0].text, "\u{1F468} home safe");
+    }
+
+    #[test]
+    fn build_message_items_bare_emoji_and_plain_text_unaffected_by_normalization() {
+        let records = vec![
+            MessageRecord {
+                text: "\u{1F600}".into(),
+                is_ours: false,
+                acked: false,
+                ts_ms: 0,
+            },
+            MessageRecord {
+                text: "plain text, no emoji".into(),
+                is_ours: true,
+                acked: false,
+                ts_ms: 0,
+            },
+        ];
+        let items = build_message_items(&records, /* is_channel */ false, "Self", &[]);
+        assert_eq!(items[0].text, "\u{1F600}");
+        assert_eq!(items[1].text, "plain text, no emoji");
+    }
+
+    #[test]
+    fn build_message_items_normalizes_sent_messages_too_same_code_path_as_mentions() {
+        // A self-composed message that happens to carry a VS16-decorated
+        // emoji (e.g. pasted from elsewhere) normalizes identically to a
+        // received one — same "one code path for sent and received" the
+        // mention tests above pin for `is_ours: true`.
+        let records = vec![MessageRecord {
+            text: "sending \u{2764}\u{FE0F} your way".into(),
+            is_ours: true,
+            acked: false,
+            ts_ms: 0,
+        }];
+        let items = build_message_items(&records, /* is_channel */ false, "Self", &[]);
+        assert_eq!(items[0].text, "sending \u{2764} your way");
     }
 }

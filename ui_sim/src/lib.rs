@@ -147,6 +147,12 @@ pub mod compose_promo;
 /// screen. See `contact_list_promo`'s module doc for the shared rationale.
 pub mod splash_promo;
 
+/// Host-sim render rig — proves `protocol::emoji::normalize_inbound`
+/// actually closes the "blank cell" defect on a REAL Slint render, not just
+/// in `protocol`'s own host unit tests. See that module's own doc for the
+/// hand-built minimal `BitmapFont` this rig registers and why.
+pub mod emoji_blank_cell_probe;
+
 pub const WIDTH: u32 = 320;
 pub const HEIGHT: u32 = 240;
 

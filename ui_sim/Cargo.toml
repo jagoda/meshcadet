@@ -31,6 +31,25 @@ slint = { version = "=1.16.1", default-features = false, features = [
 # dependency of any kind.
 image = { version = "0.25", default-features = false, features = ["png"] }
 
+# Direct access to i-slint-core internals: BitmapFont / BitmapGlyph /
+# CharacterMapEntry, for `emoji_blank_cell_probe`'s hand-built minimal bitmap
+# font (mirrors `firmware/src/ui/platform.rs`'s `emoji_font` module, which
+# uses the SAME internal types for the build-time-generated production
+# font). Pinned to match the locked slint version, same feature set as
+# `firmware/Cargo.toml`'s identical dependency — see its own comment.
+# PIN-TRACKING: bump alongside `slint`/`slint-build` above.
+i-slint-core = { version = "=1.16.1", default-features = false, features = [
+    "unsafe-single-threaded",
+    "libm",
+] }
+
+# Inbound emoji normalization under test (`protocol::emoji::normalize_inbound`)
+# — `emoji_blank_cell_probe` renders both the raw wire text and the
+# normalized text through the identical minimal font to prove the fix
+# actually closes the blank-cell gap, not just that `normalize_inbound`'s
+# own host unit tests pass in isolation.
+protocol = { workspace = true }
+
 [build-dependencies]
 # Added for its EFFECT on the host compilation graph, not because build.rs
 # calls it directly — see firmware/Cargo.toml's own identical comment for
