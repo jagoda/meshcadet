@@ -288,8 +288,9 @@ impl<'a, 'd> LineBufferProvider for TDeckLineRenderer<'a, 'd> {
         // "STACK-SAVING FIX" from an earlier fix that traded a 640 B stack
         // array for a per-call heap allocation instead). That heap round-trip
         // fired on EVERY dirty scanline — up to 240 times per full-window
-        // repaint (confirmed baseline hotspot, `docs/perf/ui-perf-baseline.md`
-        // §5 item 1) — inside `ui::step()`'s render path, the same iteration
+        // repaint (confirmed baseline hotspot, now recorded as a landed fix in
+        // `docs/perf/ui-perf-baseline.md` §3.4) — inside `ui::step()`'s render
+        // path, the same iteration
         // whose wall-clock length gates how promptly the NEXT dispatcher-loop
         // iteration's CAD attempt / RX poll runs.
         //

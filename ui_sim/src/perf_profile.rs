@@ -22,9 +22,10 @@
 //! module doesn't reimplement or approximate it), the numbers this produces
 //! are the actual repaint scope the real firmware would push over SPI for
 //! the same component/animation state — not a host-side approximation of it.
-//! This is what upgrades `docs/perf/ui-perf-baseline.md` §5.3's STATIC audit
-//! ("does not match a naive full-window backdrop failure mode", magnitude
-//! flagged unconfirmed) to a host-MEASURED confirmation — see
+//! This is what upgraded the baseline's original STATIC audit ("does not
+//! match a naive full-window backdrop failure mode", magnitude flagged
+//! unconfirmed) to a host-MEASURED confirmation — see
+//! `docs/perf/ui-perf-baseline.md` §3.2 and
 //! `tests/perf_profile.rs`.
 //!
 //! # What this does NOT measure

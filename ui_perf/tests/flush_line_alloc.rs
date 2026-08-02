@@ -8,8 +8,9 @@
 //! embedded-graphics `Rgb565` by `.collect()`-ing into a heap `Vec`, then
 //! passed the slice to `TDeckDisplay::flush_line_range`. That is a fresh heap
 //! allocation (and matching deallocation) on EVERY dirty line — up to 240
-//! times for a full-window repaint (confirmed baseline hotspot, `docs/perf/
-//! ui-perf-baseline.md` §5 item 1) — nested inside `ui::step()` →
+//! times for a full-window repaint (confirmed baseline hotspot, now recorded
+//! as a landed fix in `docs/perf/ui-perf-baseline.md` §3.4) — nested inside
+//! `ui::step()` →
 //! `render_if_needed()`, the SAME iteration whose wall-clock length gates how
 //! promptly `main.rs`'s dispatcher loop gets back around to the NEXT
 //! iteration's CAD attempt / RX poll (§6 "contention direction A" in that same
