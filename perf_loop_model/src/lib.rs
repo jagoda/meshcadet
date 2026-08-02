@@ -115,12 +115,30 @@
 //! an analytical estimate, and must be labelled as such wherever it
 //! appears — never presented as a device measurement. See
 //! `docs/perf/perf-loop-model-baseline.md`'s own provenance banner.
+//!
+//! # The re-calibration hook
+//!
+//! [`calibration::calibrate`] is the one sanctioned way a real device
+//! reading ever overwrites one of [`params::LoopModelParams`]' cited
+//! ranges — see that module's doc for exactly which four fields are
+//! reachable and why the rest are not. `report::full_sweep_with_params`
+//! and `report::render_text_report_with_params` accept whatever
+//! [`params::LoopModelParams`] [`calibration::calibrate`] produced, so a
+//! calibrated re-run is "resolve, calibrate, re-render" — no duplicated
+//! sweep/report logic. The `perf_device_report` crate (a separate
+//! root-workspace member) owns parsing `docs/perf/collection-kit.md`'s
+//! report-back format into the [`calibration::MeasuredConstants`] this
+//! hook consumes; this crate does not parse device-report text itself.
 
+pub mod calibration;
 pub mod params;
 pub mod report;
 pub mod sim;
 pub mod workload;
 
+pub use calibration::{
+    calibrate, CalibrationReport, FieldProvenance, MeasuredConstants, MeasuredPhaseMs,
+};
 pub use params::{Corner, LoopModelParams, ParamRangeMs, ResolvedParams};
 pub use sim::{dominance_check, simulate, DominanceVerdict, GapStats, SimResult, Topology};
 pub use workload::{TrafficStream, Workload};

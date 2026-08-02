@@ -19,15 +19,42 @@
 //!   compiled-in firmware literals cited by file:line, used verbatim.
 
 /// One parameter's sensitivity range, in milliseconds.
+///
+/// `mid_ms` is normally `None`, meaning [`Corner::Mid`] resolves to the
+/// average of `low_ms`/`high_ms` — the sensitivity-sweep meaning documented
+/// on [`Corner`]. [`Self::measured`] sets `mid_ms` explicitly instead: see
+/// its own doc for why a calibrated field's three corners are NOT that
+/// average.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ParamRangeMs {
     pub low_ms: f64,
     pub high_ms: f64,
+    pub mid_ms: Option<f64>,
 }
 
 impl ParamRangeMs {
     pub const fn new(low_ms: f64, high_ms: f64) -> Self {
-        Self { low_ms, high_ms }
+        Self {
+            low_ms,
+            high_ms,
+            mid_ms: None,
+        }
+    }
+
+    /// A MEASURED (not swept) point, built from a device report's phase
+    /// rollup: `mean_ms` -> [`Corner::Low`], `p95_ms` -> [`Corner::Mid`],
+    /// `max_ms` -> [`Corner::High`]. This is [`crate::calibration::
+    /// calibrate`]'s hook for the `ui_step`/`gps_poll`/`battery_poll`
+    /// fields per `docs/perf/collection-kit.md` Part D's derivation table
+    /// ("replace the whole range with these three points") — the three
+    /// corners read as real percentiles of one measured distribution here,
+    /// not as a low/high sensitivity extreme with an averaged midpoint.
+    pub const fn measured(mean_ms: f64, p95_ms: f64, max_ms: f64) -> Self {
+        Self {
+            low_ms: mean_ms,
+            high_ms: max_ms,
+            mid_ms: Some(p95_ms),
+        }
     }
 
     /// Resolve this range at `corner`.
@@ -35,7 +62,7 @@ impl ParamRangeMs {
         match corner {
             Corner::Low => self.low_ms,
             Corner::High => self.high_ms,
-            Corner::Mid => (self.low_ms + self.high_ms) / 2.0,
+            Corner::Mid => self.mid_ms.unwrap_or((self.low_ms + self.high_ms) / 2.0),
         }
     }
 }
