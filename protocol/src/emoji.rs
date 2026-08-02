@@ -21,8 +21,8 @@
 //! original 40 entries additionally live in `EMOJI_CPS` itself (the
 //! historical, still-valid way to add a picker entry); the 56 grown by
 //! `meshcadet-emoji-picker-expansion` instead reuse already-rasterised
-//! `RENDER_EXTRA_CPS` codepoints, at zero flash cost — see that mission's
-//! dossier and the campaign plan's D1 for the full rationale.
+//! `RENDER_EXTRA_CPS` codepoints, at zero flash cost — see that change's
+//! writeup and the campaign plan's D1 for the full rationale.
 //!
 //! # Categories
 //! [`EMOJI_CATEGORIES`] lists the 6 picker tabs, in display order. Every
