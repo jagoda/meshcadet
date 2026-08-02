@@ -4737,7 +4737,9 @@ dependencies = [
 name = "ui_sim"
 version = "0.5.0"
 dependencies = [
+ "i-slint-core",
  "image",
+ "protocol",
  "slint",
  "slint-build",
 ]
