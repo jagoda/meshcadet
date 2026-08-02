@@ -39,6 +39,7 @@ pub mod signal_meter;
 pub mod splash;
 pub mod theme;
 pub mod touch;
+pub mod ui_task_boundary;
 
 /// One stored message in a conversation — mirrors
 /// `firmware::ui::MessageRecord` exactly. `ts_ms` is captured at every

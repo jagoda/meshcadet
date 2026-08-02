@@ -3,23 +3,37 @@
 //!
 //! # Architecture
 //!
-//! The UI is driven cooperatively from the radio dispatcher loop in `main.rs`:
+//! Since ADR-0012 (the dispatcher/UI task split, `meshcadet-perf-
+//! rearchitecture` M1), the UI runs on its OWN pinned task (`ui_task`, core
+//! 1) — NOT the radio dispatcher's task (`main.rs::run()`'s loop, core 0)
+//! as it did pre-split. `firmware/src/ui_task.rs` holds the only `use
+//! crate::ui::UiRuntime` in the crate (D4.2): `main.rs` can no longer name
+//! `UiRuntime` at all, and talks to it exclusively through two bounded
+//! `std::sync::mpsc` channels (`UiEvent` in, `UiCommand` out — D3). See
+//! `ui_task`'s own module doc for the spawn/ownership contract this module
+//! is driven under:
 //!
 //! ```rust,ignore
-//! // At startup (before the loop):
-//! platform::TDeckPlatform::install();
-//! let mut app = UiRuntime::new(display, touch, keyboard, buzzer, trackball, is_provisioned, &pubkey_hex, &self_name)?;
+//! // ui_task.rs, on the newly spawned, core-1-pinned thread:
+//! platform::TDeckPlatform::install(); // happens inside UiRuntime::new() below
+//! let mut app = UiRuntime::new(
+//!     display, touch, keyboard, buzzer, trackball,
+//!     is_provisioned, &pubkey_hex, &self_name, cmd_tx,
+//! )?;
+//! // (WDT subscribe happens here, right after construction — D7)
 //!
-//! // Once boot bring-up settles (radio/GPS/history/admin-server live, or —
-//! // unprovisioned path — right before the USB-provisioning wait loop):
-//! app.mark_app_ready();
-//! app.run_splash_ripple(); // blocks ~1.15s on its OWN dedicated render loop
-//!                          // (first ripple cycle only — it then loops via
-//!                          // ordinary step() calls until splash dismiss;
-//!                          // see screens::splash's module doc)
-//!
-//! // In the main loop:
-//! app.step(now_ms)?;
+//! // Steady state: wake on a message or the 16ms tick (C7), forwarding
+//! // whatever arrives to `post_event` — except `UiEvent::AppReady`, which
+//! // this loop intercepts directly (D8 step 9):
+//! loop {
+//!     match evt_rx.recv_timeout(Duration::from_millis(16)) {
+//!         Ok(UiEvent::AppReady) => { app.mark_app_ready(); app.run_splash_ripple(); }
+//!         Ok(event) => app.post_event(event),
+//!         Err(RecvTimeoutError::Timeout) => {}
+//!         Err(RecvTimeoutError::Disconnected) => break,
+//!     }
+//!     app.step(now_ms)?;
+//! }
 //! ```
 //!
 //! `UiRuntime::step()` is non-blocking: it processes pending touch events,
@@ -27,19 +41,27 @@
 //! and audible notifications, and returns immediately.
 //! `UiRuntime::run_splash_ripple()` is the one exception — it deliberately
 //! BLOCKS the calling thread for the boot splash's one-shot ripple animation,
-//! on a dedicated tight render loop with no radio/GPS/input polling
-//! interleaved (see that method's doc and `screens::splash`'s module doc for why).
+//! on a dedicated tight render loop with no touch/keyboard polling
+//! interleaved (see that method's doc and `screens::splash`'s module doc for
+//! why) — post-split this no longer defers radio RX either, since the radio
+//! lives on a different task entirely (D8's "boot RX gap disappears").
 //!
-//! # Message passing (radio → UI)
+//! # Message passing (dispatcher ↔ UI)
 //!
-//! Radio events are posted via [`UiRuntime::post_event`], which is called from
-//! the receive handler in `main.rs` when a new DM or group message arrives:
+//! Radio/dispatcher events reach the UI via the `Receiver<UiEvent>` `ui_task`
+//! owns, forwarded into [`UiRuntime::post_event`] as shown above — the
+//! dispatcher-side producer is `main.rs::send_ui_event`, a thin `try_send`
+//! wrapper (ADR-0012 C2: a full/disconnected event queue drops the event and
+//! counts it, it never blocks the dispatcher):
 //!
 //! ```rust,ignore
-//! app.post_event(UiEvent::IncomingDm { from_hash: 0x42, text: "hi :smile:".into() });
+//! send_ui_event(&evt_tx, &mut evt_dropped, UiEvent::IncomingDm { from_hash: 0x42, from_name: "…".into(), text: "hi :smile:".into() });
 //! ```
 //!
-//! The UI runtime processes these events on the next `step()` call.
+//! The UI runtime processes these events on the next `step()` call. Commands
+//! flow the other way, straight from `UiRuntime` methods (`on_send_message`,
+//! `persist_runtime_settings`) onto the `SyncSender<UiCommand>` `UiRuntime`
+//! itself owns (`cmd_tx`) — see [`UiRuntime::try_send_command`].
 //!
 //! # Buzzer (audible notifications)
 //!
@@ -83,7 +105,11 @@ use esp_idf_hal::i2s::{
     config::{Config as I2sChannelConfig, DataBitWidth, SlotMode, StdClkConfig, StdConfig, StdGpioConfig, StdSlotConfig},
     I2s, I2sDriver, I2sTx,
 };
-use esp_idf_svc::nvs::{EspNvsPartition, NvsDefault};
+// `cmd_tx` (ADR-0012 D3): the dispatcher-bound command channel. `SyncSender`
+// is `Clone` (needed to hand a copy into each `'static` Slint toggle
+// closure — see `persist_runtime_settings`'s call sites) and `try_send`
+// never blocks the UI task (C2).
+use std::sync::mpsc::SyncSender;
 
 // `pin_menu` is compiled in all builds (pure Rust, no ESP-IDF deps) so this
 // import is unconditional.
@@ -296,6 +322,91 @@ pub enum UiEvent {
         room_hash: u8,
         reason: String,
     },
+    /// Boot has reached steady state (`main.rs::run()`'s dispatcher loop is
+    /// about to start, or — unprovisioned boot — the USB-provisioning wait
+    /// loop is about to start). Pre-split this was a direct
+    /// `UiRuntime::mark_app_ready()` + `UiRuntime::run_splash_ripple()` call
+    /// pair from `main.rs`; post-split `main.rs` cannot name `UiRuntime`
+    /// (ADR-0012 D4.2), so this event carries the same signal across the
+    /// queue instead. `ui_task`'s own loop intercepts this variant directly
+    /// (ADR-0012 D8 step 9) — `run_splash_ripple` deliberately blocks the
+    /// calling thread for ~1.15s on a dedicated render loop, which
+    /// `handle_event` (called from inside the ordinary per-tick `step()`)
+    /// is the wrong place to do — so this variant never actually reaches
+    /// `handle_event`; the match arm below exists only so the enum stays
+    /// exhaustively matched.
+    AppReady,
+    /// Every boot-time (`main.rs::run()`'s bring-up path) `UiRuntime` seed
+    /// call, bundled into one message (ADR-0012 C5) — see [`BootSeed`]'s
+    /// own doc for why one message replaces what used to be up to six
+    /// direct calls, and why the payload is `Box`ed.
+    BootSeed(Box<BootSeed>),
+    /// Live stdin RX byte counter on the unprovisioned screen, mirrored from
+    /// `main.rs`'s USB-provisioning wait loop. Available only with
+    /// `--features diagnostics` (matches [`UiRuntime::set_prov_rx_bytes`],
+    /// which this event now routes to via `handle_event` instead of a
+    /// direct call).
+    #[cfg(feature = "diagnostics")]
+    ProvRxBytes(u32),
+    /// Change-detected GPS status push (ADR-0012 C4) — the dispatcher holds
+    /// the last-sent value and sends only on change; `UiRuntime::
+    /// set_gps_status`'s own early-return stays as defence in depth.
+    GpsStatusChanged(gps::GpsStatus),
+    /// Change-detected room-clock-provenance push (ADR-0012 C4) — same
+    /// dedup discipline as `GpsStatusChanged`. See `UiRuntime::
+    /// set_room_clock_source`'s doc for the field meanings.
+    RoomClockChanged {
+        source: room_session::ClockSource,
+        wall_clock_secs: Option<u32>,
+        age_secs: u32,
+    },
+    /// Change-detected battery status push (ADR-0012 C4). See `UiRuntime::
+    /// set_battery_status`.
+    BatteryStatusChanged(battery::BatteryStatus),
+    /// Change-detected signal-meter push (ADR-0012 C4). See `UiRuntime::
+    /// set_signal_level`.
+    SignalLevelChanged(SignalLevel),
+}
+
+/// Every boot-time (`main.rs::run()`'s bring-up path) `UiRuntime` seed call,
+/// bundled into one message (ADR-0012 C5).
+///
+/// Pre-split, `main.rs` called `register_room`/`register_contact`/
+/// `set_channels`/`set_pin`/`set_runtime_settings`/`seed_conversation`
+/// directly, inline, from its bring-up match arms — safe because `main.rs`
+/// and the UI shared one thread. Post-split, `main.rs` cannot even name
+/// `UiRuntime` (D4.2), so it accumulates the exact same data into this
+/// struct across its bring-up path instead, and sends it as ONE
+/// `UiEvent::BootSeed` immediately before `UiEvent::AppReady` (D8 step 8).
+///
+/// `Box`ed by the `UiEvent::BootSeed` variant it travels in specifically so
+/// this struct's size — the largest of any `UiEvent` payload by a wide
+/// margin (it carries every provisioned contact/channel/room name and every
+/// restored conversation's message history) — does not inflate every one of
+/// the event channel's 32 queue slots (C5).
+#[derive(Debug, Default)]
+pub struct BootSeed {
+    /// `(hash, can_post)`, one per provisioned room — see
+    /// [`UiRuntime::register_room`].
+    pub rooms: Vec<(u8, bool)>,
+    /// `(hash, display_name)`, one per provisioned non-room contact — see
+    /// [`UiRuntime::register_contact`].
+    pub contacts: Vec<(u8, String)>,
+    /// The full channel list (true channels ∪ rooms, unioned exactly as
+    /// `main.rs`'s provisioning-gate arm already built it) — see
+    /// [`UiRuntime::set_channels`].
+    pub channels: Vec<screens::contact_list::ChannelItem>,
+    /// The provisioned PIN + its length (`pin_len == 0` disables the lock)
+    /// — see [`UiRuntime::set_pin`].
+    pub pin: [u8; pin_menu::MAX_PIN_LEN],
+    pub pin_len: u8,
+    /// The on-device admin-menu settings loaded from NVS at boot (or the
+    /// provisioning-time defaults on first boot) — see [`UiRuntime::
+    /// set_runtime_settings`].
+    pub runtime_settings: pin_menu::RuntimeSettings,
+    /// `(hash, is_channel, records)`, one per conversation with restored
+    /// flash history — see [`UiRuntime::seed_conversation`].
+    pub conversations: Vec<(u8, bool, Vec<MessageRecord>)>,
 }
 
 /// Commands from the UI layer to the radio dispatcher.
@@ -322,6 +433,11 @@ pub enum UiCommand {
         room_hash: u8,
         text: String,
     },
+    /// Persist the on-device admin-menu `RuntimeSettings` to NVS (ADR-0012
+    /// C6: the UI never writes flash itself — `set_nvs_partition` and its
+    /// four direct `runtime_settings_store::save` call sites are deleted).
+    /// `main.rs` persists to the `mc_rts` namespace on receipt.
+    PersistRuntimeSettings(pin_menu::RuntimeSettings),
 }
 
 // ── Buzzer driver ─────────────────────────────────────────────────────────────
@@ -529,9 +645,20 @@ pub struct UiRuntime<'d> {
     /// init failed at boot (UI degrades to visual-only notifications, same
     /// graceful-degradation pattern as `keyboard`).
     buzzer: Option<BuzzerDriver<'d>>,
-    /// Pending commands for the radio layer (drained by `drain_commands`).
-    commands: Vec<UiCommand>,
-    /// Buffered incoming events to process on next `step()`.
+    /// The dispatcher-bound command channel (ADR-0012 D3) — `on_send_message`
+    /// and `persist_runtime_settings` `try_send` onto this directly (C2:
+    /// never blocks; a full/disconnected queue surfaces a refusal to the
+    /// user rather than dropping silently — see `try_send_command`).
+    /// Replaces the pre-split `commands: Vec<UiCommand>` buffer main.rs used
+    /// to drain via `drain_commands()`; the dispatcher now owns the
+    /// `Receiver<UiCommand>` half directly and drains it itself.
+    cmd_tx: SyncSender<UiCommand>,
+    /// Buffered incoming events to process on next `step()`. Fed by
+    /// `post_event` — called both by `ui_task`'s own loop (forwarding
+    /// whatever it reads off the dispatcher-bound `Receiver<UiEvent>`; see
+    /// `ui_task`'s module doc) and by this module's own internal
+    /// same-tick-deferred notices (e.g. `RoomPostRefused`, raised from
+    /// `on_send_message`).
     events: Vec<UiEvent>,
     /// Message history per contact hash (hash → Vec<MessageRecord>).
     messages: std::collections::HashMap<u8, Vec<MessageRecord>>,
@@ -587,11 +714,6 @@ pub struct UiRuntime<'d> {
     /// stays hardware/settings-agnostic — it only ever sees a `NotifPrefs`
     /// table, never `pin_menu::RuntimeSettings`.
     runtime_settings: std::rc::Rc<std::cell::RefCell<pin_menu::RuntimeSettings>>,
-    /// NVS partition handle for persisting `runtime_settings`, wired by
-    /// `set_nvs_partition` once the device's provisioned config has loaded.
-    /// `None` until then (or on builds with no NVS, e.g. hil) — toggles
-    /// still apply in memory but log a warning instead of persisting.
-    nvs_partition: Option<EspNvsPartition<NvsDefault>>,
     /// Pending navigation request set from Slint callbacks.
     ///
     /// `0` = none, `1` = navigate to PinEntry, `2` = navigate to ContactList,
@@ -968,6 +1090,7 @@ impl<'d> UiRuntime<'d> {
     ///
     /// `is_provisioned`: if false, the initial screen is `Unprovisioned`.
     /// `pubkey_hex`: this device's public key in hex (shown on unprovisioned screen).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         display: TDeckDisplay<'d>,
         touch: TouchDriver<'d>,
@@ -977,6 +1100,11 @@ impl<'d> UiRuntime<'d> {
         is_provisioned: bool,
         pubkey_hex: &str,
         self_name: &str,
+        // ADR-0012 D3: the dispatcher-bound command channel — replaces the
+        // pre-split `commands: Vec<UiCommand>` buffer. Constructed by
+        // `ui_task::spawn` alongside the event channel; see this struct's
+        // `cmd_tx` field doc.
+        cmd_tx: SyncSender<UiCommand>,
     ) -> anyhow::Result<Self> {
         // Install the Slint platform (panics if called twice) and obtain the
         // cooperative rendering handle for the single shared software window.
@@ -1038,7 +1166,7 @@ impl<'d> UiRuntime<'d> {
             active_screen,
             notif: NotifDispatcher::new(notification::NotifPrefs::default()),
             buzzer,
-            commands: Vec::new(),
+            cmd_tx,
             events: Vec::new(),
             messages: std::collections::HashMap::new(),
             contact_names: std::collections::HashMap::new(),
@@ -1053,7 +1181,6 @@ impl<'d> UiRuntime<'d> {
             runtime_settings: std::rc::Rc::new(std::cell::RefCell::new(
                 pin_menu::RuntimeSettings::default_enabled(),
             )),
-            nvs_partition: None,
             pending_nav,
             pending_nav_hash,
             pin_digits: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
@@ -1190,17 +1317,11 @@ impl<'d> UiRuntime<'d> {
     }
 
     /// Seed the on-device admin-menu `RuntimeSettings` (loaded from NVS by
-    /// the caller via `runtime_settings_store::load`).  Called once from
-    /// `main.rs` alongside `set_pin`/`set_nvs_partition`.
+    /// the caller via `runtime_settings_store::load`).  Called once, as part
+    /// of `UiEvent::BootSeed` (see [`BootSeed::runtime_settings`]), alongside
+    /// `set_pin`.
     pub fn set_runtime_settings(&mut self, settings: pin_menu::RuntimeSettings) {
         *self.runtime_settings.borrow_mut() = settings;
-    }
-
-    /// Wire the NVS partition handle used to persist `runtime_settings` after
-    /// an admin-menu toggle.  Called once from `main.rs` after the
-    /// provisioned config has loaded.
-    pub fn set_nvs_partition(&mut self, nvs: EspNvsPartition<NvsDefault>) {
-        self.nvs_partition = Some(nvs);
     }
 
     /// Update the live stdin RX byte counter on the unprovisioned screen.
@@ -1492,13 +1613,13 @@ impl<'d> UiRuntime<'d> {
     }
 
     /// Post an event from the radio layer.  Processed on the next `step()`.
+    ///
+    /// Called both by `ui_task`'s own loop (forwarding whatever it reads off
+    /// the dispatcher-bound `Receiver<UiEvent>` — see `ui_task`'s module
+    /// doc) and internally by this module (same-tick-deferred notices, e.g.
+    /// `RoomPostRefused` from `on_send_message`).
     pub fn post_event(&mut self, event: UiEvent) {
         self.events.push(event);
-    }
-
-    /// Drain pending commands for the radio dispatcher.
-    pub fn drain_commands(&mut self) -> impl Iterator<Item = UiCommand> + '_ {
-        self.commands.drain(..)
     }
 
     /// One cooperative step: process events, tick Slint, redraw if needed.
@@ -2063,6 +2184,34 @@ impl<'d> UiRuntime<'d> {
 
     fn handle_event(&mut self, event: UiEvent, now_ms: u64) {
         match event {
+            // `ui_task`'s own loop intercepts `AppReady` before it is ever
+            // handed to `post_event` (D8 step 9 — `run_splash_ripple` blocks
+            // for ~1.15s on a dedicated render loop, which this per-tick
+            // handler is the wrong place to do). This arm exists only so the
+            // match stays exhaustive; unreachable in practice.
+            UiEvent::AppReady => {}
+            UiEvent::BootSeed(seed) => {
+                for (hash, can_post) in seed.rooms {
+                    self.register_room(hash, can_post);
+                }
+                for (hash, name) in seed.contacts {
+                    self.register_contact(hash, name);
+                }
+                self.set_channels(&seed.channels);
+                self.set_pin(seed.pin, seed.pin_len);
+                self.set_runtime_settings(seed.runtime_settings);
+                for (hash, is_channel, records) in seed.conversations {
+                    self.seed_conversation(hash, is_channel, records);
+                }
+            }
+            #[cfg(feature = "diagnostics")]
+            UiEvent::ProvRxBytes(n) => self.set_prov_rx_bytes(n),
+            UiEvent::GpsStatusChanged(status) => self.set_gps_status(status),
+            UiEvent::RoomClockChanged { source, wall_clock_secs, age_secs } => {
+                self.set_room_clock_source(source, wall_clock_secs, age_secs);
+            }
+            UiEvent::BatteryStatusChanged(status) => self.set_battery_status(status),
+            UiEvent::SignalLevelChanged(level) => self.set_signal_level(level),
             UiEvent::IncomingDm { from_hash, from_name, text } => {
                 self.contact_names
                     .entry(from_hash)
@@ -2444,6 +2593,50 @@ impl<'d> UiRuntime<'d> {
         }
     }
 
+    /// Attempt to enqueue `cmd` on the dispatcher-bound command channel
+    /// (ADR-0012 D3/C2).
+    ///
+    /// `try_send` never blocks the UI task. On success this is a no-op
+    /// beyond the send itself. On failure (a full queue — capacity 16
+    /// against human-typing-rate production makes this unreachable in
+    /// practice, C2 — or a disconnected one, which would mean the
+    /// dispatcher task itself is gone) the send is NOT silently dropped:
+    /// C2 requires the UI surface the failure to the user, via the exact
+    /// same "<name>: <body>" system-notice rendering
+    /// [`UiEvent::RoomPostRefused`] already established, generalised here
+    /// to DMs and channel messages. `hash`/`is_channel` identify which
+    /// conversation to render the notice into (same convention as
+    /// `refresh_message_view_for`).
+    fn try_send_command(&mut self, cmd: UiCommand, hash: u8, is_channel: bool) {
+        if let Err(e) = self.cmd_tx.try_send(cmd) {
+            log::warn!(
+                "ui: command queue full/disconnected — refusing send to 0x{:02x}: {:?}",
+                hash, e,
+            );
+            let now_ms = crate::uptime_ms();
+            self.messages
+                .entry(hash)
+                .or_default()
+                .push(MessageRecord {
+                    text: "System: send queue is busy — try again in a moment".to_string(),
+                    is_ours: false,
+                    acked: false,
+                    ts_ms: now_ms,
+                });
+            if let ActiveScreen::ContactList(ref screen) = self.active_screen {
+                let channels = build_channel_items(
+                    &self.channel_items, &self.messages, &self.unread,
+                );
+                screen.set_channels(&channels);
+                let contacts = build_contact_items(
+                    &self.contact_names, &self.messages, &self.unread,
+                );
+                screen.set_contacts(&contacts);
+            }
+            self.refresh_message_view_for(hash, is_channel);
+        }
+    }
+
     /// Route a composed message to the right transport and store it locally.
     ///
     /// Expands `:shortcode:` emoji, wraps `@name` mentions into their wire
@@ -2518,7 +2711,7 @@ impl<'d> UiRuntime<'d> {
         // shown here means nothing ever needs to be retracted there.
         if self.room_permissions.contains_key(&hash) {
             log::info!("ui: send room post room=0x{:02x} ({} bytes)", hash, text.len());
-            self.commands.push(UiCommand::SendRoomPost { room_hash: hash, text });
+            self.try_send_command(UiCommand::SendRoomPost { room_hash: hash, text }, hash, true);
         } else {
             self.messages
                 .entry(hash)
@@ -2531,10 +2724,10 @@ impl<'d> UiRuntime<'d> {
                 });
             if is_channel {
                 log::info!("ui: send GRP_TXT ch={:#04x} ({} bytes)", hash, text.len());
-                self.commands.push(UiCommand::SendGroupMsg { channel_hash: hash, text });
+                self.try_send_command(UiCommand::SendGroupMsg { channel_hash: hash, text }, hash, true);
             } else {
                 log::info!("ui: send DM to={:#04x} ({} bytes)", hash, text.len());
-                self.commands.push(UiCommand::SendDm { to_hash: hash, text });
+                self.try_send_command(UiCommand::SendDm { to_hash: hash, text }, hash, false);
             }
         }
         // Refresh the live MessageView if this conversation is the active screen.
@@ -2692,22 +2885,22 @@ impl<'d> UiRuntime<'d> {
         // Visual-notifications toggle: apply via pin_menu::apply_menu_action,
         // then persist the whole RuntimeSettings to NVS.
         let settings = self.runtime_settings.clone();
-        let nvs = self.nvs_partition.clone();
+        let cmd_tx = self.cmd_tx.clone();
         screen.on_toggle_notif_visual(move |new_val| {
             let mut s = settings.borrow_mut();
             pin_menu::apply_menu_action(&pin_menu::MenuAction::SetNotifVisual(new_val), &mut s);
             log::info!("pin_menu: notif_visual -> {}", new_val);
-            persist_runtime_settings(&nvs, &s);
+            persist_runtime_settings(&cmd_tx, &s);
         });
 
         // Audible-notifications toggle: same pattern.
         let settings = self.runtime_settings.clone();
-        let nvs = self.nvs_partition.clone();
+        let cmd_tx = self.cmd_tx.clone();
         screen.on_toggle_notif_audible(move |new_val| {
             let mut s = settings.borrow_mut();
             pin_menu::apply_menu_action(&pin_menu::MenuAction::SetNotifAudible(new_val), &mut s);
             log::info!("pin_menu: notif_audible -> {}", new_val);
-            persist_runtime_settings(&nvs, &s);
+            persist_runtime_settings(&cmd_tx, &s);
         });
 
         // Screen-sleep timeout stepper: same apply/persist pattern as the
@@ -2715,7 +2908,7 @@ impl<'d> UiRuntime<'d> {
         // (decrement) or 120 (increment) i32; apply_menu_action re-clamps to
         // 0..=120 as the single source of truth (see MenuAction::SetScreenSleepTimeout).
         let settings = self.runtime_settings.clone();
-        let nvs = self.nvs_partition.clone();
+        let cmd_tx = self.cmd_tx.clone();
         screen.on_decrement_screen_sleep_timeout(move |new_val| {
             let mut s = settings.borrow_mut();
             pin_menu::apply_menu_action(
@@ -2723,10 +2916,10 @@ impl<'d> UiRuntime<'d> {
                 &mut s,
             );
             log::info!("pin_menu: screen_sleep_timeout_s -> {}", s.screen_sleep_timeout_s);
-            persist_runtime_settings(&nvs, &s);
+            persist_runtime_settings(&cmd_tx, &s);
         });
         let settings = self.runtime_settings.clone();
-        let nvs = self.nvs_partition.clone();
+        let cmd_tx = self.cmd_tx.clone();
         screen.on_increment_screen_sleep_timeout(move |new_val| {
             let mut s = settings.borrow_mut();
             pin_menu::apply_menu_action(
@@ -2734,7 +2927,7 @@ impl<'d> UiRuntime<'d> {
                 &mut s,
             );
             log::info!("pin_menu: screen_sleep_timeout_s -> {}", s.screen_sleep_timeout_s);
-            persist_runtime_settings(&nvs, &s);
+            persist_runtime_settings(&cmd_tx, &s);
         });
 
         // "📍 GPS status" row → GpsStatus sub-screen (read-only, no state to
@@ -3326,47 +3519,32 @@ impl<'d> UiRuntime<'d> {
 // imports near the top of this file) so their tests execute under `cargo
 // test --workspace` (this crate's `#[cfg(test)]` blocks are type-checked
 // but never executed on host — see the NOTE above `mod tests` below).
-// `persist_runtime_settings`/`log_stack_hwm` below stay: the former touches
-// real NVS hardware, the latter is an unsafe FreeRTOS stack-introspection
-// call — both genuinely device-only. See
-// `docs/adr/0005-firmware-core-extraction.md`.
+// `persist_runtime_settings`/`log_stack_hwm` below stay: the former sends on
+// a real channel, the latter is an unsafe FreeRTOS stack-introspection call
+// — both genuinely device-only. See `docs/adr/0005-firmware-core-extraction.md`.
 
-/// Persist `settings` to NVS via `runtime_settings_store::save`, if a
-/// partition handle has been wired (`UiRuntime::set_nvs_partition`).
+/// Send `settings` to the dispatcher for NVS persistence
+/// (`UiCommand::PersistRuntimeSettings` — ADR-0012 C6: the UI never writes
+/// flash itself; `main.rs` persists to the `mc_rts` namespace on receipt).
 ///
 /// A free function (not a `UiRuntime` method) because it is called from
 /// inside `'static` Slint toggle closures, which cannot capture `&self`.
 ///
-/// `runtime_settings_store` is a production-only module (`#[cfg(not(feature =
-/// "hil"))]` in `main.rs`, mirroring `config_store`'s exclusion — the hil
-/// build role has no NVS at all), so this function has a matching `#[cfg]`
-/// split: the production path saves; the hil path is a documented no-op (the
-/// toggle still applies in memory for the run).
-#[cfg(not(feature = "hil"))]
+/// `try_send` never blocks; on a full/disconnected queue this logs a warning
+/// rather than escalating — a dropped settings-persist is a "toggle applies
+/// this session but reverts on reboot" degradation, not a lost message the
+/// user is waiting on (unlike `UiRuntime::try_send_command`'s DM/channel/
+/// room-post refusal surface, which the user needs to see directly).
 fn persist_runtime_settings(
-    nvs: &Option<EspNvsPartition<NvsDefault>>,
+    cmd_tx: &SyncSender<UiCommand>,
     settings: &pin_menu::RuntimeSettings,
 ) {
-    match nvs {
-        Some(n) => {
-            if let Err(e) = crate::runtime_settings_store::save(n.clone(), settings) {
-                log::error!("runtime_settings_store: save failed: {:?}", e);
-            }
-        }
-        None => {
-            log::warn!("ui: no NVS partition wired — admin-menu toggle not persisted");
-        }
+    if let Err(e) = cmd_tx.try_send(UiCommand::PersistRuntimeSettings(settings.clone())) {
+        log::warn!(
+            "ui: command queue full/disconnected — runtime-settings persist dropped: {:?}",
+            e,
+        );
     }
-}
-
-#[cfg(feature = "hil")]
-fn persist_runtime_settings(
-    _nvs: &Option<EspNvsPartition<NvsDefault>>,
-    _settings: &pin_menu::RuntimeSettings,
-) {
-    // hil builds have no NVS-backed runtime_settings_store (see module
-    // #[cfg] in main.rs) — the toggle still applies to the in-memory
-    // RuntimeSettings for the duration of the run.
 }
 
 /// Log the main-task stack high-water mark, unconditionally, tagged with
