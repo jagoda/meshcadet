@@ -56,6 +56,13 @@ pub struct TrafficCounters {
     /// by this model.
     pub frames_dropped: usize,
     pub frames_transmitted: usize,
+    /// Times a pending TX was denied by the REAL `AirtimeBudget::
+    /// can_transmit` (10% duty-cycle cap) and backed off rather than sent.
+    /// This model always treats CAD as clear (see `attempt_cad_tx`'s doc),
+    /// so this is the ONLY backoff-triggering path here — a nonzero count
+    /// means the duty-cycle cap, not just the queue depth, genuinely
+    /// bound this run's throughput.
+    pub budget_denials: usize,
 }
 
 /// One "service point" distribution: for the UI-unserviced-gap runs, gaps
@@ -191,8 +198,22 @@ fn attempt_cad_tx(
     } else {
         // Airtime-budget denial — same non-blocking backoff shape as a
         // CAD-busy result (`firmware/src/main.rs:2371-2384`): the frame
-        // stays queued for the next attempt instead of being dropped.
+        // stays queued for the next attempt instead of being dropped. The
+        // real code jitters this 1000-3000 ms (`1000 + pub_hash() % 2000`);
+        // this model fixes it at the low end of that range deterministically
+        // (see the crate root doc's "Determinism" section — no PRNG
+        // anywhere in this crate). This DOES fire in the headline sweep: a
+        // 255 B payload's 800 ms airtime against a 5 s inbound-DM cadence is
+        // a ~16% duty cycle, over `AirtimeBudget`'s real 10% cap
+        // (`BUDGET_MAX_MS`/`BUDGET_WINDOW_MS`), so some attempts are
+        // genuinely denied and back off. It does NOT skew this crate's
+        // headline metrics (longest gap, dominance): a denied attempt costs
+        // only `cad_cost` here (CAD_ACTIVE_MS + the small SPI-overhead
+        // range) — `t_ms < cad_backoff_until_ms` skips CAD+TX ENTIRELY on
+        // every iteration while backed off, so backoff duration changes how
+        // often a TX attempt is retried, not the size of any one gap.
         *cad_backoff_until_ms = t_ms + cad_cost + 1_000.0;
+        traffic.budget_denials += 1;
         cad_cost
     }
 }
@@ -585,5 +606,27 @@ mod tests {
         workload.inbound_dm.interval_ms = Some(1.0); // far faster than any real radio
         let stats = simulate_core(&r, &workload, 5_000.0, true);
         assert!(stats.traffic.frames_dropped > 0);
+    }
+
+    #[test]
+    fn headline_255b_sweep_genuinely_exercises_airtime_budget_denial() {
+        // A 255 B ACK's 800 ms airtime against the headline sweep's 5 s
+        // inbound-DM cadence is a ~16% duty cycle, over `AirtimeBudget`'s
+        // real 10% cap — so the report's 255 B row is not purely a string
+        // of clean transmits; the budget-denial backoff branch in
+        // `attempt_cad_tx` genuinely fires. Pins that fact so a future
+        // change to either the headline workload or `AirtimeBudget` itself
+        // that accidentally stops exercising this branch is caught, rather
+        // than silently leaving it untested by the crate's own headline
+        // scenario.
+        let params = LoopModelParams::documented_defaults();
+        let r = params.resolve(Corner::Mid);
+        let workload = Workload::payload_sweep(255);
+        let stats = simulate_core(&r, &workload, crate::report::SIM_DURATION_MS, true);
+        assert!(
+            stats.traffic.budget_denials > 0,
+            "expected the 10% duty-cycle cap to genuinely deny at least one \
+             255 B attempt over the headline sweep's duration"
+        );
     }
 }

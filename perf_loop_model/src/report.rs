@@ -138,7 +138,13 @@ pub fn render_text_report() -> String {
         "service_hz"
     )
     .unwrap();
-    for row in full_sweep() {
+    // Computed once and reused for both tables below — each `SweepRow` runs
+    // a full discrete-event simulation, so recomputing it a second time for
+    // the cadence table would silently double this function's total work
+    // for no reason.
+    let sweep = full_sweep();
+
+    for row in &sweep {
         let r = &row.result;
         writeln!(
             out,
@@ -172,7 +178,7 @@ pub fn render_text_report() -> String {
         "topology", "corner", "payload_B", "longest_ms", "p95_ms", "iter_hz"
     )
     .unwrap();
-    for row in full_sweep() {
+    for row in &sweep {
         let r = &row.result;
         writeln!(
             out,
