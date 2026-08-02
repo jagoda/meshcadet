@@ -364,11 +364,14 @@ This refines the constraint `docs/perf/spi2-arbitration-r1.md` §Q3 flagged
 for this ADR. That analysis correctly observed there is no explicit
 `unsafe impl Sync for SpiDriver` in the crate and concluded `Arc<SpiDriver>`
 would not be `Send`; it stopped short of checking structural
-auto-derivation. There *is* an explicit `unsafe impl Send` (`spi.rs:655`)
-because `Mutex<EspRawMutex, ()>: Send` needs `EspRawMutex: Send` through
-embassy-sync's own bound — but `Sync` needs no explicit impl, and gets one
-for free. R1's substantive point is untouched: whatever container resolves
-`'static`, the arbitration mechanism underneath is identical.
+auto-derivation. **The absence of an explicit `unsafe impl Sync` is not
+evidence that the type is `!Sync`** — auto traits are derived structurally
+unless a field negates them, and here nothing does. (The explicit
+`unsafe impl Send` at `spi.rs:655` is defensive; it does not imply the
+matching `Sync` was withheld deliberately.) R1's substantive point is
+untouched either way: whatever container resolves `'static`, the arbitration
+mechanism underneath is identical — which is why the fallback below is
+equally acceptable if CI disagrees with this reading.
 
 **Soundness of leaking** (three conditions, all met):
 
