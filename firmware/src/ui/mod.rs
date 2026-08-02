@@ -384,7 +384,7 @@ pub enum UiEvent {
 /// margin (it carries every provisioned contact/channel/room name and every
 /// restored conversation's message history) — does not inflate every one of
 /// the event channel's 32 queue slots (C5).
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct BootSeed {
     /// `(hash, can_post)`, one per provisioned room — see
     /// [`UiRuntime::register_room`].
