@@ -477,6 +477,15 @@ console, add them as additional `notes:` lines in the `felt-snappiness`
 block, one line per named step (e.g. `notes: step2_tap_to_frame_ms=180;
 step3_tap_to_frame_ms=210; step4_tap_to_rocket_ms=95`).
 
+**Where this goes.** Paste the block(s) above wherever is convenient (a
+mission dossier, a file) and hand it to `perf_device_report` — `cargo run
+-p perf_device_report --bin ingest_device_report -- <path>` — which parses,
+archives it under `docs/perf/device-reports/` (schema in that directory's
+`README.md`), and, for a `calibration` block, reports which of
+`perf_loop_model`'s swept constants it can now replace with a measured
+point. This crate never touches a serial device itself; it starts only
+once a human has already produced the pasted text above.
+
 ## 10. Safety / recovery — returning to a normal build
 
 `--features diagnostics` and `--features hil` are both compile-time flags,
