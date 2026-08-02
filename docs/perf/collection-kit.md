@@ -83,10 +83,14 @@ near-duplicate documents:
   before you start:
   ```sh
   git -C firmware log --oneline -1
-  grep -rn "features = \[\"firmware-core/diagnostics\"\]" firmware/Cargo.toml
+  test -f firmware/src/perf.rs && grep -n "PERF phase=" firmware/src/main.rs
   ```
-  If that grep prints nothing, this ref predates the instrumentation and this
-  kit cannot run against it.
+  This checks for the actual PR jagoda/meshcadet#120 artifacts — the
+  `perf.rs` module and the `PERF phase=` rollup log line — rather than the
+  `diagnostics` Cargo feature name, which exists in `firmware/Cargo.toml`
+  independent of whether this ref's instrumentation code has landed. If
+  `perf.rs` doesn't exist, or the grep prints nothing, this ref predates the
+  instrumentation and this kit cannot run against it.
 - **M1 run (after the task/core split lands):** `<REF>` = the merge commit
   that lands the split.
 - **M2 run (after the radio-path timeliness work lands):** `<REF>` = the merge
@@ -113,10 +117,18 @@ cd firmware
 cargo run --release --features diagnostics 2>&1 | tee ../meshcadet-capture-<REF>-baseline.log
 ```
 
-If `espflash` can't auto-detect the port:
+If `espflash` can't auto-detect the port, set `ESPFLASH_PORT` rather than
+passing `-- --port ...`: the firmware target's custom flash runner
+(`firmware/.cargo/config.toml` → `scripts/flash-with-partition-table.sh`)
+only ever forwards its first positional arg (the built ELF) to `espflash` —
+anything `cargo run` appends after `--` is silently dropped before it
+reaches `espflash flash`/`write-bin`/`monitor`, so `-- --port ...` has no
+effect here even though the identical-looking form works for the `host`
+crate's own CLI (Part B below) and for `README.md`'s top-level "Building and
+flashing" section, neither of which goes through this runner:
 
 ```sh
-cargo run --release --features diagnostics -- --port /dev/ttyACM0 2>&1 | tee ../meshcadet-capture-<REF>-baseline.log
+ESPFLASH_PORT=/dev/ttyACM0 cargo run --release --features diagnostics 2>&1 | tee ../meshcadet-capture-<REF>-baseline.log
 ```
 
 (Swap `/dev/ttyACM0` for `COMx` on Windows or `/dev/cu.usbmodem*` on macOS.)
@@ -482,8 +494,14 @@ retaining the NVS-persisted identity and provisioning from before — the `hil`
 build's fixed compiled seed does **not** overwrite the real, persisted
 identity; it's read only while the `hil` feature is active. If you provisioned
 the Part B dummy contact and don't want it lingering, remove it with the host
-CLI's contact-management command before or after returning to production; it
-is otherwise harmless (an unreachable allowlist entry, never emitting
+CLI's `del-contact` subcommand before or after returning to production:
+
+```sh
+cargo run -p host -- --port /dev/ttyACM0 del-contact --pubkey <the same 64 hex chars from Part B>
+cargo run -p host -- --port /dev/ttyACM0 commit
+```
+
+It is otherwise harmless (an unreachable allowlist entry, never emitting
 anything on its own).
 
 If anything in this session left the device in a confusing state (stuck
