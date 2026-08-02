@@ -323,8 +323,8 @@ source with no unmeasured constant in the derivation — every number above
 constant, not something that varies at runtime or needs a bench reading.
 
 One item is genuinely a confidence check rather than an open correctness
-question, and is named here so the collection kit can carry it if the
-Commander wants the belt-and-suspenders reading:
+question, and is named here so the collection kit can carry it if a
+maintainer wants the belt-and-suspenders reading:
 
 - **Confirm the 12.8 µs bound empirically under real concurrent load.** The
   derivation in §Q5 reads ESP-IDF's `spi_bus_lock` FSM design (request/lock
