@@ -18,12 +18,12 @@
 //! ```
 //!
 //! (the whole thing is normally wrapped in a ` ```meshcadet-perf-report `
-//! / ` ``` ` markdown fence when pasted into a doc or dossier — this
+//! / ` ``` ` markdown fence when pasted into a doc or tracking note — this
 //! parser accepts the block with or without that fence, see
 //! [`parse_report_blocks`]'s "works without markdown fences" test).
 //!
-//! A single document (a dossier `## Notes` section, a plain text file) may
-//! carry more than one block back to back — §9 says up to 6 additional
+//! A single document (a tracking note's `## Notes` section, a plain text
+//! file) may carry more than one block back to back — §9 says up to 6 additional
 //! blocks for Part G's payload/ui-load sweep on top of the single-device
 //! baseline block. [`parse_report_blocks`] finds and parses every one it
 //! sees, independently; one malformed block does not lose the others (its

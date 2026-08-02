@@ -12,7 +12,7 @@ reading the ingest crate's source.
 
 A human operator runs the on-device collection kit (`docs/perf/
 collection-kit.md`) and pastes the resulting `meshcadet-perf-report`
-block(s) back — into a mission dossier, this directory, wherever is
+block(s) back — into a tracking note, this directory, wherever is
 convenient. `perf_device_report` (root-workspace crate, `cargo run -p
 perf_device_report --bin ingest_device_report -- <path-to-pasted-text>`)
 parses that text and writes one file here per report block:
@@ -43,9 +43,9 @@ cargo run -p perf_device_report --bin ingest_device_report -- <path-to-file-cont
 
 Run from the repo root (the default archive directory, `docs/perf/
 device-reports`, is relative to the current directory). This is exactly
-what a follow-on `meshcadet-perf-device-report-ingest-2`-shaped mission
-does with the numbers once the Commander reports them — see this
-directory's parent mission's dossier for the standing re-queue command.
+what a follow-on `meshcadet-perf-device-report-ingest-2`-shaped effort
+does with the numbers once a maintainer reports them — re-run the same
+command above against the newly pasted block.
 
 For a `section: calibration` block, the same run also prints which of
 `perf_loop_model`'s four calibratable fields (`ui_step`, `cad_spi_
@@ -64,7 +64,7 @@ judgement call about what to write in prose, not a mechanical step).
 
 Every archived file is a real device reading — tag it **MEASURED (device,
 `<build_ref>`, `<capture_date>`)** wherever its numbers are quoted outside
-this directory (a doc, a dossier, a commit message). A `perf_loop_model`
+this directory (a doc, a tracking note, a commit message). A `perf_loop_model`
 sweep re-run against a calibrated point stays **SIMULATED** even when one
 or more of its INPUT constants came from here — see `perf_loop_model::
 report::render_text_report_with_params`'s own doc for why this crate
