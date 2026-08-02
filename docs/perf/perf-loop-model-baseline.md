@@ -96,7 +96,7 @@ The payload axis sweeps the same four sizes `docs/perf/ui-perf-baseline.md`
 ## 3. Reproduce
 
 ```sh
-cargo test -p perf_loop_model                                # 18 tests — correctness + regression guards
+cargo test -p perf_loop_model                                # 19 tests — correctness + regression guards
 cargo run  -p perf_loop_model --release --bin loop_model_report  # the report below
 ```
 
@@ -105,7 +105,9 @@ cargo run  -p perf_loop_model --release --bin loop_model_report  # the report be
 This is the milestone's own reroute condition: does a single radio-TX
 block, **by itself**, already exceed the WORST UI-unserviced gap achievable
 from routine per-iteration overhead alone (WDT/GPS/battery/room-sched/
-RX-poll/stats/`ui.step()`/drain) with **zero radio traffic at all**? If not
+RX-poll/stats/drain — `ui.step()`'s own duration is excluded by
+construction, since the gap is measured up to the start of the next
+`ui.step()` call, not across it) with **zero radio traffic at all**? If not
 — at every corner of the sensitivity range — later structural work should
 reroute to local UI-side optimization instead of a task/core split.
 

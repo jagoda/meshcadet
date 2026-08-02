@@ -424,8 +424,9 @@ pub const IDLE_FLOOR_DURATION_MS: f64 = 65_000.0;
 
 /// Whether a single radio-TX block, by itself, already exceeds the WORST
 /// UI-unserviced gap achievable from routine per-iteration overhead alone
-/// (WDT/GPS/battery/room-sched/RX-poll/stats/`ui.step()`/drain) with ZERO
-/// radio traffic at all — this pass's own abort/reroute question: if,
+/// (WDT/GPS/battery/room-sched/RX-poll/stats/drain — `ui.step()`'s own
+/// duration is excluded by construction; see `simulate_core`'s `gap` above)
+/// with ZERO radio traffic at all — this pass's own abort/reroute question: if,
 /// across the full plausible range of the un-measured constants, radio-TX
 /// blocking does NOT dominate the UI-unserviced gap, later milestones
 /// should reroute to local UI-side optimization instead of a task/core

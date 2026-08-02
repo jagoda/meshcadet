@@ -363,9 +363,9 @@ animation-triggered costs (comet/message-append/rocket) stay below the 5 ms
 `RX_POLL_YIELD_MS` window and cannot starve even a single RX-poll iteration;
 **the full-window navigation paint (~30.7 ms) now exceeds that window by
 ~6×**, so a navigation transition can push one RX-poll iteration's notice out
-by roughly that much — a timing shift, not a correctness gap, and still two
-orders of magnitude below the airtime blocks that dominate this budget
-regardless (§5.2).
+by roughly that much — a timing shift, not a correctness gap, and still
+roughly one order of magnitude below the airtime blocks that dominate this
+budget regardless (§5.2: the structural item is 2.7×–26× larger).
 
 **Direction B — radio delays UI.** Two mechanisms, an order of magnitude
 apart:
@@ -411,8 +411,9 @@ This is the consolidated list. Nothing needing a device is recorded anywhere
 else in this document; every [DEFERRED-DEVICE] tag above points here.
 
 **Prerequisites for all of them:** PR #120 merged (§7), a flashed T-Deck Plus
-built `--features diagnostics`, and — for D3–D6 — a second MeshCore-speaking
-peer node (`docs/hil-real-mesh-procedure.md`).
+built `--features diagnostics`, and — for D4–D6 — a second MeshCore-speaking
+peer node (`docs/hil-real-mesh-procedure.md`). D3 needs only the diagnostics
+build and a scripted usage session on the single flashed device, no peer.
 
 **Procedure source.** §8.1 below is the interim operator procedure. The
 campaign's planned `docs/perf/collection-kit.md` supersedes it once authored;
