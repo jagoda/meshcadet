@@ -243,8 +243,9 @@ impl<'d> TDeckDisplay<'d> {
     /// `.collect()` the converted RGB565 pixels into a heap `Vec` before
     /// calling this function with a `&[Rgb565]` slice — a fresh heap
     /// allocation (and matching deallocation) on EVERY dirty scanline,
-    /// confirmed at up to 240 times per full-window repaint (baseline ledger
-    /// §5 item 1, `docs/perf/ui-perf-baseline.md`). This runs nested inside
+    /// confirmed at up to 240 times per full-window repaint (now recorded as a
+    /// landed fix in `docs/perf/ui-perf-baseline.md` §3.4). This runs nested
+    /// inside
     /// `ui::step()` → `render_if_needed()`, once per main-task dispatcher-loop
     /// iteration — the SAME iteration whose wall-clock length determines how
     /// promptly the NEXT iteration's CAD attempt / RX poll runs (`main.rs`'s
