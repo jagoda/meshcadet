@@ -48,10 +48,12 @@
 //! `src/helpers/SX126XLT.cpp` @ dee3e26a.
 
 use esp_idf_hal::{
-    delay::FreeRtos,
-    gpio::{Input, Output, PinDriver},
+    delay::{FreeRtos, TickType},
+    gpio::{Input, InterruptType, Output, PinDriver},
     spi::{SpiDeviceDriver, SpiDriver},
+    task::notification::Notification,
 };
+use firmware_core::radio_wait::{Dio1Wait, Dio1WaitKind, Dio1WaitOutcome};
 
 // ── Pin assignments ───────────────────────────────────────────────────────────
 
@@ -233,6 +235,164 @@ pub const IRQ_CRC_ERR: u16 = 1 << 6;
 pub const IRQ_CAD_DONE: u16 = 1 << 7;
 pub const IRQ_CAD_DETECTED: u16 = 1 << 8;
 
+// ── DIO1 wait ──────────────────────────────────────────────────────────────────
+
+/// Interrupt/notification-driven [`Dio1Wait`] — the production implementation.
+///
+/// # Why level-triggered, not edge-triggered
+///
+/// The SX1262's DIO1 line is a LATCH, not a pulse: it goes high the instant
+/// any enabled IRQ (TxDone / RxDone / CrcErr / CadDone / CadDetected) fires
+/// and STAYS high until `ClearIrqStatus` is issued (DS_SX1261-2 V2.1
+/// §13.3.1). This wait arms `InterruptType::HighLevel`, a *level*-triggered
+/// GPIO interrupt that the ESP32 GPIO matrix continuously re-evaluates
+/// against the live pin state — arming it AFTER DIO1 has already gone high
+/// still fires immediately, because the hardware condition it checks is
+/// "is the pin high right now", not "did the pin just transition". An
+/// edge-triggered interrupt (`PosEdge`) would need a fresh low→high
+/// transition after arming, which is exactly the re-arm race this wait
+/// exists to close: "can an edge arrive between clearing the IRQ and
+/// re-arming the wait" (the correctness question this mission's dossier
+/// requires an explicit answer to). With `HighLevel`, the answer is: it
+/// cannot matter, because arming after the fact still observes the latched
+/// level. The `is_high()` check in [`GpioDio1Wait::wait_high`] below is
+/// therefore NOT required for correctness — it is kept purely as a fast
+/// path that skips the ISR round trip when the answer is already known.
+///
+/// # Lost-wakeup semantics of the ISR → task signal
+///
+/// The ISR (`subscribe_nonstatic`'s closure) signals this task with a raw
+/// FreeRTOS task notification (`esp_idf_hal::task::notification::
+/// Notification`), which is a one-word-per-task, sticky "has this task been
+/// notified since its last wait" state (`eNotified` internally) — NOT a
+/// queue and NOT a plain boolean read racily by two sides. `Notifier::
+/// notify_and_yield` calls `xTaskGenericNotifyFromISR` with `eSetBits`,
+/// which ORs a bit into that state UNCONDITIONALLY, whether or not this task
+/// is currently blocked in `Notification::wait`. If the ISR fires between
+/// one `wait_high` call returning and the next one being called (e.g. the
+/// gap between `try_receive` polls), the notification is not dropped: the
+/// very next `Notification::wait` call sees the already-set state and
+/// returns immediately instead of blocking for the full timeout. This is
+/// the same primitive `esp-idf-hal`'s own async `PinDriver::wait_for` is
+/// built on; it is not used directly here because it requires an async
+/// executor, which this synchronous dispatcher loop does not run, and every
+/// call site here needs an explicit millisecond deadline (TX timeout, RX
+/// poll cadence, CAD timeout) that the synchronous `Notification::wait(
+/// ticks)` gives directly.
+///
+/// # Timeout path
+///
+/// On timeout, [`GpioDio1Wait::wait_high`] disables the interrupt before
+/// returning [`Dio1WaitOutcome::TimedOut`], rather than leaving it armed. A
+/// caller that times out (`try_receive`'s per-poll cadence, `channel_
+/// activity_detection`'s 20 ms CAD window) always re-arms on its NEXT
+/// `wait_high` call, so nothing is missed by disabling — but leaving a
+/// level-triggered interrupt armed with no one waiting on its notification
+/// would otherwise re-fire and re-disable itself in a loop the instant the
+/// SPI-side latch next asserts, for no reason (the driver framework already
+/// self-disables per-fire; see `esp-idf-hal`'s `PinDriver::enable_interrupt`
+/// doc — this is belt-and-suspenders tidiness, not a correctness fix).
+///
+/// # Fallback
+///
+/// If arming the interrupt itself fails (`set_interrupt_type`/
+/// `enable_interrupt` return an `EspError` — e.g. the ISR service is out of
+/// slots), this falls back to the exact spin-poll the driver used before
+/// this mission rather than silently hanging: an interrupt-driven radio that
+/// can miss a wakeup is strictly worse than a spin-poll that cannot, and
+/// that is true of a failed-to-arm interrupt too.
+///
+/// # Task affinity
+///
+/// `Notification::new()` captures `task::current()` at construction time —
+/// the notification it creates may only ever be waited on from that same
+/// FreeRTOS task. `GpioDio1Wait` is constructed once, in `Radio::init`, and
+/// `Radio` is used exclusively from the dispatcher task for its entire
+/// lifetime (ADR-0012: radio stays on the dispatcher task/core 0; only UI
+/// moved to its own task), so this invariant holds by construction.
+struct GpioDio1Wait<'d> {
+    dio1: PinDriver<'d, Input>,
+    notification: Notification,
+}
+
+impl<'d> GpioDio1Wait<'d> {
+    fn new(mut dio1: PinDriver<'d, Input>) -> Result<Self, RadioError> {
+        let notification = Notification::new();
+        let notifier = notification.notifier();
+        // SAFETY: `notifier` is an `Arc<Notifier>` that must not outlive the
+        // task that created its `Notification` (see `Notifier::notify`'s own
+        // safety doc). That task is the dispatcher task, which owns `Radio`
+        // (and therefore this `GpioDio1Wait`, and therefore `notification`,
+        // whose `Notifier` this closure holds a clone of) for the process's
+        // entire lifetime — the task never exits while this closure could
+        // still be invoked. The closure runs in ISR context and calls
+        // nothing beyond `Notifier::notify_and_yield`, which is documented
+        // ISR-safe (it is exactly the primitive `esp-idf-hal`'s own
+        // ISR-to-async-waker bridge uses).
+        unsafe {
+            dio1.subscribe_nonstatic(move || {
+                // eSetBits, not eSetValueWithOverwrite — see this type's doc
+                // "Lost-wakeup semantics" for why a notification fired here
+                // can never be lost even if no one is waiting yet.
+                //
+                // `NonZeroU32::MIN` (not `::new(1).unwrap()`): this runs in
+                // ISR context, so the bit constant must not risk pulling in
+                // any panic-formatting machinery even though `unwrap` here
+                // could never actually panic — `MIN` sidesteps the question
+                // entirely.
+                let _ = notifier.notify_and_yield(core::num::NonZeroU32::MIN);
+            })
+        }
+        .map_err(|_| RadioError::Spi)?;
+        Ok(Self { dio1, notification })
+    }
+
+    /// The exact spin-poll this mission replaces, kept ONLY as the fallback
+    /// path for when arming the GPIO interrupt itself fails (see this
+    /// type's "Fallback" doc) — never invoked when interrupt arming
+    /// succeeds.
+    fn spin_poll_fallback(dio1: &mut PinDriver<'_, Input>, timeout_ms: u32) -> Dio1WaitOutcome {
+        let deadline = uptime_ms() + timeout_ms as u64;
+        loop {
+            if dio1.is_high() {
+                return Dio1WaitOutcome::Asserted;
+            }
+            if uptime_ms() >= deadline {
+                return Dio1WaitOutcome::TimedOut;
+            }
+            FreeRtos::delay_ms(1);
+        }
+    }
+}
+
+impl Dio1Wait for GpioDio1Wait<'_> {
+    fn kind(&self) -> Dio1WaitKind {
+        Dio1WaitKind::Notify
+    }
+
+    fn wait_high(&mut self, timeout_ms: u32) -> Dio1WaitOutcome {
+        // Fast path only — see this type's doc for why this check is not
+        // load-bearing for correctness.
+        if self.dio1.is_high() {
+            return Dio1WaitOutcome::Asserted;
+        }
+        if self.dio1.set_interrupt_type(InterruptType::HighLevel).is_err()
+            || self.dio1.enable_interrupt().is_err()
+        {
+            return Self::spin_poll_fallback(&mut self.dio1, timeout_ms);
+        }
+        let ticks = TickType::new_millis(timeout_ms as u64).ticks();
+        if self.notification.wait(ticks).is_some() {
+            Dio1WaitOutcome::Asserted
+        } else {
+            // Timed out — disable so a later, unrelated fire doesn't land on
+            // a wait no one issued (see "Timeout path" doc above).
+            let _ = self.dio1.disable_interrupt();
+            Dio1WaitOutcome::TimedOut
+        }
+    }
+}
+
 // ── Radio struct ──────────────────────────────────────────────────────────────
 
 /// SX1262 radio driver.
@@ -240,7 +400,7 @@ pub struct Radio<'d> {
     spi: SpiDeviceDriver<'d, &'d SpiDriver<'d>>,
     rst: PinDriver<'d, Output>,
     busy: PinDriver<'d, Input>,
-    dio1: PinDriver<'d, Input>,
+    dio1: GpioDio1Wait<'d>,
     /// `true` while the radio is armed in continuous RX (SetRx 0xFFFFFF).
     /// `transmit` and `channel_activity_detection` clear it because they take
     /// the radio out of RX; `ensure_continuous_rx` re-arms only when it is clear,
@@ -260,6 +420,7 @@ impl<'d> Radio<'d> {
         busy: PinDriver<'d, Input>,
         dio1: PinDriver<'d, Input>,
     ) -> Result<Self, RadioError> {
+        let dio1 = GpioDio1Wait::new(dio1)?;
         let mut radio = Self { spi, rst, busy, dio1, in_continuous_rx: false };
         radio.hardware_reset()?;
         radio.configure_tcxo()?;
@@ -307,17 +468,12 @@ impl<'d> Radio<'d> {
         self.wait_not_busy()?;
         self.write_cmd(&[CMD_SET_TX, 0x00, 0x00, 0x00])?;
 
-        // Poll DIO1 (TxDone)
-        let deadline_ms = airtime as u64 + 500; // generous timeout
-        let start = uptime_ms();
-        loop {
-            if self.dio1.is_high() {
-                break;
-            }
-            if uptime_ms() - start > deadline_ms {
-                return Err(RadioError::TxTimeout);
-            }
-            FreeRtos::delay_ms(1);
+        // Wait for TxDone on DIO1 (interrupt/notification-driven — see
+        // `GpioDio1Wait`'s doc for the re-arm-race and lost-wakeup argument).
+        // Generous timeout above the analytically computed airtime.
+        let deadline_ms = (airtime as u64 + 500).min(u32::MAX as u64) as u32;
+        if self.dio1.wait_high(deadline_ms) == Dio1WaitOutcome::TimedOut {
+            return Err(RadioError::TxTimeout);
         }
         self.clear_irq(IRQ_TX_DONE)?;
         Ok(airtime)
@@ -384,18 +540,13 @@ impl<'d> Radio<'d> {
         // Arm continuous RX if a prior TX/CAD took us out of it; no-op otherwise.
         self.ensure_continuous_rx()?;
 
-        // Watch DIO1. The radio stays in continuous RX throughout — this loop
-        // only spreads the poll over `poll_ms` so the task yields; it does NOT
-        // re-arm RX and does NOT drop to standby on expiry.
-        let deadline = uptime_ms() + poll_ms as u64;
-        loop {
-            if self.dio1.is_high() {
-                break;
-            }
-            if uptime_ms() >= deadline {
-                return Ok(None);
-            }
-            FreeRtos::delay_ms(1);
+        // Watch DIO1 for up to `poll_ms` (interrupt/notification-driven — see
+        // `GpioDio1Wait`'s doc). The radio stays in continuous RX throughout:
+        // this is NOT a listening window, it does NOT re-arm RX and does NOT
+        // drop to standby on expiry, so nothing is missed regardless of
+        // `poll_ms`'s value — see this function's own doc above.
+        if self.dio1.wait_high(poll_ms) == Dio1WaitOutcome::TimedOut {
+            return Ok(None);
         }
 
         // A DIO1 edge fired — read and clear the IRQ. In continuous RX the radio
@@ -464,16 +615,15 @@ impl<'d> Radio<'d> {
         self.wait_not_busy()?;
         self.write_cmd(&[CMD_SET_CAD])?;
 
-        // Poll up to 20 ms for CAD completion
-        let deadline = uptime_ms() + 20;
-        loop {
-            if self.dio1.is_high() {
-                break;
-            }
-            if uptime_ms() > deadline {
-                return Err(RadioError::CadTimeout);
-            }
-            FreeRtos::delay_ms(1);
+        // Wait up to 20 ms for CAD completion (interrupt/notification-driven
+        // — see `GpioDio1Wait`'s doc). 20 ms is unchanged from the spin-poll
+        // this replaces: it is a margin above the real CAD_ON_4_SYMB
+        // hardware time (~8.2 ms at this preset's SF7/62.5 kHz — 4 symbols ×
+        // symbol time), not a scheduler-cadence knob, so removing the
+        // spin-poll's 1 ms quantization does not change what deadline is
+        // correct here.
+        if self.dio1.wait_high(20) == Dio1WaitOutcome::TimedOut {
+            return Err(RadioError::CadTimeout);
         }
 
         let irq = self.get_irq()?;
