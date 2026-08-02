@@ -57,6 +57,14 @@
 # pinned to the author's own branch tip is not a staleness claim about
 # main; this guard's whole point is that only a fresh build settles it.
 #
+# Expect a few bytes of run-to-run noise even on an unchanged tree: two
+# consecutive builds at cd08085 measured 3,360,432 B and 3,360,448 B (16 B
+# apart). measure-app-image-size.sh deliberately skips the release build's
+# SOURCE_DATE_EPOCH / --remap-path-prefix reproducibility flags (see its
+# header), so byte-exact equality is not expected — which is precisely why
+# this guard has a +-5% band rather than an equality check. Do not chase a
+# sub-kilobyte delta.
+#
 # Bump this value ONLY after `verify-partition-budget` reports a drift you've
 # confirmed is a real, intentional change to the app image (new UI assets,
 # new glyph coverage, a dependency upgrade, etc.) — never to silence a
