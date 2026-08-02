@@ -138,10 +138,21 @@ export component CadetPeeking inherits CadetMascot {
 /// `generate_assets.py::gen_starfield_full`'s own doc comment covers the
 /// density/bias/central-band spec baked into the PNG; this component's job
 /// is purely the ≤0.35 alpha ceiling, applied here (not per-consumer) so
-/// every screen that adds `SpaceBackdrop {}` gets the same legibility
-/// guarantee for free and cannot diverge from it.
+/// every screen that adds `SpaceBackdrop { source: ... }` gets the same
+/// legibility guarantee for free and cannot diverge from it.
+///
+/// Deliberately carries NO default `source` binding (no `@image-url(...)`
+/// literal here) — every one of the 7 fan-out screens that imports this
+/// component supplies `source` itself, bound to a `backdrop_image` property
+/// its own Rust constructor sets from `ui::backdrop_asset::
+/// shared_backdrop_image()`. See `backdrop_asset.rs`'s module doc for why:
+/// this used to be a `@image-url(...)` default here, and `slint::slint!{}`
+/// re-embeds every `@image-url(...)` literal it sees once PER MACRO
+/// INVOCATION — so all 7 screens each baked their own full copy of the
+/// 300 KB texture. Isolating the one literal to `backdrop_asset.rs` and
+/// piping the resulting `Image` through as a plain runtime property
+/// (Image is a cheap `Rc`-style handle) collapses that to a single copy.
 export component SpaceBackdrop inherits Image {
-    source: @image-url("../../assets/space/starfield_full.png");
     width: 320px;
     height: 240px;
     opacity: 0.3;

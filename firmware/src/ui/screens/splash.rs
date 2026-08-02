@@ -336,11 +336,18 @@ slint::slint! {
         height: 240px;
         background: Theme.bg-space;
 
+        // Shared full-window starfield texture, set once by Rust right after
+        // construction (`ui::backdrop_asset::shared_backdrop_image()`) — see
+        // that module's doc for why this isn't a `SpaceBackdrop` default.
+        in property <image> backdrop_image;
+
         // Full-window dim starfield backdrop — FIRST child of the Window, so it
         // paints behind everything else below (z-bottom, per its own doc
         // in `motifs.slint`). Replaces the former `logo_area` header-strip
         // `Starfield` — see module doc's "Full-window backdrop" section.
-        SpaceBackdrop {}
+        // `source` comes from `backdrop_image` above, not a component
+        // default — see `backdrop_asset.rs`.
+        SpaceBackdrop { source: backdrop_image; }
 
         // Dim lower-band planet-horizon line art — declared right after
         // the backdrop (still behind the content layout below). y: 198px,
@@ -520,6 +527,7 @@ impl SplashScreen {
     pub fn new() -> anyhow::Result<Self> {
         let component = self::SplashScreenUi::new()
             .map_err(|e| anyhow::anyhow!("slint component init: {:?}", e))?;
+        component.set_backdrop_image(crate::ui::backdrop_asset::shared_backdrop_image());
         component.show()
             .map_err(|e| anyhow::anyhow!("slint window show: {:?}", e))?;
 

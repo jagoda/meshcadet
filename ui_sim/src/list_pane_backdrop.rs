@@ -62,7 +62,12 @@ slint::slint! {
 
         // Full-window dim starfield backdrop — same z-bottom placement
         // every consumer screen uses.
-        SpaceBackdrop {}
+        // `SpaceBackdrop` no longer carries a default `source` (production
+        // fan-out feeds it a Rust-shared `Image` instead — see
+        // `firmware/src/ui/backdrop_asset.rs`'s module doc); this
+        // single-consumer host-sim demo binds the literal directly, no
+        // duplication concern applies here.
+        SpaceBackdrop { source: @image-url("../../firmware/assets/space/starfield_full.png"); }
 
         // List row — verbatim value of `contact_list.rs`'s unselected
         // `ContactRow` fill (`Theme.nebula-violet-deep.with-alpha(0.12)`,

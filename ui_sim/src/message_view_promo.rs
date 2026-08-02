@@ -182,7 +182,12 @@ slint::slint! {
             flick.viewport-y = min(0px, flick.height - flick.viewport-height);
         }
 
-        SpaceBackdrop {}
+        // `SpaceBackdrop` no longer carries a default `source` (production
+        // fan-out feeds it a Rust-shared `Image` instead — see
+        // `firmware/src/ui/backdrop_asset.rs`'s module doc); this
+        // single-consumer host-sim demo binds the literal directly, no
+        // duplication concern applies here.
+        SpaceBackdrop { source: @image-url("../../firmware/assets/space/starfield_full.png"); }
 
         VerticalLayout {
             opacity: content_opacity;

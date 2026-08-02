@@ -84,6 +84,7 @@
 //! worst case). This is acceptable since notifications are rare; if latency
 //! becomes an issue a FreeRTOS timer can be used instead.
 
+pub mod backdrop_asset;
 pub mod display;
 pub mod touch;
 pub mod keyboard;

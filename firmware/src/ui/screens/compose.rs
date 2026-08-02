@@ -315,6 +315,10 @@ slint::slint! {
         // 1..=5 = bars. Pushed by `ComposeScreen::set_signal_level`; see
         // `SignalMeter`'s embedding below.
         in property <int>               signal_level: 0;
+        // Shared full-window starfield texture, set once by Rust right after
+        // construction (`ui::backdrop_asset::shared_backdrop_image()`) — see
+        // that module's doc for why this isn't a `SpaceBackdrop` default.
+        in property <image>             backdrop_image;
 
         // Phase B (`meshcadet-room-firmware-post-and-notify`): a room this
         // session can't post to (GUEST/READ_ONLY permission) sets this and
@@ -393,7 +397,9 @@ slint::slint! {
         // shows behind AND below the Send button too, by deliberate design
         // — matching the settings view's reference
         // treatment of transparent content over this shared backdrop.
-        SpaceBackdrop {}
+        // `source` comes from `backdrop_image` above, not a component
+        // default — see `backdrop_asset.rs`.
+        SpaceBackdrop { source: backdrop_image; }
 
         VerticalLayout {
             // ── Header bar ─────────────────────────────────────────────────
@@ -661,6 +667,7 @@ impl ComposeScreen {
 
         let component = self::ComposeScreenUi::new()
             .map_err(|e| anyhow::anyhow!("slint component init: {:?}", e))?;
+        component.set_backdrop_image(crate::ui::backdrop_asset::shared_backdrop_image());
 
         // Populate the emoji picker grid from the canonical table.
         let cells: slint::VecModel<EmojiCell> = slint::VecModel::default();
