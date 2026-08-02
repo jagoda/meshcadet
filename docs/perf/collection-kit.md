@@ -6,6 +6,14 @@ process runs this document, ever.** Every step below produces a value you
 read off the serial console and paste into the report block at the end. There
 is no "does it feel faster" step anywhere in this document.
 
+**Regenerated for the post-split (M1) build,
+2026-08-02, by `meshcadet-perf-task-split-host-validation`.** ADR-0012's
+dispatcher/UI task split (`meshcadet-perf-ui-task-split`, PR
+jagoda/meshcadet#134) changed the diagnostics log format this kit reads from
+— see Part C and Part G step 8 below for the specifics, and §0's table for
+which predicates that affects. Everything not called out as changed is
+unchanged from the M0 version of this document.
+
 ## 0. What this closes, and what it doesn't
 
 This is the one place in the `meshcadet-perf-rearchitecture` performance
@@ -28,15 +36,15 @@ one tightens it. Once a section here closes a predicate, strike that row from
 
 | Predicate (from `ui-perf-baseline.md` §8) | Closed by |
 |---|---|
-| D1 — on-target render cost, idle vs. 200-msg conversation | Part C, scripted scenario |
-| D2 — real per-flush SPI command overhead | Part C, scripted scenario (same run as D1) |
-| D3 — real dirty-line-count distribution in use | Part C, **partial** — see that section's honesty note |
-| D4 — longest UI-unserviced gap vs. payload size | Part G (two-device) |
-| D5 — delivery success rate (the hard constraint) | Part G (two-device) |
-| D6 — RX-notice latency, idle vs. UI-active | Part G (two-device) |
-| D7 — per-core utilization | Part C (every capture window reports it for free) |
-| D8 — post-change stack high-water mark, per task | Part E |
-| D9 — SPI2 concurrent-access confirmatory reading | Part F — **not runnable at M0**; see that section |
+| D1 — on-target render cost, idle vs. 200-msg conversation | **[BLOCKED as of the M1 ref]** — needed the dispatcher's `ui_step` phase timing, which post-split neither the dispatcher nor `ui_task` records (see `task-split-host-validation.md` §6). Was: Part C, scripted scenario. |
+| D2 — real per-flush SPI command overhead | **[BLOCKED as of the M1 ref]** — same root cause as D1. Was: Part C, scripted scenario (same run as D1). |
+| D3 — real dirty-line-count distribution in use | **[BLOCKED as of the M1 ref]** — same root cause as D1/D2 (the `ui_step`-duration proxy this predicate leaned on no longer exists). Was: Part C, **partial** — see that section's honesty note. |
+| D4 — longest UI-unserviced gap vs. payload size | **[BLOCKED as of the M1 ref]** — Part G step 8 reads the `PERF ui-starvation` line, which the M1 split removed from the dispatcher's rollup with no replacement (`meshcadet-perf-task-split-host-validation`'s `docs/perf/task-split-host-validation.md` §6 — same underlying number as ADR-0012's deferred predicate D-E). Needs a follow-up instrumentation call (`firmware_core::perf::PerfRollup::record_ui_starvation`, already written and unit-tested, just uncalled from `ui_task.rs`) before this row is runnable again. |
+| D5 — delivery success rate (the hard constraint) | Part G (two-device) — unaffected by the M1 log-format change |
+| D6 — RX-notice latency, idle vs. UI-active | Part G (two-device) — unaffected; `rx-notice-latency` is still one of the dispatcher's 5 post-split `PERF phase=`/`PERF rx-notice-latency` lines (Part C) |
+| D7 — per-core utilization | Part C (every capture window reports it for free) — unaffected |
+| D8 — post-change stack high-water mark, per task | Part E — **expanded** for the M1 ref: `ui_task` now has its own periodic HWM log alongside `main`/`admin_server`/`prov_server`'s pre-existing ones (see Part E) |
+| D9 — SPI2 concurrent-access confirmatory reading | Part F — **still not runnable**, reason changed: the M1 split now provides the concurrency Part F's reading needs, but the GPIO-toggle probe it also needs does not exist yet in `radio.rs`; see that section |
 | D10 — felt frame rate / tap-to-first-frame | Part D |
 | The loop model's swept constants (`perf_loop_model/src/params.rs`) | Part D — calibration table |
 
@@ -92,7 +100,12 @@ near-duplicate documents:
   `perf.rs` doesn't exist, or the grep prints nothing, this ref predates the
   instrumentation and this kit cannot run against it.
 - **M1 run (after the task/core split lands):** `<REF>` = the merge commit
-  that lands the split.
+  that lands the split — concretely, `meshcadet-perf-ui-task-split`'s merged
+  PR jagoda/meshcadet#134 (or any later ref on `main`, since the split's
+  `ui_task.rs`/log-format shape is unchanged by this document's own PR).
+  Confirm you're on a post-split ref before running Part C: `grep -n "fn
+  spawn" firmware/src/ui_task.rs` should find it; a pre-split ref has no
+  such file.
 - **M2 run (after the radio-path timeliness work lands):** `<REF>` = the merge
   commit that lands it.
 
@@ -185,8 +198,17 @@ Single device. This is the highest-value section: it produces the actual
 per-phase superloop numbers the loop model (Part D) currently only has as a
 sensitivity range.
 
-**What you're reading.** Every 30 seconds the device logs one rollup block.
-Exact format (from `firmware/src/main.rs`'s diagnostics-gated rollup):
+**What you're reading — CHANGED for the M1 (post-split) ref.** Every 30
+seconds the **dispatcher** (`main` task) logs one rollup block, and
+**separately**, every 30 seconds, `ui_task` logs its own, shorter block —
+two independent log sources now, not one (ADR-0012 D9 row 10: "`ui_task`
+gets its own rollup; the two are never shared"). Exact format:
+
+Dispatcher (`firmware/src/main.rs`, diagnostics-gated) — **`ui_step` and
+`ui-starvation` are GONE, not zeroed:** the dispatcher no longer calls
+`ui.step()` at all post-split, so neither line is coherent there any more
+and both are removed outright (do not wait for them; their absence is
+correct, not a capture failure):
 
 ```
 PERF phase=gps: n=<count> min=<us> mean=<us> max=<us> p95=<us>
@@ -194,32 +216,61 @@ PERF phase=battery: n=<count> min=<us> mean=<us> max=<us> p95=<us>
 PERF phase=cad: n=<count> min=<us> mean=<us> max=<us> p95=<us>
 PERF phase=tx: n=<count> min=<us> mean=<us> max=<us> p95=<us>
 PERF phase=rx_poll: n=<count> min=<us> mean=<us> max=<us> p95=<us>
-PERF phase=ui_step: n=<count> min=<us> mean=<us> max=<us> p95=<us>
 PERF rx-notice-latency: n=<count> min=<us> mean=<us> max=<us> p95=<us>
-PERF ui-starvation: cumulative=<ms> longest=<ms> (window=30s)
-PERF input-to-first-paint: n=<count> min=<ms> mean=<ms> max=<ms> p95=<ms>
 PERF core-utilization: core0=<pct or n/a> core1=<pct or n/a>
 ```
 
-All phase values are microseconds; starvation and input-to-first-paint are
-milliseconds. `n=0` on any phase (e.g. `tx`/`cad` with nothing queued) reports
-`min=0 mean=0 max=0 p95=0` — that is the "no samples" case, not a real zero
-cost; don't read it as one.
+`ui_task` (`firmware/src/ui_task.rs`, **new** for M1) — once, at boot, then
+every 30 s:
 
-**A correct run looks like** idle windows with `cad`/`tx` at `n=0`,
-`ui_step` mean in the low hundreds of microseconds or less, `core1=n/a` (no
-work ever scheduled there — this document's own §1 finding), and
-`ui-starvation longest` spiking into the tens-to-hundreds of ms only in
-windows where you triggered a send (Part D) or an incoming message. **A
-failed run** looks like the device resetting mid-capture (a fresh `firmware
-build:` / `identity ready:` pair appearing unexpectedly), or every phase
-reading `n=0` forever including `gps`/`battery`/`rx_poll` (those three should
-never be zero — they run every iteration unconditionally) — that means the
-`diagnostics` feature didn't actually compile in; re-check Part A's build
-command.
+```
+ui_task: subscribed to Task WDT (30 s timeout)
+ui_task: stack HWM: <free_B> B free / 32768 B total = <peak_B> B peak (<pct>% headroom)
+PERF input-to-first-paint: n=<count> min=<ms> mean=<ms> max=<ms> p95=<ms>
+```
 
-**Procedure — one scripted 5-minute window**, deliberately touching every
-scenario D1/D2/D3 ask for in one pass rather than three separate captures:
+(`input-to-first-paint` moved here from the dispatcher's rollup, same
+format, `diagnostics`-gated same as before — D9 row 10.)
+
+**D4/D-E's `PERF ui-starvation` line does not exist anywhere post-split** —
+see §0's table. Nothing in this kit currently produces the number that row
+used to close; skip straight to reporting `n/a — removed by the M1 split,
+see docs/perf/task-split-host-validation.md §6` for that field rather than
+waiting for a line that will never print.
+
+All phase values are microseconds; input-to-first-paint is milliseconds.
+`n=0` on any phase (e.g. `tx`/`cad` with nothing queued) reports `min=0
+mean=0 max=0 p95=0` — that is the "no samples" case, not a real zero cost;
+don't read it as one.
+
+**A correct run looks like — CHANGED for the M1 ref.** Idle windows with
+`cad`/`tx` at `n=0` in the dispatcher block, and **`core1` now showing REAL
+utilization** (a nonzero percentage), not `n/a` — `ui_task` genuinely runs
+on core 1 post-split, so a `core1=n/a` reading on an M1+ ref is itself a red
+flag (it would mean `ui_task` never spawned, or the core-affinity pin
+silently failed — see `ui_task.rs`'s headless-fallback doc for when spawn is
+skipped). There is no `ui_step` or `ui-starvation` reading to sanity-check
+any more (§0's D1-D4 rows, all `[BLOCKED]`). **A failed run** looks like the
+device resetting mid-capture (a fresh `firmware build:` / `identity ready:`
+pair appearing unexpectedly), or every phase reading `n=0` forever including
+`gps`/`battery`/`rx_poll` (those three should never be zero — they run every
+iteration unconditionally) — that means the `diagnostics` feature didn't
+actually compile in; re-check Part A's build command. A missing `ui_task:
+subscribed to Task WDT` line at boot means the UI half never came up at all
+(headless boot) — check for the "I2C/touch init failed" or "LCD SPI init
+failed" log lines just before it.
+
+**[BLOCKED as of the M1 ref] — this procedure closes D1/D2/D3 only on a
+pre-split (M0) ref.** Steps 2-4 below read the `ui_step` phase's `max` from
+the dispatcher's rollup; that phase does not exist post-split (§0's table,
+`task-split-host-validation.md` §6). Run it anyway for `gps`/`battery`/
+`rx_poll`/`cad`/`tx`/`rx-notice-latency`/`core-utilization` (still valid and
+useful on an M1+ ref, and `core-utilization` now shows real work on core 1 —
+see the "correct run looks like" note above), but record D1/D2/D3 as `n/a —
+blocked, see docs/perf/task-split-host-validation.md §6` rather than
+guessing at a `ui_step` reading that will not appear. **Procedure — one
+scripted 5-minute window**, deliberately touching every scenario D1/D2/D3
+ask for in one pass rather than three separate captures:
 
 1. [ ] Leave the device idle at the contact list for at least one full 30 s
        window with no taps. This is your **idle baseline** window.
@@ -248,24 +299,31 @@ scenario D1/D2/D3 ask for in one pass rather than three separate captures:
        navigation events above), so `gps`/`battery`/`rx_poll`'s percentile
        fields rest on more than a handful of samples.
 
-**D3 honesty note.** D3 asks for the real *dirty-line-count* distribution in
-use. The instrumentation landed by PR jagoda/meshcadet#120 times phases; it
-does not count dirty lines per frame. `ui_step`'s duration is a proxy — you
-can back out an approximate line count from a duration reading via
-`ui-perf-baseline.md` §4.1's ~128 µs/line data-only floor (e.g. a `max`
-reading of ~2.8 ms is roughly consistent with a ~22-line in-place
-message-append repaint, not a 240-line full-window one, which would be
-~30.7 ms) — but this is an inference from
-timing, not a direct count, and cannot be presented as one. Closing D3
-exactly would need a follow-up instrumentation addition (a per-frame
-dirty-line counter). Record the `ui_step` percentiles from this section in
-the report block regardless; that is the best evidence current instrumentation
-can produce for D3.
+**D3 honesty note — doubly blocked on an M1+ ref.** D3 asks for the real
+*dirty-line-count* distribution in use. On the pre-split (M0) build, the
+instrumentation landed by PR jagoda/meshcadet#120 times phases but does not
+count dirty lines per frame, so `ui_step`'s duration was already only a
+*proxy* (via `ui-perf-baseline.md` §4.1's ~128 µs/line data-only floor,
+e.g. a `max` reading of ~2.8 ms roughly consistent with a ~22-line in-place
+message-append repaint vs. a ~30.7 ms 240-line full-window one) — an
+inference from timing, never a direct count. **On the M1+ ref the proxy
+itself is gone too** (§0's table, `task-split-host-validation.md` §6): there
+is no `ui_step` reading anywhere to infer from. Closing D3 exactly needs two
+follow-ups now, not one: (1) restore a `ui_step`-equivalent phase timing on
+`ui_task` (closes D1/D2 as a side effect), and (2) a genuinely new per-frame
+dirty-line counter this instrumentation has never had, on either topology.
+Record `n/a — blocked` for this predicate on an M1+ ref rather than
+inferring from a reading that doesn't exist.
 
-**D7 (per-core utilization)** needs no extra steps — every 30 s rollup block
-already includes the `core-utilization` line. Confirming §1's finding is a
-by-product of capturing anything at all: expect `core1=n/a` (or `0`) since
-nothing is scheduled there today, in every window of this run.
+**D7 (per-core utilization)** needs no extra steps — every 30 s dispatcher
+rollup block already includes the `core-utilization` line, unaffected by
+the M1 log-format change. **Reading changed for the M1 ref:** expect
+`core1` to show REAL, nonzero utilization now (`ui_task` genuinely runs
+there) — confirming §1's *pre-split* finding is no longer the point of this
+reading on an M1+ ref; it now confirms priority 3's "both cores carry real
+work" claim (campaign plan §6 criterion 4) instead. A `core1=n/a` reading on
+an M1+ ref is a red flag, not the expected baseline — see the "correct run
+looks like" note above.
 
 ## Part D — Loop-model calibration (highest leverage)
 
@@ -286,13 +344,14 @@ that follows.
 
 | `LoopModelParams` field | How to derive it from Part C's log |
 |---|---|
-| `ui_step` | Directly: the `ui_step` phase's `mean`/`p95`/`max` from Part C, in µs → convert to ms. Replace the whole `[0.05, 30.72]` ms range with these three points. |
-| `cad_spi_overhead` | Derived: take the `cad` phase's `mean` (µs → ms), subtract the analytical `CAD_ACTIVE_MS` constant (8.192 ms, `perf_loop_model/src/sim.rs::CAD_ACTIVE_MS`), floor at 0. That's the real SPI-command overhead ahead of the CAD-active window. |
-| `gps_poll` | Directly: the `gps` phase's `mean`/`p95`/`max`, µs → ms. Note whether your capture window landed in GPS's quiet or active duty-cycle phase (`ui-perf-baseline.md`'s dispatcher-loop description) — if you only captured the quiet window, note that in the report; the active-window number needs a capture that happens to straddle a GPS active cycle. |
-| `battery_poll` | Directly: the `battery` phase's `mean`/`p95`/`max`, µs → ms. |
-| `frame_encode` | **Not directly instrumented.** The `tx` phase's own duration is `radio.transmit()`'s block time (airtime), not the crypto/encode step ahead of it — those are two different call sites and only one is timed. Leave at the documented `[0, 2.0]` ms range; closing this exactly needs a follow-up timer around the `encode_room_keep_alive_frame`-style call sites. |
-| `wdt_pet`, `tx_timestamp_rebase`, `room_keepalive_sched_check`, `drain_ui_command`, `periodic_stats` | **Not directly instrumented** — no phase in `PerfRollup` covers any of these individually; they're folded into the untimed portions of each loop iteration. Leave at their documented ranges (all already small, sub-millisecond bounds anchored to in-repo constants — see each field's doc comment in `params.rs`). |
-| `split_ui_idle_tick` | **Does not apply to M0** — this parameter only exists for the `split` topology, which is not built yet. Leave as documented; it becomes measurable only on an M1-ref run of this kit, once the split exists to actually measure. |
+| `ui_step` | **[BLOCKED as of the M1 ref]** — was: directly, the `ui_step` phase's `mean`/`p95`/`max` from Part C, in µs → convert to ms, replacing the whole `[0.05, 30.72]` ms range with these three points. That phase no longer exists on either task post-split (§0's table, `task-split-host-validation.md` §6). Leave at the documented range until the follow-up instrumentation lands. |
+| `cad_spi_overhead` | Directly: take the `cad` phase's `mean` (µs → ms), subtract the analytical `CAD_ACTIVE_MS` constant (8.192 ms, `perf_loop_model/src/sim.rs::CAD_ACTIVE_MS`), floor at 0. That's the real SPI-command overhead ahead of the CAD-active window. **Unaffected by the M1 split** — `cad` is still one of the dispatcher's 5 post-split `PERF phase=` lines. |
+| `gps_poll` | Directly: the `gps` phase's `mean`/`p95`/`max`, µs → ms. Note whether your capture window landed in GPS's quiet or active duty-cycle phase (`ui-perf-baseline.md`'s dispatcher-loop description) — if you only captured the quiet window, note that in the report; the active-window number needs a capture that happens to straddle a GPS active cycle. **Unaffected by the M1 split.** |
+| `battery_poll` | Directly: the `battery` phase's `mean`/`p95`/`max`, µs → ms. **Unaffected by the M1 split.** |
+| `frame_encode` | **Not directly instrumented**, unaffected by the M1 split. The `tx` phase's own duration is `radio.transmit()`'s block time (airtime), not the crypto/encode step ahead of it — those are two different call sites and only one is timed. Leave at the documented `[0, 2.0]` ms range; closing this exactly needs a follow-up timer around the `encode_room_keep_alive_frame`-style call sites. |
+| `wdt_pet`, `tx_timestamp_rebase`, `room_keepalive_sched_check`, `drain_ui_command`, `periodic_stats` | **Not directly instrumented**, unaffected by the M1 split — no phase in `PerfRollup` covers any of these individually; they're folded into the untimed portions of each loop iteration. Leave at their documented ranges (all already small, sub-millisecond bounds anchored to in-repo constants — see each field's doc comment in `params.rs`). |
+| `split_ui_idle_tick` | **Now applies, on an M1+ ref — but still not directly instrumented.** `ui_task.rs`'s real `UI_TICK_MS = 16` constant is already the exact high bound (`perf_loop_model/src/params.rs`'s field doc); no device reading narrows it further today, since nothing times the `evt_rx.recv_timeout` wake itself. Leave at the documented `[0, 16]` ms range. |
+| `queue_handoff` (**new field**, added by `meshcadet-perf-task-split-host-validation`) | **Not directly instrumented.** No phase times the `std::sync::mpsc` `try_send`/`try_recv`/`recv_timeout` boundary crossing (ADR-0012 D3). Leave at the documented `[0, 0.2]` ms range; closing this needs a follow-up timer bracketing those calls in both `main.rs::send_ui_event` and `ui_task.rs`'s loop. |
 
 Report every field you derived a real point for, and every field you left at
 its documented range (with the reason), in the report block (§9) — this is
@@ -304,67 +363,90 @@ point instead of the three-corner sweep.
 Single device. Reads the existing periodic and one-shot stack-headroom logs.
 No new steps beyond "leave it running and touch the admin path once":
 
-- **Main task**, every 30 s, alongside the Part C rollup:
+- **Main task** (now the dispatcher only, post-split — Slint/UI locals no
+  longer live on this stack, ADR-0012 D6), every 30 s, alongside the Part C
+  dispatcher rollup:
   ```
   main-task: stack HWM: <free_B> B free / 49152 B total = <peak_B> B peak (<pct>% headroom)
   ```
   If `<pct>` reads under 8% (i.e. under ~4096 B free — `ui-perf-baseline.md`
   §7's stated re-evaluation threshold), flag it in the report notes.
+- **`ui_task`** (**new for M1**, ADR-0012 D6/D-A), every 30 s, alongside its
+  own Part C block — a 32 768 B budget, a strict subset of the pre-split
+  main task's UI-side share:
+  ```
+  ui_task: stack HWM: <free_B> B free / 32768 B total = <peak_B> B peak (<pct>% headroom)
+  ```
 - **UI navigation one-shot samples** — tap into the admin path once during
-  this session (gear icon → PIN entry → admin menu):
+  this session (gear icon → PIN entry → admin menu). **These now report
+  `ui_task`'s HWM, not the main task's** — the call sites are unchanged
+  (`firmware/src/ui/mod.rs`'s `log_stack_hwm`, which reports the CALLING
+  task, D6), and `ui/mod.rs` now runs exclusively on `ui_task` (D4.2), so
+  this is automatic, no new instrumentation needed:
   ```
   ui: navigate_to_pin_entry stack HWM: <free_B> B free
   ui: navigate_to_admin_menu stack HWM: <free_B> B free
   ```
   These fire at the exact call sites an earlier release-build overflow was
-  traced to (see `firmware/src/ui/mod.rs`'s doc on `log_stack_hwm`), so they
-  are the most sensitive samples this kit can take.
+  traced to, so they are the most sensitive samples this kit can take —
+  cross-check them against `ui_task`'s own periodic reading above, not
+  against the main task's.
 - **Admin-server / provisioning-server threads** — run any host CLI command
   against the device (e.g. `cargo run -p host -- --port /dev/ttyACM0 status`
-  from Part B) to get one fresh sample of each:
+  from Part B) to get one fresh sample of each — unaffected by the split:
   ```
   admin_server: stack HWM: <free_B> B free / 12288 B total = <peak_B> B peak (<pct>% headroom)
   prov_server: stack HWM: <free_B> B free / 8192 B total = <peak_B> B peak (<pct>% headroom)
   ```
 
-Paste all of the above (main-task, both UI one-shots, both server threads) in
-the report block — that's D8/R3 closed, per task, in one pass.
+Paste all of the above (main-task, `ui_task`, both UI one-shots, both server
+threads) in the report block — that's D8/R3 closed, per task (now five
+readings instead of four), in one pass.
 
-## Part F — SPI2 concurrent-access confirmatory reading (D9)
+## Part F — SPI2 concurrent-access confirmatory reading (D9 / ADR-0012 D-B)
 
-**Not runnable at M0. Nothing to do here yet — this is not a gap in this
-kit, it's a gap in what exists to measure.**
+**Still not runnable on the M1 ref — but the REASON changed. Read this
+section again even if you read the pre-split version.**
 `docs/perf/spi2-arbitration-r1.md`'s "What still needs silicon" section is
 explicit: the correctness question (does `spi_master` serialise the LCD and
 radio transactions correctly) is settled by source-and-datasheet reading
 alone and needs no device reading at all. The one item named there is a
 **confidence check, not a gate**: toggling a spare GPIO around the radio's
 SPI wait point while a full-window repaint runs *concurrently, on a different
-task/core* — and no such concurrency exists in the shipped firmware today
-(everything is one task, one core, per this document's §1). There is nothing
-this kit could capture that would be a real concurrent-access reading; a
-reading taken today would just show the existing sequential (never
-concurrent) execution, which answers a different, already-settled question.
+task/core*.
 
-**Run this after the M1 ref lands the task/core split, not before.** At that
-point:
-1. The split needs to expose a GPIO-toggle probe around the radio's SPI
-   acquire/release points in `radio.rs` — this does not exist yet (PR #120's
-   instrumentation is timer-based, not GPIO-based) and would need a small
-   follow-up addition before this reading is possible.
+- **Pre-split (M0):** no such concurrency existed in the shipped firmware at
+  all (everything was one task, one core) — a reading taken then would just
+  show the existing sequential (never concurrent) execution, answering a
+  different, already-settled question. That was the blocker.
+- **Post-split (M1, this ref):** the concurrency this reading needs **now
+  genuinely exists** — `ui_task` (core 1) and the dispatcher (core 0) run
+  independently, per `meshcadet-perf-ui-task-split`/ADR-0012, confirmed by
+  `meshcadet-perf-task-split-host-validation`'s parity matrix (`docs/perf/
+  task-split-host-validation.md` §5.3/§5.4). **The blocker now is only the
+  probe itself:** `radio.rs` still has no GPIO-toggle instrumentation around
+  the SPI acquire/release points (PR #120's instrumentation is timer-based,
+  not GPIO-based) — unchanged by either the split or this document's own
+  regeneration, since neither mission touched `radio.rs`.
+
+**Run this once the probe exists.** Steps, unchanged from the pre-split
+version of this document:
+1. Add a GPIO-toggle probe around the radio's SPI acquire/release points in
+   `radio.rs` — a small follow-up addition, not yet built.
 2. With that probe in place: toggle the GPIO immediately before the radio's
    SPI wait point and again immediately after the transaction returns, while
-   triggering a full-window repaint (a contact-list navigation) on the other
-   task/core. Expected reading: every interval ≤ ~15–20 µs (the analytically
-   derived 12.8 µs bound plus scheduler/ISR jitter headroom, per
-   `spi2-arbitration-r1.md` §Q5). A reading an order of magnitude past that
-   is the signal that an assumption in that analysis (chunk size, DMA state,
-   device count) doesn't hold on real hardware and needs re-derivation — not
-   a correctness failure on its own, since §Q1-Q4's argument doesn't depend
-   on this number.
+   triggering a full-window repaint (a contact-list navigation) on `ui_task`
+   — the concurrency now exists to do this for real, unlike on M0. Expected
+   reading: every interval ≤ ~15–20 µs (the analytically derived 12.8 µs
+   bound plus scheduler/ISR jitter headroom, per `spi2-arbitration-r1.md`
+   §Q5). A reading an order of magnitude past that is the signal that an
+   assumption in that analysis (chunk size, DMA state, device count) doesn't
+   hold on real hardware and needs re-derivation — not a correctness failure
+   on its own, since §Q1-Q4's argument doesn't depend on this number.
 
-Until then, record this section in the report block as `n/a — pre-split,
-no probe exists` and move on.
+Until the probe exists, record this section in the report block as `n/a —
+post-split, concurrency exists, no probe yet` (not the pre-split `n/a —
+pre-split, no probe exists` — the reason has changed) and move on.
 
 ## Part D10 — Felt snappiness (single device)
 
@@ -423,9 +505,15 @@ correct; nothing here changes its steps, only tightens what to report:
        differencing needed if you captured both windows.
 8. [ ] Repeat step 6 at 10 B, 40 B and 255 B payloads for D4's payload-size
        scaling — one full 20-DM run **per payload size**, each producing its
-       own report block (§9) with `payload_bytes` set accordingly. Read the
-       `ui-starvation` PERF line's `longest` field after each — that is D4's
-       number directly.
+       own report block (§9) with `payload_bytes` set accordingly.
+       **[BLOCKED as of the M1 ref]** — was: read the `ui-starvation` PERF
+       line's `longest` field after each, D4's number directly. That line no
+       longer prints post-split (§0's table, `task-split-host-validation.md`
+       §6). Still run this step for its OTHER value — steps 6-8 are also
+       where D5/D6's delivery-success and RX-notice-latency counts come from
+       — but record D4 as `n/a — blocked, see docs/perf/task-split-host-
+       validation.md §6` for each payload size rather than waiting for a
+       line that will not appear.
 9. [ ] Trigger a T-Deck→peer DM **while** a screen transition or motif is
        mid-flight; confirm no new error class in the CAD/TX log lines and
        that the peer receives the DM correctly (correctness, not timing).

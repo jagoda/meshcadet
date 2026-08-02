@@ -189,21 +189,41 @@ pub struct LoopModelParams {
     /// produced. Small, non-zero.
     pub drain_ui_command: ParamRangeMs,
 
-    /// Split-topology ONLY: the UI task's own idle-loop granularity once it
-    /// is decoupled from the radio/dispatcher task (the proposed M1 split,
-    /// not yet implemented — see the crate root doc's "Two topologies, one
-    /// harness" section). A cooperatively-yielding task still has SOME
-    /// minimal loop granularity
-    /// — this repo sets no `CONFIG_FREERTOS_HZ` override
-    /// (`grep -rn FREERTOS_HZ sdkconfig.defaults` is empty), so ESP-IDF's
-    /// documented default of 100 Hz (10 ms tick) applies if the eventual
-    /// implementation waits on a polling `vTaskDelay`. Swept from 0 (a
-    /// queue/notification-driven wait can in principle render on the very
-    /// next scheduler pass with no forced delay) up to the full 10 ms tick
-    /// (the conservative case: a `vTaskDelay(1)`-style poll loop instead of
-    /// a notify-driven wait). This parameter does not exist in the current
-    /// single-superloop topology at all.
+    /// Split-topology ONLY: the UI task's own idle-loop granularity —
+    /// **re-parameterised to the AS-BUILT `ui_task`** (ADR-0012 D1/C7,
+    /// `firmware/src/ui_task.rs`), which is no longer a hypothetical polling
+    /// loop. The real implementation waits on `evt_rx.recv_timeout(UI_TICK_MS)`
+    /// (`ui_task.rs::UI_TICK_MS = 16`): it wakes IMMEDIATELY when a
+    /// `UiEvent` arrives (the low end of this range — a busy UI genuinely
+    /// sees ~0 added latency, not an invented best case), or after the full
+    /// 16 ms tick elapses with nothing pending (the high end — an EXACT
+    /// in-repo constant now, not a guessed poll granularity). This is no
+    /// longer "unmeasured, so swept defensively" — it is a real quantity
+    /// that genuinely varies between two exactly-known bounds depending on
+    /// traffic timing, which is still faithfully a [`ParamRangeMs`], just
+    /// for a different reason than the other fields in this struct. This
+    /// parameter does not exist in the current single-superloop topology at
+    /// all (see the crate root doc's "Two topologies, one harness" section).
     pub split_ui_idle_tick: ParamRangeMs,
+
+    /// Split-topology ONLY: the per-call cost of one `std::sync::mpsc`
+    /// `try_send`/`try_recv`/`recv_timeout` boundary crossing introduced by
+    /// ADR-0012 D3 (the queue that replaced the single-loop topology's
+    /// direct, in-process `ui.*` calls) — `firmware/src/ui_task.rs`'s
+    /// `EVENT_QUEUE_CAP`/`COMMAND_QUEUE_CAP` channels and
+    /// `firmware_core::ui::ui_task_boundary::send_or_count`'s `try_send`. No
+    /// on-device number exists for an ESP32-S3 `std::sync::mpsc` handoff (a
+    /// short critical section plus, when the receiver is parked, a task
+    /// notify/wake) — no device, no emulation (crate root doc). Bounded
+    /// generously above a sub-millisecond floor, well below every other
+    /// per-iteration phase this crate charges, since a channel send is a
+    /// handful of atomic/lock operations, not a bus transaction. Charged
+    /// once per iteration on EACH side of the boundary in [`crate::sim`]:
+    /// the dispatcher's own event-send(s) + command-drain
+    /// (`simulate_core`'s `include_ui: false` branch) and the UI task's own
+    /// event-receive + command-send(s) (`simulate_split_ui_task`). Does not
+    /// exist in the single-superloop topology, which has no queue at all.
+    pub queue_handoff: ParamRangeMs,
 }
 
 impl LoopModelParams {
@@ -222,7 +242,10 @@ impl LoopModelParams {
             periodic_stats: ParamRangeMs::new(0.0, 0.5),
             ui_step: ParamRangeMs::new(0.05, 30.72),
             drain_ui_command: ParamRangeMs::new(0.0, 0.05),
-            split_ui_idle_tick: ParamRangeMs::new(0.0, 10.0),
+            // Re-anchored to the as-built `UI_TICK_MS = 16` recv_timeout
+            // ceiling (`firmware/src/ui_task.rs`) — see the field's doc.
+            split_ui_idle_tick: ParamRangeMs::new(0.0, 16.0),
+            queue_handoff: ParamRangeMs::new(0.0, 0.2),
         }
     }
 
@@ -249,6 +272,7 @@ impl LoopModelParams {
             ui_step: self.ui_step.at(corner),
             drain_ui_command: self.drain_ui_command.at(corner),
             split_ui_idle_tick: self.split_ui_idle_tick.at(corner),
+            queue_handoff: self.queue_handoff.at(corner),
             corner,
         }
     }
@@ -275,6 +299,7 @@ pub struct ResolvedParams {
     pub ui_step: f64,
     pub drain_ui_command: f64,
     pub split_ui_idle_tick: f64,
+    pub queue_handoff: f64,
     pub corner: Corner,
 }
 
@@ -311,6 +336,7 @@ mod tests {
             p.ui_step,
             p.drain_ui_command,
             p.split_ui_idle_tick,
+            p.queue_handoff,
         ] {
             let low = range.at(Corner::Low);
             let mid = range.at(Corner::Mid);

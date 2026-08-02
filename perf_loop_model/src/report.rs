@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Assembles the full sensitivity sweep + dominance table into one text
 //! report — printed by `src/bin/loop_model_report.rs` and captured verbatim
-//! (labelled SIMULATED) into `docs/perf/perf-loop-model-baseline.md`, the
-//! same "run the binary, paste the output" pattern `ui_perf_bench`
-//! establishes for `docs/perf/ui-perf-baseline.md` §3.
+//! (labelled SIMULATED) into `docs/perf/perf-loop-model-baseline.md` (the M0
+//! prediction) and, after `Topology::Split` was re-parameterised to the
+//! as-built firmware, into `docs/perf/task-split-host-validation.md` (the M1
+//! before/after) — the same "run the binary, paste the output" pattern
+//! `ui_perf_bench` establishes for `docs/perf/ui-perf-baseline.md` §3, reused
+//! milestone over milestone rather than re-derived per document.
 
 use crate::params::{Corner, LoopModelParams};
 use crate::sim::{dominance_check, simulate, DominanceVerdict, SimResult, Topology};
@@ -88,7 +91,7 @@ fn corner_label(c: Corner) -> &'static str {
 fn topology_label(t: Topology) -> &'static str {
     match t {
         Topology::SingleLoop => "single-loop (current)",
-        Topology::Split => "split (proposed M1)",
+        Topology::Split => "split (as-built M1)",
     }
 }
 
@@ -113,7 +116,12 @@ pub fn render_text_report_with_params(params: &LoopModelParams) -> String {
     use std::fmt::Write;
     let mut out = String::new();
 
-    writeln!(out, "=== perf_loop_model — M0 SIMULATED baseline ===").unwrap();
+    // Milestone-neutral header: this same report shape is now reused by
+    // both the M0 baseline (`docs/perf/perf-loop-model-baseline.md`) and the
+    // M1 as-built re-run (`docs/perf/task-split-host-validation.md`), and
+    // will be again for M2 — the milestone label belongs to the caller
+    // embedding this text, not hardcoded here.
+    writeln!(out, "=== perf_loop_model — SIMULATED report ===").unwrap();
     writeln!(
         out,
         "no device, no HIL, no QEMU — host discrete-event model over real firmware-core state machines"
