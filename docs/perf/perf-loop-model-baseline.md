@@ -152,29 +152,29 @@ single-loop (current)    low             100         362.19         5.00        
 split (proposed M1)      low             100           0.00         0.00         0.00              0.0     20000.00
 single-loop (current)    low             255         813.19         5.00         5.56         178398.6       178.17
 split (proposed M1)      low             255           0.00         0.00         0.00              0.0     20000.00
-single-loop (current)    mid              10         248.65         6.56         6.84         131467.1       106.79
-split (proposed M1)      mid              10           5.00         5.00         5.00         119600.0       132.89
-single-loop (current)    mid              40         248.90         6.56         7.00         132264.1       105.04
-split (proposed M1)      mid              40           5.00         5.00         5.00         119600.0       132.89
-single-loop (current)    mid             100         370.90         6.56         7.37         134052.1       101.10
-split (proposed M1)      mid             100           5.00         5.00         5.00         119600.0       132.89
-single-loop (current)    mid             255         821.65         6.56         7.63         135266.9        98.46
-split (proposed M1)      mid             255           5.00         5.00         5.00         119600.0       132.89
-single-loop (current)    high             10         258.61         8.12         8.56         113817.8        73.72
-split (proposed M1)      high             10          10.00        10.00        10.00         119990.0        66.67
-single-loop (current)    high             40         258.61         8.12         8.77         114661.5        72.61
-split (proposed M1)      high             40          10.00        10.00        10.00         119990.0        66.67
-single-loop (current)    high            100         379.61         8.12         9.31         117114.6        69.88
-split (proposed M1)      high            100          10.00        10.00        10.00         119990.0        66.67
-single-loop (current)    high            255         830.11         8.12         9.75         118987.7        67.80
-split (proposed M1)      high            255          10.00        10.00        10.00         119990.0        66.67
+single-loop (current)    mid              10         248.90         6.56         7.23          57567.7        44.21
+split (proposed M1)      mid              10           5.00         5.00         5.00          44150.0        49.06
+single-loop (current)    mid              40         248.90         6.56         7.61          59585.9        43.48
+split (proposed M1)      mid              40           5.00         5.00         5.00          44150.0        49.06
+single-loop (current)    mid             100         369.90         6.56         8.51          64096.2        41.85
+split (proposed M1)      mid             100           5.00         5.00         5.00          44150.0        49.06
+single-loop (current)    mid             255         820.65         6.56         9.14          67105.5        40.77
+split (proposed M1)      mid             255           5.00         5.00         5.00          44150.0        49.06
+single-loop (current)    high             10         258.61         8.12         9.38          42111.8        24.94
+split (proposed M1)      high             10          10.00        10.00        10.00          44200.0        24.56
+single-loop (current)    high             40         258.61         8.12        10.05          44380.9        24.53
+split (proposed M1)      high             40          10.00        10.00        10.00          44200.0        24.56
+single-loop (current)    high            100         377.61         8.12        11.64          49473.0        23.61
+split (proposed M1)      high            100          10.00        10.00        10.00          44200.0        24.56
+single-loop (current)    high            255         828.11         8.12        12.94          53368.0        22.90
+split (proposed M1)      high            255          10.00        10.00        10.00          44200.0        24.56
 ```
 
 **Reading these numbers:**
 
 - **`single-loop`'s longest gap scales with payload size, monotonically, at
-  every corner** — 239 ms → 813 ms (low corner), 249 ms → 822 ms (mid), 259
-  ms → 830 ms (high), moving from a 10 B ACK to a 255 B frame. This is
+  every corner** — 239 ms → 813 ms (low corner), 249 ms → 821 ms (mid), 259
+  ms → 828 ms (high), moving from a 10 B ACK to a 255 B frame. This is
   exactly the mechanism `docs/perf/ui-perf-baseline.md` named: a queued
   outbound frame's `radio.transmit()` call blocks the WHOLE loop — including
   `ui.step()` — for the frame's full LoRa airtime, and a bigger frame means
@@ -188,13 +188,27 @@ split (proposed M1)      high            255          10.00        10.00        
   low bound and the split UI task's idle-tick low bound — is swept to
   exactly zero; not a claim that a real implementation achieves zero.)
 - **Order-of-magnitude improvement, at every corner, for the worst-case (255
-  B) payload:** 813.19 ms → 5.00 ms (low, 163x), 821.65 ms → 5.00 ms (mid,
-  164x), 830.11 ms → 10.00 ms (high, 83x). All comfortably clear a 10x bar.
-- **UI service cadence** improves alongside: single-loop's ~70–190 Hz
-  (bounded below by how often a TX block fires) versus split's independent,
-  payload-invariant cadence (66.67 Hz at the high corner, driven purely by
-  `ui.step()` + idle-tick cost, up to a modelled 20 000 Hz at the
-  degenerate low corner).
+  B) payload:** 813.19 ms → 5.00 ms (low, 163x), 820.65 ms → 5.00 ms (mid,
+  164x), 828.11 ms → 10.00 ms (high, 83x). All comfortably clear a 10x bar.
+- **UI service cadence does NOT uniformly improve alongside the longest-gap
+  win above** — this claim did not survive re-anchoring `ui_step`'s high
+  bound on the corrected ~30.72 ms full-repaint floor (§4.1; the earlier
+  ~3.1 ms floor understated it by ~10×, see the correction note there). At
+  the **low** corner split's cadence is still enormously higher (20 000 Hz
+  vs single-loop's ~178–192 Hz) and at the **mid** corner split is still
+  ahead (49.06 Hz vs single-loop's ~41–44 Hz). But at the **high** corner —
+  where `ui_step` is now large enough to dominate the decoupled UI task's
+  own loop period, with no CAD/TX/RX-poll cost around it to dilute it the
+  way single-loop's much larger fixed cost diluted the old, too-small
+  `ui_step` — split's cadence (24.56 Hz, flat across all four payload sizes,
+  by construction) is essentially tied with single-loop's, and for the
+  smallest payload is measurably **below** it: 24.56 Hz vs single-loop's
+  24.94 Hz at 10 B, though single-loop falls further as payload grows
+  (22.90 Hz at 255 B, still below split). The split topology still wins
+  decisively on **longest-gap** — the headline metric above, and the
+  correctness-relevant one: how long the UI can go completely unserviced —
+  at every corner and every payload size; it does not also uniformly win on
+  **average cadence** at the high corner.
 
 ## 6. SIMULATED — radio/dispatcher-task cadence
 
@@ -210,21 +224,21 @@ single-loop (current)    low             100         362.19         5.00       1
 split (proposed M1)      low             100         362.19         5.00       184.03
 single-loop (current)    low             255         813.19         5.00       178.17
 split (proposed M1)      low             255         813.19         5.00       179.95
-single-loop (current)    mid              10         248.65         6.56       106.79
+single-loop (current)    mid              10         248.90         6.56        44.21
 split (proposed M1)      mid              10         246.63         6.54       148.46
-single-loop (current)    mid              40         248.90         6.56       105.04
+single-loop (current)    mid              40         248.90         6.56        43.48
 split (proposed M1)      mid              40         248.88         6.54       145.83
-single-loop (current)    mid             100         370.90         6.56       101.10
+single-loop (current)    mid             100         369.90         6.56        41.85
 split (proposed M1)      mid             100         370.88         6.54       140.55
-single-loop (current)    mid             255         821.65         6.56        98.46
+single-loop (current)    mid             255         820.65         6.56        40.77
 split (proposed M1)      mid             255         821.63         6.54       136.88
-single-loop (current)    high             10         258.61         8.12        73.72
+single-loop (current)    high             10         258.61         8.12        24.94
 split (proposed M1)      high             10         258.56         8.07       119.85
-single-loop (current)    high             40         258.61         8.12        72.61
+single-loop (current)    high             40         258.61         8.12        24.53
 split (proposed M1)      high             40         258.56         8.07       118.04
-single-loop (current)    high            100         379.61         8.12        69.88
+single-loop (current)    high            100         377.61         8.12        23.61
 split (proposed M1)      high            100         379.56         8.07       113.61
-single-loop (current)    high            255         830.11         8.12        67.80
+single-loop (current)    high            255         828.11         8.12        22.90
 split (proposed M1)      high            255         830.06         8.07       110.21
 ```
 
@@ -251,7 +265,7 @@ topology for its own before/after.
   source-and-datasheet analysis, not this model's job.
 - **Real per-transaction SPI command overhead** beyond the analytically
   computed 4-symbol CAD-active time (`docs/perf/ui-perf-baseline.md` §4's
-  ~13 µs/line figure is the 40 MHz DISPLAY bus, not the 8 MHz radio bus, so
+  ~128 µs/line figure is the 40 MHz DISPLAY bus, not the 8 MHz radio bus, so
   it is not reused here — the unknown remainder is a swept range,
   `cad_spi_overhead`).
 - **Packet loss / retry storms / CAD-busy collisions** under real RF
