@@ -1,7 +1,7 @@
 # M1 task/core split — host validation (no hardware in the loop)
 
 **Mission:** `meshcadet-perf-task-split-host-validation`, replacing the
-cancelled `meshcadet-perf-task-split-hil`, under the Commander's 2026-08-02
+cancelled `meshcadet-perf-task-split-hil`, under the maintainer's 2026-08-02
 no-host-native/no-HIL ruling (campaign plan §0.5). Validates ADR-0012's
 dispatcher/UI task split — landed by `meshcadet-perf-ui-task-split`
 (`firmware/src/ui_task.rs`, `firmware/Cargo.toml`, `firmware/sdkconfig.
@@ -219,9 +219,9 @@ touched... Nothing inside `ui/` changes behaviour." `ui_perf` and
 (dirty lines/pixels per frame per motif) and allocation counts — so a
 faithful split predicts these numbers are **bit-identical**, not merely
 "close." [HOST] re-run, this container, `LD_LIBRARY_PATH`/`FONTCONFIG_FILE`
-set per `flight-manuals/checklists/firmware-toolchain-bootstrap-bare-
-container.md`'s fontconfig step (Slint's build-time font-matching pass needs
-`libfontconfig.so.1`, not present in this container by default):
+set per this container's standard fontconfig bootstrap step (Slint's
+build-time font-matching pass needs `libfontconfig.so.1`, not present in
+this container by default):
 
 ```
 cargo test -p ui_perf --locked   → 15 passed, 0 failed
@@ -265,11 +265,12 @@ green `check-all-features.sh` *is* the answer. Nothing here needs a bench."
 code this mission validates — PR jagoda/meshcadet#134 merged with `CI /
 firmware build gate (check-all-features.sh)` green (after one CI-fix
 iteration, `ci-fix-meshcadet-perf-ui-task-split-20260802-171541356`,
-recorded on that mission's dossier) — so R2 and the mechanical half of R8
-are **already closed** by that merge, and this mission's own push
-re-confirms it against the unchanged firmware source (this mission's diff
-touches only `perf_loop_model/`, its two `docs/perf/*.md` documents, and
-this mission's own dossier — no `firmware/` source line changes).
+recorded in that effort's own tracking note) — so R2 and the mechanical
+half of R8 are **already closed** by that merge, and this mission's own
+push re-confirms it against the unchanged firmware source (this mission's
+diff touches only `perf_loop_model/`, its two `docs/perf/*.md` documents,
+and this mission's own tracking note — no `firmware/` source line
+changes).
 
 **Verdict, leg (c):** host lane green in this container, firmware lane
 already green at the code this validates (PR #134's merged CI run) and
@@ -476,7 +477,7 @@ post-split diagnostics log format:
 
 - **§2 ("which build to check out")**: the M1 run's `<REF>` is now concrete
   — this mission's merge commit (or `meshcadet-perf-ui-task-split`'s
-  merged PR #134, whichever ref the Commander runs the kit against first;
+  merged PR #134, whichever ref a maintainer runs the kit against first;
   both carry the identical `ui_task.rs`).
 - **Part C's expected log format**: the dispatcher's `PERF phase=` block
   drops `ui_step` (now 5 phases: `gps`, `battery`, `cad`, `tx`, `rx_poll`,
