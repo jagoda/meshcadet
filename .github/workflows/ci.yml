@@ -65,6 +65,21 @@ name: CI
 # reintroduce that deadlock on site-only PRs — switch to a companion
 # always-green job (or per-job `if:` guards that still report a conclusion)
 # at that point instead of a bare `paths-ignore`.
+#
+# ── Job-level targeting: skip only the lane a diff can't affect ──────────
+#
+# The `changes` job (below) buckets the diff into `full` / `host` /
+# `firmware` via dorny/paths-filter, and `test`/`fmt`/`clippy`/`firmware`
+# each gate on it with a job-level `if:`. This is deliberately NOT another
+# `paths-ignore` (workflow-level skip): a job skipped by `if:` still reports
+# a "skipped" conclusion, which satisfies a `required_status_checks` rule
+# naming that job, whereas a workflow that never triggers at all leaves a
+# named required check stuck in "Expected — waiting for status" forever
+# (exactly the hazard called out above for the `paths-ignore` site filter).
+# So unlike that filter, this scheme stays safe to use even if 18807600
+# grows a `required_status_checks` rule later — no follow-up change needed.
+# `workflow_dispatch` runs are never filtered (see each gated job's `if:`)
+# since a manual run exists specifically to force a full check.
 on:
   pull_request:
     paths-ignore:
@@ -90,6 +105,58 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    name: detect which jobs this diff can affect
+    runs-on: ubuntu-latest
+    # Full-history checkout below so dorny/paths-filter's git-based
+    # comparison (used for the `push` trigger, which diffs against the
+    # pre-push commit) always has the commit it needs locally; for
+    # `pull_request` the action instead calls the GitHub API and ignores the
+    # checkout depth entirely.
+    outputs:
+      full: ${{ steps.filter.outputs.full }}
+      host: ${{ steps.filter.outputs.host }}
+      firmware: ${{ steps.filter.outputs.firmware }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            # Anything both lanes depend on, a lockfile, a toolchain pin, or
+            # the workflow files themselves — run the full suite, no
+            # exceptions. `protocol` and `firmware-core` are root-workspace
+            # members that the DETACHED `firmware/` crate also path-deps on
+            # (see Cargo.toml's own doc comment), so a change there can flip
+            # what firmware builds too, not just the host lane. Root
+            # `Cargo.toml` is here rather than under `host` below because
+            # `[workspace.dependencies]` version bumps there change what
+            # `protocol`/`firmware-core` resolve to even when neither
+            # crate's own Cargo.toml text changes.
+            full:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'protocol/**'
+              - 'firmware-core/**'
+              - 'firmware/Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'firmware/rust-toolchain.toml'
+              - '.github/workflows/**'
+            # Root-workspace members `firmware/` does NOT path-dep on (see
+            # Cargo.toml's `members` list) — only test/fmt/clippy need to
+            # run for these.
+            host:
+              - 'host/**'
+              - 'xtask/**'
+              - 'ui_sim/**'
+              - 'ui_perf/**'
+              - 'perf_loop_model/**'
+            firmware:
+              - 'firmware/**'
+
   version-drift-guard:
     name: firmware/Cargo.toml version matches workspace version
     runs-on: ubuntu-latest
@@ -158,6 +225,18 @@ jobs:
 
   test:
     name: cargo test (protocol, host, xtask, ui_sim, ui_perf)
+    needs: changes
+    # See the `changes` job above. `workflow_dispatch` always runs the full
+    # suite regardless of what the filter computed. `needs.changes.result !=
+    # 'success'` is a fail-SAFE, not a typo: an explicit job `if:` replaces
+    # the implicit "only run if all `needs` succeeded" check entirely, so
+    # without this clause a `changes` job failure (dorny/paths-filter action
+    # hiccup, an unresolvable git diff on some edge-case history) would leave
+    # every output unset/false and silently SKIP this job — a "skipped"
+    # conclusion that still satisfies a `required_status_checks` rule, i.e. a
+    # broken filter would silently pass PRs with zero Rust testing. Treat
+    # "the filter didn't run cleanly" the same as "the filter said run it".
+    if: github.event_name == 'workflow_dispatch' || needs.changes.result != 'success' || needs.changes.outputs.full == 'true' || needs.changes.outputs.host == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -186,6 +265,9 @@ jobs:
 
   fmt:
     name: cargo fmt --check
+    needs: changes
+    # See the `changes` job above and the fail-safe note on `test`'s `if:`.
+    if: github.event_name == 'workflow_dispatch' || needs.changes.result != 'success' || needs.changes.outputs.full == 'true' || needs.changes.outputs.host == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -198,6 +280,9 @@ jobs:
 
   clippy:
     name: cargo clippy -D warnings
+    needs: changes
+    # See the `changes` job above and the fail-safe note on `test`'s `if:`.
+    if: github.event_name == 'workflow_dispatch' || needs.changes.result != 'success' || needs.changes.outputs.full == 'true' || needs.changes.outputs.host == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -220,6 +305,9 @@ jobs:
 
   firmware:
     name: firmware build gate (check-all-features.sh)
+    needs: changes
+    # See the `changes` job above and the fail-safe note on `test`'s `if:`.
+    if: github.event_name == 'workflow_dispatch' || needs.changes.result != 'success' || needs.changes.outputs.full == 'true' || needs.changes.outputs.firmware == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
