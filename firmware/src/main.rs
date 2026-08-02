@@ -1717,20 +1717,35 @@ fn run() -> anyhow::Result<()> {
     // radio stays in continuous RX and DIO1 latches high on RxDone until
     // explicitly cleared, so a packet completing between polls is still
     // caught on the very next call regardless of how long this window is (see
-    // `Radio::try_receive`'s doc). Its only job is to give the dispatcher a
-    // yield cadence.
+    // `Radio::try_receive`'s doc). Its only job is to bound how long this
+    // task can go without servicing GPS poll, battery poll, room keep-alive,
+    // and draining `UiCommand`s TO the (now separate) UI task.
     //
-    // DEFECT: this was previously 50 ms, hard-coded at the call site. Because
-    // `ui.step()` (touch + keyboard polling, render) runs once per dispatcher
-    // loop iteration and this RX poll dominates the iteration's wall-clock
-    // cost when idle, 50 ms was the de-facto floor on how often touch/keyboard
-    // state was sampled — already slower than the ≥20 ms cadence
-    // `TouchDriver::poll_event`'s own doc says is needed for "interactive
-    // response" (`touch.rs`), and a hard bound on the keyboard byte-drain rate
-    // besides. Shrinking the window raises the loop's iteration rate (and so
-    // the touch/keyboard sampling rate) roughly 10x without weakening RX
-    // capture at all.
-    const RX_POLL_YIELD_MS: u32 = 5;
+    // CORRECTION (`meshcadet-perf-radio-dio1-interrupt`): the 5 ms value and
+    // the comment that used to justify it (touch/keyboard sampling cadence,
+    // "`ui.step()` ... runs once per dispatcher loop iteration") both predate
+    // ADR-0012's task split. `ui.step()` has not run on this task since that
+    // split — the UI (touch, keyboard, render) is `ui_task.rs`, pinned to
+    // core 1, on its own cadence entirely independent of this loop. Nothing
+    // this task still owns (GPS poll — duty-cycled; battery poll — throttled
+    // ADC; room keep-alive — its own scheduler; the 30 s RX-stats rollup) is
+    // gated on wall-clock elapsed time rather than iteration count (see
+    // `gps::should_close_active_window`/`should_reopen_active_window` for the
+    // pattern), so none of them regress from a looser iteration cadence.
+    //
+    // Retuned 5 ms → 20 ms now that `try_receive`'s DIO1 wait is interrupt/
+    // notification-driven rather than a `FreeRtos::delay_ms(1)` spin: an idle
+    // iteration used to cost up to 5 separate 1 ms sleep/wake cycles just to
+    // find nothing; it now costs exactly one blocking wait, so widening the
+    // bound reduces scheduler wake-ups on this task without reintroducing the
+    // pre-split 50 ms "DEFECT" (still 2.5x tighter), and matches `channel_
+    // activity_detection`'s own 20 ms CAD window for one consistent cadence
+    // on this task rather than two arbitrary ones. The perf_loop_model host
+    // harness (`meshcadet-perf-radio-host-validation`) is the tool that
+    // measures this window's actual effect on UI-unserviced-gap and
+    // RX-notice-latency numbers; this value is a documented, reasoned
+    // starting point, not a claimed measurement.
+    const RX_POLL_YIELD_MS: u32 = 20;
 
     #[cfg(feature = "hil")]
     let mut last_tx_ms: u64 = 0;
@@ -2531,8 +2546,10 @@ fn run() -> anyhow::Result<()> {
         // this loop last ENTERED this call — an honest-proxy upper bound on
         // "how long could a ready frame have sat before the dispatcher
         // noticed it", not a hardware RxDone-edge timestamp: `try_receive`
-        // itself busy-polls DIO1 for up to `RX_POLL_YIELD_MS`, but DIO1
-        // latches high on RxDone and stays latched until cleared (see
+        // itself waits on DIO1 (interrupt/notification-driven since
+        // `meshcadet-perf-radio-dio1-interrupt`, not a busy-poll) for up to
+        // `RX_POLL_YIELD_MS`, but DIO1 latches high on RxDone and stays
+        // latched until cleared (see
         // `Radio::try_receive`'s doc), so a frame that became ready during a
         // long CAD/TX block earlier THIS SAME iteration is already latched
         // by the time this call runs and returns almost instantly — hiding

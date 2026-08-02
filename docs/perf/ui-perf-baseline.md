@@ -267,11 +267,14 @@ against the formula on 2026-08-02.
 | 255 B (max) | **800 ms** |
 
 This is RF airtime — the SX1262 transmitting — **not** SPI-bus-hold time. SPI2
-is touched only for the initial `WRITE_BUFFER`/`SetTx` commands
-(`radio.rs:262-308`); the loop then polls the **DIO1 GPIO** for `TxDone`
-(`radio.rs:312-321`), not SPI. `radio.try_receive`'s `RX_POLL_YIELD_MS` = 5 ms
-window and `channel_activity_detection`'s 20 ms deadline
-(`radio.rs:467-477`) are likewise DIO1 GPIO watches, not SPI holds.
+is touched only for the initial `WRITE_BUFFER`/`SetTx` commands; the loop
+then waits on the **DIO1 GPIO** for `TxDone`, not SPI (interrupt/
+notification-driven as of `meshcadet-perf-radio-dio1-interrupt` — see §9 —
+so "polls" above is no longer literal, though the RF-not-SPI distinction the
+sentence exists to make still holds). `radio.try_receive`'s
+`RX_POLL_YIELD_MS` = 20 ms window (retuned from 5 ms by the same mission) and
+`channel_activity_detection`'s 20 ms deadline are likewise DIO1 GPIO watches,
+not SPI holds.
 
 ---
 
@@ -297,20 +300,30 @@ Everything in §3.4, plus the demotions that measurement produced:
 
 ### 5.2 OPEN — the structural item, and it dwarfs everything above
 
-**`radio.transmit()` blocks the single shared task for the full LoRa
-airtime, and `ui.step()` is inline behind it.** `radio.rs:312-321` spins
-`while !dio1.is_high() { FreeRtos::delay_ms(1) }` until `TxDone` — 83 ms for
-an ACK, up to 800 ms for a 255 B frame (§4.2). `ui.step()` (`main.rs:2593`) is
-the *only* place touch, keyboard and render happen, and it runs **after**
-CAD+TX in the same iteration. For the whole airtime window the UI is not
-merely slow, it is **not sampled at all**. Every inbound DM enqueues an ACK,
-which triggers another CAD+TX, which freezes the UI again.
+**`radio.transmit()` blocks the dispatcher task for the full LoRa
+airtime** — 83 ms for an ACK, up to 800 ms for a 255 B frame (§4.2). The
+`ui.step()`/single-shared-task framing this paragraph originally argued from
+is itself superseded: ADR-0012 (`meshcadet-perf-ui-task-split`) moved
+touch/keyboard/render onto their own core-1-pinned `ui_task`, so `ui.step()`
+no longer shares a task with `radio.transmit()` at all — see §9. What
+remains open, post-split, is narrower: the dispatcher task still spends the
+full airtime unable to service GPS/battery/room-keepalive/CAD/RX, which is
+why RX-notice latency and
+CAD-attempt cadence under load are still live questions for this campaign
+(plan §6 criterion 2).
+
+**CORRECTION (`meshcadet-perf-radio-dio1-interrupt`):** the
+`while !dio1.is_high() { FreeRtos::delay_ms(1) }` spin-poll this paragraph
+used to quote (at the old `radio.rs:312-321`) no longer exists — `transmit`/
+`try_receive`/`channel_activity_detection` now block on an interrupt/
+notification-driven wait (`firmware/src/radio.rs`'s `GpioDio1Wait`). The
+BLOCKING DURATION is unchanged (still the full analytically-computed
+airtime, per the table above) — only the wait MECHANISM changed, from a
+1 ms-quantized busy-poll to a single blocking wait with no polling
+quantization and no per-tick scheduler wake. See §9.
 
 Set against the largest UI-side cost ever measured here (§4.1: ~30.7 ms for a
 full-window navigation paint), **the structural item is 2.7×–26× larger.**
-
-`FreeRtos::delay_ms(1)` does yield to the scheduler, so the two aux threads
-keep running — but the UI is inline in the blocked task, so it gets nothing.
 
 The earlier record classified TX airtime as "out of scope — no UI change can
 affect this." That was correct *for a pass scoped to UI changes*, and it is
@@ -503,6 +516,27 @@ resurrected from an old harness output, not as a second narrative.
 - **"TX airtime is out of scope" is superseded, not retracted.** It was
   correct as scoped ("no *UI* change can affect this") and wrong as a
   system-level conclusion. See §5.2 and §5.3's second bullet.
+- **§5.2's "`ui.step()` shares a task with `radio.transmit()`" framing is
+  superseded, not retracted.** It was correct when written. ADR-0012
+  (`meshcadet-perf-ui-task-split`) moved touch/keyboard/render onto their own
+  core-1-pinned `ui_task`; the dispatcher task (radio + GPS + battery + room
+  keep-alive) can no longer even name `UiRuntime` (main.rs's own `mod ui_task`
+  boundary comment). §5.2's edited to reflect this; the narrower item that
+  remains open — the dispatcher task itself still can't service anything else
+  during a TX/RX/CAD window — is unaffected by the split and is what this
+  campaign's M2 (`meshcadet-perf-radio-dio1-interrupt`) and its host-validation
+  sibling are measuring.
+- **§5.2's `while !dio1.is_high() { FreeRtos::delay_ms(1) }` spin-poll quote
+  is retracted — the code it quoted is gone.** `meshcadet-perf-radio-dio1-
+  interrupt` replaced all three DIO1 spin-polls (`transmit`/`try_receive`/
+  `channel_activity_detection`) with an interrupt/notification-driven wait
+  (`firmware/src/radio.rs`'s `GpioDio1Wait`). The blocking DURATION §5.2's
+  table reports is unchanged (still the full analytical airtime); only the
+  wait mechanism changed. Every `radio.rs:NNN-NNN` line citation elsewhere in
+  this document predates that edit and should be treated as approximate, not
+  re-verified line-by-line here — the M4 campaign synthesis
+  (`meshcadet-perf-campaign-synthesis`) is where this document's citations get
+  a single consolidated re-pass.
 - **§5's earlier "CONFIRMED, concrete" open hotspots — the per-dirty-line
   `Vec<Rgb565>` and the unconditional per-tick GPS/battery recompute — are
   closed, not open.** Both landed and are pinned (§3.4). The earlier document

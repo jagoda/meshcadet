@@ -39,6 +39,7 @@
 //! | [`room_session`]  | `firmware/src/main.rs`'s room-contact RX/TX dispatch + a small dedicated NVS store for learned session state (radio TX enqueue, RX routing, flash I/O) |
 //! | [`room_admin`]    | `admin_server.rs`'s `FRAME_ADD_ROOM`/`FRAME_DEL_ROOM`/`FRAME_QUERY_ROOMS` arms and `provisioning_server.rs`'s equivalent staging arms (NVS persist, the serial write) |
 //! | [`prov_diag`]     | `provisioning_server.rs`'s `run()` raw-RX hex-dump diagnostic (the USB-serial read loop itself) |
+//! | [`radio_wait`]    | `radio.rs`'s `GpioDio1Wait` (GPIO ISR subscribe + FreeRTOS task notification) |
 //! | [`ui::gps_status`]| `ui::screens::gps_status::GpsStatusScreen` (the `slint!{}` view) |
 //! | [`ui::contact_list`] | `ui::screens::contact_list::{ContactListScreen, ContactItem}` (the `slint!{}` view) |
 //! | [`ui::admin_menu`] | `ui::screens::admin_menu::AdminMenuScreen` (the `slint!{}` view) |
@@ -73,6 +74,7 @@ pub mod notification;
 pub mod perf;
 pub mod pin_menu;
 pub mod prov_diag;
+pub mod radio_wait;
 pub mod room_admin;
 pub mod room_session;
 pub mod runtime_settings_store;
