@@ -1,5 +1,17 @@
 # Dispatcher superloop model — SIMULATED baseline (M0, no hardware in the loop)
 
+**Status update, M1 landed:** the `split` topology this document predicted
+(§2) has since been implemented (ADR-0012 /
+`meshcadet-perf-ui-task-split`, `firmware/src/ui_task.rs`). Every number
+below is preserved verbatim as the historical **M0 prediction** — nothing
+here is retracted or wrong, per this repo's correction convention
+(`ui-perf-baseline.md` §9: edit the body only for a retracted/wrong number,
+not for a milestone landing). The **as-built** re-run, re-parameterised to
+the real `ui_task.rs` constants
+(`UI_TICK_MS`, the new `queue_handoff` cost for the `std::sync::mpsc`
+boundary) and diffed against the prediction below, lives in
+`docs/perf/task-split-host-validation.md`.
+
 **Every number in this document is SIMULATED.** It comes from
 `perf_loop_model`, a host discrete-event model of the firmware dispatcher
 superloop, not from a flashed device, not from an emulator, and not from an
@@ -77,11 +89,13 @@ argument: `perf_loop_model/src/lib.rs`.
   CAD+TX and RX poll.
 - **`split` (proposed M1)** — the proposed task/core split (UI on its own
   task/core, radio+dispatcher on core 0, message queues across the
-  boundary) — **NOT YET IMPLEMENTED in firmware.** This is a *predicted*
-  delta, not a measurement of real code, and is labelled as such throughout.
-  Once the split is actually built, a later validation pass re-runs this
-  same model against the as-built topology as a permanent regression
-  harness.
+  boundary) — **NOT YET IMPLEMENTED in firmware at the time this document
+  was written.** This was a *predicted* delta, not a measurement of real
+  code, and was labelled as such throughout. **It has since been built**
+  (ADR-0012 / `meshcadet-perf-ui-task-split`); the as-built re-run and its
+  diff against the prediction below live in
+  `docs/perf/task-split-host-validation.md`. The numbers below are kept
+  unchanged as the historical M0 prediction.
 
 Traffic workload (`perf_loop_model::workload::Workload::payload_sweep`): an
 "active conversation" scenario — inbound DM every 5 s (each arrival decodes
@@ -280,10 +294,15 @@ topology for its own before/after.
 
 ## 8. Status
 
-SIMULATED half: **DONE** — harness committed (`perf_loop_model/`, 18 tests,
+SIMULATED half: **DONE** — harness committed (`perf_loop_model/`, then 18
+tests, now 30 after the M1 as-built re-parameterization —
 `cargo test --workspace`-covered), sensitivity sweep run at three corners
 across the full payload-size range, dominance verdict holds everywhere
 (§4), order-of-magnitude UI-unserviced-gap improvement holds everywhere
-(§5). On-device confirmation of every swept range, and of the split
-topology once it is actually implemented, remains open — this document
-predicts a delta, it does not confirm one on real hardware.
+(§5). **M1 update:** the split topology is no longer hypothetical — see
+`docs/perf/task-split-host-validation.md` for the as-built re-run, its diff
+against the prediction here, and the order-of-magnitude verdict re-confirmed
+against the real `ui_task.rs` constants. On-device confirmation of every
+swept range remains open regardless (deferred predicate, collection kit) —
+this document, and its M1 successor, predict a delta; neither confirms one
+on real hardware.

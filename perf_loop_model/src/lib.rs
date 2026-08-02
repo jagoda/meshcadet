@@ -102,12 +102,19 @@
 //! # Two topologies, one harness
 //!
 //! [`sim::Topology::SingleLoop`] models today's shipped superloop.
-//! [`sim::Topology::Split`] models the proposed M1 split (UI on its own
-//! task/core, radio+dispatcher on core 0, message queues across the
-//! boundary) — NOT YET IMPLEMENTED in firmware. This gives a **predicted**
-//! delta before a line of firmware changes, and is meant to become the
-//! permanent regression harness a later host-validation pass re-runs
-//! against the as-built topology once the split actually lands.
+//! [`sim::Topology::Split`] models the M1 split (UI on its own task/core,
+//! radio+dispatcher on core 0, message queues across the boundary) —
+//! **implemented in firmware as of ADR-0012 /
+//! `meshcadet-perf-ui-task-split`** (`firmware/src/ui_task.rs`,
+//! `firmware/src/main.rs`'s dispatcher loop). This module is
+//! re-parameterised to that AS-BUILT topology
+//! (`params::LoopModelParams::split_ui_idle_tick`'s real `UI_TICK_MS`
+//! anchor, and the new `params::LoopModelParams::queue_handoff` cost for
+//! the `std::sync::mpsc` boundary ADR-0012 D3 introduced) by
+//! `meshcadet-perf-task-split-host-validation`, whose before/after
+//! comparison against the original M0 prediction lives in
+//! `docs/perf/task-split-host-validation.md`. This crate remains the
+//! permanent regression harness for the topology going forward.
 //!
 //! # Every number this crate prints is SIMULATED, never a device measurement
 //!

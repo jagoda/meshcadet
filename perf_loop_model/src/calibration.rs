@@ -18,8 +18,9 @@
 //! "Derived" from a Part C capture: `ui_step`, `cad_spi_overhead`,
 //! `gps_poll`, `battery_poll`. Every other field (`frame_encode`,
 //! `wdt_pet`, `tx_timestamp_rebase`, `room_keepalive_sched_check`,
-//! `drain_ui_command`, `periodic_stats`, `split_ui_idle_tick`) has no
-//! corresponding field on [`MeasuredConstants`] at all — there is
+//! `drain_ui_command`, `periodic_stats`, `split_ui_idle_tick`,
+//! `queue_handoff`) has no corresponding field on [`MeasuredConstants`] at
+//! all — there is
 //! structurally no way to calibrate them through this hook until a future
 //! instrumentation change gives them a phase to read, which is Part D's own
 //! table's honest answer for each of them today.

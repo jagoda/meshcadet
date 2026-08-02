@@ -224,13 +224,19 @@ fn attempt_cad_tx(
 ///   `UiCommand` drain are part of THIS SAME loop, so the recorded gap is
 ///   the real UI-unserviced-gap definition (wall-clock between consecutive
 ///   `ui.step()` calls).
-/// - `false` — the radio/dispatcher HALF of the proposed M1 split topology,
-///   once decoupled from the UI task entirely: no `ui.step()`/drain in this
-///   loop at all, so the recorded "gap" is this task's own iteration
-///   cadence (a smaller number here means a faster, more responsive CAD/RX
-///   loop — feeds the "RX-poll cadence and CAD-attempt latency… improve"
-///   half of the pass's priority-1 acceptance criterion, which M1/M2's
-///   own host-validation children re-run this exact model against).
+/// - `false` — the radio/dispatcher HALF of the AS-BUILT M1 split topology
+///   (ADR-0012, `firmware/src/main.rs`'s dispatcher loop post-split), fully
+///   decoupled from the UI task: no `ui.step()`/drain in this loop at all,
+///   so the recorded "gap" is this task's own iteration cadence (a smaller
+///   number here means a faster, more responsive CAD/RX loop — feeds the
+///   "RX-poll cadence and CAD-attempt latency… improve" half of the pass's
+///   priority-1 acceptance criterion, which M2's own host-validation child
+///   re-runs this exact model against). This branch pays
+///   [`crate::params::LoopModelParams::queue_handoff`] once per iteration,
+///   standing in for the dispatcher's own `evt_tx.try_send(..)` event
+///   post(s) and `cmd_rx.try_recv()` drain loop that replaced the old
+///   direct `ui.*` calls (ADR-0012 D3, C7) — the single-loop branch above
+///   never pays it, because it has no queue at all.
 pub(crate) fn simulate_core(
     r: &ResolvedParams,
     workload: &Workload,
@@ -329,6 +335,10 @@ pub(crate) fn simulate_core(
         } else {
             // No UI in this task under the split topology — the recorded
             // "gap" is this iteration's own duration (this task's cadence).
+            // Pay the queue-handoff cost (ADR-0012 D3's `evt_tx.try_send`
+            // event post(s) + `cmd_rx.try_recv()` drain, replacing the old
+            // direct `ui.*` calls) before closing out the iteration.
+            t += r.queue_handoff;
             gaps.push(t - iteration_start_ms);
         }
     }
@@ -337,11 +347,14 @@ pub(crate) fn simulate_core(
 }
 
 /// SPLIT topology's UI task, fully decoupled from radio/dispatcher: no CAD,
-/// no TX, no RX poll — it loops purely between `ui.step()` and its own
-/// idle-tick granularity (see [`crate::params::LoopModelParams::
-/// split_ui_idle_tick`]). By construction this NEVER touches
-/// `lora_airtime_ms`/`TxQueue`/payload size at all, which is what makes
-/// "no longer scales with LoRa payload size" (pass acceptance
+/// no TX, no RX poll — it loops between `ui.step()`, a queue-handoff cost
+/// (see [`crate::params::LoopModelParams::queue_handoff`] — the AS-BUILT
+/// `ui_task`'s `evt_rx.recv_timeout(..)` wake and any `cmd_tx.try_send(..)`
+/// it issues, ADR-0012 D3/C7), and its own idle-tick granularity (see
+/// [`crate::params::LoopModelParams::split_ui_idle_tick`], re-anchored to
+/// `firmware/src/ui_task.rs`'s real `UI_TICK_MS` constant). By construction
+/// this NEVER touches `lora_airtime_ms`/`TxQueue`/payload size at all, which
+/// is what makes "no longer scales with LoRa payload size" (pass acceptance
 /// criterion 3) trivially true for this topology rather than merely
 /// asserted.
 pub(crate) fn simulate_split_ui_task(r: &ResolvedParams, duration_ms: f64) -> GapStats {
@@ -353,6 +366,7 @@ pub(crate) fn simulate_split_ui_task(r: &ResolvedParams, duration_ms: f64) -> Ga
         gaps.push(gap);
         t += r.ui_step;
         last_service_end_ms = t;
+        t += r.queue_handoff;
         t += r.split_ui_idle_tick;
     }
     GapStats::from_gaps(gaps, t, TrafficCounters::default())
@@ -364,10 +378,18 @@ pub(crate) fn simulate_split_ui_task(r: &ResolvedParams, duration_ms: f64) -> Ga
 pub enum Topology {
     /// Today's shipped topology: radio + UI in one task, one core.
     SingleLoop,
-    /// The proposed M1 split: UI on its own task/core, radio+dispatcher on
-    /// core 0, message queues across the boundary. Not yet implemented in
-    /// firmware — this is the PREDICTED delta the pass's M0 checkpoint
-    /// uses to decide whether M1 is worth building at all.
+    /// The M1 split, AS BUILT (ADR-0012 / `meshcadet-perf-ui-task-split`,
+    /// `firmware/src/ui_task.rs` + `firmware/src/main.rs`'s dispatcher
+    /// loop): UI on its own `ui_task`/core 1, radio+dispatcher on core 0,
+    /// two bounded `std::sync::mpsc` queues across the boundary. Every
+    /// as-built constant this crate can read from source (`UI_TICK_MS`,
+    /// the `recv_timeout`/`try_send` mechanism) is wired in directly;
+    /// every cost neither this container nor an emulator can produce
+    /// (queue-handoff wall-clock, `ui.step()` wall-clock) remains a cited
+    /// sensitivity range, per this crate's no-hardware-in-the-loop
+    /// constraint (`crate` root doc). See
+    /// `docs/perf/task-split-host-validation.md` for the before/after this
+    /// re-parameterization produces against the original M0 prediction.
     Split,
 }
 
@@ -465,7 +487,7 @@ pub fn dominance_check(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::params::{Corner, LoopModelParams};
+    use crate::params::{Corner, LoopModelParams, ParamRangeMs};
     use crate::workload::Workload;
 
     #[test]
@@ -553,6 +575,52 @@ mod tests {
         let small = simulate(Topology::Split, &r, &small_workload, 10, 120_000.0);
         let large = simulate(Topology::Split, &r, &large_workload, 255, 120_000.0);
         assert_eq!(small.ui.longest_gap_ms, large.ui.longest_gap_ms);
+    }
+
+    #[test]
+    fn queue_handoff_adds_directly_to_the_split_ui_tasks_gap() {
+        // As-built re-parameterization (leg (a) of the host-validation
+        // pass): the queue-handoff cost this crate now charges the split
+        // UI task (`ui_task`'s `evt_rx.recv_timeout` wake + any
+        // `cmd_tx.try_send`, ADR-0012 D3) must actually move the number it
+        // was added to move, not sit there unwired.
+        let mut params = LoopModelParams::documented_defaults();
+        params.queue_handoff = ParamRangeMs::new(0.0, 0.0);
+        let before = simulate_split_ui_task(&params.resolve(Corner::Mid), 60_000.0);
+
+        params.queue_handoff = ParamRangeMs::new(3.0, 3.0);
+        let after = simulate_split_ui_task(&params.resolve(Corner::Mid), 60_000.0);
+
+        assert!(
+            after.longest_gap_ms > before.longest_gap_ms,
+            "queue_handoff=3ms should widen the split UI task's gap: before={} after={}",
+            before.longest_gap_ms,
+            after.longest_gap_ms,
+        );
+    }
+
+    #[test]
+    fn split_dispatcher_task_pays_the_queue_handoff_cost_too() {
+        // The OTHER side of the boundary (ADR-0012 D3's `evt_tx.try_send`
+        // event post(s) + `cmd_rx.try_recv()` drain) — `simulate_core`'s
+        // `include_ui: false` branch, which models the split topology's
+        // radio/dispatcher task.
+        let mut params = LoopModelParams::documented_defaults();
+        params.queue_handoff = ParamRangeMs::new(0.0, 0.0);
+        let r_zero = params.resolve(Corner::Mid);
+        let zero = simulate_core(&r_zero, &Workload::idle(), 60_000.0, false);
+
+        params.queue_handoff = ParamRangeMs::new(3.0, 3.0);
+        let r_paid = params.resolve(Corner::Mid);
+        let paid = simulate_core(&r_paid, &Workload::idle(), 60_000.0, false);
+
+        assert!(
+            paid.longest_gap_ms > zero.longest_gap_ms,
+            "queue_handoff=3ms should widen the split dispatcher task's own cadence: \
+             zero={} paid={}",
+            zero.longest_gap_ms,
+            paid.longest_gap_ms,
+        );
     }
 
     #[test]
