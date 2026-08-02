@@ -64,14 +64,30 @@ pub struct Workload {
 /// keep-alive cadence: 5 minutes (300_000 ms)".
 pub const ROOM_KEEPALIVE_ROUTINE_INTERVAL_MS: f64 = 300_000.0;
 
-/// Real in-repo constant, not swept: `RX_POLL_YIELD_MS = 5`
-/// (`firmware/src/main.rs:1643`) — the DIO1-watch yield window `radio.
+/// Real in-repo constant, not swept: `RX_POLL_YIELD_MS = 20`
+/// (`firmware/src/main.rs:1748`) — the DIO1-watch yield window `radio.
 /// try_receive` polls for. This model conservatively charges the FULL
 /// window every iteration (worst case for the RX-poll phase's contribution
 /// to the UI-unserviced gap), since the real function returns early only on
 /// a DIO1 edge and this model does not simulate sub-window packet-arrival
 /// timing.
-pub const RX_POLL_YIELD_MS: f64 = 5.0;
+///
+/// **Retuned 5 -> 20 by `meshcadet-perf-radio-dio1-interrupt`, re-anchored
+/// here by its sibling `meshcadet-perf-radio-host-validation`** (this is the
+/// tool `main.rs:1744`'s own retune comment names as "the tool that
+/// measures this window's actual effect"). The retune's justification
+/// (`main.rs:1736-1747`) is that `try_receive`'s DIO1 wait moved from a
+/// `FreeRtos::delay_ms(1)` spin (up to 5 separate 1 ms sleep/wake cycles to
+/// find nothing) to one interrupt/notification-driven blocking wait (one
+/// wake), so widening the window trades nothing this model tracks: none of
+/// GPS poll/battery poll/room keep-alive/the 30 s RX-stats rollup are gated
+/// on wall-clock elapsed time rather than iteration count. Every published
+/// number in `docs/perf/perf-loop-model-baseline.md` and `docs/perf/
+/// task-split-host-validation.md` that depended on the OLD 5 ms value is
+/// stale as of this change — both documents carry an in-place correction
+/// note pointing here, per their own `ui-perf-baseline.md`-derived §9-style
+/// convention, rather than being silently wrong for a post-M2 ref.
+pub const RX_POLL_YIELD_MS: f64 = 20.0;
 
 impl Workload {
     /// No traffic at all — every stream disabled. Used to measure the

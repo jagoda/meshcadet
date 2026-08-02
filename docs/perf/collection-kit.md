@@ -23,6 +23,18 @@ recorded on `ui_task`'s own periodic block instead — see Part C and Part G
 step 8 for the restored format; this is still the same M1 ref, not a new
 milestone.
 
+**Extended for M2 (radio-path timeliness) by
+`meshcadet-perf-radio-host-validation`.** `meshcadet-perf-radio-dio1-
+interrupt` replaced the three DIO1 spin-polls with an interrupt/
+notification-driven wait and retuned `RX_POLL_YIELD_MS` 5 -> 20 ms — no
+diagnostics log FORMAT change (D1-D10's expected-output blocks in Part C/E
+are unchanged), but D5/D6/Part G's captures now validate the notify-driven
+wait's real delivery/latency behaviour rather than the removed spin-poll's,
+and two new predicates are added: **D11** (IRAM-safety confirmatory
+reading) and **D12** (bounded-latency-under-concurrent-NVS-write reading) —
+both from `docs/perf/radio-host-validation.md` §4.1/§6's ISR-safety static
+audit, neither a gate on M2 (see the new subsection at the end of Part F).
+
 ## 0. What this closes, and what it doesn't
 
 This is the one place in the `meshcadet-perf-rearchitecture` performance
@@ -55,6 +67,8 @@ one tightens it. Once a section here closes a predicate, strike that row from
 | D8 — post-change stack high-water mark, per task | Part E — **expanded** for the M1 ref: `ui_task` now has its own periodic HWM log alongside `main`/`admin_server`/`prov_server`'s pre-existing ones (see Part E) |
 | D9 — SPI2 concurrent-access confirmatory reading | Part F — **still not runnable**, reason changed: the M1 split now provides the concurrency Part F's reading needs, but the GPIO-toggle probe it also needs does not exist yet in `radio.rs`; see that section |
 | D10 — felt frame rate / tap-to-first-frame | Part D |
+| **D11** (new, M2) — IRAM-safety confirmatory reading for the DIO1 GPIO ISR | Part F, new subsection — **not runnable without the same GPIO-toggle probe D9 needs, plus a link-section audit; see that subsection** |
+| **D12** (new, M2) — bounded latency of a real concurrent NVS write masking the DIO1 ISR | Part F, new subsection — needs a timed capture around an admin-CLI edit issued while radio traffic is in flight |
 | The loop model's swept constants (`perf_loop_model/src/params.rs`) | Part D — calibration table |
 
 ## 1. Prerequisites and time budget
@@ -115,8 +129,16 @@ near-duplicate documents:
   Confirm you're on a post-split ref before running Part C: `grep -n "fn
   spawn" firmware/src/ui_task.rs` should find it; a pre-split ref has no
   such file.
-- **M2 run (after the radio-path timeliness work lands):** `<REF>` = the merge
-  commit that lands it.
+- **M2 run (after the radio-path timeliness work lands):** `<REF>` = the
+  merge commit that lands `meshcadet-perf-radio-dio1-interrupt` (PR
+  jagoda/meshcadet#142) or any later ref on `main`. No diagnostics
+  log-format change from M1 (confirm the same way: `grep -n "fn spawn"
+  firmware/src/ui_task.rs`) — what changed is the DIO1 wait mechanism
+  itself, which is not independently observable in the log format at all
+  (see `docs/perf/radio-host-validation.md` §2 for the host-side
+  quantification of what changed). D5/D6/Part G captures against an M2+ ref
+  are now measuring the notify-driven wait's real behaviour; D11/D12 (new,
+  §0's table) are M2-specific confirmatory readings, see Part F.
 
 Check it out and confirm you're on it:
 
@@ -466,6 +488,44 @@ version of this document:
 Until the probe exists, record this section in the report block as `n/a —
 post-split, concurrency exists, no probe yet` (not the pre-split `n/a —
 pre-split, no probe exists` — the reason has changed) and move on.
+
+### Part F, addendum — DIO1 ISR IRAM-safety and concurrent-NVS-write latency (D11, D12; new for M2)
+
+`docs/perf/radio-host-validation.md` §4.1's static audit found the DIO1
+GPIO ISR is NOT flagged `ESP_INTR_FLAG_IRAM` and is therefore masked for
+the duration of any concurrent NVS write (issued from `admin_server` or
+`provisioning_server`, both unpinned and able to float onto either core).
+The audit argues this is bounded and self-recovering (DIO1's hardware latch
+survives the mask; every call site re-clears IRQ status before trusting a
+result again) — **not** a NO-GO, but two confirmatory readings would
+tighten "bounded" to an actual number, neither a gate on M2:
+
+- **D11 — IRAM-safety, if ever attempted.** `radio-host-validation.md`
+  §4.1 explicitly declines to flip `ESP_INTR_FLAG_IRAM` blind: `esp-idf-hal`
+  carries no `#[link_section = ".iram1..."]` marker on its GPIO ISR
+  trampoline or the boxed closure it dispatches through, so setting the
+  flag without also auditing every transitively-called function's link
+  section risks a crash (illegal-instruction / garbage read while flash
+  cache is disabled) that can only be confirmed by flashing. **Not
+  recommended to attempt without a maintainer explicitly choosing to spend
+  the device time on it** — if attempted, the readable signal is simply
+  whether the device boots and radios normally after the flag change; a
+  silent hang or reset during a concurrent NVS write is the failure mode to
+  watch for.
+- **D12 — bounded-latency confirmation.** With an unmodified (still
+  non-IRAM) build: trigger an admin-CLI edit (`add-contact`/`del-contact`,
+  Part B's commands) or a provisioning commit WHILE radio traffic is
+  in flight (a DM send in progress, or Part D's calibration procedure
+  running), and watch for a `CAD: ...` or `TX error: ... retained for retry`
+  log line landing noticeably later than usual, or a `PERF phase=cad`/`tx`
+  `max` spike in the following 30 s window that stands out from the rest of
+  that window's samples. Report whatever you observe (including "nothing
+  noticeable" — a real, useful negative result) as free-text `notes:` on
+  whichever report block (baseline or two-device-delivery) the capture
+  landed in; this section has no fixed expected-value format because the
+  audit's own argument does not depend on a specific number, only on
+  confirming the effect stays small relative to the CAD/RX-poll deadlines
+  it could in principle spuriously trip (20 ms each).
 
 ## Part D10 — Felt snappiness (single device)
 

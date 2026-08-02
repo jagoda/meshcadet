@@ -1,5 +1,19 @@
 # M1 task/core split — host validation (no hardware in the loop)
 
+**Status update, M2 landed — RX_POLL_YIELD_MS retuned, numbers below are
+now historical.** `meshcadet-perf-radio-dio1-interrupt` retuned
+`RX_POLL_YIELD_MS` 5 ms -> 20 ms (`firmware/src/main.rs:1748`) after this
+document's own §2.3 numbers were captured; `perf_loop_model`'s matching
+constant is re-anchored by this milestone's host-validation sibling,
+`meshcadet-perf-radio-host-validation`. Every absolute number in §2.2/§2.3
+below was computed against the OLD 5 ms value and no longer matches a fresh
+`loop_model_report` run — preserved verbatim as the accurate M1 reading AT
+THE TIME (same convention `perf-loop-model-baseline.md`'s own M1/M2 status
+updates use: do not silently rewrite a historical number for a later
+milestone's retune). The current numbers, and the DIO1-quantization
+comparison the retune itself is validating, live in `docs/perf/radio-host-
+validation.md`.
+
 **Mission:** `meshcadet-perf-task-split-host-validation`, replacing the
 cancelled `meshcadet-perf-task-split-hil`, under the maintainer's 2026-08-02
 no-host-native/no-HIL ruling (campaign plan §0.5). Validates ADR-0012's
