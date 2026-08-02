@@ -402,7 +402,10 @@ pub fn emoji_table_subset_mismatches(gen_emoji_font_c: &Path) -> Vec<String> {
 
     let render_set: HashSet<u32> = extract_hex_numbers(&extract_array(&masked, "EMOJI_CPS"))
         .into_iter()
-        .chain(extract_hex_numbers(&extract_array(&masked, "RENDER_EXTRA_CPS")))
+        .chain(extract_hex_numbers(&extract_array(
+            &masked,
+            "RENDER_EXTRA_CPS",
+        )))
         .collect();
     let picker: Vec<(u32, &str)> = EMOJI_TABLE
         .iter()
@@ -1115,7 +1118,9 @@ static const unsigned long RENDER_EXTRA_CPS[] = {
         cleanup_fixture(&dir);
 
         assert!(
-            violations.iter().any(|v| v.contains("\"smile\"") && v.contains("U+1F60A")),
+            violations
+                .iter()
+                .any(|v| v.contains("\"smile\"") && v.contains("U+1F60A")),
             "expected a violation naming the missing \"smile\" (U+1F60A) picker entry, got: \
              {violations:?}"
         );

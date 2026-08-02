@@ -86,7 +86,9 @@
  * they are (see their own doc comments below for why a per-table size split
  * was considered and rejected, and why `EMOJI_SIZES` must not shrink).
  *
- * Full campaign plan: `flight-manuals/plans/meshcadet-emoji-coverage.md`.
+ * This is part of a multi-phase emoji-coverage expansion; see the phase
+ * notes below (and D1-D3 above) for the decisions carried forward from
+ * earlier phases.
  */
 
 #include <stdio.h>
