@@ -252,9 +252,10 @@ scenario D1/D2/D3 ask for in one pass rather than three separate captures:
 use. The instrumentation landed by PR jagoda/meshcadet#120 times phases; it
 does not count dirty lines per frame. `ui_step`'s duration is a proxy — you
 can back out an approximate line count from a duration reading via
-`ui-perf-baseline.md` §4.1's ~13 µs/line data-only floor (e.g. a `max` reading
-of ~300 µs is roughly consistent with a ~22-line in-place message-append
-repaint, not a 240-line full-window one) — but this is an inference from
+`ui-perf-baseline.md` §4.1's ~128 µs/line data-only floor (e.g. a `max`
+reading of ~2.8 ms is roughly consistent with a ~22-line in-place
+message-append repaint, not a 240-line full-window one, which would be
+~30.7 ms) — but this is an inference from
 timing, not a direct count, and cannot be presented as one. Closing D3
 exactly would need a follow-up instrumentation addition (a per-frame
 dirty-line counter). Record the `ui_step` percentiles from this section in

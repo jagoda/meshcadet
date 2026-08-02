@@ -34,8 +34,12 @@
 //! horizontal strip; this function sets the display window to that strip and
 //! writes the RGB565 pixel data via SPI. Rendering line-by-line rather than
 //! into a full frame buffer saves ~149 KB of RAM at the cost of multiple SPI
-//! writes per refresh cycle — acceptable because the SPI bus runs at 40 MHz
-//! and a 320-pixel line takes ≤ 13 µs.
+//! writes per refresh cycle — the SPI bus runs at 40 MHz, so a 320-pixel
+//! RGB565 line (640 bytes) is ~128 µs of pure data transfer, issued as 10
+//! chunked 64-byte writes (≤ 12.8 µs each) by `display-interface-spi`'s
+//! internal buffering (see `docs/perf/spi2-arbitration-r1.md` §Q5 — the
+//! bus is released and re-arbitrated after each 64-byte chunk, not once
+//! per line).
 
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;

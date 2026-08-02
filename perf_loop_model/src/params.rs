@@ -115,7 +115,7 @@ pub struct LoopModelParams {
     /// (`SetStandby`/`SetCadParams`/`ClearIrq`/`SetDioIrqParams`/`SetCad`,
     /// `firmware/src/radio.rs:415-464`) — several synchronous `write_cmd`
     /// round-trips over the 8 MHz radio SPI bus (`main.rs:1401`). No
-    /// per-transaction number exists for this bus/speed (§4's ~13 µs/line
+    /// per-transaction number exists for this bus/speed (§4's ~128 µs/line
     /// floor is the 40 MHz DISPLAY bus, a different device). Bounded above
     /// by [`crate::sim::CAD_HARD_DEADLINE_MS`] minus the analytically
     /// computed 4-symbol CAD-active time
@@ -145,12 +145,16 @@ pub struct LoopModelParams {
     /// poll, Slint tick, and a conditional `render_if_needed`. No on-device
     /// number exists for the I2C1 poll itself. The render half IS
     /// host-measured: `docs/perf/ui-perf-baseline.md` §3b/§10 give a real
-    /// idle no-op (0 ms) up to a ~3.1 ms DATA-ONLY SPI floor for a full
-    /// 240-line repaint (§4) — a floor, not a ceiling, since it excludes
-    /// undocumented per-transaction command overhead. Range: a low bound
-    /// near the measured idle no-op plus a minimal I2C1-poll floor, to a
-    /// high bound above the measured full-repaint data floor with headroom
-    /// for that undocumented overhead.
+    /// idle no-op (0 ms) up to a ~30.72 ms DATA-ONLY SPI floor for a full
+    /// 240-line repaint (§4.1: 240 lines × 640 B/line × 8 bits / 40 MHz —
+    /// corrected from an earlier ~3.1 ms figure that mistook the
+    /// `display-interface-spi` 64-byte chunk time for the whole line) — a
+    /// floor, not a ceiling, since it excludes undocumented per-transaction
+    /// command overhead. Range: a low bound near the measured idle no-op
+    /// plus a minimal I2C1-poll floor, to a high bound set at the measured
+    /// full-repaint data floor itself — the undocumented per-transaction
+    /// command overhead (§4.1, [DEFERRED-DEVICE] D2) is real but unquantified
+    /// headroom on top of this, not folded into this range.
     pub ui_step: ParamRangeMs,
 
     /// Drain `UiCommand` / handle events (`firmware/src/main.rs`, tail of
@@ -189,7 +193,7 @@ impl LoopModelParams {
             cad_spi_overhead: ParamRangeMs::new(0.0, 11.8), // see resolve()'s cap
             frame_encode: ParamRangeMs::new(0.0, 2.0),
             periodic_stats: ParamRangeMs::new(0.0, 0.5),
-            ui_step: ParamRangeMs::new(0.05, 5.0),
+            ui_step: ParamRangeMs::new(0.05, 30.72),
             drain_ui_command: ParamRangeMs::new(0.0, 0.05),
             split_ui_idle_tick: ParamRangeMs::new(0.0, 10.0),
         }
