@@ -232,18 +232,22 @@ timeliness — only a magnitude, which is [DEFERRED-DEVICE] (§8, D2).
 
 ### 4.1 Display SPI floor
 
-`firmware/src/ui/display.rs:38` documents a 320-pixel RGB565 line's pure data
-transfer at 40 MHz SPI2 as **≤ 13 µs**. `flush_line_range` is called once per
-dirty line and additionally issues the ST7789 CASET/RASET/RAMWR window-set
-commands per call; that per-transaction command overhead is **not** quantified
-here and is [DEFERRED-DEVICE] (§8, D2).
+A 320-pixel RGB565 line is 640 bytes; its pure data transfer at 40 MHz SPI2
+is **~128 µs** (640 B × 8 bits / 40 MHz). `firmware/src/ui/display.rs:38`
+previously documented this as "≤ 13 µs" — that figure is off by ~10×: it is
+the per-64-byte-chunk transfer time `display-interface-spi` buffers each
+line's writes into (`docs/perf/spi2-arbitration-r1.md` §Q5), not the whole
+line, and has been corrected in that comment. `flush_line_range` is called
+once per dirty line and additionally issues the ST7789 CASET/RASET/RAMWR
+window-set commands per call; that per-transaction command overhead is
+**not** quantified here and is [DEFERRED-DEVICE] (§8, D2).
 
-| Dirty lines this frame | Data-only SPI floor (13 µs × lines) |
+| Dirty lines this frame | Data-only SPI floor (128 µs × lines) |
 |---|---|
-| 14 (`CometOnNotify` peak, §3.2) | ~0.18 ms |
-| 22 (in-place message append, §3.4) | ~0.29 ms |
-| 28 (`RocketOnSend` peak, §3.2) | ~0.36 ms |
-| 240 (full `DISPLAY_HEIGHT`, navigation paint) | ~3.1 ms |
+| 14 (`CometOnNotify` peak, §3.2) | ~1.8 ms |
+| 22 (in-place message append, §3.4) | ~2.8 ms |
+| 28 (`RocketOnSend` peak, §3.2) | ~3.6 ms |
+| 240 (full `DISPLAY_HEIGHT`, navigation paint) | ~30.7 ms |
 
 The middle two rows are [ESTIMATE]: an [ANALYTICAL] per-line floor multiplied
 by a [HOST]-measured line count.
@@ -302,8 +306,8 @@ CAD+TX in the same iteration. For the whole airtime window the UI is not
 merely slow, it is **not sampled at all**. Every inbound DM enqueues an ACK,
 which triggers another CAD+TX, which freezes the UI again.
 
-Set against the largest UI-side cost ever measured here (§4.1: ~3.1 ms for a
-full-window navigation paint), **the structural item is 27×–260× larger.**
+Set against the largest UI-side cost ever measured here (§4.1: ~30.7 ms for a
+full-window navigation paint), **the structural item is 2.7×–26× larger.**
 
 `FreeRtos::delay_ms(1)` does yield to the scheduler, so the two aux threads
 keep running — but the UI is inline in the blocked task, so it gets nothing.
@@ -352,11 +356,16 @@ iteration by the same amount.
 **Direction A — UI delays radio.** `ui.step()`'s SPI-hold time is subtracted
 from how soon the loop reaches the next CAD attempt and RX poll. §3.2's
 measured line counts × §4.1's floor give [ESTIMATE]: idle ≈ 0 ms, comet
-≈ 0.18 ms, message append ≈ 0.29 ms, rocket ≈ 0.36 ms, full navigation paint
-≈ 3.1 ms. Correctness is not at risk — `try_receive`'s continuous-RX latching
-means no packet is missed, only *when this task notices it* shifts. Every one
-of these is far below the 5 ms `RX_POLL_YIELD_MS` window, so **no measured UI
-cost in this record starves even a single RX-poll iteration.**
+≈ 1.8 ms, message append ≈ 2.8 ms, rocket ≈ 3.6 ms, full navigation paint
+≈ 30.7 ms. Correctness is not at risk — `try_receive`'s continuous-RX latching
+means no packet is missed, only *when this task notices it* shifts. The three
+animation-triggered costs (comet/message-append/rocket) stay below the 5 ms
+`RX_POLL_YIELD_MS` window and cannot starve even a single RX-poll iteration;
+**the full-window navigation paint (~30.7 ms) now exceeds that window by
+~6×**, so a navigation transition can push one RX-poll iteration's notice out
+by roughly that much — a timing shift, not a correctness gap, and still two
+orders of magnitude below the airtime blocks that dominate this budget
+regardless (§5.2).
 
 **Direction B — radio delays UI.** Two mechanisms, an order of magnitude
 apart:
