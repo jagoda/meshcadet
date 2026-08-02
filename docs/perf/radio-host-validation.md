@@ -1,7 +1,7 @@
 # M2 radio-path timeliness — host validation (no hardware in the loop)
 
 **Mission:** `meshcadet-perf-radio-host-validation`, replacing the cancelled
-`meshcadet-perf-radio-hil-validation`, under the Commander's 2026-08-02
+`meshcadet-perf-radio-hil-validation`, under the maintainer's 2026-08-02
 no-host-native/no-HIL ruling (campaign plan §0.5). Validates
 `meshcadet-perf-radio-dio1-interrupt`'s replacement of the three DIO1
 spin-polls (`transmit`/`try_receive`/`channel_activity_detection`,
@@ -586,10 +586,9 @@ does not need to rediscover them.
 
 ## 6. Deferred to the collection kit
 
-Per this campaign's no-HIL ruling (plan §0.5) and
-`flight-manuals/library/bench-predicates-commander-deferred.md` — recorded
-as `verdict-deferred-predicates`, never as a NO-GO, never as an invented
-number:
+Per this campaign's no-HIL ruling (plan §0.5), each predicate below that
+needs real silicon is recorded as a deferred predicate — never as a
+failing verdict, never as an invented number:
 
 | Predicate | Why it needs silicon | Collection-kit section |
 |---|---|---|
