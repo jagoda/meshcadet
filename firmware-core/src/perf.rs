@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! On-device superloop timing instrumentation — `--features diagnostics`
-//! only. This is M0 of the `meshcadet-perf-rearchitecture` campaign
-//! (`flight-manuals/plans/meshcadet-perf-rearchitecture.md`): "the walking
-//! skeleton is the *instrument*, not the optimization". The campaign's whole
-//! premise (a task/core split fixes the dominant radio-airtime-blocks-the-UI
-//! finding) currently rests on `docs/perf/ui-perf-baseline.md`'s host-side
+//! only. This is M0 of the `meshcadet-perf-rearchitecture` design: "the
+//! walking skeleton is the *instrument*, not the optimization". The
+//! design's whole premise (a task/core split fixes the dominant
+//! radio-airtime-blocks-the-UI finding) currently rests on
+//! `docs/perf/ui-perf-baseline.md`'s host-side
 //! measurements plus static code reading — the device itself has never
 //! reported a single timing number. This module is the pure-computation half
 //! of closing that gap; the hardware-owning half (reading
@@ -196,12 +196,12 @@ impl PhaseStats {
 
 /// One 30 s window's worth of superloop instrumentation — one [`PhaseStats`]
 /// per named phase from the M0 objective (GPS poll, battery poll, CAD, TX,
-/// RX-poll, plus the RX-notice latency proxy), and the UI-starvation
-/// counters. `ui.step()`'s own latency and the input-to-first-paint latency
-/// live in [`crate::ui`]'s `UiRuntime` instead (see that module's
-/// `input_paint_stats`/`take_input_paint_stats` — this file has no
-/// dependency on Slint or the UI module) and are folded into the same log
-/// line by the `main.rs` call site, not by this struct.
+/// RX-poll, `ui.step()`'s own duration, plus the RX-notice latency proxy),
+/// and the UI-starvation counters. The input-to-first-paint latency is a
+/// separate metric and lives in [`crate::ui`]'s `UiRuntime` instead (see
+/// that module's `input_paint_stats`/`take_input_paint_stats` — this file
+/// has no dependency on Slint or the UI module) and is folded into the same
+/// log line by the `main.rs` call site, not by this struct.
 ///
 /// Fields are `pub` so the owning call site can `record()`/`snapshot()`
 /// each phase directly without a forwarding method per phase — this struct
@@ -214,6 +214,12 @@ pub struct PerfRollup {
     pub cad: PhaseStats,
     pub tx: PhaseStats,
     pub rx_poll: PhaseStats,
+    /// `ui.step()`'s own call duration — distinct from the input-to-first-
+    /// paint latency tracked by `UiRuntime::input_paint_stats` (that one
+    /// measures from an input event to the next render; this one measures
+    /// only the `step()` call itself). See `main.rs`'s touch-UI-step call
+    /// site for where this is recorded.
+    pub ui_step: PhaseStats,
     /// Proxy for "how long after a frame was actually ready did the
     /// dispatcher notice it" — see `main.rs`'s RX-poll call site doc for the
     /// exact (deliberately honest-proxy, not hardware-timestamped) definition.
@@ -224,8 +230,8 @@ pub struct PerfRollup {
     /// ui.step() call) - (that call's own duration)`. See `main.rs`'s
     /// dispatcher-loop call site for the exact accounting and why this is
     /// the right definition (`ui.step()` itself runs every iteration
-    /// unconditionally in the current single-loop design — see
-    /// `flight-manuals/plans/meshcadet-perf-rearchitecture.md` §1 — so
+    /// unconditionally in the current single-loop design — see the
+    /// `meshcadet-perf-rearchitecture` design's §1 — so
     /// "did not run" is a statement about UI *responsiveness*, i.e. how much
     /// of the window the UI thread spent doing something other than UI
     /// work, not about whether the call happened at all).
@@ -253,6 +259,7 @@ impl PerfRollup {
             cad: PhaseStats::new(),
             tx: PhaseStats::new(),
             rx_poll: PhaseStats::new(),
+            ui_step: PhaseStats::new(),
             rx_notice: PhaseStats::new(),
             ui_starvation_cumulative_ms: 0,
             ui_starvation_longest_ms: 0,

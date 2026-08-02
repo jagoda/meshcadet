@@ -142,9 +142,8 @@ CONFIG_ESP_BROWNOUT_DET=y
 # `CONFIG_FREERTOS_USE_TRACE_FACILITY=y` and `CONFIG_FREERTOS_USE_STATS_
 # FORMATTING_FUNCTIONS=y` are the two prerequisites `vTaskGetRunTimeStats()`
 # itself needs compiled in (FreeRTOS's own `task.h` guards that function
-# behind both). `firmware/src/main.rs`'s 30 s diagnostics rollup (M0 of
-# `meshcadet-perf-rearchitecture` —
-# flight-manuals/plans/meshcadet-perf-rearchitecture.md) calls it and reads
+# behind both). `firmware/src/main.rs`'s 30 s diagnostics rollup (M0 of the
+# `meshcadet-perf-rearchitecture` design) calls it and reads
 # each of the two per-core idle tasks' (`IDLE0`/`IDLE1`) reported percentage,
 # deriving `100 - idle%` as that core's utilization — the two ESP32-S3 SMP
 # idle tasks are pinned one per core by FreeRTOS's own construction, so no

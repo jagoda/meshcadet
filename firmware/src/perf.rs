@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! On-device superloop timing instrumentation (M0 of
-//! `meshcadet-perf-rearchitecture` —
-//! `flight-manuals/plans/meshcadet-perf-rearchitecture.md`), `--features
+//! On-device superloop timing instrumentation (M0 of the
+//! `meshcadet-perf-rearchitecture` design), `--features
 //! diagnostics` only. Pure Rust, no ESP-IDF dependency — the whole module
 //! lives in [`firmware_core::perf`] so its tests execute under `cargo test
 //! --workspace` (this crate is a detached, cross-compiled workspace — see

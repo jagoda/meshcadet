@@ -2678,8 +2678,7 @@ fn run() -> anyhow::Result<()> {
             // `meshcadet-perf-rearchitecture`) ────────────────────────────────
             //
             // Same 30 s cadence as the RX stats/stack-HWM block above — this
-            // is the instrument the whole campaign measures against
-            // (`flight-manuals/plans/meshcadet-perf-rearchitecture.md` M0):
+            // is the instrument the whole design measures against (M0):
             // per-phase superloop wall-clock min/mean/max/p95 (microseconds),
             // the UI-starvation counter, input-to-first-paint latency, RX-
             // notice latency, and per-core utilization. No behavior change —
@@ -2766,9 +2765,9 @@ fn run() -> anyhow::Result<()> {
             // ── UI-starvation accounting (diagnostics-only) ───────────────────
             //
             // `ui.step()` runs unconditionally every iteration in this
-            // single-loop design (see `flight-manuals/plans/
-            // meshcadet-perf-rearchitecture.md` §1) — "starvation" here is
-            // not about whether the call happens, but about how much of the
+            // single-loop design (see the `meshcadet-perf-rearchitecture`
+            // design's §1) — "starvation" here is not about whether the
+            // call happens, but about how much of the
             // iteration's wall clock was spent on everything ELSE (GPS/
             // battery poll, room keep-alive, CAD+TX, RX poll) before this
             // call got its turn, i.e. how long the UI thread was unable to
