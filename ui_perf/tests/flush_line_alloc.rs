@@ -33,9 +33,10 @@
 //!    only where the conversion result is buffered, never what it computes.
 //! 2. **IMPROVEMENT**: the OLD path allocates once per line (N lines ⇒ N
 //!    allocations); the NEW path allocates ZERO times, for any line count,
-//!    including the worst measured real-render case found
-//!    (`RocketOnSend`'s 86-line peak dirty frame — see `motif_repaint.rs` /
-//!    the baseline doc §3b) and the full 240-line worst case.
+//!    including the worst measured real-render motif case
+//!    (`RocketOnSend`'s 28-line peak dirty frame — see `ui_sim`'s
+//!    `perf_profile` capture / `docs/perf/ui-perf-baseline.md` §3.2) and the
+//!    full 240-line navigation-paint worst case.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -219,9 +220,11 @@ fn new_path_allocates_zero_times_per_line_old_path_allocates_once_per_line() {
 /// Extrapolates the per-frame allocation count the OLD vs. NEW path would pay
 /// at the real dirty-line counts MEASURED via the actual
 /// production Slint renderer (`motif_repaint.rs` / `model_update_repaint.rs`
-/// in this crate, and `docs/perf/ui-perf-baseline.md` §3b): idle (0 lines),
-/// `CometOnNotify` peak (14 lines), `RocketOnSend` peak (86 lines), and a
-/// full-window navigation paint (240 lines, `HEIGHT`). Ties the isolated
+/// in this crate, `ui_sim`'s `perf_profile` capture, and
+/// `docs/perf/ui-perf-baseline.md` §3.2/§3.4): idle (0 lines),
+/// `CometOnNotify` peak (14 lines), a live in-place message append (22
+/// lines), `RocketOnSend` peak (28 lines), and a full-window navigation paint
+/// (240 lines, `HEIGHT`). Ties the isolated
 /// per-line allocation result above back to whole-frame numbers comparable
 /// across this pass's other optimizations.
 #[test]
@@ -232,14 +235,21 @@ fn per_frame_allocation_projection_at_measured_dirty_line_counts() {
     let line_buf = synthetic_line_buf(WIDTH);
     let range = 0..WIDTH;
 
-    // Measured dirty-scanline counts from this crate's real-renderer harness
-    // (`motif_repaint.rs`: CometOnNotify peak; `model_update_repaint.rs` /
-    // baseline doc §3b: RocketOnSend peak) plus the two structural bounds
-    // (idle, full window).
+    // Measured dirty-scanline counts from the real-renderer harnesses
+    // (`motif_repaint.rs`: CometOnNotify peak; `model_update_repaint.rs`:
+    // in-place message append; `ui_sim`'s `perf_profile`: RocketOnSend peak)
+    // plus the two structural bounds (idle, full window).
+    //
+    // NOTE: RocketOnSend is 28 lines, NOT the 86 an earlier revision of this
+    // table carried. That 86 was a measurement artifact of `ui_sim`'s shared
+    // scene (MascotBob/Twinkle entry animations still settling, merged into
+    // one inflated dirty rect by the renderer's 3-rectangle DirtyRegion cap)
+    // and is retracted — see `docs/perf/ui-perf-baseline.md` §9.
     let scenarios: &[(&str, usize)] = &[
         ("idle (no dirty lines)", 0),
         ("CometOnNotify peak frame", 14),
-        ("RocketOnSend peak frame", 86),
+        ("live message append (in-place)", 22),
+        ("RocketOnSend peak frame", 28),
         ("full-window navigation paint", HEIGHT as usize),
     ];
 
