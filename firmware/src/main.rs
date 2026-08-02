@@ -144,6 +144,13 @@ mod radio;
 mod room_session;
 mod signal_tracker;
 mod ui;
+// On-device superloop timing instrumentation (M0 of
+// `meshcadet-perf-rearchitecture`) — pure Rust, no ESP-IDF deps, lives in
+// `firmware_core::perf` (re-exported). Declared in ALL builds (like
+// `signal_tracker` above) so the module always exists; every item inside is
+// itself gated on `--features diagnostics` (see that module's doc), so this
+// is a no-op without the feature.
+mod perf;
 // PIN-menu — pure Rust, no ESP-IDF deps; compiled in ALL builds so that
 // ui/mod.rs can call pin_menu::verify_pin without a #[cfg] gate.
 mod pin_menu;
@@ -1621,6 +1628,26 @@ fn run() -> anyhow::Result<()> {
     let mut last_rx_stats_ms: u64 = 0;
     const RX_STATS_INTERVAL_MS: u64 = 30_000;
 
+    // ── On-device superloop timing instrumentation (M0 of
+    // `meshcadet-perf-rearchitecture`, `--features diagnostics` only) ────────
+    //
+    // `Box`ed rather than a plain stack local: `PerfRollup` holds seven
+    // `PhaseStats` accumulators (a histogram apiece, ~150 B each), and this
+    // binding lives for the entire dispatcher loop's lifetime alongside every
+    // other `run()`-frame local — `firmware/sdkconfig.defaults`'s stack-
+    // budget comment documents a confirmed release-only main-task stack
+    // overflow from exactly this kind of frame growth. Diagnostics builds
+    // aren't covered by that comment's HWM measurements, so boxing this one
+    // (heap, not stack) rather than adding ~1 KB to an already-tight budget
+    // is the conservative choice.
+    #[cfg(feature = "diagnostics")]
+    let mut perf_rollup = Box::new(perf::PerfRollup::new());
+    // Wall-clock (microsecond) timestamp of the last time this loop *entered*
+    // the RX-poll call — used to derive the RX-notice-latency proxy at that
+    // call site below (see its doc for the exact definition).
+    #[cfg(feature = "diagnostics")]
+    let mut last_rx_poll_entry_us: u64 = uptime_us();
+
     // Per-iteration RX-poll yield window.
     //
     // `radio.try_receive` does not need this wait for RX *correctness* — the
@@ -1783,6 +1810,12 @@ fn run() -> anyhow::Result<()> {
     // ── Dispatcher loop ───────────────────────────────────────────────────────
     loop {
         let now = uptime_ms();
+        // Iteration start, microsecond resolution — the UI-starvation
+        // counter's baseline (see the `ui.step()` call site below for the
+        // full accounting). Diagnostics-only; does not affect `now` above,
+        // which every existing scheduling call site keeps reading unchanged.
+        #[cfg(feature = "diagnostics")]
+        let iter_start_us = uptime_us();
 
         // Pet the Task WDT: this task is still alive and iterating.
         // Called unconditionally at the top of every iteration so that any
@@ -1791,7 +1824,11 @@ fn run() -> anyhow::Result<()> {
         unsafe { esp_idf_svc::sys::esp_task_wdt_reset(); }
 
         // ── GPS poll (duty-cycle NMEA read + fix cache refresh) ──────────────
+        #[cfg(feature = "diagnostics")]
+        let phase_t0 = uptime_us();
         gps.poll(now);
+        #[cfg(feature = "diagnostics")]
+        perf_rollup.gps.record((uptime_us().saturating_sub(phase_t0)) as u32);
 
         // ── Rebase the tx timestamp origin onto GPS-synced wall-clock time ───
         // Runs unconditionally (both `hil` and production — `gps` and its
@@ -1850,7 +1887,11 @@ fn run() -> anyhow::Result<()> {
         );
 
         // ── Battery poll (throttled ADC read + charging-trend refresh) ───────
+        #[cfg(feature = "diagnostics")]
+        let phase_t0 = uptime_us();
         battery.poll(now);
+        #[cfg(feature = "diagnostics")]
+        perf_rollup.battery.record((uptime_us().saturating_sub(phase_t0)) as u32);
 
         // Refresh the shared GPS status snapshot: the touch UI (same thread,
         // fed directly) and admin_server (separate thread, via the
@@ -2269,6 +2310,12 @@ fn run() -> anyhow::Result<()> {
         // falls through to RX poll and `ui.step()` every iteration during the
         // gate instead of stalling the whole thread.
         if txq.has_pending() && now >= cad_backoff_until_ms {
+            // Timed narrowly around the CAD call itself (not the whole
+            // `if txq.has_pending() ...` block, which also does bookkeeping
+            // that isn't "CAD" and only sometimes runs at all) — see
+            // `perf::PerfRollup::cad`'s doc for what this feeds.
+            #[cfg(feature = "diagnostics")]
+            let cad_t0 = uptime_us();
             let clear_to_send = match radio.channel_activity_detection() {
                 Ok(busy) => {
                     cad_err_streak = 0;
@@ -2289,6 +2336,8 @@ fn run() -> anyhow::Result<()> {
                     }
                 }
             };
+            #[cfg(feature = "diagnostics")]
+            perf_rollup.cad.record((uptime_us().saturating_sub(cad_t0)) as u32);
 
             match clear_to_send {
                 Some(false) => {
@@ -2339,7 +2388,18 @@ fn run() -> anyhow::Result<()> {
                         } else {
                             let required = lora_airtime_ms(n);
                             if budget.can_transmit(now, required) {
-                                match radio.transmit(&tx_frame[..n]) {
+                                // Timed narrowly around `radio.transmit()`
+                                // itself — this is the campaign's §2 "dominant
+                                // finding" call site (full LoRa-airtime block,
+                                // up to ~800 ms for a 255 B frame per
+                                // `docs/perf/ui-perf-baseline.md` §4) — see
+                                // `perf::PerfRollup::tx`'s doc.
+                                #[cfg(feature = "diagnostics")]
+                                let tx_t0 = uptime_us();
+                                let tx_result = radio.transmit(&tx_frame[..n]);
+                                #[cfg(feature = "diagnostics")]
+                                perf_rollup.tx.record((uptime_us().saturating_sub(tx_t0)) as u32);
+                                match tx_result {
                                     Ok(airtime) => {
                                         txq.pop_front();
                                         budget.record_tx(now, airtime);
@@ -2390,9 +2450,34 @@ fn run() -> anyhow::Result<()> {
         }
 
         // ── RX poll ──────────────────────────────────────────────────────────
+        //
+        // `rx_notice_gap_us` (diagnostics-only) is the elapsed time since
+        // this loop last ENTERED this call — an honest-proxy upper bound on
+        // "how long could a ready frame have sat before the dispatcher
+        // noticed it", not a hardware RxDone-edge timestamp: `try_receive`
+        // itself busy-polls DIO1 for up to `RX_POLL_YIELD_MS`, but DIO1
+        // latches high on RxDone and stays latched until cleared (see
+        // `Radio::try_receive`'s doc), so a frame that became ready during a
+        // long CAD/TX block earlier THIS SAME iteration is already latched
+        // by the time this call runs and returns almost instantly — hiding
+        // exactly the delay this campaign cares about if measured only
+        // within-call. The entry-to-entry gap captures that outer delay
+        // instead: steady state (nothing blocking) it reads ≈
+        // `RX_POLL_YIELD_MS`; it spikes to the CAD/TX block's own duration
+        // whenever one runs first in the same iteration.
+        #[cfg(feature = "diagnostics")]
+        let rx_poll_t0 = uptime_us();
+        #[cfg(feature = "diagnostics")]
+        let rx_notice_gap_us = (rx_poll_t0.saturating_sub(last_rx_poll_entry_us)) as u32;
+        #[cfg(feature = "diagnostics")]
+        {
+            last_rx_poll_entry_us = rx_poll_t0;
+        }
         match radio.try_receive(&mut frame_buf, RX_POLL_YIELD_MS) {
             Ok(Some(n)) => {
                 rx_done_count += 1;
+                #[cfg(feature = "diagnostics")]
+                perf_rollup.rx_notice.record(rx_notice_gap_us);
                 if let Ok((rssi_raw, snr_raw)) = radio.get_packet_status() {
                     let rssi_dbm = -(rssi_raw as i32) / 2;
                     let snr_db   = (snr_raw as i32) / 4;
@@ -2548,6 +2633,8 @@ fn run() -> anyhow::Result<()> {
             }
             Err(e) => log::warn!("RX error: {:?}", e),
         }
+        #[cfg(feature = "diagnostics")]
+        perf_rollup.rx_poll.record((uptime_us().saturating_sub(rx_poll_t0)) as u32);
 
         // ── Periodic RX stats + stack HWM ───────────────────────────────────
         if now.saturating_sub(last_rx_stats_ms) >= RX_STATS_INTERVAL_MS {
@@ -2586,12 +2673,116 @@ fn run() -> anyhow::Result<()> {
                 const MAIN_TASK_STACK_B: u32 = 49_152;
                 log_thread_stack_hwm("main-task", MAIN_TASK_STACK_B);
             }
+
+            // ── On-device perf rollup (diagnostics-only; M0 of
+            // `meshcadet-perf-rearchitecture`) ────────────────────────────────
+            //
+            // Same 30 s cadence as the RX stats/stack-HWM block above — this
+            // is the instrument the whole campaign measures against
+            // (`flight-manuals/plans/meshcadet-perf-rearchitecture.md` M0):
+            // per-phase superloop wall-clock min/mean/max/p95 (microseconds),
+            // the UI-starvation counter, input-to-first-paint latency, RX-
+            // notice latency, and per-core utilization. No behavior change —
+            // every number below is read from timers/counters this same
+            // build already carries; nothing here alters scheduling, radio,
+            // or UI behavior.
+            #[cfg(feature = "diagnostics")]
+            {
+                let phases: [(&str, &perf::PhaseStats); 6] = [
+                    ("gps", &perf_rollup.gps),
+                    ("battery", &perf_rollup.battery),
+                    ("cad", &perf_rollup.cad),
+                    ("tx", &perf_rollup.tx),
+                    ("rx_poll", &perf_rollup.rx_poll),
+                    ("ui_step", &perf_rollup.ui_step),
+                ];
+                for (name, stats) in phases {
+                    let snap = stats.snapshot();
+                    log::info!(
+                        "PERF phase={}: n={} min={}us mean={}us max={}us p95={}us",
+                        name, snap.count, snap.min, snap.mean, snap.max, snap.p95,
+                    );
+                }
+                let rx_notice = perf_rollup.rx_notice.snapshot();
+                log::info!(
+                    "PERF rx-notice-latency: n={} min={}us mean={}us max={}us p95={}us",
+                    rx_notice.count, rx_notice.min, rx_notice.mean, rx_notice.max, rx_notice.p95,
+                );
+                log::info!(
+                    "PERF ui-starvation: cumulative={}ms longest={}ms (window={}s)",
+                    perf_rollup.ui_starvation_cumulative_ms,
+                    perf_rollup.ui_starvation_longest_ms,
+                    RX_STATS_INTERVAL_MS / 1000,
+                );
+                if let Some(ref mut ui) = ui_opt {
+                    let paint = ui.take_input_paint_stats();
+                    log::info!(
+                        "PERF input-to-first-paint: n={} min={}ms mean={}ms max={}ms p95={}ms",
+                        paint.count, paint.min, paint.mean, paint.max, paint.p95,
+                    );
+                }
+
+                // Per-core utilization via FreeRTOS run-time stats
+                // (`CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS` +
+                // `CONFIG_FREERTOS_USE_TRACE_FACILITY` +
+                // `CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS` — see
+                // `sdkconfig.defaults`). 1024 B comfortably covers this
+                // firmware's small task count (main, admin_server, the two
+                // FreeRTOS idle tasks, the timer service task, …) at the
+                // ~40 B/task `vTaskGetRunTimeStats` needs — heap-allocated,
+                // not a `run()`-stack local, same stack-budget reasoning as
+                // `perf_rollup`'s own `Box` above.
+                let mut stats_buf = vec![0u8; 1024];
+                unsafe {
+                    esp_idf_svc::sys::vTaskGetRunTimeStats(
+                        stats_buf.as_mut_ptr() as *mut core::ffi::c_char,
+                    );
+                }
+                let stats_text = std::ffi::CStr::from_bytes_until_nul(&stats_buf)
+                    .ok()
+                    .and_then(|c| c.to_str().ok())
+                    .unwrap_or("");
+                let (core0_pct, core1_pct) = perf::per_core_utilization_pct(stats_text);
+                log::info!(
+                    "PERF core-utilization: core0={} core1={}",
+                    core0_pct.map(|p| p.to_string()).unwrap_or_else(|| "n/a".into()),
+                    core1_pct.map(|p| p.to_string()).unwrap_or_else(|| "n/a".into()),
+                );
+
+                // Reset every accumulator for the next window — same
+                // "assign fresh state" reset idiom as `rx_done_count = 0;`
+                // etc. above, just for the boxed aggregate.
+                *perf_rollup = perf::PerfRollup::new();
+            }
         }
 
         // ── Touch UI step (non-blocking; only in production builds) ──────────
         if let Some(ref mut ui) = ui_opt {
+            #[cfg(feature = "diagnostics")]
+            let ui_step_t0 = uptime_us();
             if let Err(e) = ui.step(now) {
                 log::warn!("UI step error: {:?}", e);
+            }
+            // ── UI-starvation accounting (diagnostics-only) ───────────────────
+            //
+            // `ui.step()` runs unconditionally every iteration in this
+            // single-loop design (see `flight-manuals/plans/
+            // meshcadet-perf-rearchitecture.md` §1) — "starvation" here is
+            // not about whether the call happens, but about how much of the
+            // iteration's wall clock was spent on everything ELSE (GPS/
+            // battery poll, room keep-alive, CAD+TX, RX poll) before this
+            // call got its turn, i.e. how long the UI thread was unable to
+            // sample touch/keyboard or advance an animation. `iter_start_us`
+            // was captured at the very top of this same iteration, so
+            // `iter_elapsed_us - ui_step_dur_us` is exactly that: the whole
+            // iteration MINUS the one slice of it that was actually UI work.
+            #[cfg(feature = "diagnostics")]
+            {
+                let ui_step_dur_us = (uptime_us().saturating_sub(ui_step_t0)) as u32;
+                perf_rollup.ui_step.record(ui_step_dur_us);
+                let iter_elapsed_us = (uptime_us().saturating_sub(iter_start_us)) as u32;
+                let starvation_ms = iter_elapsed_us.saturating_sub(ui_step_dur_us) / 1000;
+                perf_rollup.record_ui_starvation(starvation_ms);
             }
             // Drain any commands the UI generated (send DM, etc.). Collected
             // into an owned `Vec` first rather than iterating
@@ -4643,6 +4834,23 @@ fn hex4(h: &[u8; 4]) -> heapless_hex::Hex4 {
 #[inline]
 pub(crate) fn uptime_ms() -> u64 {
     unsafe { esp_idf_svc::sys::esp_timer_get_time() as u64 / 1000 }
+}
+
+/// Return esp_timer uptime in microseconds — `--features diagnostics` only.
+///
+/// The dispatcher-loop phases this feeds (`perf::PerfRollup`'s per-phase
+/// min/mean/max/p95 rollup, M0 of `meshcadet-perf-rearchitecture`) mostly
+/// complete in well under 1 ms (GPS/battery poll, an idle RX-poll pass) —
+/// [`uptime_ms`]'s millisecond truncation would read almost all of them as a
+/// flat `0` and report no useful signal at all. This is a separate function
+/// (not a change to `uptime_ms`'s existing millisecond contract, which every
+/// pre-existing call site — loop scheduling, backoff timers, `UiRuntime`'s
+/// own clocks — depends on unchanged) purely so the instrumentation can see
+/// sub-millisecond durations.
+#[cfg(feature = "diagnostics")]
+#[inline]
+fn uptime_us() -> u64 {
+    unsafe { esp_idf_svc::sys::esp_timer_get_time() as u64 }
 }
 
 /// Log the CALLING task's stack high-water mark: `uxTaskGetStackHighWaterMark`

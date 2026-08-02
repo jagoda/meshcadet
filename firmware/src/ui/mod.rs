@@ -808,6 +808,34 @@ pub struct UiRuntime<'d> {
     /// cap (on-hardware tap-to-first-frame timeliness, `docs/perf/ui-perf-
     /// baseline.md` §8.A, would otherwise regress).
     render_settling: bool,
+
+    // ── Input-to-first-paint instrumentation (M0 of
+    // `meshcadet-perf-rearchitecture`, `--features diagnostics` only) ──────
+    /// `now_ms` of the earliest touch/keyboard/trackball input this (or an
+    /// earlier) `step()` call has dispatched into the UI without a render
+    /// attempt having been attributed to it yet. `None` once the render
+    /// block below claims it. Millisecond resolution (not the microsecond
+    /// resolution `perf::PhaseStats` elsewhere in this campaign uses):
+    /// `now_ms` is the same argument every input/render call in this module
+    /// already reasons about (`last_render_ms`, `RENDER_MIN_INTERVAL_MS`
+    /// above), and this module's own `step()` cadence — bounded by
+    /// `RX_POLL_YIELD_MS` in the dispatcher loop, ~5 ms when idle — already
+    /// dominates the achievable precision; a microsecond read here would be
+    /// false precision, not real signal.
+    #[cfg(feature = "diagnostics")]
+    pending_input_ms: Option<u64>,
+    /// Rolling min/mean/max/p95 of the elapsed time (see
+    /// `pending_input_ms`'s doc for the unit) between an input being marked
+    /// and the next render attempt this module makes. "First paint" here
+    /// means "the next `render_if_needed()` call this module issues", not a
+    /// confirmed pixel diff — `render_if_needed` has no return value
+    /// reporting whether it actually redrew anything, so this is an honest
+    /// upper-bound proxy, same framing as [`crate::signal_tracker`]'s own
+    /// "honest proxy, not a delivery guarantee" section. In practice a real
+    /// input that changes UI state marks something dirty in the very tick
+    /// it dispatches, so this tracks true first-paint latency closely.
+    #[cfg(feature = "diagnostics")]
+    input_paint_stats: firmware_core::perf::PhaseStats,
 }
 
 // `MessageRecord` (one stored message in a conversation), and the two free
@@ -1062,6 +1090,10 @@ impl<'d> UiRuntime<'d> {
             // throttled — see the field doc.
             last_render_ms: 0,
             render_settling: false,
+            #[cfg(feature = "diagnostics")]
+            pending_input_ms: None,
+            #[cfg(feature = "diagnostics")]
+            input_paint_stats: firmware_core::perf::PhaseStats::new(),
         })
     }
 
@@ -1180,6 +1212,18 @@ impl<'d> UiRuntime<'d> {
         if let ActiveScreen::Unprovisioned(ref scr) = self.active_screen {
             scr.set_rx_bytes(n);
         }
+    }
+
+    /// Read the rolling input-to-first-paint latency snapshot accumulated
+    /// since the last call, and reset the accumulator for the next window.
+    /// Called from `main.rs`'s existing 30 s diagnostics rollup (M0 of
+    /// `meshcadet-perf-rearchitecture`). Available only with `--features
+    /// diagnostics`; compiled out of production.
+    #[cfg(feature = "diagnostics")]
+    pub fn take_input_paint_stats(&mut self) -> firmware_core::perf::PhaseSnapshot {
+        let snapshot = self.input_paint_stats.snapshot();
+        self.input_paint_stats = firmware_core::perf::PhaseStats::new();
+        snapshot
     }
 
     /// Signal that boot has reached steady state.
@@ -1725,6 +1769,12 @@ impl<'d> UiRuntime<'d> {
                         // dispatch_touch returns (logical_x, logical_y) after the Deg90-CW
                         // transform; capture for diagnostics overlay (ignored in production).
                         let _lxy = self.window.dispatch_touch(ev);
+                        // Mark this as the earliest un-painted input, if none
+                        // is already pending — see `pending_input_ms`'s doc.
+                        #[cfg(feature = "diagnostics")]
+                        if self.pending_input_ms.is_none() {
+                            self.pending_input_ms = Some(now_ms);
+                        }
                         #[cfg(feature = "diagnostics")]
                         {
                             let (lx, ly) = _lxy;
@@ -1801,6 +1851,12 @@ impl<'d> UiRuntime<'d> {
                         log::info!("ui: key press woke screen (swallowed, byte=0x{:02X})", byte);
                     } else {
                         self.last_activity_ms = now_ms;
+                        // Mark this as the earliest un-painted input, if none
+                        // is already pending — see `pending_input_ms`'s doc.
+                        #[cfg(feature = "diagnostics")]
+                        if self.pending_input_ms.is_none() {
+                            self.pending_input_ms = Some(now_ms);
+                        }
                         // Printable keypress while viewing a conversation: jump
                         // straight to Compose (same destination as the Write
                         // button) with this character pre-loaded as the first
@@ -1915,6 +1971,12 @@ impl<'d> UiRuntime<'d> {
                     log::info!("ui: trackball input woke screen (swallowed, ev={:?})", ev);
                 } else {
                     self.last_activity_ms = now_ms;
+                    // Mark this as the earliest un-painted input, if none is
+                    // already pending — see `pending_input_ms`'s doc.
+                    #[cfg(feature = "diagnostics")]
+                    if self.pending_input_ms.is_none() {
+                        self.pending_input_ms = Some(now_ms);
+                    }
                     self.handle_trackball_event(ev);
                 }
             }
@@ -1986,6 +2048,14 @@ impl<'d> UiRuntime<'d> {
             self.window.render_if_needed(&mut self.display)?;
             self.last_render_ms = now_ms;
             self.render_settling = self.window.has_active_animations();
+            // Attribute any pending input to THIS render attempt — see
+            // `pending_input_ms`'s doc for why "render attempt", not a
+            // confirmed paint.
+            #[cfg(feature = "diagnostics")]
+            if let Some(input_ms) = self.pending_input_ms.take() {
+                let latency_ms = now_ms.saturating_sub(input_ms) as u32;
+                self.input_paint_stats.record(latency_ms);
+            }
         }
 
         Ok(())
