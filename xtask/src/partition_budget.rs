@@ -170,6 +170,23 @@ fn measure_app_image_size(repo_root: &Path) -> Result<u64, String> {
     let output = Command::new("bash")
         .arg(&script)
         .current_dir(repo_root.join("firmware"))
+        // `cargo run -p xtask` (the caller, invoked from the repo root) is
+        // itself launched by a rustup proxy that resolves the ROOT
+        // rust-toolchain.toml (channel "stable") and stamps that choice
+        // into THIS process's own env as `RUSTUP_TOOLCHAIN` — rustup does
+        // this for every toolchain it resolves, not just at the top level.
+        // That env var outranks directory-based `rust-toolchain.toml`
+        // lookup (verified: `RUSTUP_TOOLCHAIN=nightly cargo run` ignores a
+        // committed `channel = "stable"` file and tries to install
+        // nightly), so left inherited it would silently force the nested
+        // `cargo build --release` below (this script, cd'd into firmware/)
+        // onto the root's "stable" toolchain instead of firmware/
+        // rust-toolchain.toml's "esp" — which has no std for
+        // `xtensa-esp32s3-espidf` (`error[E0463]: can't find crate for
+        // `core``). Removing it here restores the plain directory-override
+        // resolution the doc comment on this check (and the `firmware`
+        // job's `cargo run -p xtask` step comment) always assumed applied.
+        .env_remove("RUSTUP_TOOLCHAIN")
         .output()
         .map_err(|e| format!("failed to run {}: {e}", script.display()))?;
 
