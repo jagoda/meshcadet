@@ -271,7 +271,7 @@ behaviour of flipping a toggle is unchanged.
 **C8 — The queue is the *only* channel between the two tasks.** No shared
 `Mutex`, no `Arc<AtomicX>`, no `static mut` is added by this split. See D9.
 
-### D4 — Slint is owned end-to-end by `ui_task`, enforced by visibility
+### D4 — Slint is owned end-to-end by `ui_task`, enforced by a static guard
 
 `firmware/Cargo.toml:89-105` selects `unsafe-single-threaded` on **both**
 `slint` and `i-slint-core`. That feature *removes* Slint's thread-affinity
@@ -290,18 +290,32 @@ constructing *and* using on one thread is correct under either. Moving an
 already-constructed `UiRuntime` across a task boundary would be correct only
 under one of those two readings, and the build would not tell us which.
 
-**D4.2 — The rule is enforced by Rust visibility, not by review.** The
-implementation adds `firmware/src/ui_task.rs`, which holds the **only**
-`use crate::ui::UiRuntime` in the crate and exposes exactly one item:
+**D4.2 — The rule is a convention, mechanically checked by a static guard,
+not by Rust visibility.** The implementation adds `firmware/src/ui_task.rs`,
+which holds the **only** `use crate::ui::UiRuntime` in the crate and exposes
+exactly one item:
 
 ```rust
 pub(crate) fn spawn(/* peripherals + channel endpoints */)
     -> anyhow::Result<(SyncSender<UiEvent>, Receiver<UiCommand>)>;
 ```
 
-`main.rs` can then no longer *name* `UiRuntime`, so a stray Slint call from
-the dispatcher is a compile error rather than a review miss. A CI grep guard
-would be strictly weaker and is not needed.
+This is *not* a compiler-enforced boundary: `mod ui;` is declared at the
+crate root (`main.rs`) and `UiRuntime` is plain `pub`, so privacy rules make
+it visible to the crate root's defining scope and every module beneath
+it — which is the whole crate. `main.rs` naming `crate::ui::UiRuntime`
+directly compiles today exactly as it would before this split; nothing in
+the type system stops it. A stray Slint call from the dispatcher is
+therefore silent UB at runtime (per D4's opening paragraph), not a compile
+error.
+
+What *does* catch it mechanically is `meshcadet-slint-affinity-static-guard`'s
+`xtask` harness (`xtask/src/slint_thread_affinity.rs`, run by
+`cargo test -p xtask`): it scans every `.rs` file under `firmware/src/`
+outside `ui/` and `ui_task.rs` for `UiRuntime`, `slint::`, or any `i_slint*`
+symbol in non-comment source and fails the test if one appears. A CI grep
+guard is exactly what closes this gap — the ADR's original text asserted one
+was unnecessary because visibility already did the job; it does not.
 
 **D4.3 — The full migration list.** Every inline `ui.*` call site in
 `main.rs` today, and its disposition. This is the implementation child's
@@ -554,7 +568,7 @@ longer wedges the UI with it).
 | 4 | `log::info!` / `esp_log` | Already called from three threads today (`main`, `admin_server`, `prov_server`); IDF's vprintf lock covers it. |
 | 5 | The global allocator | Every `UiEvent::IncomingDm` allocates its `String` on core 0 and frees it on core 1. ESP-IDF's `heap_caps_*` allocator is spinlock-protected and not per-core, so cross-core alloc/free is sound. Worth stating because this boundary does it on every inbound message. |
 | 6 | NVS | Single writer (the dispatcher) by C6. No concurrency at all. |
-| 7 | Slint globals | Single thread by D4, enforced by D4.2's visibility barrier. |
+| 7 | Slint globals | Single thread by D4; D4.2's boundary is a convention, checked mechanically by `xtask`'s `slint_thread_affinity` static guard, not by Rust visibility. |
 | 8 | TWDT | `esp_task_wdt_add`/`_reset` are IDF-internal and designed for multi-task subscription. |
 | 9 | SPI2 | Two devices, one per task, serialised by `spi_bus_lock` (R1). |
 | 10 | `perf::PerfRollup` (diagnostics) | **`ui_task` gets its own rollup; the two are never shared.** `ui_step` and input-to-first-paint move to it, and it logs its own `PERF` lines. Consequence: the collection kit's expected log format changes — regenerating it is already a planned M1 deliverable (`meshcadet-perf-task-split-host-validation`), and must not be forgotten. |
@@ -605,7 +619,7 @@ carried forward unchanged as a deferred predicate (D-B).
 | R5 | TWDT coverage | **Both tasks subscribed**, both petting well inside 30 s, including inside the splash ripple's tight loop. Net *increase* in coverage. | D7 |
 | R6 | Boot sequencing / `run_splash_ripple` | **Re-derived.** Ripple moves to `ui_task`; the documented ~1.15 s boot RX gap is eliminated; the two boot paths converge; dismissal logic unchanged. | D8 |
 | R7 | SMP correctness | **Audited item by item**, ten rows, exhaustive by `grep`. The only new cross-core object is `std::sync::mpsc`. | D9 |
-| R8 | Slint `unsafe-single-threaded` | **Hard requirement, mechanically enforced.** `ui_task` constructs and owns Slint end-to-end; `main.rs` cannot name `UiRuntime`; full 18-row migration list. | D4 |
+| R8 | Slint `unsafe-single-threaded` | **Hard requirement, a convention now mechanically checked.** `ui_task` constructs and owns Slint end-to-end; `main.rs` naming `UiRuntime` compiles (privacy does not block it) but is caught by `xtask`'s `slint_thread_affinity` static guard (`cargo test -p xtask`); full 18-row migration list. | D4 |
 
 ## Functional-parity argument
 
@@ -675,9 +689,12 @@ container or in CI.
    argument predicts these are bit-identical; anything else means UI logic
    moved when it should not have.
 3. **CI is the compile oracle.** `check-all-features.sh`, green, **with and
-   without `--features diagnostics`**. This is what settles R2 (D5) and the
-   mechanical half of R8 — the container has no `esp` toolchain and cannot
-   substitute for it.
+   without `--features diagnostics`**. This is what settles R2 (D5) — the
+   container has no `esp` toolchain and cannot substitute for it. R8's
+   discipline is checked separately, host-natively, by `xtask`'s
+   `slint_thread_affinity` static guard (`cargo test -p xtask`,
+   `meshcadet-slint-affinity-static-guard`) — no `esp` toolchain needed,
+   since it is a text scan over `firmware/src/`, not a compile.
 4. **The static functional-parity matrix**, row set frozen above.
 5. **New host unit tests for the boundary itself**, placed in
    `firmware-core` so they run on the host:
@@ -720,10 +737,12 @@ container or in CI.
 - **The diagnostics log format changes** (D9 row 10) — the collection kit
   must be regenerated for the post-split build.
 - **R8's discipline is permanent.** `unsafe-single-threaded` means the
-  compiler will not catch a Slint call from the wrong task. D4.2's
-  visibility barrier makes the *current* violation impossible; keeping it
-  impossible is an ongoing review obligation on `firmware/src/ui_task.rs`'s
-  module boundary.
+  compiler will not catch a Slint call from the wrong task, and D4.2's
+  module boundary is a convention, not a visibility barrier — nothing in
+  Rust's privacy rules stops `main.rs` from naming `crate::ui::UiRuntime`.
+  Keeping the boundary honoured is now a `cargo test -p xtask` obligation
+  (`slint_thread_affinity`'s static guard), not a purely human review one;
+  see `meshcadet-slint-affinity-static-guard`.
 - **The 12.8 µs bus-hold bound is a reading of ESP-IDF v5.2.2's reference
   implementation, not a vendor timing SLA** (R1's own caveat). It is
   correct for the pinned version; an IDF bump should re-check it.

@@ -10,10 +10,19 @@
 //! property write, every render — must happen on one and the same thread,
 //! and nothing in the build will tell you if it does not (ADR-0012 D4, R8).
 //!
-//! This module holds the ONLY `use crate::ui::UiRuntime` in the crate.
-//! `main.rs` cannot name `UiRuntime` at all — a stray Slint call from the
-//! dispatcher task is therefore a compile error, not a review miss. The one
-//! item this module exposes, [`spawn`], takes the raw peripherals `main.rs`
+//! This module holds the ONLY `use crate::ui::UiRuntime` in the crate — by
+//! convention, not by the compiler. `mod ui;` is declared at the crate root
+//! and `UiRuntime` is plain `pub`, so nothing in the type system actually
+//! stops `main.rs` from writing `crate::ui::UiRuntime`; a stray Slint call
+//! from the dispatcher task would compile cleanly and manifest as silent UB
+//! at runtime instead, because `firmware/Cargo.toml`'s
+//! `unsafe-single-threaded` feature is what's cited above — it removes
+//! Slint's own thread-affinity checks, it doesn't add Rust's. What
+//! mechanically enforces the barrier today is `xtask`'s
+//! `slint_thread_affinity` host harness (`cargo test -p xtask`), which greps
+//! every file under `firmware/src/` outside this one and `ui/` for
+//! `UiRuntime`/`slint::`/`i_slint*` and fails the build if one appears. The
+//! one item this module exposes, [`spawn`], takes the raw peripherals `main.rs`
 //! constructed (SPI/I2C device REGISTRATION already happened there, on the
 //! main task, before this function is ever called — D2's corollary: every
 //! `spi_bus_add_device` call happens single-threaded, before `ui_task`
