@@ -322,6 +322,24 @@ fn ui_task_main<C>(
     let mut last_hwm_log_ms: u64 = crate::uptime_ms();
     const HWM_LOG_INTERVAL_MS: u64 = 30_000;
 
+    // ADR-0012 D9 row 10 restore (collection-kit D1-D4/D-E): `ui_task`'s
+    // own on-device perf rollup, diagnostics-only, same shape as the
+    // dispatcher's `perf_rollup` in `main.rs`. The M1 split correctly
+    // dropped that task's `ui_step` phase and `record_ui_starvation` call
+    // (this loop, not that one, now owns `ui.step()`) but added no
+    // replacement here — `record_ui_starvation` was left exported and
+    // unit-tested (`firmware-core/src/perf.rs`) with no on-device caller.
+    // This rollup, and the two call sites below, are that replacement.
+    #[cfg(feature = "diagnostics")]
+    let mut perf_rollup = Box::new(crate::perf::PerfRollup::new());
+    // Timestamp of the previous `ui.step()` call. `None` until the first
+    // call completes so thread bring-up (display/touch/keyboard probe,
+    // `UiRuntime::new()`) is never counted as a starvation gap — the first
+    // recorded gap is between the first and second `ui.step()` calls, both
+    // inside the steady-state loop.
+    #[cfg(feature = "diagnostics")]
+    let mut last_ui_step_ms: Option<u64> = None;
+
     loop {
         // D7 item 3: `recv_timeout(UI_TICK_MS)` guarantees a pet at least
         // every 16 ms in steady state, with or without traffic.
@@ -347,8 +365,32 @@ fn ui_task_main<C>(
             }
         }
 
+        #[cfg(feature = "diagnostics")]
+        let ui_step_t0_us = crate::uptime_us();
+
         if let Err(e) = ui.step(crate::uptime_ms()) {
             log::warn!("ui_task: step error: {:?}", e);
+        }
+
+        // D9 row 10 restore (diagnostics-only): `ui_step`'s own call
+        // duration, same "phase" shape `main.rs` used pre-split, plus the
+        // UI-starvation gap. Unlike the pre-split dispatcher — where
+        // "starvation" meant how much of a shared iteration OTHER work
+        // stole from `ui.step()` — `ui_task` runs nothing else of
+        // consequence in this loop, so the coherent proxy here is simply
+        // the wall-clock gap between one `ui.step()` call and the next:
+        // `recv_timeout`'s up-to-16ms wait, event handling, and this same
+        // periodic-log block all land inside that gap.
+        #[cfg(feature = "diagnostics")]
+        {
+            let ui_step_dur_us = (crate::uptime_us().saturating_sub(ui_step_t0_us)) as u32;
+            perf_rollup.ui_step.record(ui_step_dur_us);
+
+            let ui_step_now_ms = crate::uptime_ms();
+            if let Some(last_ms) = last_ui_step_ms {
+                perf_rollup.record_ui_starvation(ui_step_now_ms.saturating_sub(last_ms) as u32);
+            }
+            last_ui_step_ms = Some(ui_step_now_ms);
         }
 
         // D6: periodic `ui_task` HWM sample (unconditional — see above).
@@ -356,14 +398,14 @@ fn ui_task_main<C>(
         if now.saturating_sub(last_hwm_log_ms) >= HWM_LOG_INTERVAL_MS {
             last_hwm_log_ms = now;
             crate::log_thread_stack_hwm("ui_task", UI_TASK_STACK_SIZE as u32);
-            // D9 row 10: `ui_task` gets its own rollup — `ui_step`'s own
-            // per-phase timing histogram is out of scope for this split (the
-            // collection kit's expected log format already needs
-            // regenerating for the post-split build, a planned sibling
-            // deliverable — see the ADR's Consequences section); the
-            // input-to-first-paint stat `main.rs` used to read via
-            // `ui.take_input_paint_stats()` moves here unchanged, still
-            // diagnostics-only.
+            // D9 row 10: `ui_task` gets its own rollup. The input-to-first-
+            // paint stat `main.rs` used to read via
+            // `ui.take_input_paint_stats()` moved here unchanged at the M1
+            // split, still diagnostics-only; `ui_step`'s own phase histogram
+            // and the UI-starvation counters are restored below (see the
+            // `ui.step()` call site above for what each measures) — same 30s
+            // cadence and log-line shape as the dispatcher's own rollup in
+            // `main.rs`.
             #[cfg(feature = "diagnostics")]
             {
                 let paint = ui.take_input_paint_stats();
@@ -371,6 +413,28 @@ fn ui_task_main<C>(
                     "PERF input-to-first-paint: n={} min={}ms mean={}ms max={}ms p95={}ms",
                     paint.count, paint.min, paint.mean, paint.max, paint.p95,
                 );
+
+                let ui_step_snap = perf_rollup.ui_step.snapshot();
+                log::info!(
+                    "PERF phase=ui_step: n={} min={}us mean={}us max={}us p95={}us",
+                    ui_step_snap.count,
+                    ui_step_snap.min,
+                    ui_step_snap.mean,
+                    ui_step_snap.max,
+                    ui_step_snap.p95,
+                );
+                log::info!(
+                    "PERF ui-starvation: cumulative={}ms longest={}ms (window={}s)",
+                    perf_rollup.ui_starvation_cumulative_ms,
+                    perf_rollup.ui_starvation_longest_ms,
+                    HWM_LOG_INTERVAL_MS / 1000,
+                );
+                // Reset for the next window — same reset-by-reassignment
+                // idiom as `main.rs`'s `*perf_rollup = perf::PerfRollup::new();`.
+                // `last_ui_step_ms` is NOT reset here: it tracks the
+                // continuous cross-window `ui.step()` cadence, not a
+                // per-window accumulator.
+                *perf_rollup = crate::perf::PerfRollup::new();
             }
         }
     }
