@@ -100,10 +100,18 @@
 
 /* ── Curated emoji codepoints (40 total) ─────────────────────────────── */
 /*
- * SYNC INVARIANT: these codepoints MUST match EMOJI_TABLE in
- * protocol/src/emoji.rs.  If emoji are added or removed from that table,
- * update this array AND the N_EMOJI_TABLE define below.  A divergence
- * compiles silently but the added emoji will render blank on-device.
+ * SYNC INVARIANT (CONTAINMENT, not equality — see the picker/render split
+ * contract at the top of this file): every codepoint in `protocol::emoji::
+ * EMOJI_TABLE` must appear SOMEWHERE in `EMOJI_CPS ∪ RENDER_EXTRA_CPS`.
+ * Historically this array WAS exactly `protocol::emoji::EMOJI_TABLE`'s
+ * codepoints (hence "40 total" above), and adding a picker entry meant
+ * adding it here. That is still ONE valid way to add a picker entry, but
+ * NOT the only one as of D1: a picker entry can instead be grown out of an
+ * already-rasterised `RENDER_EXTRA_CPS` codepoint at zero flash cost (no
+ * new bitmap needed) — update `N_EMOJI_TABLE` below only if you add here.
+ * `xtask::emoji_table_subset_mismatches` enforces the containment in code;
+ * a divergence otherwise compiles silently but the added emoji renders
+ * blank on-device.
  */
 static const unsigned long EMOJI_CPS[] = {
     /* Faces */
