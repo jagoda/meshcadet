@@ -69,15 +69,30 @@ fi
 
 # Root workspace member crate names, derived from Cargo.toml's `members`
 # array (not hardcoded) so this script stays correct if crates are ever
-# added/removed. Only handles the single-line `members = [...]` form
-# Cargo.toml currently uses — fails loudly below rather than silently
-# skipping the root lockfile if that ever changes (e.g. reformatted to a
-# multi-line array).
+# added/removed. Handles both the single-line `members = [...]` form and
+# the multi-line form (`members = [` on its own line, one `"crate",` entry
+# per line, closing `]` on its own line — what `cargo fmt`/rustfmt-adjacent
+# tooling wraps it to once the array grows past one line) — fails loudly
+# below rather than silently skipping the root lockfile if the array is in
+# neither shape (e.g. entries packed onto the closing-bracket line).
 members_line="$(grep -m1 -E '^members = \[.*\]$' Cargo.toml || true)"
-if [[ -z "${members_line}" ]]; then
-  die "could not find a single-line \"members = [...]\" array in Cargo.toml — this script doesn't understand a multi-line members array; update it if Cargo.toml's format changed"
+if [[ -n "${members_line}" ]]; then
+  mapfile -t member_paths < <(sed -E 's/^members = \[(.*)\]$/\1/' <<<"${members_line}" | tr ',' '\n' | tr -d ' "')
+elif grep -qm1 -E '^members = \[$' Cargo.toml; then
+  members_block="$(sed -n '/^members = \[$/,/^\]$/p' Cargo.toml)"
+  # The sed range above has no way to *fail* if its end pattern (`^\]$`,
+  # a bare closing bracket alone on its own line) never occurs before EOF
+  # — it just prints through to the last line of the file instead. Guard
+  # explicitly: if the block's last line isn't a bare "]", this Cargo.toml
+  # is in some other shape (e.g. the closing bracket glued onto the last
+  # entry's line) that isn't the multi-line form this script understands.
+  if [[ "$(tail -n1 <<<"${members_block}")" != "]" ]]; then
+    die "found a \"members = [...]\" opening line in Cargo.toml but no bare \"]\" closing line before EOF — this script only understands a multi-line members array with one entry per line and a closing bracket alone on its own line"
+  fi
+  mapfile -t member_paths < <(sed '1d;$d' <<<"${members_block}" | tr ',' '\n' | tr -d ' "')
+else
+  die "could not find a \"members = [...]\" array in Cargo.toml (checked both the single-line \"members = [...]\" form and the multi-line \"members = [\" / one-entry-per-line / \"]\" form) — update this script if Cargo.toml's format changed again"
 fi
-mapfile -t member_paths < <(sed -E 's/^members = \[(.*)\]$/\1/' <<<"${members_line}" | tr ',' '\n' | tr -d ' "')
 
 declare -a root_names=()
 for path in "${member_paths[@]}"; do
