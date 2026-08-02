@@ -14,6 +14,15 @@ jagoda/meshcadet#134) changed the diagnostics log format this kit reads from
 which predicates that affects. Everything not called out as changed is
 unchanged from the M0 version of this document.
 
+**`ui_step`/`ui-starvation` restored, same day, by
+`meshcadet-perf-ui-starvation-instrumentation-restore`.** The split above
+correctly dropped the dispatcher's `ui_step` phase and `ui-starvation`
+counter (it stopped calling `ui.step()` entirely) but landed with no
+replacement on `ui_task`, silently blocking D1-D4 (§0's table). Both are now
+recorded on `ui_task`'s own periodic block instead — see Part C and Part G
+step 8 for the restored format; this is still the same M1 ref, not a new
+milestone.
+
 ## 0. What this closes, and what it doesn't
 
 This is the one place in the `meshcadet-perf-rearchitecture` performance
@@ -36,10 +45,10 @@ one tightens it. Once a section here closes a predicate, strike that row from
 
 | Predicate (from `ui-perf-baseline.md` §8) | Closed by |
 |---|---|
-| D1 — on-target render cost, idle vs. 200-msg conversation | **[BLOCKED as of the M1 ref]** — needed the dispatcher's `ui_step` phase timing, which post-split neither the dispatcher nor `ui_task` records (see `task-split-host-validation.md` §6). Was: Part C, scripted scenario. |
-| D2 — real per-flush SPI command overhead | **[BLOCKED as of the M1 ref]** — same root cause as D1. Was: Part C, scripted scenario (same run as D1). |
-| D3 — real dirty-line-count distribution in use | **[BLOCKED as of the M1 ref]** — same root cause as D1/D2 (the `ui_step`-duration proxy this predicate leaned on no longer exists). Was: Part C, **partial** — see that section's honesty note. |
-| D4 — longest UI-unserviced gap vs. payload size | **[BLOCKED as of the M1 ref]** — Part G step 8 reads the `PERF ui-starvation` line, which the M1 split removed from the dispatcher's rollup with no replacement (`meshcadet-perf-task-split-host-validation`'s `docs/perf/task-split-host-validation.md` §6 — same underlying number as ADR-0012's deferred predicate D-E). Needs a follow-up instrumentation call (`firmware_core::perf::PerfRollup::record_ui_starvation`, already written and unit-tested, just uncalled from `ui_task.rs`) before this row is runnable again. |
+| D1 — on-target render cost, idle vs. 200-msg conversation | Part C, scripted scenario — `ui_step` phase timing restored by `meshcadet-perf-ui-starvation-instrumentation-restore`; it now lives on `ui_task`'s block, not the dispatcher's (moved at the M1 split, D9 row 10). |
+| D2 — real per-flush SPI command overhead | Part C, scripted scenario (same run as D1) — same restore as D1. |
+| D3 — real dirty-line-count distribution in use | Part C, **partial** — see that section's honesty note. Same partial status as the pre-split (M0) kit: the restored `ui_step` timing is a duration *proxy* for dirty-line count, never a direct count; a genuinely new per-frame dirty-line counter still doesn't exist on either topology. |
+| D4 — longest UI-unserviced gap vs. payload size | Part G step 8 — `PERF ui-starvation` restored by `meshcadet-perf-ui-starvation-instrumentation-restore`: `firmware_core::perf::PerfRollup::record_ui_starvation` (already written and unit-tested) is now called from `ui_task.rs`, which logs the line every 30 s on its own block. Same underlying predicate as ADR-0012's deferred D-E. |
 | D5 — delivery success rate (the hard constraint) | Part G (two-device) — unaffected by the M1 log-format change |
 | D6 — RX-notice latency, idle vs. UI-active | Part G (two-device) — unaffected; `rx-notice-latency` is still one of the dispatcher's 5 post-split `PERF phase=`/`PERF rx-notice-latency` lines (Part C) |
 | D7 — per-core utilization | Part C (every capture window reports it for free) — unaffected |
@@ -227,61 +236,70 @@ every 30 s:
 ui_task: subscribed to Task WDT (30 s timeout)
 ui_task: stack HWM: <free_B> B free / 32768 B total = <peak_B> B peak (<pct>% headroom)
 PERF input-to-first-paint: n=<count> min=<ms> mean=<ms> max=<ms> p95=<ms>
+PERF phase=ui_step: n=<count> min=<us> mean=<us> max=<us> p95=<us>
+PERF ui-starvation: cumulative=<ms>ms longest=<ms>ms (window=30s)
 ```
 
-(`input-to-first-paint` moved here from the dispatcher's rollup, same
-format, `diagnostics`-gated same as before — D9 row 10.)
+(`input-to-first-paint` moved here from the dispatcher's rollup at the M1
+split, same format, `diagnostics`-gated same as before — D9 row 10.
+`ui_step`/`ui-starvation` are restored here by
+`meshcadet-perf-ui-starvation-instrumentation-restore` — the M1 split
+correctly dropped both from the dispatcher's block, since it no longer
+calls `ui.step()` at all, but landed with no replacement on `ui_task`; this
+is that replacement, same log-line shape as the pre-split dispatcher used,
+plumbed through `firmware_core::perf::PerfRollup::record_ui_starvation`,
+which had been written and unit-tested but left uncalled.)
 
-**D4/D-E's `PERF ui-starvation` line does not exist anywhere post-split** —
-see §0's table. Nothing in this kit currently produces the number that row
-used to close; skip straight to reporting `n/a — removed by the M1 split,
-see docs/perf/task-split-host-validation.md §6` for that field rather than
-waiting for a line that will never print.
+**`ui-starvation`'s definition changed with the move — same field names,
+different measurement.** Pre-split, "starvation" meant how much of the
+dispatcher's *shared* iteration something OTHER than `ui.step()` consumed
+(GPS/battery poll, CAD+TX, RX poll all competed for the same loop turn).
+Post-split, `ui_task` runs nothing else of consequence in its own loop, so
+the coherent proxy is the wall-clock gap between one `ui.step()` call and
+the next — `recv_timeout`'s up-to-16ms wait, event handling, and this same
+30 s log block all land inside that gap (see `ui_task.rs`'s `ui.step()`
+call site doc for the exact accounting). `cumulative`/`longest` keep the
+same meaning (sum over the window / single largest gap in the window) as
+the pre-split dispatcher's numbers.
 
-All phase values are microseconds; input-to-first-paint is milliseconds.
-`n=0` on any phase (e.g. `tx`/`cad` with nothing queued) reports `min=0
-mean=0 max=0 p95=0` — that is the "no samples" case, not a real zero cost;
-don't read it as one.
+All phase values are microseconds; `ui-starvation` and input-to-first-paint
+are milliseconds. `n=0` on any phase (e.g. `tx`/`cad` with nothing queued)
+reports `min=0 mean=0 max=0 p95=0` — that is the "no samples" case, not a
+real zero cost; don't read it as one.
 
 **A correct run looks like — CHANGED for the M1 ref.** Idle windows with
-`cad`/`tx` at `n=0` in the dispatcher block, and **`core1` now showing REAL
-utilization** (a nonzero percentage), not `n/a` — `ui_task` genuinely runs
-on core 1 post-split, so a `core1=n/a` reading on an M1+ ref is itself a red
-flag (it would mean `ui_task` never spawned, or the core-affinity pin
-silently failed — see `ui_task.rs`'s headless-fallback doc for when spawn is
-skipped). There is no `ui_step` or `ui-starvation` reading to sanity-check
-any more (§0's D1-D4 rows, all `[BLOCKED]`). **A failed run** looks like the
-device resetting mid-capture (a fresh `firmware build:` / `identity ready:`
-pair appearing unexpectedly), or every phase reading `n=0` forever including
-`gps`/`battery`/`rx_poll` (those three should never be zero — they run every
-iteration unconditionally) — that means the `diagnostics` feature didn't
-actually compile in; re-check Part A's build command. A missing `ui_task:
-subscribed to Task WDT` line at boot means the UI half never came up at all
-(headless boot) — check for the "I2C/touch init failed" or "LCD SPI init
-failed" log lines just before it.
+`cad`/`tx` at `n=0` in the dispatcher block, `ui_step` mean in the low
+hundreds of microseconds or less in `ui_task`'s block, and **`core1` now
+showing REAL utilization** (a nonzero percentage), not `n/a` — `ui_task`
+genuinely runs on core 1 post-split, so a `core1=n/a` reading on an M1+ ref
+is itself a red flag (it would mean `ui_task` never spawned, or the
+core-affinity pin silently failed — see `ui_task.rs`'s headless-fallback doc
+for when spawn is skipped). `ui-starvation longest` should spike into the
+tens-to-hundreds of ms only in windows where you triggered a send (Part D)
+or an incoming message; a steady near-16ms `longest` in an idle window is
+the expected floor (the `recv_timeout` tick itself), not a fault. **A failed
+run** looks like the device resetting mid-capture (a fresh `firmware build:`
+/ `identity ready:` pair appearing unexpectedly), or every phase reading
+`n=0` forever including `gps`/`battery`/`rx_poll` (those three should never
+be zero — they run every iteration unconditionally) — that means the
+`diagnostics` feature didn't actually compile in; re-check Part A's build
+command. A missing `ui_task: subscribed to Task WDT` line at boot means the
+UI half never came up at all (headless boot) — check for the "I2C/touch
+init failed" or "LCD SPI init failed" log lines just before it.
 
-**[BLOCKED as of the M1 ref] — this procedure closes D1/D2/D3 only on a
-pre-split (M0) ref.** Steps 2-4 below read the `ui_step` phase's `max` from
-the dispatcher's rollup; that phase does not exist post-split (§0's table,
-`task-split-host-validation.md` §6). Run it anyway for `gps`/`battery`/
-`rx_poll`/`cad`/`tx`/`rx-notice-latency`/`core-utilization` (still valid and
-useful on an M1+ ref, and `core-utilization` now shows real work on core 1 —
-see the "correct run looks like" note above), but record D1/D2/D3 as `n/a —
-blocked, see docs/perf/task-split-host-validation.md §6` rather than
-guessing at a `ui_step` reading that will not appear. **Procedure — one
-scripted 5-minute window**, deliberately touching every scenario D1/D2/D3
-ask for in one pass rather than three separate captures:
+**Procedure — one scripted 5-minute window**, deliberately touching every
+scenario D1/D2/D3 ask for in one pass rather than three separate captures:
 
 1. [ ] Leave the device idle at the contact list for at least one full 30 s
        window with no taps. This is your **idle baseline** window.
 2. [ ] Open a conversation with 20+ messages (any real conversation you have,
        or send yourself several DMs first via Compose to build one up).
-       **Expected:** the log line for `ui_step`'s next 30 s window has a
-       visibly higher `max` than the idle window's `max` — that single spike
-       IS the navigation repaint (§4.1 of `ui-perf-baseline.md`: idle repaint
-       cost is 0, a full-window navigation paint is a real, one-time cost;
-       `max` isolates it from the `mean`/`p95` of the surrounding idle
-       iterations in the same window).
+       **Expected:** the log line for `ui_task`'s `ui_step` phase in its next
+       30 s window has a visibly higher `max` than the idle window's `max` —
+       that single spike IS the navigation repaint (§4.1 of
+       `ui-perf-baseline.md`: idle repaint cost is 0, a full-window
+       navigation paint is a real, one-time cost; `max` isolates it from the
+       `mean`/`p95` of the surrounding idle iterations in the same window).
 3. [ ] If you have 200+ messages in one conversation, repeat step 2
        specifically against that conversation — **this exact scenario is
        D1's own citation** ("ContactList idle vs. a 200-message conversation
@@ -299,21 +317,22 @@ ask for in one pass rather than three separate captures:
        navigation events above), so `gps`/`battery`/`rx_poll`'s percentile
        fields rest on more than a handful of samples.
 
-**D3 honesty note — doubly blocked on an M1+ ref.** D3 asks for the real
-*dirty-line-count* distribution in use. On the pre-split (M0) build, the
-instrumentation landed by PR jagoda/meshcadet#120 times phases but does not
-count dirty lines per frame, so `ui_step`'s duration was already only a
-*proxy* (via `ui-perf-baseline.md` §4.1's ~128 µs/line data-only floor,
-e.g. a `max` reading of ~2.8 ms roughly consistent with a ~22-line in-place
-message-append repaint vs. a ~30.7 ms 240-line full-window one) — an
-inference from timing, never a direct count. **On the M1+ ref the proxy
-itself is gone too** (§0's table, `task-split-host-validation.md` §6): there
-is no `ui_step` reading anywhere to infer from. Closing D3 exactly needs two
-follow-ups now, not one: (1) restore a `ui_step`-equivalent phase timing on
-`ui_task` (closes D1/D2 as a side effect), and (2) a genuinely new per-frame
-dirty-line counter this instrumentation has never had, on either topology.
-Record `n/a — blocked` for this predicate on an M1+ ref rather than
-inferring from a reading that doesn't exist.
+**D3 honesty note.** D3 asks for the real *dirty-line-count* distribution in
+use. The instrumentation (pre-split, PR jagoda/meshcadet#120; restored on
+`ui_task` post-split by `meshcadet-perf-ui-starvation-instrumentation-
+restore`) times phases; it does not count dirty lines per frame. `ui_step`'s
+duration is a proxy — you can back out an approximate line count from a
+duration reading via `ui-perf-baseline.md` §4.1's ~128 µs/line data-only
+floor (e.g. a `max` reading of ~2.8 ms is roughly consistent with a ~22-line
+in-place message-append repaint, not a 240-line full-window one, which would
+be ~30.7 ms) — but this is an inference from timing, not a direct count, and
+cannot be presented as one. This was already true pre-split and remains
+true now that the proxy is restored — the restore returns D3 to its
+original **partial** status, it does not close it outright. Closing D3
+exactly would still need a follow-up instrumentation addition (a per-frame
+dirty-line counter) this codebase has never had, on either topology. Record
+the `ui_step` percentiles from `ui_task`'s block in the report regardless;
+that is the best evidence current instrumentation can produce for D3.
 
 **D7 (per-core utilization)** needs no extra steps — every 30 s dispatcher
 rollup block already includes the `core-utilization` line, unaffected by
@@ -344,7 +363,7 @@ that follows.
 
 | `LoopModelParams` field | How to derive it from Part C's log |
 |---|---|
-| `ui_step` | **[BLOCKED as of the M1 ref]** — was: directly, the `ui_step` phase's `mean`/`p95`/`max` from Part C, in µs → convert to ms, replacing the whole `[0.05, 30.72]` ms range with these three points. That phase no longer exists on either task post-split (§0's table, `task-split-host-validation.md` §6). Leave at the documented range until the follow-up instrumentation lands. |
+| `ui_step` | Directly: the `ui_step` phase's `mean`/`p95`/`max` from Part C, in µs → convert to ms, replacing the whole `[0.05, 30.72]` ms range with these three points. **Restored by `meshcadet-perf-ui-starvation-instrumentation-restore`** — read it from `ui_task`'s block now, not the dispatcher's (moved at the M1 split, D9 row 10; the underlying measurement — `ui.step()`'s own call duration — is unchanged by the move). |
 | `cad_spi_overhead` | Directly: take the `cad` phase's `mean` (µs → ms), subtract the analytical `CAD_ACTIVE_MS` constant (8.192 ms, `perf_loop_model/src/sim.rs::CAD_ACTIVE_MS`), floor at 0. That's the real SPI-command overhead ahead of the CAD-active window. **Unaffected by the M1 split** — `cad` is still one of the dispatcher's 5 post-split `PERF phase=` lines. |
 | `gps_poll` | Directly: the `gps` phase's `mean`/`p95`/`max`, µs → ms. Note whether your capture window landed in GPS's quiet or active duty-cycle phase (`ui-perf-baseline.md`'s dispatcher-loop description) — if you only captured the quiet window, note that in the report; the active-window number needs a capture that happens to straddle a GPS active cycle. **Unaffected by the M1 split.** |
 | `battery_poll` | Directly: the `battery` phase's `mean`/`p95`/`max`, µs → ms. **Unaffected by the M1 split.** |
@@ -505,15 +524,13 @@ correct; nothing here changes its steps, only tightens what to report:
        differencing needed if you captured both windows.
 8. [ ] Repeat step 6 at 10 B, 40 B and 255 B payloads for D4's payload-size
        scaling — one full 20-DM run **per payload size**, each producing its
-       own report block (§9) with `payload_bytes` set accordingly.
-       **[BLOCKED as of the M1 ref]** — was: read the `ui-starvation` PERF
-       line's `longest` field after each, D4's number directly. That line no
-       longer prints post-split (§0's table, `task-split-host-validation.md`
-       §6). Still run this step for its OTHER value — steps 6-8 are also
-       where D5/D6's delivery-success and RX-notice-latency counts come from
-       — but record D4 as `n/a — blocked, see docs/perf/task-split-host-
-       validation.md §6` for each payload size rather than waiting for a
-       line that will not appear.
+       own report block (§9) with `payload_bytes` set accordingly. Read the
+       `ui-starvation` PERF line's `longest` field after each — D4's number
+       directly. **Restored by
+       `meshcadet-perf-ui-starvation-instrumentation-restore`:** this line
+       now prints on `ui_task`'s block (moved off the dispatcher's at the M1
+       split, D9 row 10 — see Part C for the full format and the changed
+       gap definition), every 30 s, same as before.
 9. [ ] Trigger a T-Deck→peer DM **while** a screen transition or motif is
        mid-flight; confirm no new error class in the CAD/TX log lines and
        that the peer receives the DM correctly (correctness, not timing).
