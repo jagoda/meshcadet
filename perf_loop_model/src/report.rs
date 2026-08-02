@@ -30,9 +30,18 @@ pub struct SweepRow {
     pub result: SimResult,
 }
 
-/// Every combination — 3 corners x 4 payload sizes x 2 topologies = 24 runs.
+/// Every combination — 3 corners x 4 payload sizes x 2 topologies = 24 runs,
+/// against `LoopModelParams::documented_defaults()`. See
+/// [`full_sweep_with_params`] to re-run against a calibrated
+/// [`LoopModelParams`] (`crate::calibration::calibrate`'s output) instead.
 pub fn full_sweep() -> Vec<SweepRow> {
-    let params = LoopModelParams::documented_defaults();
+    full_sweep_with_params(&LoopModelParams::documented_defaults())
+}
+
+/// Same sweep as [`full_sweep`], against caller-supplied `params` — the
+/// hook a device-report re-calibration re-run uses, per `crate`'s "The
+/// re-calibration hook" doc section.
+pub fn full_sweep_with_params(params: &LoopModelParams) -> Vec<SweepRow> {
     let mut out = Vec::new();
     for corner in Corner::ALL {
         let r = params.resolve(corner);
@@ -51,13 +60,18 @@ pub fn full_sweep() -> Vec<SweepRow> {
 
 /// This pass's own abort/reroute question: does radio-TX blocking dominate
 /// the UI-unserviced gap? Evaluated at every corner x payload-size
-/// combination.
+/// combination, against `LoopModelParams::documented_defaults()`. See
+/// [`dominance_table_with_params`] for the calibrated-re-run hook.
 pub fn dominance_table() -> Vec<DominanceVerdict> {
-    let params = LoopModelParams::documented_defaults();
+    dominance_table_with_params(&LoopModelParams::documented_defaults())
+}
+
+/// Same table as [`dominance_table`], against caller-supplied `params`.
+pub fn dominance_table_with_params(params: &LoopModelParams) -> Vec<DominanceVerdict> {
     let mut out = Vec::new();
     for corner in Corner::ALL {
         for payload_bytes in PAYLOAD_SWEEP_BYTES {
-            out.push(dominance_check(&params, payload_bytes, corner));
+            out.push(dominance_check(params, payload_bytes, corner));
         }
     }
     out
@@ -81,6 +95,21 @@ fn topology_label(t: Topology) -> &'static str {
 /// Render the full report as plain text — the exact bytes that get pasted
 /// into `docs/perf/perf-loop-model-baseline.md`, labelled SIMULATED.
 pub fn render_text_report() -> String {
+    render_text_report_with_params(&LoopModelParams::documented_defaults())
+}
+
+/// Same report as [`render_text_report`], against caller-supplied `params`.
+///
+/// **Every number this prints is still SIMULATED**, even when `params`
+/// carries one or more device-MEASURED points from `crate::calibration::
+/// calibrate` — `longest_gap_ms`/`p95_gap_ms`/etc. are always
+/// `crate::sim::simulate`'s output, a host model, never a device reading.
+/// A caller embedding this text into a doc must still tag the OUTPUT rows
+/// SIMULATED and separately cite which INPUT constants were MEASURED (e.g.
+/// via `crate::calibration::CalibrationReport`) — this function does not
+/// do that labelling for the caller, by design, so it can never silently
+/// launder a calibrated input into a "measured" output claim.
+pub fn render_text_report_with_params(params: &LoopModelParams) -> String {
     use std::fmt::Write;
     let mut out = String::new();
 
@@ -109,7 +138,7 @@ pub fn render_text_report() -> String {
         "corner", "payload_B", "airtime_ms", "idle_floor_gap_ms", "ratio_x", "dominates"
     )
     .unwrap();
-    for v in dominance_table() {
+    for v in dominance_table_with_params(params) {
         writeln!(
             out,
             "{:<8} {:>10} {:>14} {:>20.3} {:>10.1} {:>10}",
@@ -142,7 +171,7 @@ pub fn render_text_report() -> String {
     // a full discrete-event simulation, so recomputing it a second time for
     // the cadence table would silently double this function's total work
     // for no reason.
-    let sweep = full_sweep();
+    let sweep = full_sweep_with_params(params);
 
     for row in &sweep {
         let r = &row.result;
@@ -233,5 +262,43 @@ mod tests {
         let text = render_text_report();
         assert!(text.contains("SIMULATED"));
         assert!(text.contains("dominates"));
+    }
+
+    #[test]
+    fn with_params_entry_points_match_the_default_entry_points_at_documented_defaults() {
+        // The re-calibration hook's `_with_params` variants must be
+        // strictly more general than the no-arg ones, not a parallel
+        // reimplementation that can drift from them.
+        let defaults = LoopModelParams::documented_defaults();
+        assert_eq!(full_sweep().len(), full_sweep_with_params(&defaults).len());
+        assert_eq!(
+            dominance_table().len(),
+            dominance_table_with_params(&defaults).len()
+        );
+        assert_eq!(
+            render_text_report(),
+            render_text_report_with_params(&defaults)
+        );
+    }
+
+    #[test]
+    fn calibrated_params_change_the_ui_unserviced_gap_sweep() {
+        // A calibrated ui_step far above the documented range's high bound
+        // should visibly move the headline sweep's numbers — otherwise the
+        // hook would be wired to nothing.
+        let (calibrated, _report) = crate::calibration::calibrate(
+            LoopModelParams::documented_defaults(),
+            &crate::calibration::MeasuredConstants {
+                ui_step: Some(crate::calibration::MeasuredPhaseMs {
+                    mean_ms: 4.0,
+                    p95_ms: 8.0,
+                    max_ms: 12.0,
+                }),
+                ..Default::default()
+            },
+        );
+        let baseline_text = render_text_report();
+        let calibrated_text = render_text_report_with_params(&calibrated);
+        assert_ne!(baseline_text, calibrated_text);
     }
 }

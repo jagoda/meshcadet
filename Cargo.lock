@@ -3315,6 +3315,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "perf_device_report"
+version = "0.5.0"
+dependencies = [
+ "perf_loop_model",
+]
+
+[[package]]
 name = "perf_loop_model"
 version = "0.5.0"
 dependencies = [

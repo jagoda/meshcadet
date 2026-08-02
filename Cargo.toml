@@ -58,9 +58,29 @@
 # estimate. See `perf_loop_model/src/lib.rs` for the full design doc and
 # `docs/perf/perf-loop-model-baseline.md` for the committed SIMULATED
 # baseline.
+#
+# `perf_device_report` is the ingest path for `docs/perf/collection-kit.md`
+# §9's report-back format: parses a pasted `meshcadet-perf-report` block
+# (header + raw serial log) into structured data, archives it under
+# `docs/perf/device-reports/`, and — for a `section: calibration` block —
+# feeds `perf_loop_model::calibration::calibrate` the measured phase
+# constants it can derive. See `perf_device_report/src/lib.rs` for the full
+# design doc. `meshcadet-perf-device-report-ingest` (campaign:
+# `meshcadet-perf-rearchitecture`) built this crate; it has no dependency on
+# actual device data existing yet — every test here runs against synthetic
+# fixture text, never a real capture.
 [workspace]
 resolver = "2"
-members = ["protocol", "firmware-core", "host", "xtask", "ui_sim", "ui_perf", "perf_loop_model"]
+members = [
+    "protocol",
+    "firmware-core",
+    "host",
+    "xtask",
+    "ui_sim",
+    "ui_perf",
+    "perf_loop_model",
+    "perf_device_report",
+]
 
 [workspace.package]
 edition = "2021"

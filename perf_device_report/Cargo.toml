@@ -1,0 +1,26 @@
+[package]
+name = "perf_device_report"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = """
+Ingest path for `docs/perf/collection-kit.md` §9's report-back format:
+parses a pasted `meshcadet-perf-report` block (header + raw serial log)
+produced by a human operator running the on-device performance collection
+kit, archives it under `docs/perf/device-reports/`, and — for a
+`section: calibration` block — feeds `perf_loop_model`'s re-calibration
+hook the measured phase constants it can derive. See `src/lib.rs` for the
+full design doc.
+"""
+
+[[bin]]
+name = "ingest_device_report"
+path = "src/bin/ingest_device_report.rs"
+
+[dependencies]
+# The re-calibration hook this crate drives — see `src/calibration.rs`.
+# No `version` field: nothing in this repo's toolchain runs `cargo
+# package`/`cargo publish` (see root `Cargo.toml`'s
+# `[workspace.dependencies].protocol` doc comment for why that matters).
+perf_loop_model = { path = "../perf_loop_model" }
