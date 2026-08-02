@@ -2,10 +2,37 @@
 //! Curated emoji set for MeshCadet.
 //!
 //! # Scope
-//! A fixed set of 40 emoji chosen for:
+//! A curated set of 96 emoji (6 categories × 16), chosen for:
 //! - Broad, universal recognisability
 //! - Absence of violence, adult content, or ambiguous meaning
 //! - Coverage of common positive reactions (happy, love, fun, nature)
+//!
+//! # The picker/render split (meshcadet-emoji-coverage D1)
+//! `EMOJI_TABLE` (this file, the send-side picker) is a curated SUBSET of
+//! the much larger renderable set (`gen_emoji_font.c`'s `EMOJI_CPS ∪
+//! RENDER_EXTRA_CPS`, ~600 codepoints landed by
+//! `meshcadet-emoji-render-set-curation`) — not the same thing. Every entry
+//! below is drawn from that render set, so growing this table costs only
+//! `&'static str` shortcode/label bytes, never a new glyph bitmap: the
+//! codepoint is already rasterised into the bundled font one way or
+//! another. `xtask::emoji_table_subset_mismatches` enforces
+//! `EMOJI_TABLE ⊆ (EMOJI_CPS ∪ RENDER_EXTRA_CPS)` in code — a picker entry
+//! whose codepoint isn't in that union renders BLANK on-device. The
+//! original 40 entries additionally live in `EMOJI_CPS` itself (the
+//! historical, still-valid way to add a picker entry); the 56 grown by
+//! `meshcadet-emoji-picker-expansion` instead reuse already-rasterised
+//! `RENDER_EXTRA_CPS` codepoints, at zero flash cost — see that mission's
+//! dossier and the campaign plan's D1 for the full rationale.
+//!
+//! # Categories
+//! [`EMOJI_CATEGORIES`] lists the 6 picker tabs, in display order. Every
+//! [`EmojiEntry::category`] value is one of these 6 strings — pinned by the
+//! `every_entry_category_is_a_known_category` test below. The firmware
+//! picker (`firmware/src/ui/screens/compose.rs`'s `EmojiPickerGrid`) shows
+//! one category's ~16 entries at a time behind a tab row; there is
+//! deliberately no search UI here — the `:shortcode:` completion path
+//! ([`shortcode_completions`]) already covers that interaction (campaign
+//! D1: "why 96 and why tabs-not-search").
 //!
 //! # Wire format
 //! Emoji are transmitted as UTF-8 code points — no escaping or shortcode syntax
@@ -42,8 +69,10 @@
 //! `expand_shortcodes` and `normalize_inbound` both write into a
 //! caller-supplied output buffer (mirrors `crate::mention`'s send/receive
 //! buffer-based shape).
-//! The emoji table is a `const` slice; lookup is a linear scan (O(N), N=40,
-//! fast enough for interactive compose).
+//! The emoji table is a `const` slice; lookup is a linear scan (O(N), N=96,
+//! fast enough for interactive compose — see the
+//! `shortcode_completions_scan_stays_fast_at_n96` benchmark test below for a
+//! measurement, not just the O(N) claim).
 
 /// One entry in the curated emoji table.
 #[derive(Clone, Copy, Debug)]
@@ -54,32 +83,48 @@ pub struct EmojiEntry {
     pub codepoint: char,
     /// Short human-readable label for the emoji picker grid.
     pub label: &'static str,
+    /// Picker tab this entry appears under — one of [`EMOJI_CATEGORIES`].
+    pub category: &'static str,
 }
 
-/// The canonical 40-entry curated emoji set.
+/// The 6 emoji-picker category tabs, in display order (`firmware/src/ui/
+/// screens/compose.rs`'s `EmojiPickerGrid` tab row reads this list). Every
+/// [`EmojiEntry::category`] in [`EMOJI_TABLE`] must be one of these strings.
+pub const EMOJI_CATEGORIES: &[&str] = &["Faces", "Gestures", "Hearts", "Nature", "Fun", "Objects"];
+
+/// The canonical 96-entry curated emoji set (6 categories × 16 —
+/// `meshcadet-emoji-picker-expansion`, campaign D1). The first 40 entries
+/// are the original picker set (also members of `gen_emoji_font.c`'s
+/// `EMOJI_CPS`); the 56 appended after them were grown out of the
+/// render-only set (`RENDER_EXTRA_CPS`) at zero additional glyph-bitmap
+/// cost — see the module doc's "picker/render split" section.
 ///
 /// Broadly recognisable.  No violence, adult content, or ambiguous sentiment.
 pub const EMOJI_TABLE: &[EmojiEntry] = &[
-    // ── Faces ────────────────────────────────────────────────────────────────
+    // ── Faces (16) ───────────────────────────────────────────────────────────
     EmojiEntry {
         shortcode: "smile",
         codepoint: '😊',
         label: "Smile",
+        category: "Faces",
     },
     EmojiEntry {
         shortcode: "laugh",
         codepoint: '😂',
         label: "Laugh",
+        category: "Faces",
     },
     EmojiEntry {
         shortcode: "wink",
         codepoint: '😉',
         label: "Wink",
+        category: "Faces",
     },
     EmojiEntry {
         shortcode: "cool",
         codepoint: '😎',
         label: "Cool",
+        category: "Faces",
     },
     // BUG FIX: U+1F914 (🤔) is
     // outside the coverage of the bundled `NotoEmoji-Regular.ttf` (it only
@@ -92,73 +137,181 @@ pub const EMOJI_TABLE: &[EmojiEntry] = &[
         shortcode: "think",
         codepoint: '😕',
         label: "Hmm",
+        category: "Faces",
     },
     EmojiEntry {
         shortcode: "wow",
         codepoint: '😲',
         label: "Wow",
+        category: "Faces",
     },
     EmojiEntry {
         shortcode: "sleepy",
         codepoint: '😴',
         label: "Sleepy",
+        category: "Faces",
     },
     EmojiEntry {
         shortcode: "silly",
         codepoint: '😜',
         label: "Silly",
+        category: "Faces",
     },
     EmojiEntry {
         shortcode: "happy",
         codepoint: '😁',
         label: "Happy",
+        category: "Faces",
     },
     EmojiEntry {
         shortcode: "sad",
         codepoint: '😢',
         label: "Sad",
+        category: "Faces",
     },
-    // ── Gestures ─────────────────────────────────────────────────────────────
+    // The 6 below are new (meshcadet-emoji-picker-expansion), drawn from
+    // `RENDER_EXTRA_CPS`'s "Faces & emotions" section.
+    EmojiEntry {
+        shortcode: "loveeyes",
+        codepoint: '😍',
+        label: "Love Eyes",
+        category: "Faces",
+    },
+    EmojiEntry {
+        shortcode: "party",
+        codepoint: '🥳',
+        label: "Party",
+        category: "Faces",
+    },
+    EmojiEntry {
+        shortcode: "cry",
+        codepoint: '😭',
+        label: "Crying",
+        category: "Faces",
+    },
+    EmojiEntry {
+        shortcode: "crazy",
+        codepoint: '🤪',
+        label: "Crazy",
+        category: "Faces",
+    },
+    EmojiEntry {
+        shortcode: "please",
+        codepoint: '🥺',
+        label: "Puppy Eyes",
+        category: "Faces",
+    },
+    EmojiEntry {
+        shortcode: "angel",
+        codepoint: '😇',
+        label: "Angel",
+        category: "Faces",
+    },
+    // ── Gestures (16) ────────────────────────────────────────────────────────
     EmojiEntry {
         shortcode: "wave",
         codepoint: '👋',
         label: "Wave",
+        category: "Gestures",
     },
     EmojiEntry {
         shortcode: "thumbsup",
         codepoint: '👍',
         label: "Thumbs Up",
+        category: "Gestures",
     },
     EmojiEntry {
         shortcode: "clap",
         codepoint: '👏',
         label: "Clap",
+        category: "Gestures",
     },
     EmojiEntry {
         shortcode: "highfive",
         codepoint: '🙏',
         label: "High Five",
+        category: "Gestures",
     },
     EmojiEntry {
         shortcode: "fist",
         codepoint: '✊',
         label: "Fist Bump",
+        category: "Gestures",
     },
     EmojiEntry {
         shortcode: "point",
         codepoint: '👆',
         label: "Point Up",
+        category: "Gestures",
     },
     EmojiEntry {
         shortcode: "ok",
         codepoint: '👌',
         label: "OK",
+        category: "Gestures",
     },
-    // ── Love / Feelings ──────────────────────────────────────────────────────
+    // The 9 below are new (meshcadet-emoji-picker-expansion), drawn from
+    // `RENDER_EXTRA_CPS`'s "People & Body / hand-*" sections.
+    EmojiEntry {
+        shortcode: "thumbsdown",
+        codepoint: '👎',
+        label: "Thumbs Down",
+        category: "Gestures",
+    },
+    EmojiEntry {
+        shortcode: "muscle",
+        codepoint: '💪',
+        label: "Muscle",
+        category: "Gestures",
+    },
+    EmojiEntry {
+        shortcode: "handshake",
+        codepoint: '🤝',
+        label: "Handshake",
+        category: "Gestures",
+    },
+    EmojiEntry {
+        shortcode: "crossedfingers",
+        codepoint: '🤞',
+        label: "Fingers Crossed",
+        category: "Gestures",
+    },
+    EmojiEntry {
+        shortcode: "callme",
+        codepoint: '🤙',
+        label: "Call Me",
+        category: "Gestures",
+    },
+    EmojiEntry {
+        shortcode: "rockon",
+        codepoint: '🤘',
+        label: "Rock On",
+        category: "Gestures",
+    },
+    EmojiEntry {
+        shortcode: "yay",
+        codepoint: '🙌',
+        label: "Yay",
+        category: "Gestures",
+    },
+    EmojiEntry {
+        shortcode: "selfie",
+        codepoint: '🤳',
+        label: "Selfie",
+        category: "Gestures",
+    },
+    EmojiEntry {
+        shortcode: "pointright",
+        codepoint: '👉',
+        label: "Point Right",
+        category: "Gestures",
+    },
+    // ── Hearts (16) ──────────────────────────────────────────────────────────
     EmojiEntry {
         shortcode: "heart",
         codepoint: '❤',
         label: "Heart",
+        category: "Hearts",
     },
     // BUG FIX: same font-coverage
     // gap as "think" above — U+1F917 (🤗) is a Unicode 9.0 addition absent
@@ -169,114 +322,391 @@ pub const EMOJI_TABLE: &[EmojiEntry] = &[
         shortcode: "hug",
         codepoint: '😘',
         label: "Hug",
+        category: "Hearts",
     },
     EmojiEntry {
         shortcode: "sparkles",
         codepoint: '✨',
         label: "Sparkles",
+        category: "Hearts",
     },
     EmojiEntry {
         shortcode: "star",
         codepoint: '⭐',
         label: "Star",
+        category: "Hearts",
     },
     EmojiEntry {
         shortcode: "rainbow",
         codepoint: '🌈',
         label: "Rainbow",
+        category: "Hearts",
     },
-    // ── Nature ───────────────────────────────────────────────────────────────
+    // The 11 below are new (meshcadet-emoji-picker-expansion), drawn from
+    // `RENDER_EXTRA_CPS`'s "Hearts" / "Smileys & Emotion / heart" sections.
+    EmojiEntry {
+        shortcode: "yellowheart",
+        codepoint: '💛',
+        label: "Yellow Heart",
+        category: "Hearts",
+    },
+    EmojiEntry {
+        shortcode: "greenheart",
+        codepoint: '💚',
+        label: "Green Heart",
+        category: "Hearts",
+    },
+    EmojiEntry {
+        shortcode: "blueheart",
+        codepoint: '💙',
+        label: "Blue Heart",
+        category: "Hearts",
+    },
+    EmojiEntry {
+        shortcode: "purpleheart",
+        codepoint: '💜',
+        label: "Purple Heart",
+        category: "Hearts",
+    },
+    EmojiEntry {
+        shortcode: "orangeheart",
+        codepoint: '🧡',
+        label: "Orange Heart",
+        category: "Hearts",
+    },
+    EmojiEntry {
+        shortcode: "twohearts",
+        codepoint: '💕',
+        label: "Two Hearts",
+        category: "Hearts",
+    },
+    EmojiEntry {
+        shortcode: "glowheart",
+        codepoint: '💖',
+        label: "Glowing Heart",
+        category: "Hearts",
+    },
+    EmojiEntry {
+        shortcode: "brokenheart",
+        codepoint: '💔',
+        label: "Broken Heart",
+        category: "Hearts",
+    },
+    EmojiEntry {
+        shortcode: "kiss",
+        codepoint: '💋',
+        label: "Kiss",
+        category: "Hearts",
+    },
+    EmojiEntry {
+        shortcode: "hundred",
+        codepoint: '💯',
+        label: "100",
+        category: "Hearts",
+    },
+    EmojiEntry {
+        shortcode: "loveletter",
+        codepoint: '💌',
+        label: "Love Letter",
+        category: "Hearts",
+    },
+    // ── Nature (16) ──────────────────────────────────────────────────────────
     EmojiEntry {
         shortcode: "sun",
         codepoint: '☀',
         label: "Sun",
+        category: "Nature",
     },
     EmojiEntry {
         shortcode: "moon",
         codepoint: '🌙',
         label: "Moon",
+        category: "Nature",
     },
     EmojiEntry {
         shortcode: "cloud",
         codepoint: '⛅',
         label: "Cloud",
+        category: "Nature",
     },
     EmojiEntry {
         shortcode: "flower",
         codepoint: '🌸',
         label: "Flower",
+        category: "Nature",
     },
     EmojiEntry {
         shortcode: "tree",
         codepoint: '🌲',
         label: "Tree",
+        category: "Nature",
     },
     EmojiEntry {
         shortcode: "leaf",
         codepoint: '🍃',
         label: "Leaf",
+        category: "Nature",
     },
     EmojiEntry {
         shortcode: "dog",
         codepoint: '🐶',
         label: "Dog",
+        category: "Nature",
     },
     EmojiEntry {
         shortcode: "cat",
         codepoint: '🐱',
         label: "Cat",
+        category: "Nature",
     },
     EmojiEntry {
         shortcode: "rabbit",
         codepoint: '🐰',
         label: "Rabbit",
+        category: "Nature",
     },
-    // ── Objects / Fun ────────────────────────────────────────────────────────
+    // The 7 below are new (meshcadet-emoji-picker-expansion), drawn from
+    // `RENDER_EXTRA_CPS`'s "Animals" / "Animals & Nature" sections.
+    EmojiEntry {
+        shortcode: "panda",
+        codepoint: '🐼',
+        label: "Panda",
+        category: "Nature",
+    },
+    EmojiEntry {
+        shortcode: "fox",
+        codepoint: '🦊',
+        label: "Fox",
+        category: "Nature",
+    },
+    EmojiEntry {
+        shortcode: "lion",
+        codepoint: '🦁',
+        label: "Lion",
+        category: "Nature",
+    },
+    EmojiEntry {
+        shortcode: "koala",
+        codepoint: '🐨',
+        label: "Koala",
+        category: "Nature",
+    },
+    EmojiEntry {
+        shortcode: "unicorn",
+        codepoint: '🦄',
+        label: "Unicorn",
+        category: "Nature",
+    },
+    EmojiEntry {
+        shortcode: "butterfly",
+        codepoint: '🦋',
+        label: "Butterfly",
+        category: "Nature",
+    },
+    EmojiEntry {
+        shortcode: "clover",
+        codepoint: '🍀',
+        label: "Clover",
+        category: "Nature",
+    },
+    // ── Fun (16) ─────────────────────────────────────────────────────────────
     EmojiEntry {
         shortcode: "music",
         codepoint: '🎵',
         label: "Music",
+        category: "Fun",
     },
     EmojiEntry {
         shortcode: "game",
         codepoint: '🎮',
         label: "Game",
+        category: "Fun",
     },
     EmojiEntry {
         shortcode: "ball",
         codepoint: '⚽',
         label: "Ball",
+        category: "Fun",
     },
     EmojiEntry {
         shortcode: "cake",
         codepoint: '🎂',
         label: "Cake",
+        category: "Fun",
     },
     EmojiEntry {
         shortcode: "pizza",
         codepoint: '🍕',
         label: "Pizza",
+        category: "Fun",
     },
     EmojiEntry {
         shortcode: "rocket",
         codepoint: '🚀',
         label: "Rocket",
+        category: "Fun",
     },
     EmojiEntry {
         shortcode: "fire",
         codepoint: '🔥',
         label: "Fire",
+        category: "Fun",
     },
-    // ── Communication ────────────────────────────────────────────────────────
+    // The 9 below are new (meshcadet-emoji-picker-expansion), drawn from
+    // `RENDER_EXTRA_CPS`'s "Food & drink" / "Activities" sections.
+    EmojiEntry {
+        shortcode: "apple",
+        codepoint: '🍎',
+        label: "Apple",
+        category: "Fun",
+    },
+    EmojiEntry {
+        shortcode: "banana",
+        codepoint: '🍌',
+        label: "Banana",
+        category: "Fun",
+    },
+    EmojiEntry {
+        shortcode: "cookie",
+        codepoint: '🍪',
+        label: "Cookie",
+        category: "Fun",
+    },
+    EmojiEntry {
+        shortcode: "donut",
+        codepoint: '🍩',
+        label: "Donut",
+        category: "Fun",
+    },
+    EmojiEntry {
+        shortcode: "trophy",
+        codepoint: '🏆',
+        label: "Trophy",
+        category: "Fun",
+    },
+    EmojiEntry {
+        shortcode: "basketball",
+        codepoint: '🏀',
+        label: "Basketball",
+        category: "Fun",
+    },
+    EmojiEntry {
+        shortcode: "bowling",
+        codepoint: '🎳',
+        label: "Bowling",
+        category: "Fun",
+    },
+    EmojiEntry {
+        shortcode: "balloon",
+        codepoint: '🎈',
+        label: "Balloon",
+        category: "Fun",
+    },
+    EmojiEntry {
+        shortcode: "gift",
+        codepoint: '🎁',
+        label: "Gift",
+        category: "Fun",
+    },
+    // ── Objects (16) ─────────────────────────────────────────────────────────
     EmojiEntry {
         shortcode: "radio",
         codepoint: '📻',
         label: "Radio",
+        category: "Objects",
     },
     EmojiEntry {
         shortcode: "check",
         codepoint: '✅',
         label: "Done",
+        category: "Objects",
+    },
+    // The 14 below are new (meshcadet-emoji-picker-expansion), drawn from
+    // `RENDER_EXTRA_CPS`'s "Smileys & Emotion / face-costume", "emotion",
+    // "Activities", and "Travel & Places / place-map" sections.
+    EmojiEntry {
+        shortcode: "ghost",
+        codepoint: '👻',
+        label: "Ghost",
+        category: "Objects",
+    },
+    EmojiEntry {
+        shortcode: "robot",
+        codepoint: '🤖',
+        label: "Robot",
+        category: "Objects",
+    },
+    EmojiEntry {
+        shortcode: "alien",
+        codepoint: '👽',
+        label: "Alien",
+        category: "Objects",
+    },
+    EmojiEntry {
+        shortcode: "poop",
+        codepoint: '💩',
+        label: "Poop",
+        category: "Objects",
+    },
+    EmojiEntry {
+        shortcode: "thoughtballoon",
+        codepoint: '💭',
+        label: "Thought Bubble",
+        category: "Objects",
+    },
+    EmojiEntry {
+        shortcode: "speechballoon",
+        codepoint: '💬',
+        label: "Speech Bubble",
+        category: "Objects",
+    },
+    EmojiEntry {
+        shortcode: "compass",
+        codepoint: '🧭',
+        label: "Compass",
+        category: "Objects",
+    },
+    EmojiEntry {
+        shortcode: "globe",
+        codepoint: '🌍',
+        label: "Globe",
+        category: "Objects",
+    },
+    EmojiEntry {
+        shortcode: "crystalball",
+        codepoint: '🔮',
+        label: "Crystal Ball",
+        category: "Objects",
+    },
+    EmojiEntry {
+        shortcode: "puzzle",
+        codepoint: '🧩',
+        label: "Puzzle",
+        category: "Objects",
+    },
+    EmojiEntry {
+        shortcode: "teddybear",
+        codepoint: '🧸',
+        label: "Teddy Bear",
+        category: "Objects",
+    },
+    EmojiEntry {
+        shortcode: "paintpalette",
+        codepoint: '🎨',
+        label: "Palette",
+        category: "Objects",
+    },
+    EmojiEntry {
+        shortcode: "fireworks",
+        codepoint: '🎆',
+        label: "Fireworks",
+        category: "Objects",
+    },
+    EmojiEntry {
+        shortcode: "umbrella",
+        codepoint: '☔',
+        label: "Umbrella",
+        category: "Objects",
     },
 ];
 
@@ -457,8 +887,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn table_has_forty_entries() {
-        assert_eq!(EMOJI_TABLE.len(), 40);
+    fn table_has_96_entries() {
+        assert_eq!(EMOJI_TABLE.len(), 96);
+    }
+
+    /// D1's "6 categories × 16" shape — pins the exact per-tab count the
+    /// firmware picker relies on (`meshcadet-emoji-picker-expansion`'s
+    /// acceptance: "the emoji picker offers ~96 entries with category
+    /// tabs").
+    #[test]
+    fn every_category_has_sixteen_entries() {
+        for &category in EMOJI_CATEGORIES {
+            let count = EMOJI_TABLE
+                .iter()
+                .filter(|e| e.category == category)
+                .count();
+            assert_eq!(
+                count, 16,
+                "category {category:?} has {count} entries, want 16"
+            );
+        }
+    }
+
+    /// Every entry's `category` must be one of the 6 known tabs — a typo'd
+    /// category string would silently drop that entry from every picker tab
+    /// (never rendered, never reachable), with no build-time signal.
+    #[test]
+    fn every_entry_category_is_a_known_category() {
+        for entry in EMOJI_TABLE {
+            assert!(
+                EMOJI_CATEGORIES.contains(&entry.category),
+                "entry {:?} has unknown category {:?}",
+                entry.shortcode,
+                entry.category
+            );
+        }
     }
 
     #[test]
@@ -538,6 +1001,89 @@ mod tests {
                 "completion {sc:?} doesn't start with 's'"
             );
         }
+    }
+
+    /// `meshcadet-emoji-picker-expansion` acceptance: "shortcode_completions
+    /// still returns sane results at the larger N" — pins a prefix that now
+    /// has MULTIPLE matches only because of the picker's growth from 40 to
+    /// 96 entries ("think" existed before; "thumbsup"/"thumbsdown"/
+    /// "thoughtballoon" are new), through the compose screen's real
+    /// 5-slot autocomplete buffer (`ComposeScreen::refresh_completions`'s
+    /// `[""; 5]`) — sane means: no duplicates, every result actually
+    /// matches the prefix, and the buffer isn't overrun.
+    #[test]
+    fn shortcode_completions_multiple_matches_at_n96() {
+        let mut found = [""; 5];
+        let n = shortcode_completions("th", &mut found);
+        assert_eq!(
+            n,
+            4,
+            "expected exactly 4 \"th\"-prefixed shortcodes at N=96: think, thumbsup, \
+             thumbsdown, thoughtballoon — got {:?}",
+            &found[..n]
+        );
+        for &sc in &found[..n] {
+            assert!(
+                sc.starts_with("th"),
+                "completion {sc:?} doesn't start with \"th\""
+            );
+        }
+        // No duplicates.
+        for i in 0..n {
+            for j in (i + 1)..n {
+                assert_ne!(found[i], found[j], "duplicate completion {:?}", found[i]);
+            }
+        }
+    }
+
+    /// The compose-time cost claim (module doc: "linear scan, O(N), N=96,
+    /// fast enough for interactive compose") as a MEASUREMENT, not just an
+    /// assertion — `meshcadet-emoji-picker-expansion`'s acceptance calls
+    /// this out explicitly ("say so with a measurement rather than an
+    /// assertion") because the table just grew 2.4x (40 -> 96). Runs the
+    /// same scan `refresh_completions` (`firmware/src/ui/screens/
+    /// compose.rs`) drives on every physical keystroke while the
+    /// `:shortcode:` autocomplete bar is open, at the now-current N=96,
+    /// with a generous threshold: interactive UI latency budgets are
+    /// usually drawn around ~16ms (one frame); this asserts three orders of
+    /// magnitude under that, so a debug-profile host run (slower than the
+    /// firmware's release/opt-level=\"z\" xtensa build) still passes with
+    /// wide margin. `std::hint::black_box` prevents the optimizer from
+    /// const-folding the loop away.
+    #[test]
+    fn shortcode_completions_scan_stays_fast_at_n96() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        assert_eq!(EMOJI_TABLE.len(), 96, "recalibrate this test if N changes");
+
+        // Warm up (branch predictor, cache lines) before the timed pass.
+        for _ in 0..1_000 {
+            let mut found = [""; 5];
+            black_box(shortcode_completions(black_box("th"), &mut found));
+        }
+
+        let iters = 100_000u32;
+        let start = Instant::now();
+        for _ in 0..iters {
+            let mut found = [""; 5];
+            black_box(shortcode_completions(black_box("th"), &mut found));
+        }
+        let elapsed = start.elapsed();
+        let ns_per_scan = elapsed.as_nanos() as f64 / f64::from(iters);
+
+        // 100 microseconds per single 96-entry linear scan is an extremely
+        // generous ceiling (three orders of magnitude above the low-hundreds-
+        // of-nanoseconds this actually measures on a dev host) — the point
+        // is to fail loudly if this ever regresses to something
+        // algorithmically worse (e.g. an accidental O(N^2)), not to pin a
+        // tight bound that would make this test flaky on a loaded CI runner.
+        assert!(
+            ns_per_scan < 100_000.0,
+            "shortcode_completions over N={} took {ns_per_scan:.1}ns/scan — expected well under \
+             100,000ns (100us) for a linear scan this small",
+            EMOJI_TABLE.len(),
+        );
     }
 
     #[test]

@@ -46,8 +46,30 @@ slint::slint! {
         label:         string,
     }
 
+    // ── Category tabs (meshcadet-emoji-picker-expansion) ───────────────────
+    //
+    // `protocol::emoji::EMOJI_TABLE` grew from 40 to 96 entries (6
+    // categories x 16 — campaign D1). Rather than filter a single flat
+    // array in Slint (which has no array-filter primitive that would keep
+    // the GridLayout's `col`/`row` indices contiguous for a subset), Rust
+    // splits `EMOJI_TABLE` into 6 fixed per-category models ONCE at
+    // construction (`ComposeScreen::new`/`ComposePromoFrame::new`) and
+    // hands each its own property below. Which one is shown is then PURE
+    // Slint-local state (`active_category`, exactly like this screen's
+    // existing `picker_open` toggle) — no Rust round-trip needed on tab
+    // tap.
     component EmojiPickerGrid {
-        in property <[EmojiCell]> cells;
+        in property <[EmojiCell]> faces_cells;
+        in property <[EmojiCell]> gestures_cells;
+        in property <[EmojiCell]> hearts_cells;
+        in property <[EmojiCell]> nature_cells;
+        in property <[EmojiCell]> fun_cells;
+        in property <[EmojiCell]> objects_cells;
+        // Tab labels, in the same order as the 6 properties above —
+        // populated once from `protocol::emoji::EMOJI_CATEGORIES` so the
+        // tab row's text never hand-duplicates that list.
+        in property <[string]> category_names;
+        in-out property <int> active_category: 0;
         callback emoji_selected(string);
 
         width:  320px;
@@ -60,15 +82,71 @@ slint::slint! {
 
         Rectangle { background: Theme.surface; }
 
-        Flickable {
+        // The active category's cells — a ternary chain over the 6 fixed
+        // properties above, keyed by `active_category` (0..=5, matching
+        // `category_names`'/`EMOJI_CATEGORIES`' order).
+        property <[EmojiCell]> active_cells:
+            active_category == 0 ? faces_cells :
+            active_category == 1 ? gestures_cells :
+            active_category == 2 ? hearts_cells :
+            active_category == 3 ? nature_cells :
+            active_category == 4 ? fun_cells :
+            objects_cells;
+
+        // Category tab row — fixed 24px strip along the top (matching this
+        // screen's other fixed-height chrome strips: autocomplete bar
+        // 32px, action bar 40px). Purely local state: tapping a tab only
+        // ever changes `active_category`, which `active_cells` above
+        // reacts to — same "Slint owns UI-only state" pattern as
+        // `picker_open`.
+        Rectangle {
+            x: 0px; y: 0px;
             width: parent.width;
-            height: parent.height;
+            height: 24px;
+            HorizontalLayout {
+                padding: 2px;
+                spacing: 2px;
+                for name[i] in category_names : Rectangle {
+                    horizontal-stretch: 1.0;
+                    background: (i == root.active_category) ? Theme.brand-signal : Theme.surface-raised;
+                    animate background { duration: 100ms; easing: ease-out; }
+                    border-radius: 4px;
+                    Text {
+                        text: name;
+                        font-size: Theme.size-meta; // 10px
+                        color: (i == root.active_category) ? Theme.bg-space : Theme.text-secondary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    tab_touch := TouchArea {
+                        width: parent.width;
+                        height: parent.height;
+                        clicked => { root.active_category = i; }
+                    }
+                }
+            }
+        }
+
+        // Cell grid for the active category — SAME Flickable-wrapped
+        // GridLayout technique as the pre-tabs 40-cell picker (see this
+        // component's own BUG-FIX history in `compose.rs`'s module doc):
+        // an EXPLICIT width/height on the Flickable (164px minus the 24px
+        // tab strip above) so `viewport-height` auto-binds to the active
+        // category's own natural content height, keeping every one of its
+        // (up to 16) cells reachable by touch-scroll — re-verified for the
+        // 96-entry/6-tab shape by
+        // `ui_sim/tests/compose_picker_categories.rs`, not just assumed to
+        // scale from the 40-cell case.
+        Flickable {
+            x: 0px; y: 24px;
+            width: parent.width;
+            height: parent.height - 24px;
 
             GridLayout {
                 padding: 4px;
                 spacing: 2px;
 
-                for cell[i] in cells : Rectangle {
+                for cell[i] in active_cells : Rectangle {
                     col: mod(i, 5);
                     row: floor(i / 5);
                     width: 58px;
@@ -149,7 +227,13 @@ slint::slint! {
         forward-focus: draft_input;
 
         in property <string>            to_name;
-        in property <[EmojiCell]>       emoji_cells;
+        in property <[EmojiCell]>       faces_cells;
+        in property <[EmojiCell]>       gestures_cells;
+        in property <[EmojiCell]>       hearts_cells;
+        in property <[EmojiCell]>       nature_cells;
+        in property <[EmojiCell]>       fun_cells;
+        in property <[EmojiCell]>       objects_cells;
+        in property <[string]>          category_names;
         in property <[AutocompleteEntry]> completions;
         in-out property <string>        draft;
         in-out property <bool>          picker_open: false;
@@ -310,7 +394,13 @@ slint::slint! {
             }
 
             if picker_open : EmojiPickerGrid {
-                cells: emoji_cells;
+                faces_cells: faces_cells;
+                gestures_cells: gestures_cells;
+                hearts_cells: hearts_cells;
+                nature_cells: nature_cells;
+                fun_cells: fun_cells;
+                objects_cells: objects_cells;
+                category_names: category_names;
                 height: 164px;
                 emoji_selected(cp) => {
                     root.draft += cp;
@@ -363,7 +453,13 @@ impl ComposePromoFrame {
         // Empty models — the picker/autocomplete overlays are never opened
         // for this screenshot (see module doc), but the properties are
         // still `in property` on the root and must be given a model.
-        ui.set_emoji_cells(ModelRc::new(VecModel::<EmojiCell>::default()));
+        ui.set_faces_cells(ModelRc::new(VecModel::<EmojiCell>::default()));
+        ui.set_gestures_cells(ModelRc::new(VecModel::<EmojiCell>::default()));
+        ui.set_hearts_cells(ModelRc::new(VecModel::<EmojiCell>::default()));
+        ui.set_nature_cells(ModelRc::new(VecModel::<EmojiCell>::default()));
+        ui.set_fun_cells(ModelRc::new(VecModel::<EmojiCell>::default()));
+        ui.set_objects_cells(ModelRc::new(VecModel::<EmojiCell>::default()));
+        ui.set_category_names(ModelRc::new(VecModel::<slint::SharedString>::default()));
         ui.set_completions(ModelRc::new(VecModel::<AutocompleteEntry>::default()));
 
         ComposePromoFrame { window, ui }

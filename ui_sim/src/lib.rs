@@ -153,6 +153,13 @@ pub mod splash_promo;
 /// hand-built minimal `BitmapFont` this rig registers and why.
 pub mod emoji_blank_cell_probe;
 
+/// Host-sim render rig for `compose.rs`'s `EmojiPickerGrid` — proves the
+/// 96-entry/6-category-tab picker's touch reachability on a REAL Slint
+/// render (`meshcadet-emoji-picker-expansion`). See that module's own doc
+/// for why it's a narrower single-mechanism copy, not the full-screen
+/// `compose_promo` mirror (which never opens the picker overlay).
+pub mod compose_picker_probe;
+
 pub const WIDTH: u32 = 320;
 pub const HEIGHT: u32 = 240;
 
