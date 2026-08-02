@@ -759,8 +759,14 @@ fn run() -> anyhow::Result<()> {
     //
     // The T-Deck Plus SPI bus (GPIO40/41/38) is shared between the SX1262 radio
     // (CS=GPIO9) and the ST7789 LCD (CS=GPIO12). Both devices use SPI2 via
-    // borrowed SpiDeviceDriver<'_, &SpiDriver<'_>>, enforcing that only one CS
-    // is asserted at a time (software-serialised by the single-task loop).
+    // borrowed SpiDeviceDriver<'_, &SpiDriver<'_>>; only one CS is ever
+    // asserted at a time. Post-split (ADR-0012 D2/D10), the radio device is
+    // touched from this task and the LCD device from `ui_task` — two
+    // different tasks on two different cores — so that serialisation is no
+    // longer "single-task loop" software serialisation; it comes from
+    // ESP-IDF's `spi_bus_lock` per-bus arbitration, which the driver applies
+    // to every device registered on a bus regardless of which task/core
+    // issues the transaction (see docs/perf/spi2-arbitration-r1.md Q1).
     //
     // Touch IC: GT911, I2C1, SDA=GPIO18, SCL=GPIO8.
     // Buzzer: onboard I2S speaker, WS=GPIO5 / BCK=GPIO7 / DOUT=GPIO6 (I2S0).

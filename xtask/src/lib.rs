@@ -107,6 +107,7 @@ pub mod room_reflood_cadence;
 pub mod room_reflood_reset_requires_route;
 pub mod room_session_erase;
 pub mod room_watermark_persist;
+pub mod slint_thread_affinity;
 pub mod ui_event_parity;
 
 /// One known, already-documented, deliberately-deferred gap — see
