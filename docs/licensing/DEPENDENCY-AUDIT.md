@@ -3,6 +3,8 @@
 - **Status:** Audit performed 2026-07-07, against `main@9906dae` (the OSS-publish source);
   "Bundled font assets" section added 2026-07-08 to close a gap the original pass missed
   (Rust crates + Slint only — bundled font binaries were not in scope of that pass).
+  "Bundled font assets" §1 (Noto Emoji) refreshed 2026-08-02 for the upstream font-asset
+  upgrade — coverage-neutral, license terms unchanged (OFL 1.1); see that entry for detail.
 - **Result: PASS.** Every dependency in both Cargo graphs is compatible with shipping
   MeshCadet under **GPLv3** (`LICENSE` at repo root). No dependency forces a different
   outcome and none needs to be swapped out or re-licensed.
@@ -107,14 +109,27 @@ licensing. Checked here for completeness:
 
 1. **NotoEmoji-Regular.ttf** (`firmware/assets/NotoEmoji-Regular.ttf`) — **is
    bundled** (tracked in git; confirmed via `git ls-tree -r HEAD | grep -i
-   font`). Copyright 2013 Google Inc. All Rights Reserved. Licensed under the
-   SIL Open Font License, Version 1.1 (OFL 1.1). OFL 1.1 condition (2)
-   requires the license text + copyright notice travel with every
-   redistributed copy of the font. That text now accompanies the font at
+   font`). Copyright 2013 Google LLC. Licensed under the SIL Open Font
+   License, Version 1.1 (OFL 1.1). OFL 1.1 condition (2) requires the
+   license text + copyright notice travel with every redistributed copy of
+   the font. That text now accompanies the font at
    `firmware/assets/NotoEmoji-LICENSE.txt`, and the copyright/license is
-   additionally credited in `NOTICE`. **Prior to this audit update, this
-   file was bundled with no accompanying license text anywhere in the tree —
-   a real (if low-severity) OFL redistribution-compliance gap, now closed.**
+   additionally credited in `NOTICE`. **Prior to the 2026-07 audit update,
+   this file was bundled with no accompanying license text anywhere in the
+   tree — a real (if low-severity) OFL redistribution-compliance gap,
+   closed then.**
+   **2026-08-02 upgrade:** the bundled font asset itself was swapped for a
+   current upstream Noto Emoji release (pulled from google/fonts,
+   `ofl/notoemoji/NotoEmoji[wght].ttf` Version 3.002) — coverage-neutral
+   (`EMOJI_CPS`/`EMOJI_TABLE`/`UI_EXTRA_CPS`/`BMP_SYMBOLS` unchanged; see
+   `firmware/assets/NotoEmoji-LICENSE.txt` for the verification record).
+   License terms are unchanged (OFL 1.1, same condition-2 obligation, same
+   copyright holder); the only textual delta is the entity name in the
+   font's own copyright string, which now reads "Google LLC" rather than
+   "Google Inc." on this vintage — this is the 2017 Google Inc. -> Google
+   LLC rename already anticipated in the pre-upgrade text of this file, not
+   a new fact. The OFL<->GPLv3 embedding analysis below is unaffected and
+   was not re-litigated.
 
 2. **DejaVu Sans** — used by `firmware/gen_emoji_font.c` (invoked from
    `firmware/build.rs`) as the source for the ASCII/Latin glyphs in the same
