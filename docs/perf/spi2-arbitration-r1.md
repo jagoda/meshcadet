@@ -35,14 +35,14 @@ is a confidence check, not a correctness gap.
 `firmware/src/main.rs` constructs one `SpiDriver` on SPI2 and two
 `SpiDeviceDriver`s borrowing it:
 
-- `SpiDriver::new(peripherals.spi2, ...)` — `main.rs:676`, default
+- `SpiDriver::new(peripherals.spi2, ...)` — `main.rs:683`, default
   `SpiDriverConfig::new()` (DMA disabled, no custom interrupt flags).
 - LCD device: `SpiDeviceDriver::new(&spi_driver, Some(gpio12), &SpiConfig::new().baudrate(40u32.MHz().into()))`
-  — `main.rs:738-741`. Hardware CS (`Some(pin)`), all other `Config` fields
+  — `main.rs:745-748`. Hardware CS (`Some(pin)`), all other `Config` fields
   default: `polling: true`, `duplex: Duplex::Full`, `write_only: false`,
   `queue_size: 1`.
 - Radio device: `SpiDeviceDriver::new(&spi_driver, Some(gpio9), &SpiConfig::new().baudrate(8u32.MHz().into()))`
-  — `main.rs:1398-1401`. Same defaults.
+  — `main.rs:1405-1408`. Same defaults.
 
 Neither device overrides `.polling()`, `.duplex()`, `.write_only()`, or
 `.allow_pre_post_delays()` anywhere in the repo (`grep` over
@@ -157,7 +157,7 @@ not about correctness; correctness is the C driver's job regardless (Q1).
 
 **The borrow.** `SpiDeviceDriver<'d, T>` is generic over
 `T: Borrow<SpiDriver<'d>> + 'd`; this repo instantiates `T = &SpiDriver<'_>`
-(`main.rs:738`, `main.rs:1398`), a plain immutable borrow of a stack-local
+(`main.rs:745`, `main.rs:1405`), a plain immutable borrow of a stack-local
 `SpiDriver`. That borrowed form cannot itself be captured by a `'static`
 task spawn — the referent lives on `main()`'s stack frame, and the borrow
 checker has no way to know that frame outlives the spawned task (even though
@@ -308,9 +308,11 @@ exactly the correct figure for **one 64-byte chunk** (12.8 µs), which
 strongly suggests the original author computed the right number for the
 wrong unit. This is a comment-accuracy defect, not a functional one — no
 code path relies on the stated figure — but it is the same 64-byte quantity
-this analysis needed for the real bound, so it is corrected here and worth
-a follow-up doc fix at `display.rs:37-38` when M1 touches that file (out of
-scope for this pure-analysis mission to edit).
+this analysis needed for the real bound, so it is corrected here. **The
+follow-up doc fix at `display.rs:37-38` has since landed** (PR #127,
+`meshcadet-perf-display-spi-floor-correction`): the comment now cites the
+128 µs/line, 10×64-byte-chunk figure derived above and points back to this
+document's §Q5 instead of repeating the stale 13 µs claim.
 
 ## What still needs silicon
 

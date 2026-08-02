@@ -286,7 +286,7 @@ that follows.
 
 | `LoopModelParams` field | How to derive it from Part C's log |
 |---|---|
-| `ui_step` | Directly: the `ui_step` phase's `mean`/`p95`/`max` from Part C, in µs → convert to ms. Replace the whole `[0.05, 5.0]` ms range with these three points. |
+| `ui_step` | Directly: the `ui_step` phase's `mean`/`p95`/`max` from Part C, in µs → convert to ms. Replace the whole `[0.05, 30.72]` ms range with these three points. |
 | `cad_spi_overhead` | Derived: take the `cad` phase's `mean` (µs → ms), subtract the analytical `CAD_ACTIVE_MS` constant (8.192 ms, `perf_loop_model/src/sim.rs::CAD_ACTIVE_MS`), floor at 0. That's the real SPI-command overhead ahead of the CAD-active window. |
 | `gps_poll` | Directly: the `gps` phase's `mean`/`p95`/`max`, µs → ms. Note whether your capture window landed in GPS's quiet or active duty-cycle phase (`ui-perf-baseline.md`'s dispatcher-loop description) — if you only captured the quiet window, note that in the report; the active-window number needs a capture that happens to straddle a GPS active cycle. |
 | `battery_poll` | Directly: the `battery` phase's `mean`/`p95`/`max`, µs → ms. |
