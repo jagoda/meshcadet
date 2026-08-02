@@ -252,8 +252,8 @@ pub const IRQ_CAD_DETECTED: u16 = 1 << 8;
 /// edge-triggered interrupt (`PosEdge`) would need a fresh low→high
 /// transition after arming, which is exactly the re-arm race this wait
 /// exists to close: "can an edge arrive between clearing the IRQ and
-/// re-arming the wait" (the correctness question this mission's dossier
-/// requires an explicit answer to). With `HighLevel`, the answer is: it
+/// re-arming the wait" (the correctness question this design must answer
+/// explicitly). With `HighLevel`, the answer is: it
 /// cannot matter, because arming after the fact still observes the latched
 /// level. The `is_high()` check in [`GpioDio1Wait::wait_high`] below is
 /// therefore NOT required for correctness — it is kept purely as a fast
