@@ -149,11 +149,20 @@ pub fn violations_in_source(file_label: &str, src: &str) -> Vec<Violation> {
 
 /// Recursively collect every `.rs` file under `dir`, sorted, for
 /// deterministic output.
+///
+/// Panics (rather than silently skipping) on a directory it cannot read —
+/// per this crate's "parse gap = NO-GO" doctrine (see the glyph-coverage
+/// harness's module doc): a swallowed `read_dir` error here would make
+/// [`check`] silently scan fewer files than it should and report a false
+/// "barrier holds" on an incomplete scan, exactly the failure mode a guard
+/// like this exists to rule out.
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    let mut entries: Vec<PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+    let entries =
+        fs::read_dir(dir).unwrap_or_else(|e| panic!("reading directory {}: {e}", dir.display()));
+    let mut entries: Vec<PathBuf> = entries
+        .map(|e| e.unwrap_or_else(|e| panic!("reading entry under {}: {e}", dir.display())))
+        .map(|e| e.path())
+        .collect();
     entries.sort();
     for path in entries {
         if path.is_dir() {
@@ -184,8 +193,8 @@ pub fn check(repo_root: &Path) -> Vec<Violation> {
         if path.starts_with(&ui_dir) || path == ui_task_path {
             continue;
         }
-        let src = fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+        let src =
+            fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
         let rel = path
             .strip_prefix(repo_root)
             .unwrap_or(&path)
@@ -204,9 +213,9 @@ mod tests {
     /// exempt boundary) does not name `UiRuntime`, `slint::`, or any
     /// `i_slint*` symbol. This is the M1 task-split checkpoint's own grep
     /// finding ("ZERO Slint symbols exist outside firmware/src/ui/ today"),
-    /// now certified by `cargo test` instead of asserted in a mission
-    /// dossier. It also doubles as the regression guard for this scanner's
-    /// own exemption logic: `firmware/src/ui_task.rs` and every file under
+    /// now certified by `cargo test` instead of asserted by hand. It also
+    /// doubles as the regression guard for this scanner's own exemption
+    /// logic: `firmware/src/ui_task.rs` and every file under
     /// `firmware/src/ui/` are packed with exactly these symbols in real
     /// code (not comments) — if the exclusion filter above were ever
     /// broken, this assertion would fail immediately and loudly with a
@@ -228,8 +237,7 @@ mod tests {
 
     #[test]
     fn flags_bare_uiruntime_use_in_code() {
-        let violations =
-            violations_in_source("main.rs", "use crate::ui::UiRuntime;\nfn f() {}\n");
+        let violations = violations_in_source("main.rs", "use crate::ui::UiRuntime;\nfn f() {}\n");
         assert_eq!(
             violations,
             vec![Violation {
@@ -311,6 +319,9 @@ mod tests {
         );
         let mut symbols: Vec<String> = violations.into_iter().map(|v| v.symbol).collect();
         symbols.sort();
-        assert_eq!(symbols, vec!["UiRuntime".to_string(), "slint::".to_string()]);
+        assert_eq!(
+            symbols,
+            vec!["UiRuntime".to_string(), "slint::".to_string()]
+        );
     }
 }
