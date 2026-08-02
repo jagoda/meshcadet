@@ -31,8 +31,14 @@ name: release
 #   5. publishes onto the GitHub Release for this tag: the merged image, the
 #      app-only image, an esp-web-tools `manifest.json` (Fresh install) and
 #      `manifest-update.json` (app-only Upgrade, single part @ 0x10000),
-#      `update-meta.json` (layout_hash/upgrade_safe), and `SHA256SUMS`;
-#   6. attests SLSA build provenance over those six published assets.
+#      `update-meta.json` (layout_hash/upgrade_safe), `SHA256SUMS`, and the
+#      `NOTICE` / `NotoEmoji-LICENSE.txt` / `DejaVuSans-LICENSE.txt`
+#      attribution files that SIL OFL 1.1 condition (2) requires travel with
+#      every redistributed copy of the rasterized Noto Emoji glyph data baked
+#      into the two firmware images (docs/licensing/DEPENDENCY-AUDIT.md
+#      "Bundled font assets" §1 — the git tree was already compliant; these
+#      binaries were not, until now);
+#   6. attests SLSA build provenance over those nine published assets.
 #
 # release-please (.github/workflows/release-please.yml) already created the
 # Release object for this tag — changelog notes only, no assets — in the
@@ -210,6 +216,24 @@ jobs:
           name: update-artifacts
           path: dist
 
+      # SIL OFL 1.1 condition (2) requires the license text + copyright
+      # notice travel with EVERY redistributed copy of a Modified Version —
+      # and the rasterized Noto Emoji glyph data baked into both firmware
+      # images by firmware/gen_emoji_font.c is exactly that. The git tree
+      # already carries these three files (NOTICE credits Noto Emoji +
+      # DejaVu Sans; the other two are the upstream license texts
+      # firmware/assets/NotoEmoji-LICENSE.txt and
+      # docs/licensing/DejaVuSans-LICENSE.txt) — this step is what makes the
+      # *published binaries*, not just the repo, compliant. See
+      # docs/licensing/DEPENDENCY-AUDIT.md "Bundled font assets" for the
+      # full analysis (do not re-litigate it here).
+      - name: Copy OFL/attribution files for release attachment
+        run: |
+          set -euo pipefail
+          cp NOTICE dist/NOTICE
+          cp firmware/assets/NotoEmoji-LICENSE.txt dist/NotoEmoji-LICENSE.txt
+          cp docs/licensing/DejaVuSans-LICENSE.txt dist/DejaVuSans-LICENSE.txt
+
       - name: Generate esp-web-tools manifest.json
         env:
           TAG: ${{ github.ref_name }}
@@ -276,10 +300,13 @@ jobs:
             manifest.json \
             manifest-update.json \
             update-meta.json \
+            NOTICE \
+            NotoEmoji-LICENSE.txt \
+            DejaVuSans-LICENSE.txt \
             > SHA256SUMS
           cd -
 
-      # Provenance for exactly the six published assets, over their final
+      # Provenance for exactly the nine published assets, over their final
       # bytes (post-manifest/checksum generation, pre-upload) — see
       # docs/release-reproducibility.md for the `gh attestation verify`
       # third-party re-check this pairs with.
@@ -293,6 +320,9 @@ jobs:
             dist/manifest-update.json
             dist/update-meta.json
             dist/SHA256SUMS
+            dist/NOTICE
+            dist/NotoEmoji-LICENSE.txt
+            dist/DejaVuSans-LICENSE.txt
 
       - name: Extract release notes from CHANGELOG.md
         env:
@@ -377,7 +407,10 @@ jobs:
             "dist/manifest.json" \
             "dist/manifest-update.json" \
             "dist/update-meta.json" \
-            "dist/SHA256SUMS"
+            "dist/SHA256SUMS" \
+            "dist/NOTICE" \
+            "dist/NotoEmoji-LICENSE.txt" \
+            "dist/DejaVuSans-LICENSE.txt"
 
           # Un-draft last, now that the real notes and every asset are in
           # place, so `release: published` fires exactly once with a
