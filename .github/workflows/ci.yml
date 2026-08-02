@@ -364,3 +364,20 @@ jobs:
       # auto-skip since src/hil_keys.rs is gitignored/absent on a CI runner.
       - name: cd firmware && bash check-all-features.sh
         run: cd firmware && bash check-all-features.sh
+
+      # Recomputes the actual RELEASE app-image size from a fresh build and
+      # diffs it against the committed baseline
+      # (firmware/app-image-budget-baseline.txt), failing loudly past a 5%
+      # drift — see xtask/src/partition_budget.rs's module doc for why this
+      # exists (firmware/partitions.csv's `factory` comment used to carry
+      # this figure as hand-written "measured" prose with no recompute
+      # trigger, and it decayed 2.72 MB stale, undetected, across an entire
+      # campaign's worth of flash-budget decisions). Deliberately its own
+      # step, after check-all-features.sh (a debug build): this one needs an
+      # actual `cargo build --release`, which check-all-features.sh does
+      # not run. Runs from the repo root (not `firmware/`) because the
+      # `xtask` binary itself is a host-native crate — see that module's
+      # doc for why the nested release build still resolves the `esp`
+      # toolchain correctly via rustup's per-directory rust-toolchain.toml.
+      - name: cargo run -p xtask -- verify-partition-budget
+        run: cargo run -p xtask --bin xtask -- verify-partition-budget

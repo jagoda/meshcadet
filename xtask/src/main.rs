@@ -46,11 +46,49 @@
 //! human-readable report and a nonzero exit code on failure. It runs BOTH
 //! checks and reports both before exiting, rather than short-circuiting on
 //! the first — a manual re-check should surface everything in one pass.
+//!
+//! One check is deliberately NOT part of that default battery and is NOT a
+//! `cargo test`, because it needs the `esp` cross-toolchain and takes
+//! minutes rather than milliseconds — it must be named explicitly:
+//!
+//! - **verify-partition-budget** — recomputes the actual firmware app-image
+//!   size from a fresh release build and diffs it against the committed
+//!   baseline, failing loudly past a drift threshold (see
+//!   `xtask::partition_budget`'s doc). Run with:
+//!   `cargo run -p xtask --bin xtask -- verify-partition-budget`.
 
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let repo_root = xtask::repo_root_from_manifest_dir();
+
+    // `verify-partition-budget` requires the `esp` cross-toolchain and a
+    // multi-minute release build (see xtask::partition_budget's module doc
+    // for why it can't just join the battery below) — dispatch it alone,
+    // rather than unconditionally running it on every plain `cargo run -p
+    // xtask --bin xtask`, which would break on any machine without that
+    // toolchain bootstrapped.
+    if std::env::args().any(|a| a == "verify-partition-budget") {
+        return match xtask::partition_budget::check(&repo_root) {
+            Ok(report) => {
+                if report.over_threshold {
+                    eprintln!(
+                        "xtask verify-partition-budget: FAILED — {}",
+                        report.summary()
+                    );
+                    ExitCode::FAILURE
+                } else {
+                    println!("xtask verify-partition-budget: OK — {}", report.summary());
+                    ExitCode::SUCCESS
+                }
+            }
+            Err(e) => {
+                eprintln!("xtask verify-partition-budget: ERROR — {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let mut ok = true;
 
     let glyph = xtask::check(&repo_root);

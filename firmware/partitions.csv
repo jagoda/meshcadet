@@ -9,9 +9,22 @@
 # nvs/phy_init offsets and sizes are unchanged from the ESP-IDF default table (mc_id/
 # mc_cfg/runtime config continue to live in nvs, untouched here).
 #
-# `factory` is sized at 6 MB. Verified against the actual built (release, `hil` off)
-# Slint app image: espflash reports 2,359,440 bytes (~2.25 MB) for the flashed app —
-# comfortably under 6 MB, leaving ~3.75 MB of headroom for UI asset growth.
+# `factory` is sized at 6 MB. The actual app-image size is deliberately NOT
+# pinned here as a static "measured" figure — that exact framing decayed
+# silently (a prior version of this comment claimed 2,359,440 B / ~2.25 MB;
+# a direct release-build measurement later found 5,083,402 B / ~4.85 MiB,
+# 2.72 MB of undetected drift that an entire campaign had budgeted against —
+# see meshcadet-emoji-font-upgrade-checkpoint-20260802-140922469). The live,
+# recomputed figure — checked against a committed baseline with a 5% drift
+# guard — comes from:
+#
+#   cargo run -p xtask --bin xtask -- verify-partition-budget
+#
+# (requires the `esp` cross-toolchain; see xtask/src/partition_budget.rs's
+# module doc, wired into .github/workflows/ci.yml's `firmware` job). The
+# baseline it diffs against, plus the last-known figure, live in
+# firmware/app-image-budget-baseline.txt — read/bump THAT file, never this
+# comment.
 #
 # `mc_hist` (SubType 0x40, in the ESP-IDF user-defined data range 0x40–0xFE) is a raw
 # 256 KB region for per-conversation history. This file only DECLARES the partition;
@@ -27,7 +40,8 @@
 #
 # nvs: 24 KB (unchanged — mc_id/mc_cfg/runtime)
 # phy_init: 4 KB (unchanged)
-# factory: 6 MB — actual app image ~2.25 MB, ~3.75 MB headroom (measured, see above)
+# factory: 6 MB — actual app-image size: see firmware/app-image-budget-baseline.txt
+#   and `cargo run -p xtask --bin xtask -- verify-partition-budget` (above)
 # mc_hist: 256 KB — raw per-conversation history
 #
 # Name,   Type, SubType, Offset,  Size,     Flags
