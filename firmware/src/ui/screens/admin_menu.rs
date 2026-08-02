@@ -332,6 +332,10 @@ slint::slint! {
         // 2=screen-sleep stepper, 3=GPS status row. `-1` = no highlight yet
         // (touch taps a row directly and never sets this).
         in property <int>    selected_index: -1;
+        // Shared full-window starfield texture, set once by Rust right after
+        // construction (`ui::backdrop_asset::shared_backdrop_image()`) — see
+        // that module's doc for why this isn't a `SpaceBackdrop` default.
+        in property <image>  backdrop_image;
 
         callback back_pressed;
         callback toggle_notif_visual;
@@ -351,9 +355,10 @@ slint::slint! {
         // tint" note) rather than stacking both, per the "do not
         // double-wash; pick one" design rule. Declared first, so
         // Slint paints it before the header/rows below; the ≤0.35 alpha
-        // ceiling is baked into `SpaceBackdrop` itself (see `motifs.slint`),
-        // not overridden here.
-        SpaceBackdrop {}
+        // ceiling is baked into `SpaceBackdrop` itself (see `motifs.slint`).
+        // `source` comes from `backdrop_image` above, not a component
+        // default — see `backdrop_asset.rs`.
+        SpaceBackdrop { source: backdrop_image; }
 
         VerticalLayout {
             spacing: 0px;
@@ -474,6 +479,7 @@ impl AdminMenuScreen {
     pub fn new() -> anyhow::Result<Self> {
         let component = self::AdminMenuScreenUi::new()
             .map_err(|e| anyhow::anyhow!("slint component init: {:?}", e))?;
+        component.set_backdrop_image(crate::ui::backdrop_asset::shared_backdrop_image());
         component.show()
             .map_err(|e| anyhow::anyhow!("slint window show: {:?}", e))?;
         Ok(AdminMenuScreen { component })

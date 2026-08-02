@@ -394,6 +394,10 @@ slint::slint! {
         // 1..=5 = bars. Pushed by `MessageViewScreen::set_signal_level`; see
         // `SignalMeter`'s embedding below.
         in property <int>             signal_level: 0;
+        // Shared full-window starfield texture, set once by Rust right after
+        // construction (`ui::backdrop_asset::shared_backdrop_image()`) — see
+        // that module's doc for why this isn't a `SpaceBackdrop` default.
+        in property <image>           backdrop_image;
 
         callback back_pressed;
         callback compose_pressed;
@@ -441,8 +445,10 @@ slint::slint! {
         // between bubbles and in the blank area below the last message; the
         // bottom bar's own background is switched to a translucent wash
         // (see that Rectangle below) so the backdrop shows behind AND below
-        // the Write button too, by deliberate design.
-        SpaceBackdrop {}
+        // the Write button too, by deliberate design. `source` comes from
+        // `backdrop_image` above, not a component default — see
+        // `backdrop_asset.rs`.
+        SpaceBackdrop { source: backdrop_image; }
 
         VerticalLayout {
             // Screen-entry one-shot fade-in — see `content_opacity`'s doc above.
@@ -669,6 +675,7 @@ impl MessageViewScreen {
     pub fn new() -> anyhow::Result<Self> {
         let component = self::MessageViewScreenUi::new()
             .map_err(|e| anyhow::anyhow!("slint component init: {:?}", e))?;
+        component.set_backdrop_image(crate::ui::backdrop_asset::shared_backdrop_image());
         component.show()
             .map_err(|e| anyhow::anyhow!("slint window show: {:?}", e))?;
         // Install ONE persistent, initially empty model on the component; every

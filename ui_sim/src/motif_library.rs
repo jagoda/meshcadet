@@ -233,7 +233,16 @@ slint::slint! {
         // proving the backdrop composites BEHIND foreground content rather
         // than asserting anything about final on-hardware legibility (that
         // sign-off is deferred to the HIL gate).
-        SpaceBackdrop {}
+        //
+        // `SpaceBackdrop` no longer carries a default `source` (see that
+        // component's doc in `motifs.slint` + `firmware/src/ui/
+        // backdrop_asset.rs`'s module doc): the 7-screen production fan-out
+        // now feeds it a Rust-shared `Image` instead, so each of the 7
+        // `slint::slint!{}` invocations doesn't re-embed its own copy of the
+        // texture. This demo has exactly ONE consumer of `SpaceBackdrop`, so
+        // no such duplication risk applies here — binding the literal
+        // directly is the simplest faithful proof of the same asset.
+        SpaceBackdrop { source: @image-url("../../firmware/assets/space/starfield_full.png"); }
         Rectangle {
             x: 40px;
             y: 100px;
@@ -312,4 +321,99 @@ impl Default for SpaceBackdropFrame {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ── Backdrop property-handoff regression proof ────────────────────────────
+// Proves the SAME mechanism `firmware/src/ui/backdrop_asset.rs` uses in
+// production: ONE `slint::slint!{}` invocation holds the `@image-url(...)`
+// literal (`BackdropAssetProof` below); two OTHER, independent components
+// (`BackdropConsumerA`/`B` — standing in for two of the 7 real fan-out
+// screens) never reference that literal at all and instead receive the
+// decoded `Image` at Rust runtime via a plain `in property <image>`, exactly
+// like each real screen's `Window` root now does. This is the regression
+// this dedupe fix guards against: if a future change reintroduces a default
+// `source: @image-url(...)` on `motifs.slint`'s `SpaceBackdrop` (undoing the
+// fix and re-duplicating the texture per screen again), this test itself
+// keeps passing (it doesn't touch `SpaceBackdrop`) — what it actually
+// guards is the OTHER half of the mechanism: that a `slint::Image` obtained
+// from one component's property genuinely paints identical pixels when
+// hand-carried into a completely different component's own property,
+// independent of the compiler's per-Document embed. `space_backdrop.rs`
+// (above) already proves `SpaceBackdrop` itself renders; this proves the
+// hand-off plumbing every real screen's constructor now performs.
+
+slint::slint! {
+    export component BackdropAssetProof inherits Window {
+        out property <image> image: @image-url("../../firmware/assets/space/starfield_full.png");
+    }
+}
+
+slint::slint! {
+    export component BackdropConsumerA inherits Window {
+        width: 320px;
+        height: 240px;
+        in property <image> backdrop_image;
+        Image {
+            source: backdrop_image;
+            width: 320px;
+            height: 240px;
+        }
+    }
+}
+
+slint::slint! {
+    export component BackdropConsumerB inherits Window {
+        width: 320px;
+        height: 240px;
+        in property <image> backdrop_image;
+        Image {
+            source: backdrop_image;
+            width: 320px;
+            height: 240px;
+        }
+    }
+}
+
+struct BackdropHandoffPlatform {
+    window: Rc<MinimalSoftwareWindow>,
+    start: Instant,
+}
+
+impl Platform for BackdropHandoffPlatform {
+    fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, PlatformError> {
+        Ok(self.window.clone())
+    }
+
+    fn duration_since_start(&self) -> Duration {
+        self.start.elapsed()
+    }
+}
+
+/// Returns `(canonical, from_consumer_a, from_consumer_b)` — the same
+/// `slint::Image`, obtained from `BackdropAssetProof`'s own property, handed
+/// to two independently-constructed `Window` components' `backdrop_image`
+/// property, then read back off each. Same process-wide-`Platform`-
+/// singleton constraint as [`SpaceBackdropFrame::new`] — callers must ensure
+/// exactly one Slint `Platform` is installed per process (`ui_sim/tests/
+/// backdrop_property_handoff.rs` gets its own process).
+pub fn prove_backdrop_property_handoff() -> (slint::Image, slint::Image, slint::Image) {
+    let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+    window.set_size(PhysicalSize::new(WIDTH, HEIGHT));
+    slint::platform::set_platform(Box::new(BackdropHandoffPlatform {
+        window,
+        start: Instant::now(),
+    }))
+    .expect("Slint platform already set in this process");
+
+    let canonical = BackdropAssetProof::new()
+        .expect("BackdropAssetProof::new")
+        .get_image();
+
+    let a = BackdropConsumerA::new().expect("BackdropConsumerA::new");
+    a.set_backdrop_image(canonical.clone());
+
+    let b = BackdropConsumerB::new().expect("BackdropConsumerB::new");
+    b.set_backdrop_image(canonical.clone());
+
+    (canonical, a.get_backdrop_image(), b.get_backdrop_image())
 }

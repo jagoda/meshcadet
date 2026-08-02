@@ -291,6 +291,11 @@ slint::slint! {
         // Shows raw GT911 coords and transformed logical coords for empirical calibration.
         in property <string> touch_debug;
 
+        // Shared full-window starfield texture, set once by Rust right after
+        // construction (`ui::backdrop_asset::shared_backdrop_image()`) — see
+        // that module's doc for why this isn't a `SpaceBackdrop` default.
+        in property <image> backdrop_image;
+
         // Full-window dim starfield backdrop — same z-bottom placement
         // `admin_menu.rs`'s `SpaceBackdrop` doc establishes (declared first,
         // so Slint paints it before every other node below). The tab-bar
@@ -301,8 +306,10 @@ slint::slint! {
         // screen already had the translucent-row treatment the settings view
         // established; it was only missing the full-window backdrop layer
         // underneath. The Flickable itself carries no fill, so the backdrop
-        // also shows through the blank area below the last row.
-        SpaceBackdrop {}
+        // also shows through the blank area below the last row. `source`
+        // comes from `backdrop_image` above, not a component default — see
+        // `backdrop_asset.rs`.
+        SpaceBackdrop { source: backdrop_image; }
 
         VerticalLayout {
             // Screen-entry one-shot fade-in — see `content_opacity`'s doc above.
@@ -553,6 +560,7 @@ impl ContactListScreen {
     pub fn new() -> anyhow::Result<Self> {
         let component = self::ContactListScreenUi::new()
             .map_err(|e| anyhow::anyhow!("slint component init: {:?}", e))?;
+        component.set_backdrop_image(crate::ui::backdrop_asset::shared_backdrop_image());
         component.show()
             .map_err(|e| anyhow::anyhow!("slint window show: {:?}", e))?;
         Ok(ContactListScreen {

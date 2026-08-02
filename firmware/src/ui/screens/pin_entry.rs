@@ -145,6 +145,10 @@ slint::slint! {
         in property <string>  subtitle: "Enter your PIN";
         // Number of digits entered so far (0–4).
         in-out property <int> digits_entered: 0;
+        // Shared full-window starfield texture, set once by Rust right after
+        // construction (`ui::backdrop_asset::shared_backdrop_image()`) — see
+        // that module's doc for why this isn't a `SpaceBackdrop` default.
+        in property <image>   backdrop_image;
 
         // Callbacks
         callback digit_pressed(int);   // 0–9
@@ -159,8 +163,10 @@ slint::slint! {
 
         // Full-window dim starfield backdrop — declared first so it paints
         // behind every other node; the ≤0.35 alpha ceiling is baked into
-        // `SpaceBackdrop` itself (see `motifs.slint`), not overridden here.
-        SpaceBackdrop {}
+        // `SpaceBackdrop` itself (see `motifs.slint`). `source` comes from
+        // `backdrop_image` above, not a component default — see
+        // `backdrop_asset.rs`.
+        SpaceBackdrop { source: backdrop_image; }
 
         VerticalLayout {
             spacing: 0px;
@@ -273,6 +279,7 @@ impl PinEntryScreen {
         let component = self::PinEntryScreenUi::new()
             .map_err(|e| anyhow::anyhow!("slint component init: {:?}", e))?;
         component.set_menu_title(title.into());
+        component.set_backdrop_image(crate::ui::backdrop_asset::shared_backdrop_image());
         component.show()
             .map_err(|e| anyhow::anyhow!("slint window show: {:?}", e))?;
         Ok(PinEntryScreen { component })
