@@ -133,6 +133,34 @@ CONFIG_ESP_TASK_WDT_PANIC=y
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
 CONFIG_ESP_BROWNOUT_DET=y
 
+# ── FreeRTOS run-time stats (per-core utilization, diagnostics-only reader) ──────
+#
+# `CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y` turns on FreeRTOS's per-task
+# run-time counter (a lightweight increment on every context switch, driven
+# by the CPU-cycle/`esp_timer` clock the port wires in) — with no reader,
+# this is a few extra cycles per switch and otherwise invisible.
+# `CONFIG_FREERTOS_USE_TRACE_FACILITY=y` and `CONFIG_FREERTOS_USE_STATS_
+# FORMATTING_FUNCTIONS=y` are the two prerequisites `vTaskGetRunTimeStats()`
+# itself needs compiled in (FreeRTOS's own `task.h` guards that function
+# behind both). `firmware/src/main.rs`'s 30 s diagnostics rollup (M0 of the
+# `meshcadet-perf-rearchitecture` design) calls it and reads
+# each of the two per-core idle tasks' (`IDLE0`/`IDLE1`) reported percentage,
+# deriving `100 - idle%` as that core's utilization — the two ESP32-S3 SMP
+# idle tasks are pinned one per core by FreeRTOS's own construction, so no
+# separate per-task core-affinity lookup is needed.
+#
+# These three options apply to ALL build configs (hil, diagnostics,
+# default) — Kconfig has no lever conditioned on a Cargo feature, so the
+# always-on counter itself is the accepted trade-off (same shape as
+# CONFIG_APP_REPRODUCIBLE_BUILD below: a config-level cost paid by every
+# build so one Cargo feature can read it later). Only the READ (the `unsafe`
+# FFI call + the log lines) is gated behind `--features diagnostics`, in
+# firmware/src/main.rs — a non-diagnostics build never calls
+# `vTaskGetRunTimeStats()` and never logs anything different.
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS=y
+
 # ── Custom partition table (16 MB flash) ──────────────────────────────────────────
 #
 # T-Deck Plus ships 16 MB of flash; the ESP-IDF DEFAULT partition table assumes
