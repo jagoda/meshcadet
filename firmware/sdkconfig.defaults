@@ -80,6 +80,19 @@
 #   they all share the same identity+crypto init path in main.rs::run().
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=49152
 
+# ADR-0012 (`meshcadet-perf-rearchitecture` M1, dispatcher/UI task split) D1:
+# pin the ESP-IDF main task (the radio/dispatcher — main.rs::run()'s loop) to
+# core 0, explicitly. Pre-split this was an inherited IDF default, never
+# stated in the repo; `ui_task` (the whole touch UI — display, touch,
+# keyboard, trackball, buzzer, Slint) is now pinned to core 1 via
+# `esp_idf_hal::task::thread::ThreadSpawnConfiguration` at spawn time
+# (`firmware/src/ui_task.rs`). Every claim in ADR-0012 D9's SMP-correctness
+# audit and D10's SPI2-arbitration analysis (bounded ≤12.8µs bus-hold,
+# per-task device ownership) assumes this exact two-core split holds; stating
+# it here — rather than relying on the default — makes it a fact of the repo
+# instead of an assumption about the toolchain.
+CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0=y
+
 # ── T-Deck Plus hardware ─────────────────────────────────────────────────────────
 # 8 MB octal PSRAM — needed for UI framebuffers and rotating conversation history.
 CONFIG_ESP32S3_SPIRAM_SUPPORT=y

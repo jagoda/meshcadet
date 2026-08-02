@@ -80,6 +80,10 @@ use esp_idf_hal::{
     uart::{UartDriver, config::Config as UartConfig},
     units::FromValueType,
 };
+// ADR-0012 (`meshcadet-perf-rearchitecture` M1): the dispatcher ↔ UI queue
+// boundary. `SyncSender::try_send`/`Receiver::try_recv` never block (C2) —
+// see `send_ui_event` and the dispatcher-loop command-drain site below.
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use protocol::{
     Header, PayloadType, RouteType, PathLen,
     encode_dm_payload, decode_dm_payload, encode_txt_msg_plaintext,
@@ -144,6 +148,15 @@ mod radio;
 mod room_session;
 mod signal_tracker;
 mod ui;
+// The UI task (ADR-0012, `meshcadet-perf-rearchitecture` M1) — the ONLY
+// module in this crate allowed to `use crate::ui::UiRuntime` (D4.2). This
+// file (`run()`, below) can no longer name `UiRuntime` at all; it talks to
+// the UI exclusively through the two bounded channels `ui_task::spawn`
+// returns. Declared unconditionally (like `ui` above) so it always
+// type-checks; `run()` only ever calls `ui_task::spawn` under
+// `#[cfg(not(feature = "hil"))]` (HIL rigs have no display — see the
+// "Touch UI" bring-up section below).
+mod ui_task;
 // On-device superloop timing instrumentation (M0 of
 // `meshcadet-perf-rearchitecture`) — pure Rust, no ESP-IDF deps, lives in
 // `firmware_core::perf` (re-exported). Declared in ALL builds (like
@@ -219,7 +232,7 @@ use battery::BatteryDriver;
 use dispatcher::{AirtimeBudget, DuplicateFilter, TxQueue, lora_airtime_ms, tx_guard_allows};
 use gps::GpsDriver;
 use radio::Radio;
-use signal_tracker::{SignalConfig, SignalTracker};
+use signal_tracker::{SignalConfig, SignalLevel, SignalTracker};
 
 // ── RX diagnostic log macro ───────────────────────────────────────────────────
 
@@ -563,6 +576,29 @@ fn main() {
     }
 }
 
+/// Post `event` to the UI task, never blocking (ADR-0012 C2).
+///
+/// `SyncSender::try_send` degrades rather than stalls: on a full queue (the
+/// UI task fell behind — capacity 32 against ≲2 events/iteration production
+/// makes this a safety valve, not a design path) OR a disconnected one (the
+/// UI task's `Receiver<UiEvent>` was dropped — either it never spawned at
+/// all, e.g. HIL or a headless boot, or it exited after a construction
+/// failure; see `ui_task`'s module doc), the event is dropped and
+/// `dropped` is incremented. The dispatcher NEVER waits on the UI — a
+/// missed CAD window or a late RX drain is a priority-1 violation this
+/// boundary exists specifically to make unreachable. Callers accumulate
+/// `dropped` into the existing periodic (`RX_STATS_INTERVAL_MS`) stats log
+/// rather than logging per-occurrence.
+fn send_ui_event(evt_tx: &SyncSender<ui::UiEvent>, dropped: &mut u32, event: ui::UiEvent) {
+    // The drop-and-count policy itself is `firmware_core::ui::ui_task_
+    // boundary::send_or_count` — a generic, host-tested function over the
+    // real `std::sync::mpsc::SyncSender<T>` this crate also uses. This
+    // wrapper exists only to fix the type to `ui::UiEvent` at every call
+    // site, matching `main.rs`'s existing convention of thin
+    // `firmware_core`-delegating wrappers.
+    firmware_core::ui::ui_task_boundary::send_or_count(evt_tx, event, dropped);
+}
+
 fn run() -> anyhow::Result<()> {
     // 1.5. USB-Serial-JTAG interrupt-driven RX driver (production builds only).
     //
@@ -678,14 +714,45 @@ fn run() -> anyhow::Result<()> {
 
     // 5a. SPI2 bus driver — shared between radio (CS=GPIO9) and LCD (CS=GPIO12).
     //     Declared here (before the display init below) so its lifetime covers
-    //     both the LCD SpiDeviceDriver and the radio SpiDeviceDriver (step 5b,
-    //     after the provisioning gate).
-    let spi_driver = SpiDriver::new(
+    //     both the LCD SpiDeviceDriver and the radio SpiDeviceDriver
+    //     (registered immediately below, step 5b).
+    //
+    // ADR-0012 D5: `Box::leak`'d to `'static` — post-split, the LCD's
+    // SpiDeviceDriver is moved into `ui_task` (a separate, core-1-pinned
+    // OS thread), so it can no longer borrow a `run()` stack local. The
+    // leaked bus is never dropped (`run()` never returns; `spi_bus_free`
+    // was never reachable pre-split either), immutable after construction
+    // as far as `Borrow` consumers are concerned, and every mutating SPI
+    // operation goes through `&mut SpiDeviceDriver` with each device
+    // exclusively owned by one task (D2) — the three conditions the ADR
+    // cites for this being sound. `SpiDriver<'static>: Sync` auto-derives
+    // (D5's source-level chain through `esp-idf-hal`/`embassy-sync`), so
+    // `&'static SpiDriver<'static>: Send`, so
+    // `SpiDeviceDriver<'static, &'static SpiDriver<'static>>: Send` — CI's
+    // `xtensa-esp32s3-espidf` cross-compile is the oracle for this (this
+    // container has no `esp` toolchain); D5's pre-authorised `SpiBus`
+    // newtype fallback exists if CI disagrees.
+    let spi_driver: &'static SpiDriver<'static> = Box::leak(Box::new(SpiDriver::new(
         peripherals.spi2,
         peripherals.pins.gpio40,          // SCK
         peripherals.pins.gpio41,          // MOSI
         Some(peripherals.pins.gpio38),    // MISO
         &SpiDriverConfig::new(),
+    )?));
+
+    // 5b. Radio SpiDeviceDriver — REGISTRATION only (`spi_bus_add_device`),
+    // moved up beside the LCD's (ADR-0012 D2's corollary: every
+    // `spi_bus_add_device` call happens on this task, before `ui_task`
+    // exists, so device registration stays strictly sequential and
+    // single-threaded exactly as pre-split — only SPI *transactions* ever
+    // become concurrent). `Radio::init`'s actual chip bring-up (the RST/
+    // BUSY/DIO1 pins + the SPI transactions themselves) stays at its
+    // original later call site, after the provisioning gate — this device
+    // handle is simply held until then.
+    let spi_device = SpiDeviceDriver::new(
+        spi_driver,
+        Some(peripherals.pins.gpio9),      // CS
+        &SpiConfig::new().baudrate(8u32.MHz().into()),
     )?;
 
     // 7. Touch UI — display + touch + notification runtime (production only).
@@ -715,8 +782,20 @@ fn run() -> anyhow::Result<()> {
     #[cfg(not(feature = "hil"))]
     let prov_result = config_store::is_provisioned(nvs_partition.clone());
 
+    // ADR-0012: `ui_task` (the whole touch UI — display, touch, keyboard,
+    // trackball, buzzer, and every Slint call) now runs on its OWN
+    // core-1-pinned task, spawned by `ui_task::spawn` below. This task
+    // (`main.rs::run()`) can no longer name `ui::UiRuntime` at all (D4.2) —
+    // it talks to the UI exclusively through `evt_tx`/`cmd_rx`, the two
+    // bounded channels `ui_task::spawn` returns (D3). Every raw peripheral
+    // `ui_task` will own is still constructed HERE, on this task, before the
+    // spawn (SPI/I2C device REGISTRATION must stay single-threaded — D2's
+    // corollary); only the actual display/touch bring-up (fallible
+    // transactions, not registration) and `UiRuntime::new()` itself move
+    // into the spawned thread — see `ui_task`'s module doc for the full
+    // headless-fallback contract this preserves.
     #[cfg(not(feature = "hil"))]
-    let mut ui_opt: Option<ui::UiRuntime<'_>> = {
+    let (evt_tx, cmd_rx): (SyncSender<ui::UiEvent>, Receiver<ui::UiCommand>) = {
         // ── I2C1 for GT911 capacitive touch ─────────────────────────────────
         // Bus clock = 100 kHz (standard mode), NOT 400 kHz fast mode.
         //
@@ -731,7 +810,7 @@ fn run() -> anyhow::Result<()> {
         // exact reported symptom.  Standard mode is within GT911 spec, so the
         // only cost is slightly slower touch transactions (sub-ms, imperceptible
         // in the cooperative UI loop).
-        let touch_result = I2cDriver::new(
+        let i2c1_result = I2cDriver::new(
             peripherals.i2c1,
             peripherals.pins.gpio18,        // SDA
             peripherals.pins.gpio8,         // SCL
@@ -739,17 +818,16 @@ fn run() -> anyhow::Result<()> {
         );
 
         // ── LCD SPI device — shares SPI2 (same bus as radio, CS=GPIO12) ─────
-        // FIX: use &spi_driver (borrow) so GPIO40/41 stay under SPI2 control.
-        // The broken integration created a SEPARATE SPI3 on GPIO40/41, which
-        // remapped those GPIOs away from SPI2 and silenced the radio.
+        // Registration only (like the radio's `spi_device` above); the
+        // fallible display BRING-UP transactions run on `ui_task` itself.
         let lcd_spi_result = SpiDeviceDriver::new(
-            &spi_driver,
+            spi_driver,
             Some(peripherals.pins.gpio12), // LCD CS
             &SpiConfig::new().baudrate(40u32.MHz().into()),
         );
 
         let dc  = PinDriver::output(peripherals.pins.gpio11)?; // LCD DC
-        let rst = PinDriver::output(peripherals.pins.gpio16)?; // LCD RST
+        let lcd_rst = PinDriver::output(peripherals.pins.gpio16)?; // LCD RST
         // Backlight: LEDC PWM on GPIO42 (channel1 / timer1 / 2 kHz / 10-bit / 100% duty).
         // A plain GPIO set_high() does NOT activate the T-Deck Plus backlight: the
         // boost converter on GPIO42 needs a PWM switching signal, not static DC.
@@ -812,98 +890,49 @@ fn run() -> anyhow::Result<()> {
             }
         };
 
-        match (touch_result, lcd_spi_result) {
-            (Ok(i2c), Ok(lcd_spi)) => {
-                // The GT911 touch IC and the T-Deck keyboard co-processor share
-                // I2C1.  Wrap the single I2cDriver in an Rc<RefCell> so both
-                // drivers can borrow the bus from the cooperative UI task; the
-                // borrows are software-serialised (one transaction at a time).
-                let i2c_bus: ui::touch::I2cBus<'_> =
-                    std::rc::Rc::new(std::cell::RefCell::new(i2c));
+        // Use the already-queried provisioning state (reused by step 2.6
+        // below — avoids a second NVS read).
+        let provisioned = prov_result.unwrap_or(false);
+        let pubkey_str = format!("{}", hex_full(&identity.pubkey));
+        // Self-name for @mention wrap (send) / self-tier highlight (receive)
+        // — see UiRuntime::self_name's doc. Read once here at UI
+        // construction, same as the channel-send path's per-send live read
+        // (device_sender_name); a name change made after boot takes effect
+        // on the next reboot for the UI copy (acceptable — mentions are a
+        // display/typing aid, not a wire-correctness concern).
+        let self_name = device_sender_name(&identity, nvs_partition.clone());
 
-                let display_result = ui::display::TDeckDisplay::new(
-                    lcd_spi,
-                    dc,
-                    rst,
-                    peripherals.ledc.channel1,
-                    bl_timer,
-                    peripherals.pins.gpio42,
-                );
-                match display_result {
-                    Ok(display) => {
-                        match ui::touch::TouchDriver::new(i2c_bus.clone()) {
-                            Ok(touch) => {
-                                // Probe the physical QWERTY keyboard co-processor
-                                // (0x55) on the same bus.  Absence is non-fatal:
-                                // the UI degrades to touch-only.  A probe line is
-                                // logged either way so the boot log shows it next
-                                // to the GT911 line.
-                                let keyboard = match ui::keyboard::KeyboardDriver::new(
-                                    i2c_bus.clone(),
-                                ) {
-                                    Ok(kb) => Some(kb),
-                                    Err(e) => {
-                                        log::warn!(
-                                            "keyboard co-processor probe failed: {:?}                                              — running touch-only (no physical keyboard)",
-                                            e,
-                                        );
-                                        None
-                                    }
-                                };
-
-                                // Use the already-queried provisioning state (reused by
-                                // step 2.6 below — avoids a second NVS read).
-                                let provisioned = prov_result.unwrap_or(false);
-
-                                let pubkey_str = format!("{}", hex_full(&identity.pubkey));
-                                // Self-name for @mention wrap (send) / self-tier
-                                // highlight (receive) — see UiRuntime::self_name's
-                                // doc. Read once here at UI construction, same as
-                                // the channel-send path's per-send live read
-                                // (device_sender_name); a name change made after
-                                // boot takes effect on the next reboot for the UI
-                                // copy (acceptable — mentions are a display/typing
-                                // aid, not a wire-correctness concern).
-                                let self_name = device_sender_name(&identity, nvs_partition.clone());
-                                match ui::UiRuntime::new(display, touch, keyboard, buzzer, trackball, provisioned, &pubkey_str, &self_name) {
-                                    Ok(runtime) => {
-                                        log::info!(
-                                            "touch UI runtime initialised — {}×240 ST7789 + GT911",
-                                            ui::display::DISPLAY_WIDTH,
-                                        );
-                                        Some(runtime)
-                                    }
-                                    Err(e) => {
-                                        log::error!("UI runtime init failed: {:?} — running headless", e);
-                                        None
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                log::error!("GT911 touch probe failed: {:?} — running headless", e);
-                                None
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("display init failed: {:?} — running headless", e);
-                        None
-                    }
-                }
-            }
-            (Err(e), _) => {
-                log::error!("I2C/touch init failed: {:?} — running headless", e);
-                None
-            }
-            (_, Err(e)) => {
-                log::error!("LCD SPI init failed: {:?} — running headless", e);
-                None
-            }
-        }
+        ui_task::spawn(
+            i2c1_result,
+            lcd_spi_result,
+            dc,
+            lcd_rst,
+            peripherals.ledc.channel1,
+            bl_timer,
+            peripherals.pins.gpio42,
+            buzzer,
+            trackball,
+            provisioned,
+            pubkey_str,
+            self_name,
+        )?
     };
-    // HIL builds: UI is absent (no display hardware on the HIL rig).
+    // HIL builds: UI is absent (no display hardware on the HIL rig). The
+    // channel pair is still constructed so every later dispatcher-loop
+    // `evt_tx.try_send(..)`/`cmd_rx.try_recv()` call site compiles and runs
+    // unchanged — nothing is ever on the other end (mirrors the pre-split
+    // `ui_opt: Option<ui::UiRuntime> = None` HIL fallback exactly).
     #[cfg(feature = "hil")]
-    let mut ui_opt: Option<ui::UiRuntime<'_>> = None;
+    let (evt_tx, cmd_rx): (SyncSender<ui::UiEvent>, Receiver<ui::UiCommand>) = {
+        let (evt_tx, _evt_rx) = sync_channel::<ui::UiEvent>(32);
+        let (_cmd_tx, cmd_rx) = sync_channel::<ui::UiCommand>(16);
+        (evt_tx, cmd_rx)
+    };
+    // Count of `UiEvent`s dropped because `evt_tx.try_send` found the queue
+    // full or disconnected (ADR-0012 C2) — logged at `warn` once per RX
+    // stats rollup window (`RX_STATS_INTERVAL_MS`) rather than per
+    // occurrence, alongside the existing periodic stats block below.
+    let mut evt_dropped: u32 = 0;
 
     // The loaded provisioned config — the single mutable source of truth the
     // admin_server uses to answer QUERY_STATUS / QUERY_CONTACTS / QUERY_CHANNELS
@@ -924,6 +953,24 @@ fn run() -> anyhow::Result<()> {
     // where it stays empty) so `on_receive`/`handle_path_return` keep one
     // signature across both build profiles.
     let mut room_runtime: Vec<RoomRuntime> = Vec::new();
+
+    // ADR-0012 C5: every boot-time `UiRuntime` seed call (`register_room`/
+    // `register_contact`/`set_channels`/`set_pin`/`set_runtime_settings`/
+    // `seed_conversation`) used to be a direct call, inline, from the
+    // bring-up match arms below — safe pre-split, when this task and the UI
+    // shared one thread. Post-split this task cannot even name `UiRuntime`
+    // (D4.2), so each site below accumulates into these locals instead; the
+    // whole bundle is sent as ONE `UiEvent::BootSeed` immediately before
+    // `UiEvent::AppReady`, right before the dispatcher loop starts (D8 step
+    // 8) — see `ui::BootSeed`'s doc.
+    let mut boot_seed_rooms: Vec<(u8, bool)> = Vec::new();
+    let mut boot_seed_contacts: Vec<(u8, String)> = Vec::new();
+    let mut boot_seed_channels: Vec<ui::screens::contact_list::ChannelItem> = Vec::new();
+    let mut boot_seed_pin: [u8; pin_menu::MAX_PIN_LEN] = [0u8; pin_menu::MAX_PIN_LEN];
+    let mut boot_seed_pin_len: u8 = 0;
+    let mut boot_seed_runtime_settings: pin_menu::RuntimeSettings =
+        pin_menu::RuntimeSettings::default_enabled();
+    let mut boot_seed_conversations: Vec<(u8, bool, Vec<ui::MessageRecord>)> = Vec::new();
 
     // 2.6. First-boot provisioning gate + policy population (production only)
     #[cfg(not(feature = "hil"))]
@@ -984,24 +1031,20 @@ fn run() -> anyhow::Result<()> {
                         }
                     })
                     .expect("prov_server thread spawn failed");
-                log::info!("prov_server thread started — pumping UI while waiting");
+                log::info!("prov_server thread started — signalling UI ready while waiting");
                 // Waiting for USB provisioning IS the "ready" state for an
                 // unprovisioned device (no radio/GPS bring-up to wait on) —
                 // signals the boot-splash dismissal gate the same way the
                 // provisioned path does right before its dispatcher loop.
-                if let Some(ref mut ui) = ui_opt {
-                    ui.mark_app_ready();
-                    // Play the boot splash's one-shot ripple on ITS OWN
-                    // dedicated render loop, right here, BEFORE the
-                    // USB-provisioning wait loop below starts sharing the
-                    // thread with `prov_server` polling — see
-                    // `UiRuntime::run_splash_ripple`'s doc for why the ripple
-                    // needs its own dedicated render loop.
-                    ui.run_splash_ripple();
-                }
-                // Pump the UI render loop until provisioning signals complete.
-                // 50 ms matches the prov_server EAGAIN yield cadence and keeps
-                // SPI traffic serialised on the single-task main thread.
+                // ADR-0012 D8 step 6: `ui_task` intercepts `AppReady` itself
+                // (mark_app_ready + the dedicated-render-loop splash ripple)
+                // — this task can no longer call either directly (D4.2).
+                send_ui_event(&evt_tx, &mut evt_dropped, ui::UiEvent::AppReady);
+                // Wait for provisioning to complete. ADR-0012 D8 step 6: the
+                // `ui.step()` pump loop this used to share the thread with is
+                // DELETED — the UI now steps itself, continuously, on its own
+                // task; this thread only needs to poll `prov_done`. 50 ms
+                // matches the prov_server EAGAIN yield cadence.
                 while !prov_done.load(std::sync::atomic::Ordering::Acquire) {
                     // Mirror the RX counter onto the on-screen display (diagnostics
                     // build only — lets the operator observe USB-serial RX activity
@@ -1009,14 +1052,7 @@ fn run() -> anyhow::Result<()> {
                     #[cfg(feature = "diagnostics")]
                     {
                         let rx_n = prov_rx_count.load(std::sync::atomic::Ordering::Relaxed);
-                        if let Some(ref mut ui) = ui_opt {
-                            ui.set_prov_rx_bytes(rx_n);
-                        }
-                    }
-                    if let Some(ref mut ui) = ui_opt {
-                        if let Err(e) = ui.step(uptime_ms()) {
-                            log::warn!("UI step (unprovisioned): {:?}", e);
-                        }
+                        send_ui_event(&evt_tx, &mut evt_dropped, ui::UiEvent::ProvRxBytes(rx_n));
                     }
                     esp_idf_hal::delay::FreeRtos::delay_ms(50);
                 }
@@ -1113,9 +1149,9 @@ fn run() -> anyhow::Result<()> {
                                         // session, not just the provisioning-time
                                         // seed) permission with the UI so
                                         // `navigate_to_compose` can gate on it.
-                                        if let Some(ref mut ui) = ui_opt {
-                                            ui.register_room(hash, session.permission().can_post());
-                                        }
+                                        // ADR-0012 C5: accumulated into the
+                                        // BootSeed bundle, not a direct call.
+                                        boot_seed_rooms.push((hash, session.permission().can_post()));
                                         room_runtime.push(RoomRuntime {
                                             pubkey: cfg.contacts[i].pubkey,
                                             hash,
@@ -1150,9 +1186,8 @@ fn run() -> anyhow::Result<()> {
                                     // BUG FIX: wire contact names into the UI runtime so the
                                     // contact list screen shows the provisioned contacts (§B).
                                     // register_contact() was defined but never called from main.rs.
-                                    if let Some(ref mut ui) = ui_opt {
-                                        ui.register_contact(hash, name);
-                                    }
+                                    // ADR-0012 C5: accumulated into the BootSeed bundle.
+                                    boot_seed_contacts.push((hash, name));
                                 }
                             }
                         }
@@ -1162,7 +1197,8 @@ fn run() -> anyhow::Result<()> {
                         );
                         // BUG FIX: push channel list into the UI so the Groups tab
                         // shows the provisioned channel(s) (§B channels-tab acceptance).
-                        if let Some(ref mut ui) = ui_opt {
+                        // ADR-0012 C5: accumulated into the BootSeed bundle.
+                        {
                             let ch_count = cfg.channel_count as usize;
                             let mut channel_items: Vec<ui::screens::contact_list::ChannelItem> =
                                 cfg.channels[..ch_count].iter().map(|ch| {
@@ -1191,28 +1227,30 @@ fn run() -> anyhow::Result<()> {
                             // — visually distinguished by `ChannelItem::is_room`
                             // (see contact_list.rs's `ContactRow`/room styling).
                             channel_items.append(&mut room_channel_items);
-                            ui.set_channels(&channel_items);
+                            boot_seed_channels = channel_items;
                         }
                         // Wire the provisioned PIN into the UI runtime so the
                         // settings button can gate entry via pin_menu::verify_pin.
-                        if let Some(ref mut ui) = ui_opt {
-                            ui.set_pin(cfg.pin, cfg.pin_len);
-                        }
-                        // Wire the NVS handle + load any previously-saved
-                        // on-device admin-menu RuntimeSettings so the AdminMenu
-                        // screen's toggles persist across reboot (separate store
-                        // from the provisioning config blob — see
-                        // runtime_settings_store module docs). On first boot
-                        // (nothing saved yet in that store), seed the notif
-                        // toggles from the admin's provisioning-time
-                        // `set-notif-defaults` value rather than a hardcoded
-                        // true/true default.
-                        if let Some(ref mut ui) = ui_opt {
-                            ui.set_nvs_partition(nvs_partition.clone());
+                        // ADR-0012 C5: accumulated into the BootSeed bundle.
+                        boot_seed_pin = cfg.pin;
+                        boot_seed_pin_len = cfg.pin_len;
+                        // Load any previously-saved on-device admin-menu
+                        // RuntimeSettings so the AdminMenu screen's toggles
+                        // persist across reboot (separate store from the
+                        // provisioning config blob — see runtime_settings_store
+                        // module docs). On first boot (nothing saved yet in
+                        // that store), seed the notif toggles from the admin's
+                        // provisioning-time `set-notif-defaults` value rather
+                        // than a hardcoded true/true default. ADR-0012 C6: the
+                        // UI never writes flash itself anymore — persistence
+                        // now flows the other way, via
+                        // `UiCommand::PersistRuntimeSettings` (see the
+                        // dispatcher-loop command-drain site below).
+                        {
                             let notif_defaults =
                                 (cfg.notif_defaults.visual, cfg.notif_defaults.audible);
                             match runtime_settings_store::load(nvs_partition.clone(), notif_defaults) {
-                                Ok(settings) => ui.set_runtime_settings(settings),
+                                Ok(settings) => boot_seed_runtime_settings = settings,
                                 Err(e) => log::warn!(
                                     "runtime_settings_store: load failed: {:?} — using defaults",
                                     e,
@@ -1398,16 +1436,13 @@ fn run() -> anyhow::Result<()> {
     let mut adopted_server_clock: Option<room_session::AdoptedServerClock> = None;
 
     // 5b. Initialise SX1262 radio (pins per LilyGo utilities.h).
-    //     Board power enable (step 4) and SPI2 bus driver (step 5a) were moved
-    //     above the provisioning gate so the display is available on first boot.
-    // Radio SPI device — borrows spi_driver (from step 5a); LCD also shares SPI2.
-    // (SpiDriver<'d> is &spi_driver here; Radio::init accepts the borrowed form.)
-    let spi_device = SpiDeviceDriver::new(
-        &spi_driver,
-        Some(peripherals.pins.gpio9),     // CS
-        &SpiConfig::new().baudrate(8u32.MHz().into()),
-    )?;
-
+    //     Board power enable (step 4), the SPI2 bus driver, and the radio's
+    //     SpiDeviceDriver REGISTRATION (step 5a/5b) were all moved above the
+    //     provisioning gate (ADR-0012 D2's corollary) so the display is
+    //     available on first boot AND every `spi_bus_add_device` call stays
+    //     single-threaded. `spi_device` (this task's exclusively-owned
+    //     radio SPI handle) is still in scope from there; only the actual
+    //     chip bring-up below is new at this point in `run()`.
     let rst  = PinDriver::output(peripherals.pins.gpio17)?;
     let busy = PinDriver::input(peripherals.pins.gpio13, Pull::Floating)?;
     let dio1 = PinDriver::input(peripherals.pins.gpio45, Pull::Floating)?;
@@ -1493,7 +1528,17 @@ fn run() -> anyhow::Result<()> {
         // `mark_app_ready` + the splash-minimum timer — always later than this
         // point in `run()`), so the very first contact-list paint already reflects
         // restored history instead of only a live send/receive filling it in.
-        if let Some(ref mut ui) = ui_opt {
+        // ADR-0012 C5: accumulated into the BootSeed bundle rather than a
+        // direct `ui.seed_conversation(..)` call — this task can no longer
+        // name `UiRuntime` (D4.2). Unlike pre-split (gated on `ui_opt` being
+        // `Some`), history is now always hydrated regardless of whether
+        // `ui_task` ends up running headless: `room.recent`'s content-dedup
+        // tail (below) depends on this same read, and this task has no way
+        // to observe `ui_task`'s construction outcome by the time it reaches
+        // this point (D4.2's visibility barrier cuts both ways) — a strictly
+        // more-correct default, at the cost of one extra flash read in the
+        // rare real-hardware-failure case.
+        {
             match store.load_all_conversations() {
                 Ok(conversations) => {
                     for (kind, conv_hash, entries) in conversations {
@@ -1549,7 +1594,7 @@ fn run() -> anyhow::Result<()> {
                                 }
                             })
                             .collect();
-                        ui.seed_conversation(conv_hash, is_channel, records);
+                        boot_seed_conversations.push((conv_hash, is_channel, records));
                     }
                 }
                 Err(e) => log::warn!(
@@ -1620,6 +1665,18 @@ fn run() -> anyhow::Result<()> {
 
     let mut pending_ack: Option<PendingAck> = None;
     let mut pending_channel_ack: Option<PendingChannelAck> = None;
+
+    // ADR-0012 C4: per-iteration state snapshots become change-detected
+    // events. Four values are recomputed every dispatcher iteration but
+    // almost always unchanged — holding the last-sent value here and
+    // comparing before every `send_ui_event` call keeps queue traffic well
+    // below the old per-iteration call rate rather than raising it.
+    // `UiRuntime::set_*`'s own early-return (unchanged) stays as defence in
+    // depth on the receiving end.
+    let mut last_sent_gps_status: Option<gps::GpsStatus> = None;
+    let mut last_sent_room_clock: Option<(room_session::ClockSource, Option<u32>, u32)> = None;
+    let mut last_sent_battery_status: Option<battery::BatteryStatus> = None;
+    let mut last_sent_signal_level: Option<SignalLevel> = None;
 
     // RX counters
     let mut rx_done_count: u32 = 0;
@@ -1793,29 +1850,35 @@ fn run() -> anyhow::Result<()> {
     }
 
     // Boot sequence complete — radio, GPS, history store, and the
-    // admin-server thread are all live. Signals the boot-splash dismissal
-    // gate; see `UiRuntime::mark_app_ready`.
-    if let Some(ref mut ui) = ui_opt {
-        ui.mark_app_ready();
-        // Play the boot splash's one-shot ripple on ITS OWN dedicated render
-        // loop, right here, BEFORE the dispatcher loop below starts
-        // interleaving GPS/battery poll, CAD+TX, and RX poll with `ui.step()`
-        // again — see `UiRuntime::run_splash_ripple`'s doc for why. This blocks
-        // the main thread for ~1.15s; RX poll below resumes immediately
-        // after — see that method's doc for why deferring it this briefly,
-        // this once, at boot, is safe.
-        ui.run_splash_ripple();
-    }
+    // admin-server thread are all live. ADR-0012 D8 step 8: send the whole
+    // BootSeed bundle FIRST, then AppReady — `ui_task` applies the seed via
+    // `handle_event`'s `UiEvent::BootSeed` arm before it ever sees
+    // `AppReady` (C3: single producer, so mpsc's FIFO gives total order per
+    // direction). `ui_task`'s own loop intercepts `AppReady` directly
+    // (mark_app_ready + the dedicated-render-loop splash ripple, D8 step 9)
+    // — this task can no longer call either (D4.2). Unlike the pre-split
+    // direct call, this does NOT block this task for ~1.15s: the ripple now
+    // runs on `ui_task`'s own core-1 thread while this dispatcher loop
+    // starts immediately below — the documented boot RX gap this used to
+    // cause is gone (a real, if secondary, win the ADR calls out).
+    send_ui_event(
+        &evt_tx,
+        &mut evt_dropped,
+        ui::UiEvent::BootSeed(Box::new(ui::BootSeed {
+            rooms: boot_seed_rooms,
+            contacts: boot_seed_contacts,
+            channels: boot_seed_channels,
+            pin: boot_seed_pin,
+            pin_len: boot_seed_pin_len,
+            runtime_settings: boot_seed_runtime_settings,
+            conversations: boot_seed_conversations,
+        })),
+    );
+    send_ui_event(&evt_tx, &mut evt_dropped, ui::UiEvent::AppReady);
 
     // ── Dispatcher loop ───────────────────────────────────────────────────────
     loop {
         let now = uptime_ms();
-        // Iteration start, microsecond resolution — the UI-starvation
-        // counter's baseline (see the `ui.step()` call site below for the
-        // full accounting). Diagnostics-only; does not affect `now` above,
-        // which every existing scheduling call site keeps reading unchanged.
-        #[cfg(feature = "diagnostics")]
-        let iter_start_us = uptime_us();
 
         // Pet the Task WDT: this task is still alive and iterating.
         // Called unconditionally at the top of every iteration so that any
@@ -1911,8 +1974,8 @@ fn run() -> anyhow::Result<()> {
                     *e.into_inner() = gps_status;
                 }
             }
-            if let Some(ref mut ui) = ui_opt {
-                ui.set_gps_status(gps_status);
+            if firmware_core::ui::ui_task_boundary::changed_on_send(&mut last_sent_gps_status, gps_status) {
+                send_ui_event(&evt_tx, &mut evt_dropped, ui::UiEvent::GpsStatusChanged(gps_status));
             }
 
             // Refresh the shared room-clock-provenance snapshot — same
@@ -1944,8 +2007,13 @@ fn run() -> anyhow::Result<()> {
                 }
                 room_session::ClockSource::None => 0,
             };
-            if let Some(ref mut ui) = ui_opt {
-                ui.set_room_clock_source(room_clock_source, room_wall_clock_secs, room_clock_age_secs);
+            let room_clock_snapshot = (room_clock_source, room_wall_clock_secs, room_clock_age_secs);
+            if firmware_core::ui::ui_task_boundary::changed_on_send(&mut last_sent_room_clock, room_clock_snapshot) {
+                send_ui_event(&evt_tx, &mut evt_dropped, ui::UiEvent::RoomClockChanged {
+                    source: room_clock_source,
+                    wall_clock_secs: room_wall_clock_secs,
+                    age_secs: room_clock_age_secs,
+                });
             }
         }
 
@@ -1962,8 +2030,8 @@ fn run() -> anyhow::Result<()> {
                     *e.into_inner() = battery_status;
                 }
             }
-            if let Some(ref mut ui) = ui_opt {
-                ui.set_battery_status(battery_status);
+            if firmware_core::ui::ui_task_boundary::changed_on_send(&mut last_sent_battery_status, battery_status) {
+                send_ui_event(&evt_tx, &mut evt_dropped, ui::UiEvent::BatteryStatusChanged(battery_status));
             }
         }
 
@@ -1977,8 +2045,11 @@ fn run() -> anyhow::Result<()> {
         // no further packets arriving. `UiRuntime::set_signal_level` no-ops
         // routing the value to a screen that has no meter (splash,
         // unprovisioned, pin_entry, admin_menu — ADR-0010 D5).
-        if let Some(ref mut ui) = ui_opt {
-            ui.set_signal_level(signal_tracker.level(now));
+        {
+            let level = signal_tracker.level(now);
+            if firmware_core::ui::ui_task_boundary::changed_on_send(&mut last_sent_signal_level, level) {
+                send_ui_event(&evt_tx, &mut evt_dropped, ui::UiEvent::SignalLevelChanged(level));
+            }
         }
 
         // ── Enqueue periodic TEST DM (HIL only) ──────────────────────────────
@@ -2054,9 +2125,10 @@ fn run() -> anyhow::Result<()> {
                      absorbed while draining",
                     room.hash, count,
                 );
-                if let Some(ref mut ui) = ui_opt {
-                    ui.post_event(ui::UiEvent::RoomDrainComplete { room_hash: room.hash, count });
-                }
+                send_ui_event(
+                    &evt_tx, &mut evt_dropped,
+                    ui::UiEvent::RoomDrainComplete { room_hash: room.hash, count },
+                );
             }
 
             // `has_route()`, never `out_path_len == 0`
@@ -2199,14 +2271,12 @@ fn run() -> anyhow::Result<()> {
                         );
                         // This scheduler loop isn't already collecting into a
                         // `ui_events` buffer (unlike `on_receive`'s call
-                        // sites) — post directly, same as `RoomPostSent`/
+                        // sites) — send directly, same as `RoomPostSent`/
                         // `RoomPostRefused` further down this same loop.
-                        if let Some(ref mut ui) = ui_opt {
-                            ui.post_event(ui::UiEvent::RoomDrainComplete {
-                                room_hash: room.hash,
-                                count,
-                            });
-                        }
+                        send_ui_event(
+                            &evt_tx, &mut evt_dropped,
+                            ui::UiEvent::RoomDrainComplete { room_hash: room.hash, count },
+                        );
                     }
                     log::warn!(
                         "room: 0x{:02x} exceeded {} consecutive missed keep-alive ACKs — \
@@ -2526,10 +2596,8 @@ fn run() -> anyhow::Result<()> {
                     let key = packet_dedup_key(&frame_buf[..n]);
                     let mut ui_events: Vec<ui::UiEvent> = Vec::new();
                     let acked_channel = match_pending_channel_ack(key, &mut pending_channel_ack, &mut ui_events);
-                    if let Some(ref mut ui) = ui_opt {
-                        for ev in ui_events {
-                            ui.post_event(ev);
-                        }
+                    for ev in ui_events {
+                        send_ui_event(&evt_tx, &mut evt_dropped, ev);
                     }
                     // Persist the flip to flash so it survives a power-cycle —
                     // the channel counterpart of the DM ack-state persistence
@@ -2608,11 +2676,9 @@ fn run() -> anyhow::Result<()> {
                                 }
                             }
                         }
-                        // Forward radio events to the UI runtime.
-                        if let Some(ref mut ui) = ui_opt {
-                            for ev in ui_events {
-                                ui.post_event(ev);
-                            }
+                        // Forward radio events to the UI task.
+                        for ev in ui_events {
+                            send_ui_event(&evt_tx, &mut evt_dropped, ev);
                         }
                     }
                 }
@@ -2647,6 +2713,19 @@ fn run() -> anyhow::Result<()> {
             crc_err_count = 0;
             rx_none_count = 0;
             last_rx_stats_ms = now;
+
+            // ADR-0012 C2: `send_ui_event`'s drop-and-count policy — logged
+            // here, at `warn`, once per rollup window, rather than per
+            // occurrence (capacity 32 against ≲2 events/iteration production
+            // makes this a safety valve, not a design path — see that
+            // function's doc).
+            if evt_dropped > 0 {
+                log::warn!(
+                    "ui event queue: {} event(s) dropped (full/disconnected) in the last {}s",
+                    evt_dropped, RX_STATS_INTERVAL_MS / 1000,
+                );
+                evt_dropped = 0;
+            }
 
             // ── Main-task stack high-water mark (acceptance criterion) ────────
             //
@@ -2687,13 +2766,16 @@ fn run() -> anyhow::Result<()> {
             // or UI behavior.
             #[cfg(feature = "diagnostics")]
             {
-                let phases: [(&str, &perf::PhaseStats); 6] = [
+                // ADR-0012 D9 row 10: `ui_step` dropped from this task's
+                // phases — this dispatcher no longer calls `ui.step()` at
+                // all (see the removed "PERF ui-starvation" log below); the
+                // phase moves to `ui_task`'s own periodic rollup instead.
+                let phases: [(&str, &perf::PhaseStats); 5] = [
                     ("gps", &perf_rollup.gps),
                     ("battery", &perf_rollup.battery),
                     ("cad", &perf_rollup.cad),
                     ("tx", &perf_rollup.tx),
                     ("rx_poll", &perf_rollup.rx_poll),
-                    ("ui_step", &perf_rollup.ui_step),
                 ];
                 for (name, stats) in phases {
                     let snap = stats.snapshot();
@@ -2707,19 +2789,14 @@ fn run() -> anyhow::Result<()> {
                     "PERF rx-notice-latency: n={} min={}us mean={}us max={}us p95={}us",
                     rx_notice.count, rx_notice.min, rx_notice.mean, rx_notice.max, rx_notice.p95,
                 );
-                log::info!(
-                    "PERF ui-starvation: cumulative={}ms longest={}ms (window={}s)",
-                    perf_rollup.ui_starvation_cumulative_ms,
-                    perf_rollup.ui_starvation_longest_ms,
-                    RX_STATS_INTERVAL_MS / 1000,
-                );
-                if let Some(ref mut ui) = ui_opt {
-                    let paint = ui.take_input_paint_stats();
-                    log::info!(
-                        "PERF input-to-first-paint: n={} min={}ms mean={}ms max={}ms p95={}ms",
-                        paint.count, paint.min, paint.mean, paint.max, paint.p95,
-                    );
-                }
+                // ADR-0012 D9 row 10: `ui_step` and input-to-first-paint move
+                // to `ui_task`'s own periodic rollup (it now owns the loop
+                // those measured) — this task no longer calls `ui.step()` at
+                // all, so "ui-starvation" (how long THIS loop went without
+                // servicing the UI) is no longer a coherent measurement here;
+                // the whole structural gap it tracked is what this split
+                // removes. Both lines are dropped rather than logged as
+                // permanently-zero.
 
                 // Per-core utilization via FreeRTOS run-time stats
                 // (`CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS` +
@@ -2755,46 +2832,26 @@ fn run() -> anyhow::Result<()> {
             }
         }
 
-        // ── Touch UI step (non-blocking; only in production builds) ──────────
-        if let Some(ref mut ui) = ui_opt {
-            #[cfg(feature = "diagnostics")]
-            let ui_step_t0 = uptime_us();
-            if let Err(e) = ui.step(now) {
-                log::warn!("UI step error: {:?}", e);
+        // ── UI command drain (ADR-0012 C7) ────────────────────────────────────
+        //
+        // `ui.step()`/`ui.drain_commands()` are GONE from this task entirely
+        // — the UI now runs on its own core-1-pinned `ui_task`, stepping
+        // itself continuously (see `ui_task`'s module doc). This is exactly
+        // the structural change the whole campaign targets: this dispatcher
+        // loop no longer waits on UI work of any kind, at any point, in any
+        // iteration. What remains here is C7's non-blocking drain of
+        // UI-initiated commands, at exactly the point `drain_commands()` ran
+        // pre-split — collected into an owned `Vec` first (not drained
+        // inline) for the same reason the pre-split code did: the room-post
+        // handling below calls `send_ui_event(...)` mid-loop to confirm or
+        // refuse a send back to the UI (`UiEvent::RoomPostSent`/
+        // `RoomPostRefused`), and mixing that with the receive loop below
+        // would be needlessly tangled.
+        {
+            let mut cmds: Vec<ui::UiCommand> = Vec::new();
+            while let Ok(cmd) = cmd_rx.try_recv() {
+                cmds.push(cmd);
             }
-            // ── UI-starvation accounting (diagnostics-only) ───────────────────
-            //
-            // `ui.step()` runs unconditionally every iteration in this
-            // single-loop design (see the `meshcadet-perf-rearchitecture`
-            // design's §1) — "starvation" here is not about whether the
-            // call happens, but about how much of the
-            // iteration's wall clock was spent on everything ELSE (GPS/
-            // battery poll, room keep-alive, CAD+TX, RX poll) before this
-            // call got its turn, i.e. how long the UI thread was unable to
-            // sample touch/keyboard or advance an animation. `iter_start_us`
-            // was captured at the very top of this same iteration, so
-            // `iter_elapsed_us - ui_step_dur_us` is exactly that: the whole
-            // iteration MINUS the one slice of it that was actually UI work.
-            #[cfg(feature = "diagnostics")]
-            {
-                let ui_step_dur_us = (uptime_us().saturating_sub(ui_step_t0)) as u32;
-                perf_rollup.ui_step.record(ui_step_dur_us);
-                let iter_elapsed_us = (uptime_us().saturating_sub(iter_start_us)) as u32;
-                let starvation_ms = iter_elapsed_us.saturating_sub(ui_step_dur_us) / 1000;
-                perf_rollup.record_ui_starvation(starvation_ms);
-            }
-            // Drain any commands the UI generated (send DM, etc.). Collected
-            // into an owned `Vec` first rather than iterating
-            // `ui.drain_commands()` directly: the room-post handling below
-            // now calls `ui.post_event(...)` mid-loop, to confirm or refuse
-            // a send back to the UI (`UiEvent::RoomPostSent`/
-            // `RoomPostRefused` — this mission's Objective,
-            // `meshcadet-room-post-refusal-surface`), and the borrow checker
-            // ties `drain_commands`'s returned iterator to the whole `&mut
-            // UiRuntime` (its `&mut self` signature, even though it only
-            // touches `self.commands`) — a second `&mut ui` call from
-            // inside the loop body would conflict with that live borrow.
-            let cmds: Vec<ui::UiCommand> = ui.drain_commands().collect();
             for cmd in cmds {
                 match cmd {
                     ui::UiCommand::SendDm { to_hash, text } => {
@@ -3042,7 +3099,7 @@ fn run() -> anyhow::Result<()> {
                                             // this command WITHOUT rendering an
                                             // optimistic bubble first, precisely so a
                                             // refusal below never has one to retract.
-                                            ui.post_event(ui::UiEvent::RoomPostSent {
+                                            send_ui_event(&evt_tx, &mut evt_dropped, ui::UiEvent::RoomPostSent {
                                                 room_hash: room.hash,
                                                 text,
                                             });
@@ -3078,7 +3135,7 @@ fn run() -> anyhow::Result<()> {
                                                  last_room_ts={})",
                                                 room.hash, e, gps_synced_now, candidate_ts, last_room_ts,
                                             );
-                                            ui.post_event(ui::UiEvent::RoomPostRefused {
+                                            send_ui_event(&evt_tx, &mut evt_dropped, ui::UiEvent::RoomPostRefused {
                                                 room_hash: room.hash,
                                                 reason,
                                             });
@@ -3089,6 +3146,29 @@ fn run() -> anyhow::Result<()> {
                         }
                         #[cfg(feature = "hil")]
                         let _ = (room_hash, text);
+                    }
+                    // ADR-0012 C6: the UI never writes flash itself anymore
+                    // — `UiRuntime::set_nvs_partition` and its four direct
+                    // `runtime_settings_store::save` call sites are deleted;
+                    // this dispatcher persists on the UI's behalf instead.
+                    ui::UiCommand::PersistRuntimeSettings(settings) => {
+                        #[cfg(not(feature = "hil"))]
+                        {
+                            if let Err(e) = runtime_settings_store::save(nvs_partition.clone(), &settings) {
+                                log::error!(
+                                    "runtime_settings_store: save failed (from UI command): {:?}",
+                                    e,
+                                );
+                            }
+                        }
+                        // hil builds have no NVS-backed runtime_settings_store
+                        // (see the module's `#[cfg]` at the top of this file)
+                        // — unreachable in practice (hil never spawns
+                        // `ui_task`, so no `PersistRuntimeSettings` command is
+                        // ever produced), kept only so this arm type-checks
+                        // under `--features hil`.
+                        #[cfg(feature = "hil")]
+                        let _ = settings;
                     }
                 }
             }
@@ -3255,9 +3335,10 @@ fn device_sender_name(identity: &Identity, nvs_partition: EspDefaultNvsPartition
 }
 
 /// HIL builds have no `identity_store` (fixed compiled seed, NVS untouched —
-/// see the module gate at the top of this file) and never populate `ui_opt`,
-/// so this arm is unreachable at runtime; it exists only so the
-/// `UiCommand::SendGroupMsg` match arm still type-checks under `--features
+/// see the module gate at the top of this file) and never spawn `ui_task`
+/// (`run()`'s "Touch UI" bring-up section is `#[cfg(not(feature = "hil"))]`),
+/// so no `UiCommand::SendGroupMsg` is ever actually produced under `hil`;
+/// this arm exists only so that match still type-checks under `--features
 /// hil`. Mirrors the pre-fix behavior for this build config.
 #[cfg(feature = "hil")]
 fn device_sender_name(identity: &Identity, _nvs_partition: EspDefaultNvsPartition) -> String {
