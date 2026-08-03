@@ -280,6 +280,20 @@ pub const IRQ_CAD_DETECTED: u16 = 1 << 8;
 /// poll cadence, CAD timeout) that the synchronous `Notification::wait(
 /// ticks)` gives directly.
 ///
+/// # Postcondition — a wake is a hint, not a snapshot of the line
+///
+/// Because the notification above is sticky, a call to `Notification::wait`
+/// can return due to a notification left over from an EARLIER,
+/// already-serviced-and-cleared DIO1 assertion — one whose line has since
+/// gone low again (the seed: a DIO1 edge landing in the gap between this
+/// wait's own timeout and the `disable_interrupt()` that follows it; see
+/// "Timeout path" below). [`GpioDio1Wait::wait_high`] therefore never treats
+/// a wake as proof by itself: every wake, genuine or stale, is followed by
+/// re-reading `is_high()` before reporting `Asserted`, and a stale wake
+/// (line still low) loops back and keeps waiting out the *remaining*
+/// deadline rather than returning early. This is the invariant every call
+/// site depends on: **`Asserted` ⇒ DIO1 is asserted right now.**
+///
 /// # Timeout path
 ///
 /// On timeout, [`GpioDio1Wait::wait_high`] disables the interrupt before
@@ -387,14 +401,45 @@ impl Dio1Wait for GpioDio1Wait<'_> {
             log::warn!("radio: DIO1 interrupt arm failed — falling back to spin-poll for this wait");
             return Self::spin_poll_fallback(&mut self.dio1, timeout_ms);
         }
-        let ticks = TickType::new_millis(timeout_ms as u64).ticks();
-        if self.notification.wait(ticks).is_some() {
-            Dio1WaitOutcome::Asserted
-        } else {
-            // Timed out — disable so a later, unrelated fire doesn't land on
-            // a wait no one issued (see "Timeout path" doc above).
-            let _ = self.dio1.disable_interrupt();
-            Dio1WaitOutcome::TimedOut
+        // Track an absolute deadline (not a per-wait timeout) so a spurious
+        // or stale wake does not restart the budget — see this type's
+        // "Postcondition" doc: a wake is a hint, the line is the truth, and
+        // re-waiting after a stale one must still honour the caller's
+        // original `timeout_ms`.
+        let deadline = uptime_ms() + timeout_ms as u64;
+        loop {
+            let now = uptime_ms();
+            if now >= deadline {
+                // Timed out — disable so a later, unrelated fire doesn't
+                // land on a wait no one issued (see "Timeout path" doc
+                // above).
+                let _ = self.dio1.disable_interrupt();
+                return Dio1WaitOutcome::TimedOut;
+            }
+            let ticks = TickType::new_millis(deadline - now).ticks();
+            if self.notification.wait(ticks).is_some() {
+                // A notification is a hint, not a snapshot of the line (see
+                // "Postcondition" doc above) — re-check before trusting it.
+                if self.dio1.is_high() {
+                    return Dio1WaitOutcome::Asserted;
+                }
+                // Stale/spurious: the notification is already consumed, so
+                // looping back genuinely re-blocks for the remaining
+                // deadline rather than spinning.
+                //
+                // Observability: this is the exact condition the checkpoint
+                // gate found undetectable in the field (a silently dropped
+                // TX with no signal it ever happened) — one `debug!` per
+                // occurrence turns "how often does this race actually fire
+                // on real hardware" from an open question into something a
+                // log capture answers directly.
+                log::debug!(
+                    "radio: stale DIO1 notification observed with the line low — waiting for a genuine edge"
+                );
+            } else {
+                let _ = self.dio1.disable_interrupt();
+                return Dio1WaitOutcome::TimedOut;
+            }
         }
     }
 }
