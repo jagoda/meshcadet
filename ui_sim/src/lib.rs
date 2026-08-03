@@ -168,6 +168,13 @@ pub mod emoji_blank_cell_probe;
 /// `compose_promo` mirror (which never opens the picker overlay).
 pub mod compose_picker_probe;
 
+/// Host-sim render rig proving fixed-UI-emoji per-site colorization
+/// (`meshcadet-emoji-mono-glyph-legibility` Scope item 4) actually
+/// composites: a hand-built minimal `BitmapFont` rendered through three
+/// `Text` elements, one per colorized call site, each carrying that site's
+/// real `Theme` color. See that module's own doc for the full mechanism.
+pub mod emoji_color_probe;
+
 pub const WIDTH: u32 = 320;
 pub const HEIGHT: u32 = 240;
 

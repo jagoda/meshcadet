@@ -191,7 +191,14 @@ slint::slint! {
                             y: (parent.height - self.height) / 2;
                         }
                     }
-                    Text { text: "🔐"; font-size: Theme.icon-lg; vertical-alignment: center; }
+                    // Amber — this screen's "security / needs-attention" semantic
+                    // (`Theme.warn`), giving the lock icon its own intended color
+                    // now that the emoji face rasterises solid ink instead of
+                    // washed-out gray (mono-glyph-legibility mission). Isolated
+                    // in its own Text element already — no split needed, unlike
+                    // the merged-icon+label sites this mission left alone (see
+                    // that mission's Findings for the scoping call).
+                    Text { text: "🔐"; font-size: Theme.icon-lg; color: Theme.warn; vertical-alignment: center; }
                     Text {
                         text: menu_title;
                         font-size: Theme.size-subtitle; // 15px

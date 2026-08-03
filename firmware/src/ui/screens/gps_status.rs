@@ -282,25 +282,49 @@ slint::slint! {
                         TouchArea { clicked => { root.back_pressed(); } }
                     }
 
-                    Text {
-                        text: "📍 GPS Status";
-                        // BUG FIX:
-                        // was 15px. 15 is a valid PIXEL_SIZES entry but is NOT
-                        // in `EMOJI_SIZES` (`gen_emoji_font.c`), so the 📍
-                        // glyph rasterised as an empty (blank) bitmap at this
-                        // size — the exact "silent blank icon" failure mode
-                        // this file's own SYNC INVARIANT comments document,
-                        // caught by the host glyph-coverage harness (`xtask`).
-                        // `Theme.size-body-lg` (14px) IS in EMOJI_SIZES and
-                        // matches the header-title convention used elsewhere
-                        // (e.g. message_view.rs's contact-name header, also
-                        // 14px).
-                        font-size: Theme.size-body-lg;
-                        font-weight: 600;
-                        color: Theme.text-primary;
+                    // Split into two Text elements (mono-glyph-legibility
+                    // mission) so the 📍 glyph can carry its own color
+                    // (`Theme.ok` — green, this mission's "location" choice)
+                    // WITHOUT recoloring "GPS Status", which stays
+                    // `Theme.text-primary` to match every other screen's
+                    // header-title convention. A single merged Text/color
+                    // pair (the previous shape) would have made the whole
+                    // title green instead of just the icon — Slint has no
+                    // per-run color, so this is the only way to color one
+                    // glyph inside what used to be one string. `alignment:
+                    // center` + `horizontal-stretch: 1.0` on the wrapping
+                    // layout reproduce the prior Text's own centering.
+                    HorizontalLayout {
                         horizontal-stretch: 1.0;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
+                        alignment: center;
+                        spacing: 4px;
+
+                        Text {
+                            text: "📍";
+                            // BUG FIX:
+                            // was 15px. 15 is a valid PIXEL_SIZES entry but is
+                            // NOT in `EMOJI_SIZES` (`gen_emoji_font.c`), so the
+                            // 📍 glyph rasterised as an empty (blank) bitmap at
+                            // this size — the exact "silent blank icon" failure
+                            // mode this file's own SYNC INVARIANT comments
+                            // document, caught by the host glyph-coverage
+                            // harness (`xtask`). `Theme.size-body-lg` (14px) IS
+                            // in EMOJI_SIZES and matches the header-title
+                            // convention used elsewhere (e.g. message_view.rs's
+                            // contact-name header, also 14px).
+                            font-size: Theme.size-body-lg;
+                            font-weight: 600;
+                            color: Theme.ok;
+                            vertical-alignment: center;
+                        }
+
+                        Text {
+                            text: "GPS Status";
+                            font-size: Theme.size-body-lg;
+                            font-weight: 600;
+                            color: Theme.text-primary;
+                            vertical-alignment: center;
+                        }
                     }
 
                     // Balance the back button's width so the title stays

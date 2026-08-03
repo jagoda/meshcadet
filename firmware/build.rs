@@ -153,11 +153,16 @@ fn build_emoji_font() {
             .collect();
 
     // ── Compile the C host tool ───────────────────────────────────────────────
+    // `-lm`: gen_emoji_font.c's emoji alpha-gamma correction calls `pow()`
+    // (mono-glyph-legibility mission) — link libm explicitly rather than
+    // relying on it being folded into libc, which isn't guaranteed on every
+    // build host/toolchain.
     let gcc_status = Command::new("gcc")
         .arg("-O2")
         .args(&ft_cflags)
         .arg(&c_src)
         .args(&ft_libs)
+        .arg("-lm")
         .arg("-o")
         .arg(&gen_exe)
         .status()

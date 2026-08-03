@@ -649,6 +649,14 @@ slint::slint! {
                         Text {
                             text: "😀";
                             font-size: Theme.icon-sm; // 18px
+                            // `star-gold` — a warm accent distinct from this
+                            // bar's cyan (`brand-signal`) toggle-state fill,
+                            // giving the picker-toggle glyph its own intended
+                            // color now that the emoji face rasterises solid
+                            // ink instead of washed-out gray (mono-glyph-
+                            // legibility mission). Isolated in its own Text
+                            // already — no split needed.
+                            color: Theme.star-gold;
                             horizontal-alignment: center;
                             vertical-alignment: center;
                         }
