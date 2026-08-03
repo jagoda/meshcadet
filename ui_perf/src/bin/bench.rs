@@ -124,5 +124,58 @@ fn main() {
     }
     println!();
 
+    // ── spi_probe_toggle_overhead — D9/D11 GPIO-toggle probe host proxy ──
+    //
+    // `firmware/src/radio.rs`'s `--features diagnostics` SPI2 bus-hold probe
+    // (D9/D11, `docs/perf/ui-perf-baseline.md` §9.1) brackets each SPI
+    // transaction with two calls shaped exactly like this:
+    // `#[cfg(feature = "diagnostics")] let _ = self.probe.set_high();` /
+    // `set_low()`. `esp-idf-hal`'s `PinDriver::set_level` (v0.46.2,
+    // `src/gpio.rs:846`) is `#[inline]` and reduces, per pin, to one
+    // bounds-checked branch plus one `extern "C"` call into ESP-IDF's
+    // `gpio_set_level` (`components/driver/gpio/gpio.c:236`, pinned
+    // ESP-IDF v5.2.2), which itself is a `GPIO_CHECK` macro (no-op on the
+    // valid-pin path) followed by `gpio_hal_set_level` → the `static inline`
+    // `gpio_ll_set_level` (`components/hal/esp32s3/include/hal/gpio_ll.h:341`)
+    // — a single memory-mapped `out_w1ts`/`out_w1tc` register store, no lock,
+    // no ISR mask. There is no GPIO peripheral on this host, so that register
+    // store cannot be executed here; what CAN be measured on host is the
+    // *shape* this bench reproduces below — two calls, each one bounds-style
+    // branch plus one memory write plus a discarded `Result` — as a portable
+    // proxy for the wrapping cost, exactly as `render_mentions` above stands
+    // in for the on-target render-logic cost (§3.1's same caveat: not
+    // identical codegen to Xtensa, quote shape/magnitude, not the absolute ns).
+    println!("-- spi_probe_toggle_overhead (radio.rs's diagnostics-only SPI2 probe bracket, host proxy) --");
+    {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static PROBE_STATE: AtomicU32 = AtomicU32::new(0);
+
+        // `#[inline(never)]` so the call is real, not folded away — matching
+        // `gpio_set_level` being a genuine (non-inlined, `extern "C"`) call
+        // on-target, unlike `PinDriver::set_high`/`set_level` themselves
+        // (which the esp-idf-hal source above shows ARE `#[inline]`).
+        #[inline(never)]
+        fn probe_set(level: bool) -> Result<(), ()> {
+            if level {
+                PROBE_STATE.fetch_add(1, Ordering::Relaxed);
+            } else {
+                PROBE_STATE.fetch_sub(1, Ordering::Relaxed);
+            }
+            Ok(())
+        }
+
+        let iters = 1_000_000;
+        let elapsed = time_it(iters, || {
+            let _ = std::hint::black_box(probe_set(std::hint::black_box(true)));
+            let _ = std::hint::black_box(probe_set(std::hint::black_box(false)));
+        });
+        report_timing(
+            "spi_probe_toggle_overhead (set_high+set_low pair)",
+            iters,
+            elapsed,
+        );
+    }
+    println!();
+
     println!("=== end baseline — see docs/perf/ui-perf-baseline.md for the ledger these numbers feed ===");
 }

@@ -1453,7 +1453,20 @@ fn run() -> anyhow::Result<()> {
     let busy = PinDriver::input(peripherals.pins.gpio13, Pull::Floating)?;
     let dio1 = PinDriver::input(peripherals.pins.gpio45, Pull::Floating)?;
 
-    let mut radio = Radio::init(spi_device, rst, busy, dio1)?;
+    // D9/D11 SPI2 bus-hold probe (`radio::PIN_SPI_PROBE`, GPIO39/BOARD_SDCARD_CS
+    // — see that constant's doc for the pin choice). `--features diagnostics`
+    // only, so a production build claims no extra GPIO.
+    #[cfg(feature = "diagnostics")]
+    let probe = PinDriver::output(peripherals.pins.gpio39)?;
+
+    let mut radio = Radio::init(
+        spi_device,
+        rst,
+        busy,
+        dio1,
+        #[cfg(feature = "diagnostics")]
+        probe,
+    )?;
     log::info!("radio initialised");
 
     // 6. Initialise GPS UART1 (GPIO43 TX, GPIO44 RX; baud auto-probed —
