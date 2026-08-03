@@ -35,6 +35,13 @@ reading) and **D12** (bounded-latency-under-concurrent-NVS-write reading) —
 both from `docs/perf/radio-host-validation.md` §4.1/§6's ISR-safety static
 audit, neither a gate on M2 (see the new subsection at the end of Part F).
 
+**Completed for the review's landing (M4), 2026-08-03.** Added **Part H**
+(the hands-on functional sweep — the device-side half of functional parity),
+a stale-DIO1 log-line count to Part G, and the two register rows that had no
+procedure at all (P1 and D-H). `docs/perf/ui-perf-baseline.md` §9 is the
+register this table mirrors; the two are now the same set, indexed
+differently. No capture step below changed.
+
 ## 0. What this closes, and what it doesn't
 
 This is the one place in the `meshcadet-perf-rearchitecture` performance
@@ -42,20 +49,21 @@ review that needs real silicon. Everything host-testable already has an
 answer: `docs/perf/ui-perf-baseline.md` (real measurements + analytical
 derivations) and `docs/perf/perf-loop-model-baseline.md` (a host discrete-event
 simulation). What remains is the handful of numbers only a flashed device can
-produce — listed in `ui-perf-baseline.md` §8's deferred-predicate register —
+produce — listed in `ui-perf-baseline.md` §9's deferred-predicate register —
 plus the constants `perf_loop_model` currently carries as a cited sensitivity
 *range* rather than a measured point.
 
-This document **supersedes** `ui-perf-baseline.md` §8.1's interim procedure.
+This document **supersedes** the interim operator procedure `ui-perf-baseline.md`
+used to carry inline (removed from that document once this one existed).
 Where that procedure was already correct, this one reuses it verbatim; where
 it was vague ("time tap-to-first-frame", no format for what comes back), this
 one tightens it. Once a section here closes a predicate, strike that row from
-`ui-perf-baseline.md` §8 and move the number into the document body with a
+`ui-perf-baseline.md` §9 and move the number into the document body with a
 **[DEVICE]** tag, per that document's own instruction.
 
 **Quick reference — which part closes what:**
 
-| Predicate (from `ui-perf-baseline.md` §8) | Closed by |
+| Predicate (from `ui-perf-baseline.md` §9) | Closed by |
 |---|---|
 | D1 — on-target render cost, idle vs. 200-msg conversation | Part C, scripted scenario — `ui_step` phase timing restored by `meshcadet-perf-ui-starvation-instrumentation-restore`; it now lives on `ui_task`'s block, not the dispatcher's (moved at the M1 split, D9 row 10). |
 | D2 — real per-flush SPI command overhead | Part C, scripted scenario (same run as D1) — same restore as D1. |
@@ -70,6 +78,14 @@ one tightens it. Once a section here closes a predicate, strike that row from
 | **D11** (new, M2) — IRAM-safety confirmatory reading for the DIO1 GPIO ISR | Part F, new subsection — **not runnable without the same GPIO-toggle probe D9 needs, plus a link-section audit; see that subsection** |
 | **D12** (new, M2) — bounded latency of a real concurrent NVS write masking the DIO1 ISR | Part F, new subsection — needs a timed capture around an admin-CLI edit issued while radio traffic is in flight |
 | The loop model's swept constants (`perf_loop_model/src/params.rs`) | Part D — calibration table |
+| **P1** — hands-on functional sweep: every screen, navigation path, input and radio path exercised on hardware | **Part H** (new) — walk `docs/perf/task-split-host-validation.md` §5's 58-row parity matrix on the device. Its host-side half (a source-cited preservation argument per row) is already met; this is the device-side half |
+| **D-H** — free internal-heap headroom after the split's +32 768 B of task stack | **Not runnable, and not for want of hardware:** the firmware logs no `heap_caps_get_free_size(MALLOC_CAP_INTERNAL)` reading. One line in `main.rs`'s 30 s diagnostics block would close it; until then this predicate is blocked on code, not on silicon |
+
+**One more thing to record on any Part G run**, not a predicate of its own:
+`firmware/src/radio.rs:437` emits `radio: stale DIO1 notification observed with
+the line low` whenever the DIO1 wait's postcondition actually catches a stale
+notification. Grep the serial log for `stale DIO1` and record the count — see
+Part G's recording step.
 
 ## 1. Prerequisites and time budget
 
@@ -96,6 +112,7 @@ the session, not a device measurement):
 | F | SPI2 confirmatory reading | no | 0 min — not runnable yet, see below |
 | D10 | Felt-snappiness stopwatch/video steps | no | 10 min |
 | G | Delivery + radio timing under UI load | **yes** | 20–30 min |
+| H | Hands-on functional sweep (58 parity rows) | **for its radio rows** | 30–45 min |
 
 Parts A–D10 (everything except G) can be run solo, in one sitting, without
 waiting for a second node or another operator.
@@ -568,8 +585,9 @@ cd firmware
 cargo run --release --features hil,diagnostics 2>&1 | tee ../meshcadet-capture-<REF>-delivery.log
 ```
 
-This reuses `ui-perf-baseline.md` §8.1.B verbatim — that protocol was already
-correct; nothing here changes its steps, only tightens what to report:
+This reuses the radio-timing protocol `ui-perf-baseline.md` used to carry
+inline — that protocol was already correct; nothing here changes its steps,
+only tightens what to report:
 
 6. [ ] With the peer, send 20 DMs peer→T-Deck **while idly navigating** the
        T-Deck UI (tap between ContactList/MessageView every few seconds). Log
@@ -608,6 +626,49 @@ received-and-decoded / peer-claimed-sent, computed by whoever ingests this
 report, not something to compute by hand here (this avoids an operator
 arithmetic slip becoming the number the campaign gates M1/M2 delivery
 correctness against).
+
+11. [ ] **Stale-DIO1 count.** Grep every capture log from steps 6–10 for
+        `stale DIO1`:
+        ```sh
+        grep -c "stale DIO1" ../meshcadet-capture-<REF>-delivery.log
+        ```
+        This `debug!` line (`firmware/src/radio.rs:437`) fires only when the
+        DIO1 wait's postcondition catches a notification left over from an
+        earlier, already-serviced assertion — the exact condition that, before
+        that postcondition existed, could report `TxDone` on a frame still in
+        the air. A nonzero count is not a fault: it means the guard is doing
+        its job. Report the raw count (and `0` if none) in the report block's
+        `notes` field; it is the only field evidence that the defect class was
+        real on this hardware.
+
+## Part H — Hands-on functional sweep (closes P1)
+
+Single device for most rows; the radio rows need Part G's peer. No
+instrumentation involved — this is the device-side half of functional parity,
+whose host-side half (a source-level preservation argument with a citation per
+row) is already met by `docs/perf/task-split-host-validation.md` §5.
+
+Open that document's §5 matrix and walk it **row by row** on the hardware:
+
+- §5.1 Screens — every screen renders, with its themed backdrop and fade.
+- §5.2 Navigation — every path between screens, forward and back.
+- §5.3 Input — touch, keyboard, trackball on each screen that accepts them.
+- §5.4 Radio — every send and receive path the matrix names (DM, DM ACK,
+  GRP_TXT, room post, advert handling).
+- §5.5 Peripheral — backlight, buzzer, GPS status, battery status.
+- §5.6 Persistence — settings survive a reboot; history survives a reboot.
+- §5.7 Boot — cold boot to ContactList, and the unprovisioned path.
+
+For each row record `pass` / `fail` / `not exercised`. **A `fail` is the only
+result in this entire kit that is a stop-the-line finding rather than a
+number** — the split's whole premise is that no behaviour changed. Report
+failures with the row number, what you did, and what happened.
+
+Part H has **no `section:` value of its own** in §9's report block — that
+field is machine-parsed against a fixed set, and this part produces pass/fail
+rows rather than serial-log numbers. Record its outcome as `notes:` lines on
+the `baseline` block ("Part H: 58/58 pass", or the failing rows), or simply as
+prose alongside the blocks.
 
 ## 9. Report-back format
 

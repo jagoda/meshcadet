@@ -1,5 +1,12 @@
 # M2 radio-path timeliness — host validation (no hardware in the loop)
 
+**Status update, review landed (M4), 2026-08-03:** the single current source
+for every model number is now `docs/perf/ui-perf-baseline.md` §5 — the state
+of record — which prints a fresh sweep at the current commit and, in §5.5,
+explains exactly which re-parameterisations moved which figures. This document
+stays as the M2 snapshot: its §2 quantification and its §4 ISR-safety audit
+are still the primary sources for *how* the DIO1 wait was validated.
+
 **Mission:** `meshcadet-perf-radio-host-validation`, replacing the cancelled
 `meshcadet-perf-radio-hil-validation`, under the maintainer's 2026-08-02
 no-host-native/no-HIL ruling (campaign plan §0.5). Validates

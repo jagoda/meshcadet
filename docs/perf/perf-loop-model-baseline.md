@@ -1,11 +1,17 @@
 # Dispatcher superloop model — SIMULATED baseline (M0, no hardware in the loop)
 
+**Status update, review landed (M4), 2026-08-03:** the single current source
+for every model number is now `docs/perf/ui-perf-baseline.md` §5 — the state
+of record — which prints a fresh sweep at the current commit and, in §5.5,
+explains exactly which re-parameterisations moved which figures. This document
+stays as the historical snapshot described above.
+
 **Status update, M1 landed:** the `split` topology this document predicted
 (§2) has since been implemented (ADR-0012 /
 `meshcadet-perf-ui-task-split`, `firmware/src/ui_task.rs`). Every number
 below is preserved verbatim as the historical **M0 prediction** — nothing
 here is retracted or wrong, per this repo's correction convention
-(`ui-perf-baseline.md` §9: edit the body only for a retracted/wrong number,
+(`ui-perf-baseline.md` §11: edit the body only for a retracted/wrong number,
 not for a milestone landing). The **as-built** re-run, re-parameterised to
 the real `ui_task.rs` constants
 (`UI_TICK_MS`, the new `queue_handoff` cost for the `std::sync::mpsc`

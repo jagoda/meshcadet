@@ -808,7 +808,7 @@ addresses the radio's own blocking without a third task. Revisit only if
 post-split measurements demand it.
 
 **A6 — Do nothing structural; pursue the residual UI-side optimizations
-only.** Rejected by the numbers. `docs/perf/ui-perf-baseline.md` §5's
+only.** Rejected by the numbers. `docs/perf/ui-perf-baseline.md` §6's
 surviving UI-side items are 0.18–3.1 ms; the structural item is 83–800 ms.
 That earlier pass declared TX airtime out of scope, which was correct *for a
 pass scoped to UI changes* and is the wrong frame here — a task split is

@@ -183,7 +183,7 @@ fn entry_fade_render_cadence_throttle_reduces_renders_and_settles_identically() 
     // like `UiRuntime`'s own field would be. A fresh redraw observed under
     // that condition renders on the very next tick, completely uncapped —
     // this is the guarantee that keeps tap-to-first-frame latency
-    // (`docs/perf/ui-perf-baseline.md` §8.1.A) unaffected by this fix.
+    // (`docs/perf/ui-perf-baseline.md` §9, D10) unaffected by this fix.
     assert!(
         !h.has_active_animations(),
         "the fade must be fully settled (no active animations) by the end of the throttled run \
