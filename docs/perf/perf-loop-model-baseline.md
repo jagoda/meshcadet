@@ -12,6 +12,25 @@ the real `ui_task.rs` constants
 boundary) and diffed against the prediction below, lives in
 `docs/perf/task-split-host-validation.md`.
 
+**Status update, M2 landed:** `meshcadet-perf-radio-dio1-interrupt` replaced
+the three DIO1 spin-polls with an interrupt/notification-driven wait AND
+retuned `RX_POLL_YIELD_MS` 5 ms -> 20 ms (`firmware/src/main.rs:1748`) now
+that `try_receive`'s wait no longer burns a scheduler slot per poll tick.
+This crate's `RX_POLL_YIELD_MS` constant (`perf_loop_model/src/
+workload.rs`) is re-anchored to the new value by this milestone's host-
+validation sibling, `meshcadet-perf-radio-host-validation` — which means
+**every number in §4/§5/§6 below that depends on the RX-poll phase's
+contribution to per-iteration cost (i.e. essentially all of them) is now
+computed against a STALE 5 ms constant and no longer matches a fresh run of
+this same report.** Per this document's own convention above (preserve the
+historical prediction verbatim, do not silently edit it for a milestone
+landing), these numbers are NOT retracted or rewritten in place — they are
+the accurate M0/M1 prediction AS COMPUTED AT THE TIME. The current,
+re-anchored numbers, together with the DIO1-quantization-removed comparison
+this retune motivates, live in `docs/perf/radio-host-validation.md`
+(M2's host-validation document) — read that document for anything
+post-M2, and treat every absolute number below as historical.
+
 **Every number in this document is SIMULATED.** It comes from
 `perf_loop_model`, a host discrete-event model of the firmware dispatcher
 superloop, not from a flashed device, not from an emulator, and not from an

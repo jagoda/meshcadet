@@ -8,8 +8,12 @@
 //! `ui_perf_bench` establishes for `docs/perf/ui-perf-baseline.md` §3, reused
 //! milestone over milestone rather than re-derived per document.
 
+use firmware_core::radio_wait::Dio1WaitKind;
+
 use crate::params::{Corner, LoopModelParams};
-use crate::sim::{dominance_check, simulate, DominanceVerdict, SimResult, Topology};
+use crate::sim::{
+    dominance_check, simulate, simulate_with_dio1_wait, DominanceVerdict, SimResult, Topology,
+};
 use crate::workload::Workload;
 
 /// The headline payload-size sweep: "10 B ACK-shaped through 255 B".
@@ -56,6 +60,105 @@ pub fn full_sweep_with_params(params: &LoopModelParams) -> Vec<SweepRow> {
                     result: simulate(topology, &r, &workload, payload_bytes, SIM_DURATION_MS),
                 });
             }
+        }
+    }
+    out
+}
+
+/// One (corner, payload) row of the [`Dio1WaitKind::SpinPoll`] vs.
+/// [`Dio1WaitKind::Notify`] comparison — `meshcadet-perf-radio-host-
+/// validation`'s own headline table: quantifies "up to 1 ms of quantization
+/// per DIO1 wait" (campaign plan, M2) directly against the SPLIT topology's
+/// dispatcher/radio task, the metric plan §6 criterion 2 gates on ("the loop
+/// model shows RX-poll cadence and CAD-attempt latency improved under UI
+/// load").
+pub struct Dio1WaitComparisonRow {
+    pub corner: Corner,
+    pub payload_bytes: usize,
+    pub spin_poll: SimResult,
+    pub notify: SimResult,
+}
+
+impl Dio1WaitComparisonRow {
+    /// How much LONGER the spin-poll counterfactual's dispatcher-task
+    /// iteration duration is than the shipped notify wait's, at this row's
+    /// (corner, payload) point — always `>= 0`, per `apply_dio1_wait_
+    /// quantization`'s own invariant (quantization can only add cost).
+    pub fn dispatcher_longest_delta_ms(&self) -> f64 {
+        self.spin_poll.dispatcher.longest_gap_ms - self.notify.dispatcher.longest_gap_ms
+    }
+
+    /// How much FASTER the shipped notify wait's dispatcher-task cadence is
+    /// than the spin-poll counterfactual's, in Hz — the direct "CAD-attempt
+    /// latency / RX-poll cadence improved" reading.
+    pub fn dispatcher_service_hz_delta(&self) -> f64 {
+        self.notify.dispatcher.service_hz - self.spin_poll.dispatcher.service_hz
+    }
+}
+
+/// Run the [`Dio1WaitKind::SpinPoll`] (legacy, `tick_ms = 1`, the exact
+/// removed-code behaviour) vs. [`Dio1WaitKind::Notify`] (shipped) comparison
+/// across every (corner, payload) point in the headline sweep, against the
+/// SPLIT topology (ADR-0012's as-built radio/dispatcher task — the topology
+/// M2 actually runs on; `Topology::SingleLoop` is deliberately not swept
+/// here since M2 landed after the M1 split, so "under UI load" now means
+/// "concurrently with `ui_task` on the other core", not "in the same loop
+/// as `ui.step()`").
+///
+/// **Deliberately isolated from `Workload::payload_sweep`'s GRP_TXT/room-
+/// keepalive streams** (unlike every other table in this report) — those
+/// have their own, payload-size-INDEPENDENT airtime and compete with the
+/// swept inbound-DM/ACK frame for the same one-TX-per-iteration `TxQueue`
+/// drain. Mixed in, a run's `longest_gap_ms` can end up dominated by
+/// WHICHEVER stream happens to win a given (corner, payload) point's
+/// scheduling — a real, separate effect, but not the DIO1-quantization
+/// claim this table exists to isolate (same confound
+/// `sim::tests::single_loop_gap_scales_monotonically_with_payload_size`
+/// found and the same fix applied). Every other headline table in this
+/// report answers "what is the overall gap distribution under realistic
+/// mixed traffic" (already settled by earlier missions); this one answers
+/// "what does the DIO1 wait choice, alone, change" — a different question,
+/// deliberately isolated to answer it precisely.
+pub fn dio1_wait_comparison_table() -> Vec<Dio1WaitComparisonRow> {
+    dio1_wait_comparison_table_with_params(&LoopModelParams::documented_defaults())
+}
+
+/// Same table as [`dio1_wait_comparison_table`], against caller-supplied
+/// `params`.
+pub fn dio1_wait_comparison_table_with_params(
+    params: &LoopModelParams,
+) -> Vec<Dio1WaitComparisonRow> {
+    let mut out = Vec::new();
+    for corner in Corner::ALL {
+        let r = params.resolve(corner);
+        for payload_bytes in PAYLOAD_SWEEP_BYTES {
+            let workload = Workload {
+                inbound_dm: crate::workload::TrafficStream::every(5_000.0, payload_bytes),
+                grp_txt: crate::workload::TrafficStream::disabled(),
+                room_keepalive: crate::workload::TrafficStream::disabled(),
+            };
+            let spin_poll = simulate_with_dio1_wait(
+                Topology::Split,
+                &r,
+                &workload,
+                payload_bytes,
+                SIM_DURATION_MS,
+                Dio1WaitKind::SpinPoll { tick_ms: 1 },
+            );
+            let notify = simulate_with_dio1_wait(
+                Topology::Split,
+                &r,
+                &workload,
+                payload_bytes,
+                SIM_DURATION_MS,
+                Dio1WaitKind::Notify,
+            );
+            out.push(Dio1WaitComparisonRow {
+                corner,
+                payload_bytes,
+                spin_poll,
+                notify,
+            });
         }
     }
     out
@@ -229,6 +332,46 @@ pub fn render_text_report_with_params(params: &LoopModelParams) -> String {
         )
         .unwrap();
     }
+    writeln!(out).unwrap();
+
+    writeln!(
+        out,
+        "-- DIO1 wait comparison (meshcadet-perf-radio-host-validation): legacy"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "   1 ms-tick spin-poll (removed) vs. shipped notify wait, SPLIT dispatcher task --"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "{:<8} {:>10} {:>16} {:>16} {:>16} {:>16} {:>16} {:>16}",
+        "corner",
+        "payload_B",
+        "spinpoll_long_ms",
+        "notify_long_ms",
+        "delta_ms",
+        "spinpoll_hz",
+        "notify_hz",
+        "hz_delta"
+    )
+    .unwrap();
+    for row in dio1_wait_comparison_table_with_params(params) {
+        writeln!(
+            out,
+            "{:<8} {:>10} {:>16.3} {:>16.3} {:>16.3} {:>16.2} {:>16.2} {:>16.2}",
+            corner_label(row.corner),
+            row.payload_bytes,
+            row.spin_poll.dispatcher.longest_gap_ms,
+            row.notify.dispatcher.longest_gap_ms,
+            row.dispatcher_longest_delta_ms(),
+            row.spin_poll.dispatcher.service_hz,
+            row.notify.dispatcher.service_hz,
+            row.dispatcher_service_hz_delta(),
+        )
+        .unwrap();
+    }
 
     out
 }
@@ -247,6 +390,36 @@ mod tests {
     fn dominance_table_has_every_combination() {
         let rows = dominance_table();
         assert_eq!(rows.len(), 3 * PAYLOAD_SWEEP_BYTES.len());
+    }
+
+    #[test]
+    fn dio1_wait_comparison_table_has_every_combination() {
+        let rows = dio1_wait_comparison_table();
+        assert_eq!(rows.len(), 3 * PAYLOAD_SWEEP_BYTES.len());
+    }
+
+    #[test]
+    fn dio1_wait_comparison_never_shows_spin_poll_faster_than_notify() {
+        // The report's own headline claim for M2: removing the
+        // quantization can only ever help (or be a wash), never hurt — see
+        // `sim::apply_dio1_wait_quantization`'s own invariant.
+        for row in dio1_wait_comparison_table() {
+            assert!(
+                row.dispatcher_longest_delta_ms() >= -1e-9,
+                "corner {:?} payload {}: spin-poll's longest dispatcher gap ({}) should \
+                 never be smaller than notify's ({})",
+                row.corner,
+                row.payload_bytes,
+                row.spin_poll.dispatcher.longest_gap_ms,
+                row.notify.dispatcher.longest_gap_ms,
+            );
+        }
+    }
+
+    #[test]
+    fn render_text_report_mentions_the_dio1_wait_comparison() {
+        let text = render_text_report();
+        assert!(text.contains("DIO1 wait comparison"));
     }
 
     #[test]

@@ -6,9 +6,61 @@
 //! M0 checkpoint needs. See `crate` (`lib.rs`) for the full module doc.
 
 use firmware_core::dispatcher::{lora_airtime_ms, AirtimeBudget, TxQueue};
+use firmware_core::radio_wait::{quantize_spin_poll_ms, Dio1WaitKind};
 
 use crate::params::ResolvedParams;
 use crate::workload::{Workload, RX_POLL_YIELD_MS};
+
+/// Apply a [`Dio1WaitKind`]'s quantization to an analytically-computed DIO1
+/// edge time (`edge_at_ms`, already-exact — `CAD_ACTIVE_MS` or
+/// `lora_airtime_ms`'s result) — the loop-model side of the SAME formula
+/// `firmware_core::radio_wait::quantize_spin_poll_ms` also drives
+/// `firmware/src/radio.rs`'s (removed) production spin-poll reference
+/// against, per that function's own doc: "so both the production spin-poll
+/// reference ... and a host reference model compute the identical number
+/// from the identical formula, instead of two hand-copied constants silently
+/// drifting apart." [`Dio1WaitKind::Notify`] returns `edge_at_ms` unchanged
+/// (rounded to the nearest whole ms only because `quantize_spin_poll_ms`
+/// itself is integer-typed — the real notification-driven wait has no
+/// quantization at all, see `GpioDio1Wait`'s doc in `firmware/src/radio.rs`),
+/// which is why every existing call site in this module (all of which
+/// predate this mission and were written against the AS-SHIPPED
+/// notification-driven wait) is unaffected when this function is threaded in
+/// at [`Dio1WaitKind::Notify`].
+///
+/// **Non-obvious consequence, worth stating up front:** at the removed
+/// code's actual `tick_ms = 1`, this is a genuine no-op for the TX site
+/// specifically, NOT just a small one — `firmware_core::dispatcher::
+/// lora_airtime_ms` already returns `(t_pre_ms + t_pay_ms).ceil() as u32`
+/// (`dispatcher.rs:335`), i.e. the smallest whole millisecond at or above
+/// the continuous-time airtime. Quantizing an already-whole-millisecond
+/// value to the next multiple of a 1 ms tick is the identity function
+/// (`div_ceil(n, 1) * 1 == n` for every integer `n`) — "round up to the
+/// nearest ms" applied twice is idempotent. The CAD site does NOT share
+/// this: `CAD_ACTIVE_MS = 8.192` (`sim.rs` above) is an exact analytical
+/// value with real sub-ms structure that the removed spin-poll's 1 ms tick
+/// genuinely rounds up (8.192 -> 9.0, +0.808 ms) — see `crate::sim::tests`'
+/// `apply_dio1_wait_quantization_*` for both halves of this pinned.
+fn apply_dio1_wait_quantization(edge_at_ms: f64, kind: Dio1WaitKind) -> f64 {
+    match kind {
+        Dio1WaitKind::Notify => edge_at_ms,
+        Dio1WaitKind::SpinPoll { tick_ms } => {
+            // `quantize_spin_poll_ms` is `u32`-typed (it mirrors the removed
+            // production code's own `u32`-millisecond `uptime_ms()` polling
+            // clock exactly). `ceil`, not `round` or `trunc`: a real
+            // 1 ms-tick spin-poll can only ever observe an edge at the FIRST
+            // integer-ms checkpoint AT OR AFTER the true (possibly
+            // fractional) edge time — rounding-to-nearest could report a
+            // checkpoint BEFORE the edge for a `.4`-ish fraction, which
+            // `quantize_spin_poll_ms`'s own doc rules out ("the observed
+            // time is the smallest such multiple that is >= edge_at_ms");
+            // `ceil` is what preserves that invariant end-to-end through
+            // this f64 wrapper — see `spin_poll_never_produces_a_smaller_
+            // cad_or_tx_wait_than_notify`.
+            quantize_spin_poll_ms(edge_at_ms.ceil() as u32, tick_ms) as f64
+        }
+    }
+}
 
 /// LoRa symbol time at the locked SF7/BW62.5kHz preset: `2^SF / BW` (Semtech
 /// AN1200.13 §4 — the SAME base relation `firmware_core::dispatcher::
@@ -178,23 +230,35 @@ fn attempt_cad_tx(
     cad_backoff_until_ms: &mut f64,
     r: &ResolvedParams,
     traffic: &mut TrafficCounters,
+    dio1_wait: Dio1WaitKind,
 ) -> f64 {
     if !txq.has_pending() || t_ms < *cad_backoff_until_ms {
         return 0.0;
     }
-    let cad_cost = CAD_ACTIVE_MS + r.cad_spi_overhead;
+    // CAD's own DIO1 wait (`radio.rs`'s `channel_activity_detection`,
+    // waiting on CadDone) is one of the three sites this mission's quantized
+    // comparison covers — `CAD_ACTIVE_MS` is the exact analytical edge time,
+    // `r.cad_spi_overhead` is the separate, already-swept unknown SPI
+    // command cost ahead of it (never itself quantized — it isn't a DIO1
+    // wait), so only the CAD_ACTIVE_MS component is passed through the
+    // wait-kind quantization.
+    let cad_cost = apply_dio1_wait_quantization(CAD_ACTIVE_MS, dio1_wait) + r.cad_spi_overhead;
     let mut buf = [0u8; 255];
     let n = txq.peek(&mut buf);
     if n == 0 {
         return cad_cost;
     }
     let required = lora_airtime_ms(n); // REAL function — see crate doc.
+                                       // TX's own DIO1 wait (`radio.rs`'s `transmit`, waiting on TxDone) is the
+                                       // second of the three sites — `required` (the real airtime) is the exact
+                                       // analytical edge time.
+    let tx_wait_ms = apply_dio1_wait_quantization(required as f64, dio1_wait);
     let now_ms = (t_ms + cad_cost).round() as u64;
     if budget.can_transmit(now_ms, required) {
         budget.record_tx(now_ms, required);
         txq.pop_front();
         traffic.frames_transmitted += 1;
-        cad_cost + required as f64
+        cad_cost + tx_wait_ms
     } else {
         // Airtime-budget denial — same non-blocking backoff shape as a
         // CAD-busy result (`firmware/src/main.rs:2371-2384`): the frame
@@ -242,6 +306,48 @@ pub(crate) fn simulate_core(
     workload: &Workload,
     duration_ms: f64,
     include_ui: bool,
+) -> GapStats {
+    // `Dio1WaitKind::Notify` — the AS-SHIPPED wait (`meshcadet-perf-radio-
+    // dio1-interrupt`, landed) — is the default for every pre-existing call
+    // site in this module, all of which predate this mission's wait-kind
+    // parameterization and were written/pinned against exact (unquantized)
+    // analytical edge times. See [`simulate_core_with_dio1_wait`] for the
+    // parameterised form this mission adds.
+    simulate_core_with_dio1_wait(r, workload, duration_ms, include_ui, Dio1WaitKind::Notify)
+}
+
+/// Same replay as [`simulate_core`], parameterised over which [`Dio1Wait`]
+/// strategy's cost model to charge at the CAD and TX DIO1-wait sites
+/// (`radio.rs:481`/`radio.rs:631` — TxDone/CadDone respectively; NOT the RX
+/// poll site, `radio.rs:554` — see below for why that one is unaffected).
+/// This is what lets `meshcadet-perf-radio-host-validation` drive the exact
+/// same replay against BOTH the legacy [`Dio1WaitKind::SpinPoll`] this
+/// mission's sibling (`meshcadet-perf-radio-dio1-interrupt`) removed from
+/// production, and the shipped [`Dio1WaitKind::Notify`] — see `crate::sim`'s
+/// `dio1_wait_kind_*` tests for the quantified before/after.
+///
+/// **Why the RX-poll phase (`RX_POLL_YIELD_MS` below) is NEVER passed
+/// through [`apply_dio1_wait_quantization`].** This model already charges
+/// RX poll's FULL window every iteration regardless of whether a packet
+/// arrives (see `RX_POLL_YIELD_MS`'s own doc: "conservatively charges the
+/// FULL window... since the real function returns early only on a DIO1 edge
+/// and this model does not simulate sub-window packet-arrival timing").
+/// Quantization only has something to bite on when the model tracks a
+/// specific, exactly-known edge time within the wait — which it does for
+/// CAD (`CAD_ACTIVE_MS`) and TX (`lora_airtime_ms`'s result), but
+/// deliberately does not for RX poll's "did a packet arrive this window"
+/// question. Whichever [`Dio1WaitKind`] is passed in, the RX-poll phase's
+/// contribution to `t` is therefore identical — this is a real, documented
+/// simplification (unaffected by this mission), not a gap this function
+/// silently introduces.
+///
+/// [`Dio1Wait`]: firmware_core::radio_wait::Dio1Wait
+pub(crate) fn simulate_core_with_dio1_wait(
+    r: &ResolvedParams,
+    workload: &Workload,
+    duration_ms: f64,
+    include_ui: bool,
+    dio1_wait: Dio1WaitKind,
 ) -> GapStats {
     let mut txq = TxQueue::new();
     let mut budget = AirtimeBudget::new();
@@ -302,6 +408,7 @@ pub(crate) fn simulate_core(
             &mut cad_backoff_until_ms,
             r,
             &mut traffic,
+            dio1_wait,
         );
 
         // RX poll — full `RX_POLL_YIELD_MS` window every iteration (see
@@ -409,6 +516,12 @@ pub struct SimResult {
 /// Run one simulation: `params` already resolved at a [`crate::params::
 /// Corner`], `workload` already sized for `payload_bytes` (callers building
 /// a payload sweep should use [`crate::workload::Workload::payload_sweep`]).
+///
+/// Charges [`Dio1WaitKind::Notify`] at the CAD/TX DIO1-wait sites — the
+/// AS-SHIPPED wait strategy — see [`simulate_with_dio1_wait`] for the
+/// parameterised form `meshcadet-perf-radio-host-validation` uses to compare
+/// it against the legacy [`Dio1WaitKind::SpinPoll`] this mission's sibling
+/// removed from production.
 pub fn simulate(
     topology: Topology,
     r: &ResolvedParams,
@@ -416,9 +529,32 @@ pub fn simulate(
     payload_bytes: usize,
     duration_ms: f64,
 ) -> SimResult {
+    simulate_with_dio1_wait(
+        topology,
+        r,
+        workload,
+        payload_bytes,
+        duration_ms,
+        Dio1WaitKind::Notify,
+    )
+}
+
+/// Same run as [`simulate`], against caller-supplied `dio1_wait` — the hook
+/// `meshcadet-perf-radio-host-validation`'s before/after comparison uses.
+/// [`Topology::Split`]'s `ui` leg (`simulate_split_ui_task`) never touches a
+/// DIO1 wait at all (no radio in that task, ADR-0012), so `dio1_wait` only
+/// ever affects the `dispatcher` leg's CAD/TX phases, for either topology.
+pub fn simulate_with_dio1_wait(
+    topology: Topology,
+    r: &ResolvedParams,
+    workload: &Workload,
+    payload_bytes: usize,
+    duration_ms: f64,
+    dio1_wait: Dio1WaitKind,
+) -> SimResult {
     match topology {
         Topology::SingleLoop => {
-            let stats = simulate_core(r, workload, duration_ms, true);
+            let stats = simulate_core_with_dio1_wait(r, workload, duration_ms, true, dio1_wait);
             SimResult {
                 topology,
                 payload_bytes,
@@ -428,7 +564,8 @@ pub fn simulate(
         }
         Topology::Split => {
             let ui = simulate_split_ui_task(r, duration_ms);
-            let dispatcher = simulate_core(r, workload, duration_ms, false);
+            let dispatcher =
+                simulate_core_with_dio1_wait(r, workload, duration_ms, false, dio1_wait);
             SimResult {
                 topology,
                 payload_bytes,
@@ -625,12 +762,36 @@ mod tests {
 
     #[test]
     fn single_loop_gap_scales_monotonically_with_payload_size() {
+        // Isolated to the inbound-DM stream alone (GRP_TXT/room-keepalive
+        // disabled), unlike `Workload::payload_sweep` (used by the report
+        // and by every OTHER test in this module): `payload_sweep`'s fixed
+        // 60 B GRP_TXT stream has its own, payload-size-INDEPENDENT airtime,
+        // which competes with the swept inbound-DM/ACK frame for the same
+        // one-TX-per-iteration `TxQueue` drain. At the small end of the
+        // sweep (10 B / 40 B, airtime 83/165 ms) GRP_TXT's fixed airtime can
+        // itself be the run's longest single TX block, and exactly WHICH
+        // iteration lands the longest overall gap is then a coin flip
+        // between the two competing streams' interleaving — sensitive to
+        // sub-ms timing noise unrelated to the payload axis this test
+        // exists to check (confirmed: `meshcadet-perf-radio-host-
+        // validation`'s `RX_POLL_YIELD_MS` retune, 5 -> 20 ms, shifted that
+        // interleaving by a fraction of a ms and flipped 10 B/40 B's
+        // ordering under `Workload::payload_sweep`, with NO firmware-facing
+        // implication at all — see this crate's `docs/perf/radio-host-
+        // validation.md` for the full account). Disabling the confounding
+        // streams here makes the assertion test what its name says: this
+        // ONE stream's own airtime scaling with its OWN payload size, not
+        // "whichever of two competing streams happens to win a given run."
         let params = LoopModelParams::documented_defaults();
         let r = params.resolve(Corner::Mid);
         let sizes = [10usize, 40, 100, 255];
         let mut prev = 0.0;
         for size in sizes {
-            let workload = Workload::payload_sweep(size);
+            let workload = Workload {
+                inbound_dm: crate::workload::TrafficStream::every(5_000.0, size),
+                grp_txt: crate::workload::TrafficStream::disabled(),
+                room_keepalive: crate::workload::TrafficStream::disabled(),
+            };
             let stats = simulate_core(&r, &workload, 120_000.0, true);
             assert!(
                 stats.longest_gap_ms >= prev,
@@ -697,5 +858,155 @@ mod tests {
             "expected the 10% duty-cycle cap to genuinely deny at least one \
              255 B attempt over the headline sweep's duration"
         );
+    }
+
+    // ── DIO1 wait-kind quantization (meshcadet-perf-radio-host-validation) ──
+
+    #[test]
+    fn apply_dio1_wait_quantization_is_a_no_op_under_notify() {
+        // Notify == the AS-SHIPPED wait: no quantization at all, ever,
+        // exact edge time back out unchanged — see
+        // `apply_dio1_wait_quantization`'s doc.
+        for edge in [0.0, 1.0, 8.192, 82.0, 799.6] {
+            assert_eq!(
+                apply_dio1_wait_quantization(edge, Dio1WaitKind::Notify),
+                edge
+            );
+        }
+    }
+
+    #[test]
+    fn apply_dio1_wait_quantization_rounds_up_under_spin_poll() {
+        // Same rounding-up-to-the-next-tick behaviour
+        // `firmware_core::radio_wait::quantize_spin_poll_ms`'s own tests
+        // pin, reached through this crate's f64 wrapper. CAD_ACTIVE_MS
+        // (8.192, real sub-ms structure) genuinely widens; an
+        // already-whole-ms edge (83.0, the shape every `lora_airtime_ms`
+        // result takes) does not — see `apply_dio1_wait_quantization`'s doc
+        // for why that is the correct, non-obvious result, not a bug.
+        let kind = Dio1WaitKind::SpinPoll { tick_ms: 1 };
+        assert_eq!(apply_dio1_wait_quantization(8.192, kind), 9.0); // CAD_ACTIVE_MS
+        assert_eq!(apply_dio1_wait_quantization(83.0, kind), 83.0); // already whole-ms: no-op
+        assert_eq!(apply_dio1_wait_quantization(0.0, kind), 0.0);
+    }
+
+    #[test]
+    fn spin_poll_never_produces_a_smaller_cad_or_tx_wait_than_notify() {
+        // The quantization this mission's sibling REMOVED can only ever add
+        // delay, never subtract it — `quantize_spin_poll_ms`'s own doc:
+        // "the smallest such multiple that is >= edge_at_ms".
+        let kind = Dio1WaitKind::SpinPoll { tick_ms: 1 };
+        for edge in [0.0, 0.4, 1.0, 8.192, 82.6, 799.9] {
+            assert!(apply_dio1_wait_quantization(edge, kind) >= edge);
+        }
+    }
+
+    /// The legacy 1 ms-tick spin-poll this mission's sibling
+    /// (`meshcadet-perf-radio-dio1-interrupt`) removed from production —
+    /// `FreeRtos::delay_ms(1)`, `radio.rs`'s (removed) spin-poll fallback —
+    /// reconstructed here purely as the loop model's COUNTERFACTUAL
+    /// comparison point, never as a claim about what ships today.
+    const LEGACY_SPIN_POLL: Dio1WaitKind = Dio1WaitKind::SpinPoll { tick_ms: 1 };
+
+    #[test]
+    fn spin_poll_widens_the_first_cad_tx_cycles_own_iteration_duration_vs_notify() {
+        // This mission's own quantified "what comes off" claim, isolated
+        // down to ONE CAD+TX cycle rather than summed over a long run
+        // (summing over `crate::report::SIM_DURATION_MS` mixes in the
+        // discrete-event loop's own `while t < duration_ms` boundary
+        // rounding — how many whole iterations fit before the fixed
+        // duration runs out — which is itself sensitive to the exact
+        // per-iteration cost and can make an AGGREGATE comparison noisy in
+        // a way unrelated to the quantization claim itself). A 6 s window
+        // against the headline sweep's 5 s inbound-DM cadence contains
+        // EXACTLY one CAD+TX cycle, deterministically timed the same in
+        // both runs (nothing before the first DM's arrival ever touches
+        // CAD/TX, so the two runs are identical up to that point) — the
+        // run's own `longest_gap_ms` (the split dispatcher task's own
+        // iteration-duration distribution) is therefore exactly that one
+        // cycle's cost, letting this test assert the precise mechanism
+        // directly: CAD's `+0.808 ms` (8.192 -> 9.0, `CAD_ACTIVE_MS`
+        // quantized at `tick_ms = 1`) with TX's own wait UNCHANGED (the 10 B
+        // ACK's 83 ms airtime is already whole-ms, see
+        // `apply_dio1_wait_quantization`'s doc for why that is a genuine
+        // no-op, not an approximation).
+        let params = LoopModelParams::documented_defaults();
+        for corner in Corner::ALL {
+            let r = params.resolve(corner);
+            let workload = Workload::payload_sweep(10);
+            let one_cycle_ms = 6_000.0;
+            let notify = simulate_with_dio1_wait(
+                Topology::Split,
+                &r,
+                &workload,
+                10,
+                one_cycle_ms,
+                Dio1WaitKind::Notify,
+            );
+            let spin_poll = simulate_with_dio1_wait(
+                Topology::Split,
+                &r,
+                &workload,
+                10,
+                one_cycle_ms,
+                LEGACY_SPIN_POLL,
+            );
+            assert_eq!(notify.dispatcher.traffic.frames_transmitted, 1);
+            assert_eq!(spin_poll.dispatcher.traffic.frames_transmitted, 1);
+            let delta = spin_poll.dispatcher.longest_gap_ms - notify.dispatcher.longest_gap_ms;
+            assert!(
+                (delta - 0.808).abs() < 1e-9,
+                "corner {:?}: expected exactly the CAD-site quantization delta \
+                 (9.0 - 8.192 = 0.808 ms), got {delta} \
+                 (spin_poll={}, notify={})",
+                corner,
+                spin_poll.dispatcher.longest_gap_ms,
+                notify.dispatcher.longest_gap_ms,
+            );
+        }
+    }
+
+    #[test]
+    fn rx_poll_phase_cost_is_identical_regardless_of_dio1_wait_kind() {
+        // Documented simplification, pinned: this model charges RX poll's
+        // FULL window unconditionally (see `simulate_core_with_dio1_wait`'s
+        // doc for why), so an IDLE workload (no CAD/TX at all — the only
+        // phase left that could differ) produces byte-identical dispatcher
+        // cadence under both wait kinds.
+        let params = LoopModelParams::documented_defaults();
+        let r = params.resolve(Corner::Mid);
+        let notify = simulate_core_with_dio1_wait(
+            &r,
+            &Workload::idle(),
+            60_000.0,
+            false,
+            Dio1WaitKind::Notify,
+        );
+        let spin_poll =
+            simulate_core_with_dio1_wait(&r, &Workload::idle(), 60_000.0, false, LEGACY_SPIN_POLL);
+        assert_eq!(notify.longest_gap_ms, spin_poll.longest_gap_ms);
+        assert_eq!(notify.service_iterations, spin_poll.service_iterations);
+    }
+
+    #[test]
+    fn simulate_defaults_to_notify_matching_simulate_with_dio1_wait_explicit() {
+        // `simulate`'s no-arg-wait-kind convenience wrapper must be strictly
+        // equivalent to the explicit form at `Dio1WaitKind::Notify`, not a
+        // parallel implementation that can silently drift from it — same
+        // discipline `report.rs`'s `_with_params` pair enforces.
+        let params = LoopModelParams::documented_defaults();
+        let r = params.resolve(Corner::Mid);
+        let workload = Workload::payload_sweep(255);
+        let a = simulate(Topology::SingleLoop, &r, &workload, 255, 120_000.0);
+        let b = simulate_with_dio1_wait(
+            Topology::SingleLoop,
+            &r,
+            &workload,
+            255,
+            120_000.0,
+            Dio1WaitKind::Notify,
+        );
+        assert_eq!(a.ui.longest_gap_ms, b.ui.longest_gap_ms);
+        assert_eq!(a.dispatcher.longest_gap_ms, b.dispatcher.longest_gap_ms);
     }
 }
