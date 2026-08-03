@@ -50,6 +50,13 @@ low-water mark since boot, no extra capture step needed. D-H moves from
 `ui-perf-baseline.md` §9.2 (code-blocked) to §9.1 (hardware-only, runnable
 today); this table's own D-H row above reflects the same move.
 
+**D9/D11 unblocked, same day, by `meshcadet-perf-spi2-gpio-toggle-probe`.**
+The GPIO-toggle probe Part F needed now exists in `radio.rs`
+(`--features diagnostics`, GPIO39). Both D9 and D11 move from "blocked on
+missing code" to hardware-runnable — Part F below is the rewritten,
+concrete procedure; D12 is unchanged. With D-H's move above, §9.2 (code-
+blocked) is now empty — every deferred predicate is hardware-runnable.
+
 ## 0. What this closes, and what it doesn't
 
 This is the one place in the `meshcadet-perf-rearchitecture` performance
@@ -81,10 +88,10 @@ one tightens it. Once a section here closes a predicate, strike that row from
 | D6 — RX-notice latency, idle vs. UI-active | Part G (two-device) — unaffected; `rx-notice-latency` is still one of the dispatcher's 5 post-split `PERF phase=`/`PERF rx-notice-latency` lines (Part C) |
 | D7 — per-core utilization | Part C (every capture window reports it for free) — unaffected |
 | D8 — post-change stack high-water mark, per task | Part E — **expanded** for the M1 ref: `ui_task` now has its own periodic HWM log alongside `main`/`admin_server`/`prov_server`'s pre-existing ones (see Part E) |
-| D9 — SPI2 concurrent-access confirmatory reading | Part F — **still not runnable**, reason changed: the M1 split now provides the concurrency Part F's reading needs, but the GPIO-toggle probe it also needs does not exist yet in `radio.rs`; see that section |
+| D9 — SPI2 concurrent-access confirmatory reading | **Part F** — runnable now that the GPIO-toggle probe (GPIO39, `--features diagnostics`) has landed in `radio.rs` |
 | D10 — felt frame rate / tap-to-first-frame | Part D |
-| **D11** (new, M2) — IRAM-safety confirmatory reading for the DIO1 GPIO ISR | Part F, new subsection — **not runnable without the same GPIO-toggle probe D9 needs, plus a link-section audit; see that subsection** |
-| **D12** (new, M2) — bounded latency of a real concurrent NVS write masking the DIO1 ISR | Part F, new subsection — needs a timed capture around an admin-CLI edit issued while radio traffic is in flight |
+| **D11** — DIO1 ISR-masking empirical margin | **Part F** — runnable, reuses the D9 probe plus GPIO45 (DIO1, no firmware change needed) |
+| **D12** (new, M2) — bounded latency of a real concurrent NVS write masking the DIO1 ISR | Part F, own subsection — needs a timed capture around an admin-CLI edit issued while radio traffic is in flight |
 | The loop model's swept constants (`perf_loop_model/src/params.rs`) | Part D — calibration table |
 | **P1** — hands-on functional sweep: every screen, navigation path, input and radio path exercised on hardware | **Part H** (new) — walk `docs/perf/task-split-host-validation.md` §5's 58-row parity matrix on the device. Its host-side half (a source-cited preservation argument per row) is already met; this is the device-side half |
 | **D-H** — free internal-heap headroom after the split's +32 768 B of task stack | **Part C** — the dispatcher's rollup block now logs `PERF heap-internal: free=<bytes> min_ever=<bytes>` (`MALLOC_CAP_INTERNAL` only, not total free heap) every 30 s, same run as D1/D2/D7 |
@@ -117,7 +124,7 @@ the session, not a device measurement):
 | C | M0 per-phase baseline capture | no | 10–15 min |
 | D | Loop-model calibration | no | 10 min (reuses Part C's log) |
 | E | Stack high-water-mark reading | no | 5 min |
-| F | SPI2 confirmatory reading | no | 0 min — not runnable yet, see below |
+| F | SPI2 bus-hold probe (D9 + D11) | no | 15–20 min (scope hookup + a few navigation/traffic cycles) |
 | D10 | Felt-snappiness stopwatch/video steps | no | 10 min |
 | G | Delivery + radio timing under UI load | **yes** | 20–30 min |
 | H | Hands-on functional sweep (58 parity rows) | **for its radio rows** | 30–45 min |
@@ -479,88 +486,149 @@ Paste all of the above (main-task, `ui_task`, both UI one-shots, both server
 threads) in the report block — that's D8/R3 closed, per task (now five
 readings instead of four), in one pass.
 
-## Part F — SPI2 concurrent-access confirmatory reading (D9 / ADR-0012 D-B)
+## Part F — SPI2 bus-hold probe: D9 confirmatory reading + D11 ISR-margin reading (ADR-0012 D-B)
 
-**Still not runnable on the M1 ref — but the REASON changed. Read this
-section again even if you read the pre-split version.**
-`docs/perf/spi2-arbitration-r1.md`'s "What still needs silicon" section is
-explicit: the correctness question (does `spi_master` serialise the LCD and
-radio transactions correctly) is settled by source-and-datasheet reading
-alone and needs no device reading at all. The one item named there is a
-**confidence check, not a gate**: toggling a spare GPIO around the radio's
-SPI wait point while a full-window repaint runs *concurrently, on a different
-task/core*.
+**The probe now exists — this section replaces the "not yet built"
+procedure every earlier version of this document carried.** Landed by
+`meshcadet-perf-spi2-gpio-toggle-probe`: `firmware/src/radio.rs`'s two SPI
+touch points (`write_cmd`, `spi_transfer` — every `self.spi.*` call in the
+file goes through one of these two) now bracket the transaction with a
+GPIO toggle, compiled in only under `--features diagnostics`.
 
-- **Pre-split (M0):** no such concurrency existed in the shipped firmware at
-  all (everything was one task, one core) — a reading taken then would just
-  show the existing sequential (never concurrent) execution, answering a
-  different, already-settled question. That was the blocker.
-- **Post-split (M1, this ref):** the concurrency this reading needs **now
-  genuinely exists** — `ui_task` (core 1) and the dispatcher (core 0) run
-  independently, per `meshcadet-perf-ui-task-split`/ADR-0012, confirmed by
-  `meshcadet-perf-task-split-host-validation`'s parity matrix (`docs/perf/
-  task-split-host-validation.md` §5.3/§5.4). **The blocker now is only the
-  probe itself:** `radio.rs` still has no GPIO-toggle instrumentation around
-  the SPI acquire/release points (PR #120's instrumentation is timer-based,
-  not GPIO-based) — unchanged by either the split or this document's own
-  regeneration, since neither mission touched `radio.rs`.
+**The probe pin: GPIO 39 (`BOARD_SDCARD_CS` per LilyGo `utilities.h`,
+`radio::PIN_SPI_PROBE`).** MeshCadet has no SD-card driver anywhere in this
+workspace, so this is the one board pin whose sole documented function goes
+completely unused — no other peripheral is perturbed by driving it. It is
+not a strapping pin and not one of the fixed USB-D+/D- pins. **One caveat:**
+GPIO39 physically shares SPI2's SCK/MOSI/MISO with the LCD and radio (only
+CS is dedicated per device) via the microSD slot wiring — **remove any
+microSD card from the slot before running this section** (this firmware
+never talks to one, so the slot should already be empty in normal use; a
+card left in could be woken by the shared clock and drive MISO while the
+radio is also on the bus).
 
-**Run this once the probe exists.** Steps, unchanged from the pre-split
-version of this document:
-1. Add a GPIO-toggle probe around the radio's SPI acquire/release points in
-   `radio.rs` — a small follow-up addition, not yet built.
-2. With that probe in place: toggle the GPIO immediately before the radio's
-   SPI wait point and again immediately after the transaction returns, while
-   triggering a full-window repaint (a contact-list navigation) on `ui_task`
-   — the concurrency now exists to do this for real, unlike on M0. Expected
-   reading: every interval ≤ ~15–20 µs (the analytically derived 12.8 µs
-   bound plus scheduler/ISR jitter headroom, per `spi2-arbitration-r1.md`
-   §Q5). A reading an order of magnitude past that is the signal that an
-   assumption in that analysis (chunk size, DMA state, device count) doesn't
-   hold on real hardware and needs re-derivation — not a correctness failure
-   on its own, since §Q1-Q4's argument doesn't depend on this number.
+**Build:** `--features diagnostics` (Part A's flash command, plus this
+flag) — the same build every other diagnostics-gated reading in this kit
+already requires.
 
-Until the probe exists, record this section in the report block as `n/a —
-post-split, concurrency exists, no probe yet` (not the pre-split `n/a —
-pre-split, no probe exists` — the reason has changed) and move on.
+### D9 — SPI2 bus-hold confirmatory reading
 
-### Part F, addendum — DIO1 ISR IRAM-safety and concurrent-NVS-write latency (D11, D12; new for M2)
+`docs/perf/spi2-arbitration-r1.md`'s "What still needs silicon" section
+already settled correctness by source/datasheet reading alone; this is the
+**confidence check, not a gate**, that section named — an on-target reading
+of the ≤ 12.8 µs analytically-derived bus-hold bound (`ui-perf-baseline.md`
+§4.3) under real concurrent load.
+
+1. [ ] Flash `--features diagnostics`, confirm no microSD card is present.
+2. [ ] Clip a scope probe to GPIO39 and GND. Each high pulse is one bracketed
+       radio SPI transaction, **including** any time it spent waiting for
+       the bus behind an in-flight LCD chunk (the wait happens transparently
+       inside `SpiDeviceDriver::write`/`transfer_in_place`, before the probe
+       goes low) — that pulse width is directly the number this reading
+       exists to confirm.
+3. [ ] Trigger a full-window repaint (navigate ContactList ↔ a conversation,
+       or any path that forces the 240-line full paint — `ui-perf-baseline.md`
+       §4.1) **while radio traffic is concurrently in flight** — hold Part
+       D's calibration send loop running, or repeat a Compose→Send cycle, so
+       CAD/TX keeps issuing SPI commands on the dispatcher (core 0) while
+       the repaint runs on `ui_task` (core 1). This is the exact concurrency
+       `spi2-arbitration-r1.md` needed and the pre-split kit never had.
+4. [ ] Read pulse widths off the scope (infinite/high persistence helps
+       catch outliers over a few navigation cycles). **Expected:** every
+       pulse ≤ ~15–20 µs (12.8 µs bound + scheduler/ISR jitter headroom,
+       `spi2-arbitration-r1.md` §Q5). A pulse an order of magnitude past
+       that is the signal that an assumption in that analysis (chunk size,
+       DMA state, device count) doesn't hold on real hardware and needs
+       re-derivation — not a correctness failure on its own, since that
+       document's §Q1-Q4 argument doesn't depend on this number.
+5. [ ] Record `notes: d9_spi_probe_max_pulse_us=<value> n=<pulses observed>`
+       on the `baseline` report block (§9) the capture ran alongside.
+
+**Does the probe itself perturb the ≤12.8 µs bound it's confirming?** No,
+by a wide margin. Each bracket is two calls shaped like
+`esp-idf-hal`'s `PinDriver::set_high()`/`set_low()` (v0.46.2, `src/gpio.rs:846`),
+which is `#[inline]` and reduces to one bounds-checked branch plus a single
+non-inlined `extern "C"` call into ESP-IDF's `gpio_set_level`
+(`components/driver/gpio/gpio.c:236`, pinned v5.2.2) — a `GPIO_CHECK` macro
+(no-op on the valid-pin path) then `gpio_hal_set_level` → the `static
+inline` `gpio_ll_set_level` (`components/hal/esp32s3/include/hal/gpio_ll.h:341`):
+one memory-mapped `out_w1ts`/`out_w1tc` register store, no lock, no ISR
+mask. Generously bounding that whole call (function-call overhead + one
+branch + one store) at 200 Xtensa LX7 cycles — an order of magnitude above
+what a function that small should need — two calls cost ≤ 400 cycles ≈
+1.67 µs at 240 MHz, under 13% of the 12.8 µs budget, and dwarfed by DIO1's
+1 ms poll granularity and LoRa's 83–800 ms airtime this same subsystem
+already lives with. `ui_perf`'s host proxy bench corroborates the shape is
+cheap in absolute terms too (`cargo run -p ui_perf --release --bin
+ui_perf_bench`: `spi_probe_toggle_overhead (set_high+set_low pair)` ≈
+13.7 ns/pair on host x86-64 — not the on-target number, the same
+portable-proxy caveat as every other [HOST] figure in this kit, but
+consistent with "cheap register-level operation," not something
+algorithmically expensive).
+
+### D11 — DIO1 ISR-masking empirical margin (uses the same probe)
 
 `docs/perf/radio-host-validation.md` §4.1's static audit found the DIO1
-GPIO ISR is NOT flagged `ESP_INTR_FLAG_IRAM` and is therefore masked for
-the duration of any concurrent NVS write (issued from `admin_server` or
-`provisioning_server`, both unpinned and able to float onto either core).
-The audit argues this is bounded and self-recovering (DIO1's hardware latch
-survives the mask; every call site re-clears IRQ status before trusting a
-result again) — **not** a NO-GO, but two confirmatory readings would
-tighten "bounded" to an actual number, neither a gate on M2:
+GPIO ISR is NOT flagged `ESP_INTR_FLAG_IRAM`, so it is masked for the
+duration of any concurrent NVS write (issued from `admin_server` or
+`provisioning_server`, both unpinned). The audit argues this is bounded and
+self-recovering — **not** a NO-GO — and this reading tightens "bounded" to
+an actual empirical margin, reusing the D9 probe rather than needing new
+instrumentation.
 
-- **D11 — IRAM-safety, if ever attempted.** `radio-host-validation.md`
-  §4.1 explicitly declines to flip `ESP_INTR_FLAG_IRAM` blind: `esp-idf-hal`
-  carries no `#[link_section = ".iram1..."]` marker on its GPIO ISR
-  trampoline or the boxed closure it dispatches through, so setting the
-  flag without also auditing every transitively-called function's link
-  section risks a crash (illegal-instruction / garbage read while flash
-  cache is disabled) that can only be confirmed by flashing. **Not
-  recommended to attempt without a maintainer explicitly choosing to spend
-  the device time on it** — if attempted, the readable signal is simply
-  whether the device boots and radios normally after the flag change; a
-  silent hang or reset during a concurrent NVS write is the failure mode to
-  watch for.
-- **D12 — bounded-latency confirmation.** With an unmodified (still
-  non-IRAM) build: trigger an admin-CLI edit (`add-contact`/`del-contact`,
-  Part B's commands) or a provisioning commit WHILE radio traffic is
-  in flight (a DM send in progress, or Part D's calibration procedure
-  running), and watch for a `CAD: ...` or `TX error: ... retained for retry`
-  log line landing noticeably later than usual, or a `PERF phase=cad`/`tx`
-  `max` spike in the following 30 s window that stands out from the rest of
-  that window's samples. Report whatever you observe (including "nothing
-  noticeable" — a real, useful negative result) as free-text `notes:` on
-  whichever report block (baseline or two-device-delivery) the capture
-  landed in; this section has no fixed expected-value format because the
-  audit's own argument does not depend on a specific number, only on
-  confirming the effect stays small relative to the CAD/RX-poll deadlines
-  it could in principle spuriously trip (20 ms each).
+1. [ ] Same build/setup as D9.
+2. [ ] Clip a **second** scope channel to GPIO45 (`RADIO_DIO1_PIN` — an
+       existing board signal, no firmware change needed to observe it)
+       alongside GPIO39 from D9.
+3. [ ] Trigger the same concurrent-NVS-write condition D12 (below) uses: an
+       admin-CLI edit (`add-contact`/`del-contact`, Part B) or a
+       provisioning commit, issued WHILE radio traffic is in flight (a DM
+       send in progress, or Part D's calibration loop running).
+4. [ ] Measure the elapsed time from DIO1's rising edge to the probe pin's
+       **next** high pulse. That next pulse is always the SPI-level
+       `clear_irq`/`get_irq` transaction the code issues in direct reaction
+       to the interrupt (`radio.rs`'s `transmit`/`try_receive`, immediately
+       after their `dio1.wait_high(...)` calls) — so this interval **is**
+       the empirical margin: how long the hardware-latched interrupt sat
+       unserviced (potentially masked by the concurrent NVS write disabling
+       flash cache) before software's SPI-level acknowledgment of it.
+5. [ ] Record `notes: d11_dio1_to_probe_margin_us=<value>` (and, if you
+       captured it during a window with no concurrent NVS write, a second
+       `d11_dio1_to_probe_margin_us_baseline=<value>` for comparison) on the
+       same report block as D9. **Expected:** the margin tracks the
+       un-masked baseline (dominated by ordinary task-scheduling latency,
+       not the ISR mask) with, at most, an addition on the order of one NVS
+       write's duration. A margin that never resolves (the probe pulse
+       never arrives) would contradict the static audit's "self-recovering"
+       half — but the audit already found no such condition by inspection,
+       so this reading is confirmatory, not a gate.
+
+**Out of scope, and separately gated — not part of this reading:** actually
+flipping `ESP_INTR_FLAG_IRAM` on the DIO1 ISR. `radio-host-validation.md`
+§4.1 explicitly declines to do this blind: `esp-idf-hal` carries no
+`#[link_section = ".iram1..."]` marker on its GPIO ISR trampoline or the
+boxed closure it dispatches through, so flipping the flag without also
+auditing every transitively-called function's link section risks a crash
+(illegal-instruction / garbage read while flash cache is disabled) that can
+only be confirmed by flashing. **Not recommended without a maintainer
+explicitly choosing to spend the device time on it.** D11 above never
+touches this flag — it only reads the existing (non-IRAM) build's margin.
+
+### D12 — bounded-latency confirmation (unchanged; no probe needed)
+
+With an unmodified (still non-IRAM) build: trigger an admin-CLI edit
+(`add-contact`/`del-contact`, Part B's commands) or a provisioning commit
+WHILE radio traffic is in flight (a DM send in progress, or Part D's
+calibration procedure running), and watch for a `CAD: ...` or `TX error:
+... retained for retry` log line landing noticeably later than usual, or a
+`PERF phase=cad`/`tx` `max` spike in the following 30 s window that stands
+out from the rest of that window's samples. Report whatever you observe
+(including "nothing noticeable" — a real, useful negative result) as
+free-text `notes:` on whichever report block (baseline or
+two-device-delivery) the capture landed in; this section has no fixed
+expected-value format because the audit's own argument does not depend on a
+specific number, only on confirming the effect stays small relative to the
+CAD/RX-poll deadlines it could in principle spuriously trip (20 ms each).
 
 ## Part D10 — Felt snappiness (single device)
 

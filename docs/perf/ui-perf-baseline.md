@@ -654,23 +654,24 @@ MeshCore-speaking peer node.
 | **D6** | RX-notice latency, UI-idle vs. UI-active; CAD-busy and TX-retry counts | §5.3's modelled cadence improvement, on silicon | **Part G**, same run as D5, differenced |
 | **D7** | Per-core utilization | §1's core-affinity claim, and §6.1's "core 1 carries real work" | **Part C** — every 30 s window reports it for free (`PERF core-utilization`) |
 | **D8** | Post-split per-task stack high-water mark, dispatcher **and** `ui_task` | The 49 152 B / 32 768 B budgets; unblocks the deliberately deferred dispatcher-stack trim | **Part E** — both tasks now log their own HWM |
+| **D9** | SPI2 bus-hold behaviour under a *concurrent* full LCD repaint and radio TX, at 40 MHz and 8 MHz | Confirmatory only: §4.3's ≤12.8 µs bound is already settled analytically (source + datasheet); this is the on-target reading | **Part F** — GPIO-toggle probe (`radio::PIN_SPI_PROBE`, GPIO39, `--features diagnostics`) landed in `radio.rs` by `meshcadet-perf-spi2-gpio-toggle-probe`; bracket every pulse the probe fires while a full-window repaint runs concurrently with radio traffic |
 | **D-H** | Free internal-heap headroom (`MALLOC_CAP_INTERNAL`) after the split's +32 768 B of task stack | ADR-0012's own deferred D-H predicate — see §9.4 | **Part C** — every 30 s window now reports `PERF heap-internal: free=<bytes> min_ever=<bytes>` for free, alongside the other dispatcher-rollup lines. `min_ever` is `heap_caps_get_minimum_free_size`'s own lifetime low-water mark, so a transient squeeze between rollup windows still shows up even if the instantaneous `free` reading missed it |
 | **D10** | Felt frame rate / tap-to-first-frame; splash-ripple smoothness on the concurrent boot path | Human-perceptible responsiveness, which no counter captures. The only instrument that could contradict the decision not to re-architect the renderer | **Part D10** (stopwatch + 120/240 fps video), plus the automatic `PERF input-to-first-paint` block |
-| **D12** | Bounded latency of a real concurrent NVS write masking the DIO1 GPIO ISR | `radio-host-validation.md` §4.1's one open ISR-safety item. Bounded and self-recovering by argument; this measures the bound | **Part F addendum** — timed capture around an admin-CLI edit issued while radio traffic is in flight |
+| **D11** | DIO1 GPIO ISR IRAM-safety confirmatory reading | `radio-host-validation.md` §4.1's static audit already found no NO-GO condition; this tightens "bounded" to an empirical margin | **Part F** — the same probe as D9, plus GPIO45 (DIO1, already a board signal) on a second scope channel; measures DIO1-rising-edge-to-probe-pulse latency under a concurrent NVS write |
+| **D12** | Bounded latency of a real concurrent NVS write masking the DIO1 GPIO ISR | `radio-host-validation.md` §4.1's one open ISR-safety item. Bounded and self-recovering by argument; this measures the bound | **Part F** — timed capture around an admin-CLI edit issued while radio traffic is in flight |
 | **P1** | Hands-on functional sweep: every screen, every navigation path, every radio path, on the device | The device-side half of functional parity. Its host-side half — a 58-row static parity matrix with a source citation per row — is met (`task-split-host-validation.md` §5) | **Part H** — walk `task-split-host-validation.md` §5's matrix row by row on hardware |
 | **P2** | The loop model's swept constants (`perf_loop_model/src/params.rs`) — every real ESP32-S3 wall-clock figure it currently carries as a cited *range* | Replaces §5's sensitivity sweep with a calibrated point model. Consumed automatically by `perf_loop_model::calibration` | **Part D** — the calibration table (reuses Part C's log) |
 
 ### 9.2 Blocked on missing code, not on missing hardware
 
-**These two do not close by running the kit.** They are listed here so the
-register is complete, and they are deliberately *not* filed as hardware
-deferrals — the distinction matters, because a hardware deferral is closed by
-the operator and these are closed by a maintainer first.
-
-| # | Predicate | What is missing | Then what |
-|---|---|---|---|
-| **D9** | SPI2 bus-hold behaviour under a *concurrent* full LCD repaint and radio TX, at 40 MHz and 8 MHz | A GPIO-toggle probe in `radio.rs` (bracket the SPI transaction with a scope-visible pin) — it does not exist | **Part F**, once the probe lands. Confirmatory only: §4.3's ≤12.8 µs bound is settled by source and datasheet |
-| **D11** | DIO1 GPIO ISR IRAM-safety confirmatory reading | The same probe as D9, plus a link-section audit | **Part F addendum**. The static audit already found no NO-GO condition; this is empirical margin |
+**Nothing remains blocked on missing code.** This section is kept for
+structural completeness — a hardware deferral (§9.1) is closed by the
+operator, where a code-blocked predicate would instead be closed by a
+maintainer first, but none are currently in that state. D9 and D11 used to be
+listed here, until both moved to §9.1 once `meshcadet-perf-spi2-gpio-toggle-probe`
+landed the GPIO-toggle probe they were waiting on; D-H used to be listed here
+too, until it moved to §9.1 once `meshcadet-perf-diagnostics-heap-headroom`
+landed the missing log line.
 
 ### 9.3 One observation to fold into any Part G run
 
@@ -690,7 +691,7 @@ register:
 | ADR-0012 | Here |
 |---|---|
 | D-A — post-split per-task stack HWM | **D8** |
-| D-B — the ≤12.8 µs bus-hold bound, empirically | **D9** (code-blocked, §9.2) |
+| D-B — the ≤12.8 µs bus-hold bound, empirically | **D9** (hardware-runnable, §9.1) |
 | D-C — delivery success rate vs. baseline | **D5** |
 | D-D — real per-core utilization | **D7** |
 | D-E — device UI-unserviced gap vs. the model | **D4** |
@@ -732,7 +733,7 @@ launders a deferred form into a met one.
 | 4 | **Both cores carry real work** | **MET.** Explicit affinities in code, both directions: `CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0=y` (`sdkconfig.defaults:94`) and `pin_to_core: Some(Core::Core1)` (`ui_task.rs:213`), cross-compiled green in CI on every merged change | **Open — D7.** Per-core utilization from `vTaskGetRunTimeStats()` |
 | 5 | **Functional parity** | **MET.** A 58-row static parity matrix covering every screen, navigation path, input, radio path, peripheral, persistence and boot item, each with a source-level preservation argument and citation (`task-split-host-validation.md` §5). All CI gates green, re-run at this commit: `cargo test --workspace` 63 binaries / **1134 passed / 0 failed**, `clippy -D warnings` clean, `fmt --check` clean, `xtask` glyph-coverage and ui-event-parity green. The firmware cross-compile gate is green on the last firmware-touching merged change (`firmware build gate (check-all-features.sh)`, 11 m 56 s, pass) | **Open — P1.** The hands-on sweep |
 | 6 | **Provenance on every number** | **MET.** This document. Five tags, defined in §0, exactly one per quantity; an untagged number is defined as a document bug. [SIM] is used, is defined as distinct from a device measurement, and closes no deferred row | — |
-| 7 | **The deferred set is complete and actionable** | **MET, with the boundary drawn explicitly.** §9 is one page: 13 hardware-only predicates each paired with the exact kit part that closes them (D-H moved here once `meshcadet-perf-diagnostics-heap-headroom` landed the missing log line), plus — separately and labelled as such — two that are still blocked on *missing code* rather than missing hardware (§9.2), each with the specific change that unblocks it, plus one log line to watch (§9.3). A register that quietly listed a code-blocked predicate alongside the rest would have implied the kit closes it | — |
+| 7 | **The deferred set is complete and actionable** | **MET, with the boundary drawn explicitly.** §9 is one page: 15 hardware-only predicates each paired with the exact kit part that closes them (D-H moved here once `meshcadet-perf-diagnostics-heap-headroom` landed the missing log line; D9/D11 moved here once `meshcadet-perf-spi2-gpio-toggle-probe` landed the GPIO-toggle probe both were waiting on, §11), plus one log line to watch (§9.3). §9.2 (blocked on *missing code* rather than missing hardware) is now empty — nothing in the deferred set is code-blocked. A register that quietly listed a code-blocked predicate alongside the rest would have implied the kit closes it | — |
 
 **What the review did not do.** It did not measure anything on silicon — by
 design, no hardware was in the loop at any point. It did not change airtime,
@@ -822,3 +823,11 @@ resurrected from an old harness output, not as a second narrative.
   this document's "exact, does not move" class, and they moved without anyone
   noticing for several commits. That is the failure mode §2's last paragraph
   now warns about.
+- **D9/D11 are no longer code-blocked (2026-08-03,
+  `meshcadet-perf-spi2-gpio-toggle-probe`).** Not a retraction — the
+  ≤12.8 µs bound (§4.3) and the ISR-safety static audit (`radio-host-
+  validation.md` §4.1) are unchanged and were never in question. What moved:
+  `radio.rs` now has the GPIO-toggle probe (`PIN_SPI_PROBE`, GPIO39,
+  `--features diagnostics`) both predicates were waiting on, so both are
+  hardware-runnable (§9.1) rather than blocked on missing code (§9.2 no
+  longer lists them). §9.4's ADR-0012 D-B cross-reference updated to match.

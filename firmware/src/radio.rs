@@ -76,6 +76,40 @@ pub const PIN_BUSY: i32 = 13; // RADIO_BUSY_PIN
 #[allow(dead_code)]
 pub const PIN_DIO1: i32 = 45; // RADIO_DIO1_PIN
 
+/// SPI2 bus-hold GPIO-toggle probe (D9/D11, `docs/perf/collection-kit.md`
+/// Part F). Compiled in only with `--features diagnostics` — see
+/// [`Radio::spi_transfer`]/[`Radio::write_cmd`]'s bracketing and
+/// `docs/perf/ui-perf-baseline.md` §9.1.
+///
+/// **Chosen pin: GPIO 39 (`BOARD_SDCARD_CS` per LilyGo `utilities.h`).**
+/// Rationale, in order:
+/// - **Genuinely free.** MeshCadet has no SD-card driver anywhere in this
+///   workspace (`grep -ri sdcard\|sd_card firmware/src` — no hits); this is
+///   the only pin on the whole board whose *sole* documented function this
+///   firmware does not use for anything, so claiming it perturbs no other
+///   peripheral.
+/// - **Not a strapping pin** (ESP32-S3 strapping is GPIO0/3/45/46 only) and
+///   not one of the fixed USB-D+/D- pins (GPIO19/20, already committed to
+///   `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG`) — safe to drive from first boot.
+///   It sits in the same GPIO39-42 JTAG-alternate-function group as
+///   `PIN_SCK`/`PIN_MOSI`/`PIN_POWERON`'s backlight pin (GPIO40-42), all
+///   already repurposed as plain GPIO in this exact firmware — GPIO39
+///   following the same precedent is nothing new for this board.
+/// - **Physically reachable.** It breaks out to the microSD card slot's CS
+///   pad — a standard-pitch solder point on the card slot, not a fine-pitch
+///   IC leg — easy to land a scope hook or probe clip on without disturbing
+///   any active signal.
+/// - **Caveat, stated once here so it travels with the constant:** GPIO39
+///   physically shares SPI2's SCK/MOSI/MISO lines with the LCD and radio
+///   (only CS is dedicated per device). With no microSD card inserted (the
+///   normal state — this firmware never talks to one) the pad is otherwise
+///   unconnected and toggling it is side-effect-free. **Remove any microSD
+///   card before running the Part F probe** — a card left in the slot could
+///   otherwise be woken by the shared clock and drive MISO while the radio
+///   is also on the bus.
+#[allow(dead_code)]
+pub const PIN_SPI_PROBE: i32 = 39; // BOARD_SDCARD_CS, repurposed — see doc above
+
 // ── Preset constants ──────────────────────────────────────────────────────────
 
 /// RF frequency register word for 910.525 MHz.
@@ -452,6 +486,12 @@ pub struct Radio<'d> {
     rst: PinDriver<'d, Output>,
     busy: PinDriver<'d, Input>,
     dio1: GpioDio1Wait<'d>,
+    /// SPI2 bus-hold probe (D9/D11) — see [`PIN_SPI_PROBE`]'s doc for the
+    /// pin choice and rationale. `--features diagnostics` only; every read
+    /// site is `#[cfg]`-gated the same way, so this field does not exist at
+    /// all in a non-diagnostics build (no idle GPIO claimed in production).
+    #[cfg(feature = "diagnostics")]
+    probe: PinDriver<'d, Output>,
     /// `true` while the radio is armed in continuous RX (SetRx 0xFFFFFF).
     /// `transmit` and `channel_activity_detection` clear it because they take
     /// the radio out of RX; `ensure_continuous_rx` re-arms only when it is clear,
@@ -470,9 +510,18 @@ impl<'d> Radio<'d> {
         rst: PinDriver<'d, Output>,
         busy: PinDriver<'d, Input>,
         dio1: PinDriver<'d, Input>,
+        #[cfg(feature = "diagnostics")] probe: PinDriver<'d, Output>,
     ) -> Result<Self, RadioError> {
         let dio1 = GpioDio1Wait::new(dio1)?;
-        let mut radio = Self { spi, rst, busy, dio1, in_continuous_rx: false };
+        let mut radio = Self {
+            spi,
+            rst,
+            busy,
+            dio1,
+            #[cfg(feature = "diagnostics")]
+            probe,
+            in_continuous_rx: false,
+        };
         radio.hardware_reset()?;
         radio.configure_tcxo()?;
         radio.configure_preset()?;
@@ -862,11 +911,27 @@ impl<'d> Radio<'d> {
         let mut buf = [0u8; 16];
         let n = data.len().min(16);
         buf[..n].copy_from_slice(&data[..n]);
-        self.spi.write(&buf[..n]).map_err(|_| RadioError::Spi)
+        // D9/D11 probe bracket — see `PIN_SPI_PROBE`'s doc. High immediately
+        // before the SPI acquire/wait point, low immediately after the
+        // transaction returns; a probe-pin error is swallowed (`let _ =`) so
+        // a diagnostics-only instrumentation fault can never fail a real SPI
+        // transfer. Cost argued in `docs/perf/ui-perf-baseline.md` §9.1 (D9).
+        #[cfg(feature = "diagnostics")]
+        let _ = self.probe.set_high();
+        let result = self.spi.write(&buf[..n]).map_err(|_| RadioError::Spi);
+        #[cfg(feature = "diagnostics")]
+        let _ = self.probe.set_low();
+        result
     }
 
     fn spi_transfer(&mut self, buf: &mut [u8]) -> Result<(), RadioError> {
-        self.spi.transfer_in_place(buf).map_err(|_| RadioError::Spi)
+        // Same D9/D11 probe bracket as `write_cmd` — see that fn's comment.
+        #[cfg(feature = "diagnostics")]
+        let _ = self.probe.set_high();
+        let result = self.spi.transfer_in_place(buf).map_err(|_| RadioError::Spi);
+        #[cfg(feature = "diagnostics")]
+        let _ = self.probe.set_low();
+        result
     }
 
     fn clear_irq(&mut self, mask: u16) -> Result<(), RadioError> {
