@@ -1671,6 +1671,7 @@ name = "firmware"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "color_quant",
  "display-interface-spi",
  "embedded-graphics",
  "embuild",
@@ -1678,12 +1679,14 @@ dependencies = [
  "esp-idf-svc",
  "firmware-core",
  "i-slint-core",
+ "image",
  "log",
  "mipidsi",
  "protocol",
  "rand 0.8.6",
  "slint",
  "slint-build",
+ "ttf-parser",
 ]
 
 [[package]]

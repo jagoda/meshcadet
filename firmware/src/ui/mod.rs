@@ -86,6 +86,7 @@
 
 pub mod backdrop_asset;
 pub mod display;
+pub mod emoji_color;
 pub mod touch;
 pub mod keyboard;
 pub mod trackball;

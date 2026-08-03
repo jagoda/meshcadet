@@ -30,7 +30,12 @@
 //!    16 each — `meshcadet-emoji-picker-expansion`, campaign D1; deliberately
 //!    no search UI here, since the `:shortcode:` completion path above
 //!    already covers that interaction). Tapping any cell inserts that
-//!    emoji's codepoint at the cursor and closes the picker.
+//!    emoji's codepoint at the cursor and closes the picker. Cells render in
+//!    **full color** (`ui/emoji_color.rs`, `meshcadet-emoji-picker-color-cells`)
+//!    — the one place color is cheap, since these cells are already `Image`-
+//!    shaped `GridLayout` entries; every other emoji call site in this file
+//!    (the picker's own 😀 toggle, the draft field, the shortcode
+//!    autocomplete bar) keeps rendering through the mono bitmap font.
 //!
 //! The `expand_shortcodes()` function in `protocol::emoji` is called on the
 //! final text just before encoding the outbound DM, not at compose time.
@@ -164,8 +169,15 @@ slint::slint! {
     // ── Emoji picker overlay ──────────────────────────────────────────────────
 
     struct EmojiCell {
-        codepoint_str: string,  // UTF-8 char as string (Slint Text renders it)
+        codepoint_str: string,  // UTF-8 char as string — inserted into the draft on tap
         label:         string,
+        // Color raster for this cell (`ui/emoji_color.rs`'s build-time-
+        // generated, palette-indexed picker art — see
+        // `meshcadet-emoji-picker-color-cells`). Cells render this `Image`
+        // now, not `codepoint_str` as `Text`; `codepoint_str` is unchanged
+        // and still what gets inserted into the draft on tap — this is a
+        // presentation-only swap, no wire-format change.
+        emoji_image:   image,
     }
 
     // ── Category tabs (meshcadet-emoji-picker-expansion) ───────────────────
@@ -298,11 +310,21 @@ slint::slint! {
                     animate background { duration: 100ms; easing: ease-out; }
                     border-radius: 6px;
 
-                    Text {
-                        text: cell.codepoint_str;
-                        font-size: Theme.icon-lg; // 20px
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
+                    // Color raster (`meshcadet-emoji-picker-color-cells`) —
+                    // replaces the mono bitmap-font `Text` this cell used to
+                    // render. `width`/`height` match the font-rendered
+                    // predecessor's `Theme.icon-lg` (20px) box exactly, so
+                    // this is a same-footprint swap within the unchanged
+                    // 58x36 cell, not a re-layout. `image-fit: contain`
+                    // rather than `fill`: every source raster is generated
+                    // square (`build_emoji_color.rs`'s `CELL_PX`x`CELL_PX`),
+                    // so `contain` is a no-op for aspect ratio today, but
+                    // guards against distortion if that ever changes.
+                    Image {
+                        source: cell.emoji_image;
+                        width: 20px;
+                        height: 20px;
+                        image-fit: contain;
                     }
 
                     emoji_touch := TouchArea {
@@ -917,6 +939,7 @@ fn cells_for_category(category: &'static str) -> slint::ModelRc<EmojiCell> {
         cells.push(EmojiCell {
             codepoint_str: entry.codepoint.to_string().into(),
             label: entry.label.into(),
+            emoji_image: crate::ui::emoji_color::image_for_codepoint(entry.codepoint),
         });
     }
     slint::ModelRc::new(cells)

@@ -12,6 +12,14 @@
   every GitHub Release alongside the firmware images, covering the OFL 1.1 condition-2 and
   Bitstream-Vera-license redistribution obligations for the shipped binaries, not just the
   repo. See `docs/release-reproducibility.md` for the updated (nine-asset) list.
+  **2026-08-03:** §3 (Noto Color Emoji) added by `meshcadet-emoji-picker-color-cells` — a
+  second, independent OFL 1.1 font asset (`firmware/assets/NotoColorEmoji.ttf`), pulled from
+  the same `googlefonts/noto-emoji` upstream, whose CBDT color-bitmap glyphs feed a NEW,
+  separate build-time pipeline (`firmware/build_emoji_color.rs`) generating the emoji
+  picker's color-cell rasters — verified OFL 1.1, not Apache-2.0 (that repo's top-level
+  tooling is Apache-2.0; only `fonts/`, including this file, is OFL 1.1). Release-artifact
+  attachment extended to a tenth asset, `NotoColorEmoji-LICENSE.txt` — see
+  `docs/release-reproducibility.md`'s updated (ten-asset) list.
 - **Result: PASS.** Every dependency in both Cargo graphs is compatible with shipping
   MeshCadet under **GPLv3** (`LICENSE` at repo root). No dependency forces a different
   outcome and none needs to be swapped out or re-licensed.
@@ -138,7 +146,32 @@ licensing. Checked here for completeness:
    a new fact. The OFL<->GPLv3 embedding analysis below is unaffected and
    was not re-litigated.
 
-2. **DejaVu Sans** — used by `firmware/gen_emoji_font.c` (invoked from
+2. **NotoColorEmoji.ttf** (`firmware/assets/NotoColorEmoji.ttf`) — **is
+   bundled** (tracked in git). Added by `meshcadet-emoji-picker-color-cells`
+   (2026-08-03) as the source for the emoji picker's color-cell rasters — a
+   SEPARATE build-time pipeline (`firmware/build_emoji_color.rs`, invoked
+   from `firmware/build.rs` alongside, not instead of,
+   `gen_emoji_font.c`'s existing mono-glyph pipeline) decodes its CBDT
+   color-bitmap glyphs and re-encodes them as small palette-indexed rasters;
+   the font file itself is a build-time-only asset (never embedded — only
+   the tiny generated output is). Pulled 2026-08-03 from
+   `googlefonts/noto-emoji`, `fonts/NotoColorEmoji.ttf`
+   (sha256 `72a635cb3d2f3524c51620cdde406b217204e8a6a06c6a096ff8ed4b5fd6e27b`),
+   embedded `name`-table copyright "Copyright 2022 Google Inc.", Version
+   string `2.051;GOOG;noto-emoji:20250818:e92753bfa55fd449e427d4d325f9c8c40408c74e`.
+   Licensed under the SIL Open Font License, Version 1.1 (OFL 1.1) —
+   **verified from the same repo's `fonts/LICENSE`, not assumed**: that
+   repo's top-level tooling (Python build scripts) is Apache-2.0, but
+   everything under `fonts/`, including this file, ships OFL 1.1 via its own
+   `fonts/LICENSE` (per campaign D4's explicit "verify OFL 1.1, not
+   Apache-2.0" instruction — this is the same license family and the same
+   upstream project as (1) above, just a different font file within it, so
+   the OFL<->GPLv3 embedding analysis already established for (1) applies
+   identically and was not re-litigated). License text accompanies the font
+   at `firmware/assets/NotoColorEmoji-LICENSE.txt`, and the copyright/license
+   is additionally credited in `NOTICE`.
+
+3. **DejaVu Sans** — used by `firmware/gen_emoji_font.c` (invoked from
    `firmware/build.rs`) as the source for the ASCII/Latin glyphs in the same
    build-time-generated bitmap font that also carries the Noto Emoji glyphs.
    **Not bundled**: `git ls-tree -r HEAD` shows no DejaVu file tracked in
@@ -154,7 +187,7 @@ licensing. Checked here for completeness:
    of the same redistribution-compliance caution as (1), even though no
    DejaVu font file itself needs to (or does) travel in this git tree.
 
-**2026-08-02 — release-binary redistribution gap closed.** (1) and (2) above
+**2026-08-02 — release-binary redistribution gap closed.** (1) and (3) above
 established that the license text lives in this git tree; neither closed the
 separate question of whether it travels with the *shipped release binaries*
 (the merged/app firmware images `.github/workflows/release.yml` uploads to
@@ -166,7 +199,10 @@ OFL/attribution files for release attachment" step attaches `NOTICE`,
 the firmware images (covered by the same `SHA256SUMS` and provenance
 attestation as the binaries themselves) — closing the gap. This does not
 reopen or change the OFL<->GPLv3 embedding analysis above; it is a packaging
-fix, not a licensing-conclusion change.
+fix, not a licensing-conclusion change. **2026-08-03:** the same step now
+also attaches `firmware/assets/NotoColorEmoji-LICENSE.txt` for (2) above,
+closing the identical gap for the newly-bundled color-emoji font asset at
+the moment it landed, rather than after the fact.
 
 ## Conclusion
 

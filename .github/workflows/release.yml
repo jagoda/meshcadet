@@ -32,13 +32,15 @@ name: release
 #      app-only image, an esp-web-tools `manifest.json` (Fresh install) and
 #      `manifest-update.json` (app-only Upgrade, single part @ 0x10000),
 #      `update-meta.json` (layout_hash/upgrade_safe), `SHA256SUMS`, and the
-#      `NOTICE` / `NotoEmoji-LICENSE.txt` / `DejaVuSans-LICENSE.txt`
-#      attribution files that SIL OFL 1.1 condition (2) requires travel with
-#      every redistributed copy of the rasterized Noto Emoji glyph data baked
-#      into the two firmware images (docs/licensing/DEPENDENCY-AUDIT.md
-#      "Bundled font assets" §1 — the git tree was already compliant; these
+#      `NOTICE` / `NotoEmoji-LICENSE.txt` / `NotoColorEmoji-LICENSE.txt` /
+#      `DejaVuSans-LICENSE.txt` attribution files that SIL OFL 1.1
+#      condition (2) requires travel with every redistributed copy of the
+#      rasterized Noto Emoji glyph data (mono font) and the palette-indexed
+#      color-emoji picker-cell rasters (`meshcadet-emoji-picker-color-cells`)
+#      baked into the two firmware images (docs/licensing/DEPENDENCY-AUDIT.md
+#      "Bundled font assets" — the git tree was already compliant; these
 #      binaries were not, until now);
-#   6. attests SLSA build provenance over those nine published assets.
+#   6. attests SLSA build provenance over those ten published assets.
 #
 # release-please (.github/workflows/release-please.yml) already created the
 # Release object for this tag — changelog notes only, no assets — in the
@@ -218,11 +220,15 @@ jobs:
 
       # SIL OFL 1.1 condition (2) requires the license text + copyright
       # notice travel with EVERY redistributed copy of a Modified Version —
-      # and the rasterized Noto Emoji glyph data baked into both firmware
-      # images by firmware/gen_emoji_font.c is exactly that. The git tree
-      # already carries these three files (NOTICE credits Noto Emoji +
-      # DejaVu Sans; the other two are the upstream license texts
-      # firmware/assets/NotoEmoji-LICENSE.txt and
+      # the rasterized Noto Emoji glyph data baked into both firmware images
+      # by firmware/gen_emoji_font.c is exactly that, and so (since
+      # `meshcadet-emoji-picker-color-cells`) is the palette-indexed color
+      # raster data `firmware/build_emoji_color.rs` bakes in from
+      # `firmware/assets/NotoColorEmoji.ttf`. The git tree already carries
+      # these four files (NOTICE credits Noto Emoji, Noto Color Emoji, and
+      # DejaVu Sans; the other three are the upstream license texts
+      # firmware/assets/NotoEmoji-LICENSE.txt,
+      # firmware/assets/NotoColorEmoji-LICENSE.txt, and
       # docs/licensing/DejaVuSans-LICENSE.txt) — this step is what makes the
       # *published binaries*, not just the repo, compliant. See
       # docs/licensing/DEPENDENCY-AUDIT.md "Bundled font assets" for the
@@ -232,6 +238,7 @@ jobs:
           set -euo pipefail
           cp NOTICE dist/NOTICE
           cp firmware/assets/NotoEmoji-LICENSE.txt dist/NotoEmoji-LICENSE.txt
+          cp firmware/assets/NotoColorEmoji-LICENSE.txt dist/NotoColorEmoji-LICENSE.txt
           cp docs/licensing/DejaVuSans-LICENSE.txt dist/DejaVuSans-LICENSE.txt
 
       - name: Generate esp-web-tools manifest.json
@@ -302,11 +309,12 @@ jobs:
             update-meta.json \
             NOTICE \
             NotoEmoji-LICENSE.txt \
+            NotoColorEmoji-LICENSE.txt \
             DejaVuSans-LICENSE.txt \
             > SHA256SUMS
           cd -
 
-      # Provenance for exactly the nine published assets, over their final
+      # Provenance for exactly the ten published assets, over their final
       # bytes (post-manifest/checksum generation, pre-upload) — see
       # docs/release-reproducibility.md for the `gh attestation verify`
       # third-party re-check this pairs with.
@@ -322,6 +330,7 @@ jobs:
             dist/SHA256SUMS
             dist/NOTICE
             dist/NotoEmoji-LICENSE.txt
+            dist/NotoColorEmoji-LICENSE.txt
             dist/DejaVuSans-LICENSE.txt
 
       - name: Extract release notes from CHANGELOG.md
@@ -410,6 +419,7 @@ jobs:
             "dist/SHA256SUMS" \
             "dist/NOTICE" \
             "dist/NotoEmoji-LICENSE.txt" \
+            "dist/NotoColorEmoji-LICENSE.txt" \
             "dist/DejaVuSans-LICENSE.txt"
 
           # Un-draft last, now that the real notes and every asset are in
