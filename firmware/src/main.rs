@@ -2848,6 +2848,40 @@ fn run() -> anyhow::Result<()> {
                     core1_pct.map(|p| p.to_string()).unwrap_or_else(|| "n/a".into()),
                 );
 
+                // ── Free internal-heap headroom (ADR-0012 D-H,
+                // `ui-perf-baseline.md` §9.2) ───────────────────────────────
+                //
+                // `MALLOC_CAP_INTERNAL`, deliberately, not total free heap:
+                // this firmware also has PSRAM backing some allocations, and
+                // PSRAM availability does not answer whether the split's
+                // +32 768 B of additional task stack (carved from the same
+                // internal SRAM every other internal-only allocation
+                // competes for) left adequate headroom. A total-heap number
+                // here would silently paper over an internal-only squeeze.
+                //
+                // Two readings, not one: `free` is the instantaneous value
+                // at this 30 s tick, which can miss a transient squeeze that
+                // recovered before the next sample. `min_ever` is
+                // `heap_caps_get_minimum_free_size`'s own lifetime-low-water
+                // mark for this capability since boot — free from ESP-IDF,
+                // no extra state to carry across this block's own per-window
+                // reset below (unlike `perf_rollup`, this number is not
+                // windowed; it never resets).
+                let heap_free_internal = unsafe {
+                    esp_idf_svc::sys::heap_caps_get_free_size(
+                        esp_idf_svc::sys::MALLOC_CAP_INTERNAL,
+                    )
+                };
+                let heap_min_ever_internal = unsafe {
+                    esp_idf_svc::sys::heap_caps_get_minimum_free_size(
+                        esp_idf_svc::sys::MALLOC_CAP_INTERNAL,
+                    )
+                };
+                log::info!(
+                    "PERF heap-internal: free={} min_ever={}",
+                    heap_free_internal, heap_min_ever_internal,
+                );
+
                 // Reset every accumulator for the next window — same
                 // "assign fresh state" reset idiom as `rx_done_count = 0;`
                 // etc. above, just for the boxed aggregate.

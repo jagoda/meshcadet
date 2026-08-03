@@ -24,6 +24,7 @@ PERF phase=ui_step: n=118 min=8 mean=40 max=95 p95=70
 PERF rx-notice-latency: n=0 min=0 mean=0 max=0 p95=0
 PERF ui-starvation: cumulative=0 longest=0 (window=30s)
 PERF core-utilization: core0=3.1 core1=n/a
+PERF heap-internal: free=184000 min_ever=184000
 main-task: stack HWM: 19000 B free / 49152 B total = 30152 B peak (38.6% headroom)
 PERF phase=gps: n=1 min=920 mean=920 max=920 p95=920
 PERF phase=battery: n=1 min=135 mean=135 max=135 p95=135
@@ -34,6 +35,7 @@ PERF phase=ui_step: n=121 min=9 mean=52 max=430 p95=190
 PERF rx-notice-latency: n=0 min=0 mean=0 max=0 p95=0
 PERF ui-starvation: cumulative=0 longest=0 (window=30s)
 PERF core-utilization: core0=4.0 core1=n/a
+PERF heap-internal: free=183104 min_ever=182016
 main-task: stack HWM: 18900 B free / 49152 B total = 30252 B peak (38.4% headroom)
 --- end-raw-serial-log ---
 ```

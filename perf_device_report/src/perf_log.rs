@@ -55,6 +55,19 @@ pub struct CoreUtilization {
     pub core1_pct: Option<f64>,
 }
 
+/// `PERF heap-internal: free=<bytes> min_ever=<bytes>` (Part C; ADR-0012
+/// D-H, `ui-perf-baseline.md` §9.1). `MALLOC_CAP_INTERNAL` only — this is
+/// free internal-SRAM heap, not total free heap, and PSRAM headroom is not
+/// tracked here at all. `free` is the instantaneous reading at this 30 s
+/// tick; `min_ever` is the lifetime low-water mark since boot
+/// (`heap_caps_get_minimum_free_size`), so a transient squeeze that
+/// recovered between rollup windows is still visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeapInternal {
+    pub free_bytes: u64,
+    pub min_ever_bytes: u64,
+}
+
 /// One stack high-water-mark sample (Part E). The one-shot UI-navigation
 /// samples only ever report `free_bytes`; the periodic task/server samples
 /// additionally report a budget and headroom percentage.
@@ -102,6 +115,7 @@ pub struct ParsedLog {
     pub rollups: Vec<Rollup>,
     pub ui_starvation: Vec<UiStarvation>,
     pub core_utilization: Vec<CoreUtilization>,
+    pub heap_internal: Vec<HeapInternal>,
     pub stack_hwm: Vec<StackHwmSample>,
     pub delivery: DeliveryCounters,
 }
@@ -128,6 +142,13 @@ impl ParsedLog {
             .into_iter()
             .rev()
             .find(|r| r.n > 0)
+    }
+
+    /// The chronologically LAST heap-internal reading, if any — the same
+    /// "last window is the one number to report" convention as
+    /// [`Self::latest_phase_window`].
+    pub fn latest_heap_internal(&self) -> Option<&HeapInternal> {
+        self.heap_internal.last()
     }
 
     /// Part C's own definition of a run where the `diagnostics` feature
@@ -179,6 +200,10 @@ pub fn parse(raw_log: &str) -> ParsedLog {
         } else if let Some(rest) = t.strip_prefix("PERF core-utilization:") {
             if let Some(c) = parse_core_utilization(rest) {
                 parsed.core_utilization.push(c);
+            }
+        } else if let Some(rest) = t.strip_prefix("PERF heap-internal:") {
+            if let Some(h) = parse_heap_internal(rest) {
+                parsed.heap_internal.push(h);
             }
         } else if let Some(s) = parse_stack_hwm_line(t) {
             parsed.stack_hwm.push(s);
@@ -238,6 +263,15 @@ fn parse_core_utilization(rest: &str) -> Option<CoreUtilization> {
     Some(CoreUtilization {
         core0_pct: fields.get("core0").and_then(|v| parse_pct(v)),
         core1_pct: fields.get("core1").and_then(|v| parse_pct(v)),
+    })
+}
+
+/// `free=<bytes> min_ever=<bytes>`.
+fn parse_heap_internal(rest: &str) -> Option<HeapInternal> {
+    let fields = key_value_fields(rest);
+    Some(HeapInternal {
+        free_bytes: fields.get("free")?.parse().ok()?,
+        min_ever_bytes: fields.get("min_ever")?.parse().ok()?,
     })
 }
 
@@ -340,6 +374,7 @@ PERF rx-notice-latency: n=0 min=0 mean=0 max=0 p95=0
 PERF ui-starvation: cumulative=12 longest=8 (window=30s)
 PERF input-to-first-paint: n=3 min=90 mean=140 max=210 p95=205
 PERF core-utilization: core0=4.2 core1=n/a
+PERF heap-internal: free=182304 min_ever=170112
 main-task: stack HWM: 18432 B free / 49152 B total = 30720 B peak (37.5% headroom)
 ui: navigate_to_pin_entry stack HWM: 15000 B free
 ui: navigate_to_admin_menu stack HWM: 14500 B free
@@ -424,6 +459,26 @@ TX error: retained for retry in 200ms
         assert_eq!(parsed.core_utilization.len(), 1);
         assert_eq!(parsed.core_utilization[0].core0_pct, Some(4.2));
         assert_eq!(parsed.core_utilization[0].core1_pct, None);
+    }
+
+    #[test]
+    fn parses_heap_internal() {
+        let parsed = parse(SAMPLE_LOG);
+        assert_eq!(parsed.heap_internal.len(), 1);
+        assert_eq!(parsed.heap_internal[0].free_bytes, 182304);
+        assert_eq!(parsed.heap_internal[0].min_ever_bytes, 170112);
+        assert_eq!(
+            parsed.latest_heap_internal(),
+            Some(&HeapInternal {
+                free_bytes: 182304,
+                min_ever_bytes: 170112
+            })
+        );
+    }
+
+    #[test]
+    fn latest_heap_internal_is_none_when_absent() {
+        assert_eq!(ParsedLog::default().latest_heap_internal(), None);
     }
 
     #[test]

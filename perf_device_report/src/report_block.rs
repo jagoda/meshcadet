@@ -73,7 +73,7 @@ impl Section {
     /// automatically.
     pub fn closes_predicates(&self) -> &'static [&'static str] {
         match self {
-            Section::Baseline => &["D1", "D2", "D3 (partial)", "D7"],
+            Section::Baseline => &["D1", "D2", "D3 (partial)", "D7", "D-H"],
             Section::Calibration => &["loop-model swept constants (params.rs)"],
             Section::StackHwm => &["D8"],
             Section::FeltSnappiness => &["D10"],

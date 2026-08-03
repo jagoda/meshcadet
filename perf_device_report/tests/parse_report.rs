@@ -49,6 +49,25 @@ fn baseline_fixture_parses_and_reports_two_ui_step_windows() {
     // — collection-kit.md Part C step 2's own expectation, and exactly why
     // the parser exposes every window rather than collapsing them.
     assert!(ui_step_windows[1].max > ui_step_windows[0].max);
+
+    // ADR-0012 D-H: Part C's rollup block reports free internal-heap
+    // headroom for free, once per 30 s window — same "every window
+    // recorded, latest is the default read" shape as every other rollup
+    // this fixture exercises.
+    assert_eq!(log.heap_internal.len(), 2);
+    let latest = log
+        .latest_heap_internal()
+        .expect("fixture logs heap-internal");
+    assert_eq!(latest.free_bytes, 183104);
+    assert_eq!(latest.min_ever_bytes, 182016);
+    // The lifetime low-water mark can only fall or hold, never rise.
+    assert!(log.heap_internal[1].min_ever_bytes <= log.heap_internal[0].min_ever_bytes);
+}
+
+#[test]
+fn baseline_section_closes_d_h_now_that_the_kit_reports_it() {
+    let block = parse_report_blocks(BASELINE)[0].clone().unwrap();
+    assert!(block.section.closes_predicates().contains(&"D-H"));
 }
 
 #[test]
