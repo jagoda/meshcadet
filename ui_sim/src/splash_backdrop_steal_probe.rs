@@ -168,7 +168,11 @@ pub fn buggy_ordering() -> (bool, bool, bool) {
     let attached_after_steal = component_attached(&window);
     let painted_after_steal = render_tick(&window);
 
-    (attached_before_steal, attached_after_steal, painted_after_steal)
+    (
+        attached_before_steal,
+        attached_after_steal,
+        painted_after_steal,
+    )
 }
 
 /// The FIX's ordering: pre-warm the asset-carrier cache-miss path BEFORE
