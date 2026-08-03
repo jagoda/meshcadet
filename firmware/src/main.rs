@@ -908,16 +908,20 @@ fn run() -> anyhow::Result<()> {
         // display/typing aid, not a wire-correctness concern).
         let self_name = device_sender_name(&identity, nvs_partition.clone());
 
+        // Bundled behind one `Box` — not passed as separate by-value
+        // arguments — see `ui_task::UiHardware`'s doc for why.
         ui_task::spawn(
-            i2c1_result,
-            lcd_spi_result,
-            dc,
-            lcd_rst,
-            peripherals.ledc.channel1,
-            bl_timer,
-            peripherals.pins.gpio42,
-            buzzer,
-            trackball,
+            Box::new(ui_task::UiHardware {
+                i2c1: i2c1_result,
+                lcd_spi: lcd_spi_result,
+                dc,
+                rst: lcd_rst,
+                backlight_channel: peripherals.ledc.channel1,
+                backlight_timer: bl_timer,
+                backlight_pin: peripherals.pins.gpio42,
+                buzzer,
+                trackball,
+            }),
             provisioned,
             pubkey_str,
             self_name,
