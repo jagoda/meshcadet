@@ -348,6 +348,14 @@ slint::slint! {
                         Text {
                             text: "😀";
                             font-size: Theme.icon-sm;
+                            // Kept in sync with compose.rs's real `color:
+                            // Theme.star-gold;` (mono-glyph-legibility
+                            // mission) — this is a verbatim copy of that
+                            // screen's markup (see module doc), so a
+                            // fixed-emoji color change on the real screen
+                            // must land here too or this promo rig silently
+                            // drifts from what it's supposed to mirror.
+                            color: Theme.star-gold;
                             horizontal-alignment: center;
                             vertical-alignment: center;
                         }

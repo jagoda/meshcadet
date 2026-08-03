@@ -91,6 +91,7 @@
  * earlier phases.
  */
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -99,6 +100,8 @@
 #include FT_FREETYPE_H
 #include FT_SFNT_NAMES_H
 #include FT_TRUETYPE_TABLES_H
+#include FT_MULTIPLE_MASTERS_H
+#include FT_OUTLINE_H
 
 /* ── Curated emoji codepoints (40 total) ─────────────────────────────── */
 /*
@@ -990,6 +993,183 @@ static FT_Library ft_library;
 static FT_Face latin_face;
 static FT_Face emoji_face;
 
+/* ── Monochrome emoji legibility tuning (mono-glyph-legibility mission) ──
+ *
+ * NotoEmoji-Regular.ttf v3.002 is a VARIABLE font with one `wght` axis
+ * (range 300-700, default 400 — confirmed by a live FT_Get_MM_Var probe
+ * against the bundled asset, not assumed). Left at the axis default,
+ * outline strokes at the small EMOJI_SIZES this font is rasterised at
+ * (11-20px) land sub-pixel and antialias into mid-gray rather than solid
+ * ink: "washed out," a legibility defect distinct from the missing-/wrong-
+ * glyph failure mode PIXEL_SIZES/EMOJI_SIZES's own comments document.
+ *
+ * Two independent, additive corrections are applied ONLY to glyphs actually
+ * rasterised from `emoji_face` — never `latin_face`. DejaVu Sans is a
+ * different font on a different rasterisation path (not variable, never
+ * washed out), so the parallel-path audit this kind of fix owes its sibling
+ * (dispatcher-parallel-pass-parity doctrine) concludes there is nothing to
+ * mirror onto it, not that the mirroring was skipped:
+ *
+ *   1. Weight axis -> EMOJI_WGHT_TARGET, set once on `emoji_face` right
+ *      after it opens (`set_variable_weight` below), guarded by
+ *      `FT_Get_MM_Var` succeeding and an explicit `wght` axis tag lookup —
+ *      never assumes axis 0, and clamps to the axis's own reported range
+ *      rather than trusting the target blindly.
+ *   2. Alpha gamma boost -> EMOJI_ALPHA_GAMMA, applied per-pixel to every
+ *      rasterised `emoji_face` glyph's grayscale mask (`render_from_face`'s
+ *      FT_PIXEL_MODE_GRAY branch).
+ *
+ * Combination chosen empirically (FreeType probe against the bundled asset:
+ * per-size ink-coverage deltas plus raster dumps at every EMOJI_SIZES
+ * entry — see mission Findings for the full table). wght 700 alone, or 700
+ * stacked with a gamma boost, over-inks small glyphs (counters start
+ * closing at 11px) for only a marginal legibility gain over 600+gamma, and
+ * grows bitmap extents more (partition-budget/layout risk). wght 600 +
+ * gamma 0.75 raises mean ink coverage +22% to +28% at EVERY EMOJI_SIZES
+ * entry (11-20px), measured across the FULL 649-glyph rasterised emoji set
+ * (not a sample) by diffing this generator's own before/after output —
+ * e.g. 11px: 27.7% -> 35.5%; 20px: 26.9% -> 33.0% — while holding bitmap
+ * extents flat, or within 2px, at every (glyph, size) pair, with zero
+ * blank-glyph regressions. `FT_Outline_Embolden`
+ * (the scope's third, optional lever) was evaluated and is deliberately
+ * NOT applied: the chosen wght+gamma combination alone already reads crisp,
+ * and stacking embolden on top closed eyes/counters in the probe's raster
+ * dumps at 11px — the exact over-inking failure mode
+ * `metric-blinded-by-its-own-fix.md` warns a coverage-only readout would
+ * miss.
+ */
+#define EMOJI_WGHT_TARGET 600.0
+#define EMOJI_ALPHA_GAMMA 0.75
+
+/* Drive `face`'s `wght` variation axis toward `target` (a design-space
+ * value, e.g. 600.0). No-op if `face` isn't a variable font, has no `wght`
+ * axis, or FT_Get_MM_Var otherwise fails — callers must not assume this
+ * changed anything, and nothing downstream depends on it having. `target`
+ * is clamped to the axis's OWN reported [minimum, maximum] rather than
+ * trusted blindly, so a future font-asset swap with a narrower axis range
+ * degrades gracefully instead of clamping to a FreeType-internal error. */
+static void set_variable_weight(FT_Face face, double target) {
+    FT_MM_Var *mm_var = NULL;
+    if (FT_Get_MM_Var(face, &mm_var) != 0 || mm_var == NULL) {
+        return; /* not a variable font (or no MM support in this build) */
+    }
+    if (mm_var->num_axis == 0) {
+        FT_Done_MM_Var(ft_library, mm_var);
+        return;
+    }
+
+    FT_Fixed *coords = (FT_Fixed *)calloc(mm_var->num_axis, sizeof(FT_Fixed));
+    if (!coords) {
+        FT_Done_MM_Var(ft_library, mm_var);
+        return;
+    }
+
+    int found_wght = 0;
+    for (FT_UInt i = 0; i < mm_var->num_axis; i++) {
+        coords[i] = mm_var->axis[i].def; /* default every OTHER axis explicitly */
+        if (mm_var->axis[i].tag == FT_MAKE_TAG('w', 'g', 'h', 't')) {
+            FT_Fixed want = (FT_Fixed)(target * 65536.0);
+            if (want < mm_var->axis[i].minimum) want = mm_var->axis[i].minimum;
+            if (want > mm_var->axis[i].maximum) want = mm_var->axis[i].maximum;
+            coords[i] = want;
+            found_wght = 1;
+        }
+    }
+
+    if (found_wght) {
+        FT_Set_Var_Design_Coordinates(face, mm_var->num_axis, coords);
+    }
+
+    free(coords);
+    FT_Done_MM_Var(ft_library, mm_var);
+}
+
+/* Alpha gamma-correction LUT (a' = 255*(a/255)^EMOJI_ALPHA_GAMMA), applied
+ * ONLY to glyphs rasterised from `emoji_face` — see the tuning doc above.
+ * Built lazily (once) rather than at a fixed point in `main`'s call order,
+ * so it has no ordering dependency on face setup. */
+static uint8_t emoji_gamma_lut[256];
+static int emoji_gamma_lut_ready = 0;
+
+static void ensure_emoji_gamma_lut(void) {
+    if (emoji_gamma_lut_ready) return;
+    for (int a = 0; a < 256; a++) {
+        double af = (double)a / 255.0;
+        double corrected = pow(af, EMOJI_ALPHA_GAMMA) * 255.0;
+        if (corrected > 255.0) corrected = 255.0;
+        if (corrected < 0.0) corrected = 0.0;
+        emoji_gamma_lut[a] = (uint8_t)(corrected + 0.5);
+    }
+    emoji_gamma_lut_ready = 1;
+}
+
+/* ── Ink-coverage regression floor (mono-glyph-legibility mission) ──────
+ *
+ * Guards against a FUTURE edit silently reverting or weakening the fix
+ * above (deleting the `set_variable_weight` call, walking
+ * EMOJI_WGHT_TARGET/EMOJI_ALPHA_GAMMA back toward washed-out defaults, or
+ * an upstream font-asset swap that changes rasterisation without anyone
+ * re-running the FreeType probe this mission's Findings document) without
+ * anyone noticing until a field report — the exact recurring failure mode
+ * this file's other build-time gates (`g_missing_glyph_count`) already
+ * exist to convert into a build break instead of a silent regression.
+ *
+ * Canary: U+1F44D (👍) at 20px, reusing the ALREADY-rasterised
+ * `rendered[][]` buffer (no extra FreeType work). Measured mean alpha
+ * coverage BEFORE this mission's fix was ~19.7%; AFTER is ~27.4%. The floor
+ * below is set comfortably above the pre-fix baseline and comfortably below
+ * the post-fix measurement, so a full revert fails loudly here rather than
+ * shipping silently washed-out glyphs again — this is a REGRESSION floor
+ * under an already-chosen combination, not a proxy metric a future change
+ * could satisfy by cranking weight/gamma past the over-inking point
+ * `metric-blinded-by-its-own-fix.md` warns against (this file's own tuning
+ * doc above already picked the ceiling on qualitative, not just numeric,
+ * grounds). */
+#define INK_COVERAGE_CANARY_CP ((unsigned long)0x1F44D)
+#define INK_COVERAGE_CANARY_PX 20
+#define INK_COVERAGE_FLOOR_PCT 24.0
+
+static int check_ink_coverage_floor(void) {
+    int size_idx = -1;
+    for (int si = 0; si < N_SIZES; si++) {
+        if (PIXEL_SIZES[si] == INK_COVERAGE_CANARY_PX) { size_idx = si; break; }
+    }
+    if (size_idx < 0) return 0; /* canary size not in PIXEL_SIZES at all */
+
+    int char_idx = -1;
+    for (int ci = 0; ci < n_chars; ci++) {
+        if (chars[ci].cp == INK_COVERAGE_CANARY_CP) { char_idx = ci; break; }
+    }
+    if (char_idx < 0) return 0; /* canary codepoint dropped from this build's table */
+
+    const RenderedGlyph *g = &rendered[size_idx][char_idx];
+    if (g->width == 0 || g->height == 0 || g->data == NULL) {
+        fprintf(stderr,
+            "gen_emoji_font: NOTE — ink-coverage canary U+%04lX is blank at "
+            "%dpx (not rasterised); skipping the regression-floor check.\n",
+            INK_COVERAGE_CANARY_CP, INK_COVERAGE_CANARY_PX);
+        return 0;
+    }
+
+    long sum = 0;
+    long n = (long)g->width * (long)g->height;
+    for (long i = 0; i < n; i++) sum += g->data[i];
+    double coverage_pct = (double)sum / (255.0 * (double)n) * 100.0;
+
+    if (coverage_pct < INK_COVERAGE_FLOOR_PCT) {
+        fprintf(stderr,
+            "gen_emoji_font: FAILED — ink-coverage regression: U+%04lX at "
+            "%dpx measured %.1f%%, below the %.1f%% floor "
+            "(mono-glyph-legibility mission). Did the emoji weight/gamma "
+            "tuning above get reverted or weakened, or the bundled font "
+            "asset change?\n",
+            INK_COVERAGE_CANARY_CP, INK_COVERAGE_CANARY_PX, coverage_pct,
+            INK_COVERAGE_FLOOR_PCT);
+        return 1;
+    }
+    return 0;
+}
+
 /* Render one glyph from the given face at the given pixel size.
  *
  * Returns 1 if `face` maps `cp` to an actual glyph (even if that glyph's
@@ -1056,9 +1236,24 @@ static int render_from_face(FT_Face face, unsigned long cp,
     int pitch = abs(bm->pitch);
 
     if (bm->pixel_mode == FT_PIXEL_MODE_GRAY) {
-        /* Grayscale: copy w bytes per row */
-        for (int row = 0; row < h; row++) {
-            memcpy(g->data + row * w, bm->buffer + row * pitch, (size_t)w);
+        if (face == emoji_face) {
+            /* Emoji face: apply the alpha gamma boost per-pixel (see the
+             * tuning doc above emoji_face's declaration) — never applied to
+             * latin_face, which is a different, non-variable, non-washed-out
+             * font on its own rasterisation path. */
+            ensure_emoji_gamma_lut();
+            for (int row = 0; row < h; row++) {
+                const uint8_t *src = bm->buffer + row * pitch;
+                uint8_t *dst = g->data + row * w;
+                for (int col = 0; col < w; col++) {
+                    dst[col] = emoji_gamma_lut[src[col]];
+                }
+            }
+        } else {
+            /* Grayscale: copy w bytes per row, unmodified */
+            for (int row = 0; row < h; row++) {
+                memcpy(g->data + row * w, bm->buffer + row * pitch, (size_t)w);
+            }
         }
     } else if (bm->pixel_mode == FT_PIXEL_MODE_BGRA) {
         /* Color bitmap (CBDT): convert BGRA → alpha using luminance */
@@ -1225,6 +1420,11 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* Drive the emoji face's `wght` axis toward EMOJI_WGHT_TARGET — see the
+     * tuning doc above `set_variable_weight`'s definition. Never applied to
+     * latin_face (DejaVu Sans is not a variable font). */
+    set_variable_weight(emoji_face, EMOJI_WGHT_TARGET);
+
     /* ── Build sorted character list ──────────────────────────────────── */
     n_chars = 0;
 
@@ -1307,6 +1507,10 @@ int main(int argc, char **argv)
             "render BLANK on-device. Fix: either drop the offending size from "
             "EMOJI_SIZES for that char, or use a codepoint both faces cover.\n",
             g_missing_glyph_count);
+        return 1;
+    }
+
+    if (check_ink_coverage_floor()) {
         return 1;
     }
 
