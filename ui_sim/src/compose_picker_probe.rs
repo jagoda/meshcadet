@@ -1,0 +1,315 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//! Host-native render rig for `compose.rs`'s `EmojiPickerGrid` — the ONE
+//! previously-unproven mechanism `meshcadet-emoji-picker-expansion` touches:
+//! category tabs over a Flickable-scrolled grid, at the new 96-entry/6-tab
+//! shape (up from the pre-expansion flat 40-cell grid).
+//!
+//! # Why this is a separate, narrower render path
+//!
+//! `firmware/src/ui/screens/compose.rs` cannot itself be compiled on the
+//! host (the `firmware` crate cross-compiles for `xtensa-esp32s3-espidf`
+//! only — see `lib.rs`'s module doc for the full explanation). This module
+//! copies `EmojiPickerGrid`'s markup VERBATIM (same technique
+//! `compose_promo.rs`/`splash_lineart.rs` already establish for this
+//! codebase's other host-unprovable components), as its OWN top-level
+//! `Window` component rather than nested inside a full compose-screen copy
+//! — `compose_promo.rs`'s copy deliberately never opens its picker overlay
+//! (see that module's doc), so it cannot exercise this mechanism at all.
+//! One deliberate ADDITION on top of the verbatim copy: a
+//! `scroll_to_bottom()` public function, purely a test aid (mirrors
+//! `message_view_promo.rs`'s own `scroll_to_bottom` — `flick.viewport-y =
+//! min(0px, flick.height - flick.viewport-height);`) so this rig can drive
+//! the Flickable to its maximum scroll deterministically instead of
+//! simulating a drag gesture's threshold/inertia. Everything else is an
+//! exact copy of `compose.rs`'s `EmojiPickerGrid`.
+//!
+//! Cell data comes from the REAL `protocol::emoji::EMOJI_TABLE` /
+//! `EMOJI_CATEGORIES`, split into the 6 per-category models the same way
+//! `firmware/src/ui/screens/compose.rs`'s `cells_for_category` does (that
+//! function itself lives in the unbuildable `firmware` crate, so this is a
+//! duplicated-but-equivalent host-side copy, not a shared import).
+//!
+//! Slint enforces a process-wide `Platform` singleton, so this module's
+//! render entry point must never run in the same process as any other
+//! `ui_sim` render rig — `ui_sim/tests/compose_picker_categories.rs` is its
+//! own Cargo integration-test binary (own process), same isolation
+//! technique `compose_send.rs`'s own doc explains.
+
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType, Rgb565Pixel};
+use slint::platform::{Platform, PlatformError, PointerEventButton, WindowAdapter, WindowEvent};
+use slint::{LogicalPosition, PhysicalSize};
+
+use protocol::emoji::{EMOJI_CATEGORIES, EMOJI_TABLE};
+
+/// The picker overlay's real on-device footprint (`compose.rs`'s
+/// `EmojiPickerGrid`: `width: 320px; height: 164px;`).
+pub const WIDTH: u32 = 320;
+pub const HEIGHT: u32 = 164;
+
+slint::slint! {
+    import { Theme } from "../../firmware/src/ui/theme.slint";
+
+    struct EmojiCell {
+        codepoint_str: string,
+        label:         string,
+    }
+
+    // Verbatim copy of `compose.rs`'s `EmojiPickerGrid` body, promoted to a
+    // top-level exported `Window` (164px tall, matching the real overlay's
+    // own height) instead of a nested `component` — see this file's module
+    // doc for why, and for the one addition (`scroll_to_bottom`).
+    export component EmojiPickerProbeUi inherits Window {
+        width: 320px;
+        height: 164px;
+        background: Theme.surface;
+
+        in property <[EmojiCell]> faces_cells;
+        in property <[EmojiCell]> gestures_cells;
+        in property <[EmojiCell]> hearts_cells;
+        in property <[EmojiCell]> nature_cells;
+        in property <[EmojiCell]> fun_cells;
+        in property <[EmojiCell]> objects_cells;
+        in property <[string]> category_names;
+        in-out property <int> active_category: 0;
+        callback emoji_selected(string);
+
+        property <[EmojiCell]> active_cells:
+            active_category == 0 ? faces_cells :
+            active_category == 1 ? gestures_cells :
+            active_category == 2 ? hearts_cells :
+            active_category == 3 ? nature_cells :
+            active_category == 4 ? fun_cells :
+            objects_cells;
+
+        // Test-only: jump the grid Flickable to its maximum scroll
+        // position, deterministically (no drag-gesture threshold/inertia
+        // to account for) — see this file's module doc.
+        public function scroll_to_bottom() {
+            flick.viewport-y = min(0px, flick.height - flick.viewport-height);
+        }
+        public function scroll_to_top() {
+            flick.viewport-y = 0px;
+        }
+
+        Rectangle {
+            x: 0px; y: 0px;
+            width: parent.width;
+            height: 24px;
+            HorizontalLayout {
+                padding: 2px;
+                spacing: 2px;
+                for name[i] in category_names : Rectangle {
+                    horizontal-stretch: 1.0;
+                    background: (i == root.active_category) ? Theme.brand-signal : Theme.surface-raised;
+                    animate background { duration: 100ms; easing: ease-out; }
+                    border-radius: 4px;
+                    Text {
+                        text: name;
+                        font-size: Theme.size-meta;
+                        color: (i == root.active_category) ? Theme.bg-space : Theme.text-secondary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    tab_touch := TouchArea {
+                        width: parent.width;
+                        height: parent.height;
+                        clicked => { root.active_category = i; }
+                    }
+                }
+            }
+        }
+
+        flick := Flickable {
+            x: 0px; y: 24px;
+            width: parent.width;
+            height: parent.height - 24px;
+
+            GridLayout {
+                padding: 4px;
+                spacing: 2px;
+
+                for cell[i] in active_cells : Rectangle {
+                    col: mod(i, 5);
+                    row: floor(i / 5);
+                    width: 58px;
+                    height: 36px;
+                    background: emoji_touch.has-hover ? Theme.select : transparent;
+                    animate background { duration: 100ms; easing: ease-out; }
+                    border-radius: 6px;
+
+                    Text {
+                        text: cell.codepoint_str;
+                        font-size: Theme.icon-lg;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    emoji_touch := TouchArea {
+                        width: parent.width;
+                        height: parent.height;
+                        clicked => { root.emoji_selected(cell.codepoint_str); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct EmojiPickerProbePlatform {
+    window: Rc<MinimalSoftwareWindow>,
+    start: Instant,
+}
+
+impl Platform for EmojiPickerProbePlatform {
+    fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, PlatformError> {
+        Ok(self.window.clone())
+    }
+
+    fn duration_since_start(&self) -> Duration {
+        self.start.elapsed()
+    }
+}
+
+/// Build the picker model for one category — same filter-by-category
+/// technique as `compose.rs`'s `cells_for_category`, duplicated here since
+/// that function lives in the host-unbuildable `firmware` crate (see
+/// module doc).
+fn cells_for_category(category: &'static str) -> slint::ModelRc<EmojiCell> {
+    let cells: slint::VecModel<EmojiCell> = slint::VecModel::default();
+    for entry in EMOJI_TABLE.iter().filter(|e| e.category == category) {
+        cells.push(EmojiCell {
+            codepoint_str: entry.codepoint.to_string().into(),
+            label: entry.label.into(),
+        });
+    }
+    slint::ModelRc::new(cells)
+}
+
+/// Host-sim rig for `EmojiPickerGrid`, wired with the REAL
+/// `protocol::emoji::EMOJI_TABLE` (96 entries / 6 categories).
+///
+/// # Panics
+/// Panics if a Slint platform is already installed in this process — see
+/// `compose_send.rs::ComposeSendFrame::new`'s identical note. Callers must
+/// ensure exactly one [`EmojiPickerProbeFrame::new`] runs per process.
+pub struct EmojiPickerProbeFrame {
+    window: Rc<MinimalSoftwareWindow>,
+    ui: EmojiPickerProbeUi,
+}
+
+impl EmojiPickerProbeFrame {
+    pub fn new() -> Self {
+        let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+        window.set_size(PhysicalSize::new(WIDTH, HEIGHT));
+        slint::platform::set_platform(Box::new(EmojiPickerProbePlatform {
+            window: window.clone(),
+            start: Instant::now(),
+        }))
+        .expect("Slint platform already set in this process");
+
+        let ui = EmojiPickerProbeUi::new().expect("EmojiPickerProbeUi::new");
+        ui.show().expect("EmojiPickerProbeUi::show");
+
+        ui.set_faces_cells(cells_for_category(EMOJI_CATEGORIES[0]));
+        ui.set_gestures_cells(cells_for_category(EMOJI_CATEGORIES[1]));
+        ui.set_hearts_cells(cells_for_category(EMOJI_CATEGORIES[2]));
+        ui.set_nature_cells(cells_for_category(EMOJI_CATEGORIES[3]));
+        ui.set_fun_cells(cells_for_category(EMOJI_CATEGORIES[4]));
+        ui.set_objects_cells(cells_for_category(EMOJI_CATEGORIES[5]));
+        let names: slint::VecModel<slint::SharedString> = slint::VecModel::default();
+        for &category in EMOJI_CATEGORIES {
+            names.push(category.into());
+        }
+        ui.set_category_names(slint::ModelRc::new(names));
+
+        EmojiPickerProbeFrame { window, ui }
+    }
+
+    pub fn set_active_category(&self, i: i32) {
+        self.ui.set_active_category(i);
+    }
+
+    pub fn get_active_category(&self) -> i32 {
+        self.ui.get_active_category()
+    }
+
+    pub fn scroll_to_top(&self) {
+        self.ui.invoke_scroll_to_top();
+    }
+
+    pub fn scroll_to_bottom(&self) {
+        self.ui.invoke_scroll_to_bottom();
+    }
+
+    pub fn on_emoji_selected(&self, cb: impl Fn(String) + 'static) {
+        self.ui.on_emoji_selected(move |s| cb(s.to_string()));
+    }
+
+    /// Simulate a real touch tap (press + release at the same point) at
+    /// LOGICAL window coordinates — the exact `WindowEvent::PointerPressed`
+    /// / `PointerReleased` pair `firmware/src/ui/platform.rs`'s real touch
+    /// panel driver dispatches for a physical tap (see that file's
+    /// `TouchKind::Pressed`/`Released` handling), so this is a faithful
+    /// touch simulation, not an approximation.
+    pub fn tap(&self, x: f32, y: f32) {
+        let position = LogicalPosition::new(x, y);
+        self.window
+            .window()
+            .dispatch_event(WindowEvent::PointerPressed {
+                position,
+                button: PointerEventButton::Left,
+            });
+        self.window
+            .window()
+            .dispatch_event(WindowEvent::PointerReleased {
+                position,
+                button: PointerEventButton::Left,
+            });
+    }
+
+    /// Advance Slint's animation clock and render one frame — must be
+    /// called after any state change (tap, category switch, scroll) whose
+    /// on-screen effect a test wants to observe, same convention every
+    /// other `ui_sim` render module uses.
+    pub fn render(&self) -> Vec<Rgb565Pixel> {
+        slint::platform::update_timers_and_animations();
+        self.window.request_redraw();
+
+        let mut framebuffer = vec![Rgb565Pixel(0); (WIDTH * HEIGHT) as usize];
+        self.window.draw_if_needed(|renderer| {
+            renderer.render(&mut framebuffer, WIDTH as usize);
+        });
+        framebuffer
+    }
+}
+
+impl Default for EmojiPickerProbeFrame {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Convert a rendered RGB565 framebuffer to an `image::RgbImage` (RGB8) —
+/// same conversion every other `ui_sim` render module duplicates locally.
+pub fn framebuffer_to_rgb_image(
+    framebuffer: &[Rgb565Pixel],
+    width: u32,
+    height: u32,
+) -> image::RgbImage {
+    let mut img = image::RgbImage::new(width, height);
+    for (i, px) in framebuffer.iter().enumerate() {
+        let r5 = (px.0 >> 11) & 0x1F;
+        let g6 = (px.0 >> 5) & 0x3F;
+        let b5 = px.0 & 0x1F;
+        let r8 = ((r5 << 3) | (r5 >> 2)) as u8;
+        let g8 = ((g6 << 2) | (g6 >> 4)) as u8;
+        let b8 = ((b5 << 3) | (b5 >> 2)) as u8;
+        let x = (i as u32) % width;
+        let y = (i as u32) / width;
+        img.put_pixel(x, y, image::Rgb([r8, g8, b8]));
+    }
+    img
+}
