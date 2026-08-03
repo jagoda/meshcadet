@@ -196,7 +196,7 @@ rendered frame no matter how often it renders. Only two things change that:
 
 1. **Narrow the opacity subtree** — fade a smaller region, or drop the
    screen-entry fade. This is a **visual/product change**, and the
-   Commander's standing constraint on this campaign is that *all
+   project's standing constraint on this campaign is that *all
    functionality must remain, nothing may regress*. It needs a design ruling,
    not a perf mission's judgement.
 2. **Composite off a retained framebuffer** instead of re-rendering — 320 ×
