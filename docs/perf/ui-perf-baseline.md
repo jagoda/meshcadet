@@ -106,12 +106,13 @@ the buzzer, the LCD and **all** of Slint. Its loop blocks on
 (`ui_task.rs:121`, `:371`), so it wakes on a queued event **or** on a 16 ms
 tick, whichever comes first.
 
-**The boundary is two bounded `std::sync::mpsc` channels**, both used with
-`try_send`-equivalent bounded semantics: dispatcher → UI events
-(`EVENT_QUEUE_CAP = 32`, `ui_task.rs:126`) and UI → dispatcher commands
-(`COMMAND_QUEUE_CAP = 16`, `ui_task.rs:129`). **The dispatcher never blocks on
-the UI.** A full command queue surfaces a user-visible refusal
-(`firmware/src/ui/mod.rs`'s send path) rather than silently dropping a send.
+**The boundary is two bounded `std::sync::mpsc::sync_channel`s**
+(`ui_task.rs:182-183`), both driven by `try_send`, which never blocks:
+dispatcher → UI events (`EVENT_QUEUE_CAP = 32`, `ui_task.rs:126`) and UI →
+dispatcher commands (`COMMAND_QUEUE_CAP = 16`, `ui_task.rs:129`). **The
+dispatcher never blocks on the UI.** A full command queue surfaces a
+user-visible refusal — a "send queue is busy" row in the conversation
+(`ui/mod.rs:2664`) — rather than silently dropping a send.
 
 Both tasks are Task-WDT subscribed (`main.rs:1792`, `ui_task.rs:331`); both log
 their own stack high-water mark every 30 s (`main.rs:2776`, `ui_task.rs:423`).
@@ -449,8 +450,8 @@ Modelled against the removed spin-poll, split topology:
 The honest reading: this bought a **fixed, small, deterministic** latency
 reduction on the CAD path and removed a per-millisecond scheduler wake. It did
 not change throughput. Its larger value is structural — the wait is now a
-blocking primitive with a testable postcondition (§6, and `radio-host-validation.md`
-§4's ISR-safety audit).
+blocking primitive with a testable postcondition (§6.1, and
+`radio-host-validation.md` §4's ISR-safety audit).
 
 ### 5.5 Why the milestone documents print different numbers
 
@@ -678,7 +679,24 @@ serial log for `stale DIO1`** — a nonzero count on real traffic is the field
 evidence that the defect class was real, and a zero count over a long run is
 weak evidence it is rare. Either way, record the count in the report block.
 
-### 9.4 Emulation does not close any of these
+### 9.4 If you came here from ADR-0012
+
+ADR-0012 numbered its own deferred predicates `D-A`…`D-H`. They are the same
+set, under different labels — resolved here so nobody hunts for a second
+register:
+
+| ADR-0012 | Here |
+|---|---|
+| D-A — post-split per-task stack HWM | **D8** |
+| D-B — the ≤12.8 µs bus-hold bound, empirically | **D9** (code-blocked, §9.2) |
+| D-C — delivery success rate vs. baseline | **D5** |
+| D-D — real per-core utilization | **D7** |
+| D-E — device UI-unserviced gap vs. the model | **D4** |
+| D-F — device input-to-first-paint | **D10** (the automatic `PERF input-to-first-paint` half) |
+| D-G — splash-ripple visual confirmation on the concurrent boot path | **D10** (the stopwatch/video half) |
+| D-H — free internal-heap headroom after +32 768 B of stack | **D-H** (code-blocked, §9.2 — the one that keeps its ADR label, because nothing here supersedes it) |
+
+### 9.5 Emulation does not close any of these
 
 Espressif's QEMU fork emulates the ESP32-S3 CPU, memory, flash-SPI, PSRAM,
 crypto and timers, but models no general-purpose SPI2 slave devices (no ST7789,
@@ -686,7 +704,7 @@ no SX1262), no DIO1/BUSY GPIO semantics, no I2C touch/keyboard, and no RF — an
 is documented as non-cycle-accurate. It cannot boot this application past
 display/radio init, and any timing number it produced would be fiction.
 
-### 9.5 When a predicate closes
+### 9.6 When a predicate closes
 
 Move its number into the body of this document with a **[DEVICE]** tag naming
 the build ref and the date, strike its row from §9, and add a §11 line if it
