@@ -143,7 +143,55 @@ impl TDeckWindowAdapter {
     /// Uses the `SoftwareRenderer` in line-buffer mode: one
     /// `DISPLAY_WIDTH`-pixel-wide RGB565 line at a time, avoiding the ~150 KB
     /// full-frame buffer.  A no-op when nothing is dirty.
+    ///
+    /// BUG FIX (boot panic): `SoftwareRenderer::render_by_line`
+    /// (`i-slint-renderer-software` 1.16.1 `lib.rs:754`) reads the window's
+    /// currently-set component via `WindowInner::component()` —
+    /// UNCONDITIONALLY, with no fallback — which is documented to "Panic if
+    /// it wasn't set" (`i-slint-core` 1.16.1 `window.rs:579`). The
+    /// buffer-based `render()` entry point Slint also ships
+    /// (`render_buffer_impl`) does NOT have this gap: it reads the softer
+    /// `try_component()`/`window_item()` and falls back to a
+    /// buffer-dimensions default when nothing is set yet — see Slint's own
+    /// `test_empty_window` regression test, whose comment says exactly this
+    /// ("when creating an empty window without a component, we don't panic
+    /// when render() is called"). `render_by_line` — the ONLY renderer entry
+    /// point this module calls, chosen for its per-line buffer instead of a
+    /// ~150 KB full-frame one (see this fn's own doc above) — was simply
+    /// never given the same safety net upstream.
+    ///
+    /// `render_if_needed` is the ONE call site in this crate that reaches
+    /// `render_by_line` (directly here, and via `UiRuntime::step()` /
+    /// `UiRuntime::run_splash_ripple()`, both of which call THIS method) —
+    /// so guarding here closes the gap everywhere at once, for both the
+    /// production and `--features diagnostics` builds identically (neither
+    /// caller is diagnostics-gated). A render attempted while the window's
+    /// component has no live strong reference anywhere — whether because
+    /// none has been shown yet, or because the previously-shown one was
+    /// just dropped mid-navigation — hit this exact unwrap and hard-panicked
+    /// the whole `ui_task`, which ESP-IDF turns into `abort()` on core 1 and
+    /// an indefinite reboot loop. `try_component()` is `pub` on
+    /// `i_slint_core::window::WindowInner`, which this crate already reaches
+    /// into directly (see `Cargo.toml`'s `i-slint-core` dependency comment,
+    /// used today for `register_bitmap_font`) — this is the exact check
+    /// `render()`'s own safe path uses internally, just invoked from our
+    /// side of the API instead of Slint's. Skipping a render with nothing
+    /// live yet costs at most one `UI_TICK_MS` (16 ms) — the very next
+    /// `render_if_needed` call picks the frame back up — the same
+    /// degrade-not-panic shape every other hardware/resource path in this
+    /// module already follows (display/touch/keyboard probe failures all
+    /// log-and-continue rather than panic).
     pub fn render_if_needed(&self, display: &mut TDeckDisplay<'_>) -> anyhow::Result<()> {
+        if i_slint_core::window::WindowInner::from_pub(self.window.window())
+            .try_component()
+            .is_none()
+        {
+            log::warn!(
+                "ui: render_if_needed called with no Slint component set on the window — \
+                 skipping this frame (retried on the next tick)"
+            );
+            return Ok(());
+        }
         self.window.draw_if_needed(|renderer| {
             renderer.render_by_line(TDeckLineRenderer { display });
         });
