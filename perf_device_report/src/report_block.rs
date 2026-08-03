@@ -66,7 +66,7 @@ impl Section {
         }
     }
 
-    /// Which `docs/perf/ui-perf-baseline.md` §8 predicates a block of this
+    /// Which `docs/perf/ui-perf-baseline.md` §9 predicates a block of this
     /// section can close, per `docs/perf/collection-kit.md` §0's own
     /// "which part closes what" table. Informational only — closing a
     /// predicate is a human/doc-editing act, not something this crate does

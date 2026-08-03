@@ -245,7 +245,7 @@ fn per_frame_allocation_projection_at_measured_dirty_line_counts() {
     // table carried. That 86 was a measurement artifact of `ui_sim`'s shared
     // scene (MascotBob/Twinkle entry animations still settling, merged into
     // one inflated dirty rect by the renderer's 3-rectangle DirtyRegion cap)
-    // and is retracted — see `docs/perf/ui-perf-baseline.md` §9.
+    // and is retracted — see `docs/perf/ui-perf-baseline.md` §11.
     let scenarios: &[(&str, usize)] = &[
         ("idle (no dirty lines)", 0),
         ("CometOnNotify peak frame", 14),

@@ -1,5 +1,11 @@
 # M1 task/core split — host validation (no hardware in the loop)
 
+**Status update, review landed (M4), 2026-08-03:** the single current source
+for every model number is now `docs/perf/ui-perf-baseline.md` §5 — the state
+of record — which prints a fresh sweep at the current commit and, in §5.5,
+explains exactly which re-parameterisations moved which figures. This document
+stays as the historical snapshot described above.
+
 **Status update, M2 landed — RX_POLL_YIELD_MS retuned, numbers below are
 now historical.** `meshcadet-perf-radio-dio1-interrupt` retuned
 `RX_POLL_YIELD_MS` 5 ms -> 20 ms (`firmware/src/main.rs:1748`) after this
