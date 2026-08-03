@@ -241,6 +241,27 @@ that carry M3's subject: `firmware/src/ui/mod.rs` `render_settling` /
 "Render dirty regions" block. **Comments only — no code, no constant, and no
 behaviour changed.**
 
+### The coupling this document creates, recorded where it will be read
+
+§4.1's demotion rests on `ui_task::UI_TICK_MS` (16 ms) happening to equal
+`UiRuntime::RENDER_MIN_INTERVAL_MS` (16 ms). Neither constant's doc mentioned
+the other, so retuning either — `UI_TICK_MS` is a live loop-model parameter
+and a plausible target of a future perf pass — would silently falsify this
+document with no diff-visible signal. Both const docs now carry the
+cross-reference: raising `UI_TICK_MS` above `RENDER_MIN_INTERVAL_MS` re-opens
+the demotion; lowering it makes the throttle load-bearing in the steady state
+again.
+
+They are deliberately **not** pinned equal by a `const` assertion. They are
+independent knobs that merely coincide today (one bounds the whole `ui_task`
+loop and its TWDT pet; the other bounds only frame flushes while an animation
+settles) — asserting equality would encode an invariant that does not exist
+and would block a legitimate retune of either. A host test cannot pin the
+relationship either: both live in `firmware/`, a detached cross-compiled
+workspace whose `cargo test` only type-checks (`ui-perf-baseline.md` §0).
+The cross-referenced comment is the strongest available mitigation, and this
+is recorded rather than left implicit.
+
 ### Handed to M4's consolidated citation re-pass
 
 `ui-perf-baseline.md` §9 already names the M4 campaign synthesis as where

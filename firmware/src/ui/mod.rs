@@ -1068,6 +1068,23 @@ impl<'d> UiRuntime<'d> {
     /// intermediate frames a human eye was never going to resolve anyway,
     /// each of which would otherwise cost a full SPI-bus-contending
     /// `flush_line_range` sweep of whatever region the animation covers.
+    ///
+    /// DO NOT RAISE THIS TO SAVE FADE FRAMES — it provably does not work.
+    /// `docs/perf/ui-residual-opt-r1.md` §4.2: `render_if_needed` blocks for
+    /// the flush it issues, and `last_render_ms` is stamped from the `now_ms`
+    /// captured at the TOP of the same `step()` call, so the interval the
+    /// predicate observes on the next tick already includes that flush. A
+    /// full-window flush is ~30.7 ms (`docs/perf/ui-perf-baseline.md` §4.1) —
+    /// already longer than any cap worth setting — so the predicate is
+    /// unconditionally true on the tick after one, and raising this constant
+    /// changes nothing about the full-window fade frames it would be aimed
+    /// at. It would only start dropping frames from the CHEAP motif
+    /// animations (14–28 dirty lines, ~1.8–3.6 ms) it was never aimed at.
+    ///
+    /// COUPLED CONSTANT: see `ui_task::UI_TICK_MS`, which today holds the
+    /// same 16 ms value for an unrelated reason and is what makes this
+    /// throttle nearly redundant in a quiet steady state (§4.1). It is still
+    /// load-bearing under an event burst (§5) — do not remove it.
     const RENDER_MIN_INTERVAL_MS: u64 = 16;
 
     /// Bound on how many touch events / keyboard bytes `step()` will drain

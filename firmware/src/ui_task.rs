@@ -104,6 +104,20 @@ use crate::ui::{BuzzerDriver, UiCommand, UiEvent, UiRuntime};
 /// C7: wake on a message or this tick deadline — the direct analogue of the
 /// loop model's `split_ui_idle_tick` parameter (`perf_loop_model/src/
 /// sim.rs:356`).
+///
+/// COUPLED CONSTANT — read before retuning. This value happens to equal
+/// `ui::UiRuntime::RENDER_MIN_INTERVAL_MS` (also 16 ms), and
+/// `docs/perf/ui-residual-opt-r1.md` §4.1 leans on that coincidence: it is
+/// why M3 concluded the split ALREADY supplies the render-cadence cap in a
+/// quiet steady state, and therefore why the entry-fade repaint item was
+/// demoted rather than optimized further. The two are independent knobs (one
+/// bounds the whole `ui_task` loop and its TWDT pet, the other bounds only
+/// frame FLUSHES while an animation settles), so they are deliberately NOT
+/// asserted equal — but raising this one above `RENDER_MIN_INTERVAL_MS`
+/// re-opens that demotion, and lowering it makes the throttle load-bearing
+/// again in the steady state as well as under the event bursts it already
+/// covers. Either direction wants §4.1's argument re-derived, not just
+/// re-read.
 const UI_TICK_MS: u64 = 16;
 
 /// D3: dispatcher → UI event queue capacity. Steady-state production is
