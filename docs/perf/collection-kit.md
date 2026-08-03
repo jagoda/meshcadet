@@ -42,6 +42,14 @@ procedure at all (P1 and D-H). `docs/perf/ui-perf-baseline.md` §9 is the
 register this table mirrors; the two are now the same set, indexed
 differently. No capture step below changed.
 
+**D-H closed the same day by `meshcadet-perf-diagnostics-heap-headroom`.**
+The dispatcher's Part C rollup block now logs
+`PERF heap-internal: free=<bytes> min_ever=<bytes>` — free internal-heap
+headroom (`MALLOC_CAP_INTERNAL`, not total free heap), plus the lifetime
+low-water mark since boot, no extra capture step needed. D-H moves from
+`ui-perf-baseline.md` §9.2 (code-blocked) to §9.1 (hardware-only, runnable
+today); this table's own D-H row above reflects the same move.
+
 ## 0. What this closes, and what it doesn't
 
 This is the one place in the `meshcadet-perf-rearchitecture` performance
@@ -79,7 +87,7 @@ one tightens it. Once a section here closes a predicate, strike that row from
 | **D12** (new, M2) — bounded latency of a real concurrent NVS write masking the DIO1 ISR | Part F, new subsection — needs a timed capture around an admin-CLI edit issued while radio traffic is in flight |
 | The loop model's swept constants (`perf_loop_model/src/params.rs`) | Part D — calibration table |
 | **P1** — hands-on functional sweep: every screen, navigation path, input and radio path exercised on hardware | **Part H** (new) — walk `docs/perf/task-split-host-validation.md` §5's 58-row parity matrix on the device. Its host-side half (a source-cited preservation argument per row) is already met; this is the device-side half |
-| **D-H** — free internal-heap headroom after the split's +32 768 B of task stack | **Not runnable, and not for want of hardware:** the firmware logs no `heap_caps_get_free_size(MALLOC_CAP_INTERNAL)` reading. One line in `main.rs`'s 30 s diagnostics block would close it; until then this predicate is blocked on code, not on silicon |
+| **D-H** — free internal-heap headroom after the split's +32 768 B of task stack | **Part C** — the dispatcher's rollup block now logs `PERF heap-internal: free=<bytes> min_ever=<bytes>` (`MALLOC_CAP_INTERNAL` only, not total free heap) every 30 s, same run as D1/D2/D7 |
 
 **One more thing to record on any Part G run**, not a predicate of its own:
 `firmware/src/radio.rs:437` emits `radio: stale DIO1 notification observed with
@@ -266,6 +274,7 @@ PERF phase=tx: n=<count> min=<us> mean=<us> max=<us> p95=<us>
 PERF phase=rx_poll: n=<count> min=<us> mean=<us> max=<us> p95=<us>
 PERF rx-notice-latency: n=<count> min=<us> mean=<us> max=<us> p95=<us>
 PERF core-utilization: core0=<pct or n/a> core1=<pct or n/a>
+PERF heap-internal: free=<bytes> min_ever=<bytes>
 ```
 
 `ui_task` (`firmware/src/ui_task.rs`, **new** for M1) — once, at boot, then
@@ -305,6 +314,15 @@ All phase values are microseconds; `ui-starvation` and input-to-first-paint
 are milliseconds. `n=0` on any phase (e.g. `tx`/`cad` with nothing queued)
 reports `min=0 mean=0 max=0 p95=0` — that is the "no samples" case, not a
 real zero cost; don't read it as one.
+
+`heap-internal`'s two fields are both byte counts of free
+**`MALLOC_CAP_INTERNAL`** heap — internal SRAM only, never PSRAM, so this
+number does not answer "is there enough PSRAM"; it answers D-H's actual
+question, whether the split's extra task stack left adequate internal-heap
+room. `free` is this window's instantaneous reading; `min_ever` is the
+lifetime low-water mark since boot (`heap_caps_get_minimum_free_size`), so it
+only ever falls or holds across a capture — it catches a transient squeeze
+between rollup windows that `free` alone could miss.
 
 **A correct run looks like — CHANGED for the M1 ref.** Idle windows with
 `cad`/`tx` at `n=0` in the dispatcher block, `ui_step` mean in the low

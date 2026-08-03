@@ -532,7 +532,7 @@ plus the demotions measurement produced:
   change than a task split.
 - **`ui_perf/tests/flush_line_alloc.rs`'s 28-line `RocketOnSend` fixture** vs.
   the live 29-line measurement (§3.2). Cosmetic; reconcile on next touch.
-- **Three predicates are blocked on missing code, not on missing hardware**
+- **Two predicates are blocked on missing code, not on missing hardware**
   (§9.2). They will not close by running the collection kit as it stands.
 
 ### 6.3 SETTLED — do not re-litigate
@@ -604,6 +604,7 @@ the whole module compiles to nothing without the feature):
 | Per-phase dispatcher timing (GPS, battery, CAD, TX, RX poll) — n/min/mean/max/p95 | `PERF phase=<name>: …` | `main.rs:2806` |
 | RX-notice latency proxy | `PERF rx-notice-latency: …` | `main.rs:2812` |
 | Per-core utilization (`vTaskGetRunTimeStats()`) | `PERF core-utilization: core0=… core1=…` | `main.rs:2846` |
+| Free internal-heap headroom (`MALLOC_CAP_INTERNAL`; instantaneous + lifetime low-water mark) | `PERF heap-internal: free=… min_ever=…` | `main.rs:2881` |
 | `ui.step()` phase timing | `PERF phase=ui_step: …` | `ui_task.rs:442` |
 | UI-starvation counter (cumulative + longest gap) | `PERF ui-starvation: cumulative=…ms longest=…ms` | `ui_task.rs:450` |
 | Input-to-first-paint latency | `PERF input-to-first-paint: …` | `ui_task.rs:436`, sampled in `ui/mod.rs:1371` |
@@ -621,9 +622,10 @@ options back the core-utilization reading
 replacement; that was caught at the M1 boundary and restored before this
 document landed. `collection-kit.md` reads the restored format.
 
-**Not instrumented, and therefore not closable by the kit:** free internal-heap
-headroom (§9.2, D-H) and a per-frame dirty-line *count* (only a duration proxy
-exists — §9.1, D3).
+**Not instrumented, and therefore not closable by the kit:** a per-frame
+dirty-line *count* (only a duration proxy exists — §9.1, D3). Free
+internal-heap headroom (§9.1, D-H) is instrumented as of this table's own
+`PERF heap-internal` row above — no longer in this "not closable" list.
 
 ---
 
@@ -652,6 +654,7 @@ MeshCore-speaking peer node.
 | **D6** | RX-notice latency, UI-idle vs. UI-active; CAD-busy and TX-retry counts | §5.3's modelled cadence improvement, on silicon | **Part G**, same run as D5, differenced |
 | **D7** | Per-core utilization | §1's core-affinity claim, and §6.1's "core 1 carries real work" | **Part C** — every 30 s window reports it for free (`PERF core-utilization`) |
 | **D8** | Post-split per-task stack high-water mark, dispatcher **and** `ui_task` | The 49 152 B / 32 768 B budgets; unblocks the deliberately deferred dispatcher-stack trim | **Part E** — both tasks now log their own HWM |
+| **D-H** | Free internal-heap headroom (`MALLOC_CAP_INTERNAL`) after the split's +32 768 B of task stack | ADR-0012's own deferred D-H predicate — see §9.4 | **Part C** — every 30 s window now reports `PERF heap-internal: free=<bytes> min_ever=<bytes>` for free, alongside the other dispatcher-rollup lines. `min_ever` is `heap_caps_get_minimum_free_size`'s own lifetime low-water mark, so a transient squeeze between rollup windows still shows up even if the instantaneous `free` reading missed it |
 | **D10** | Felt frame rate / tap-to-first-frame; splash-ripple smoothness on the concurrent boot path | Human-perceptible responsiveness, which no counter captures. The only instrument that could contradict the decision not to re-architect the renderer | **Part D10** (stopwatch + 120/240 fps video), plus the automatic `PERF input-to-first-paint` block |
 | **D12** | Bounded latency of a real concurrent NVS write masking the DIO1 GPIO ISR | `radio-host-validation.md` §4.1's one open ISR-safety item. Bounded and self-recovering by argument; this measures the bound | **Part F addendum** — timed capture around an admin-CLI edit issued while radio traffic is in flight |
 | **P1** | Hands-on functional sweep: every screen, every navigation path, every radio path, on the device | The device-side half of functional parity. Its host-side half — a 58-row static parity matrix with a source citation per row — is met (`task-split-host-validation.md` §5) | **Part H** — walk `task-split-host-validation.md` §5's matrix row by row on hardware |
@@ -659,7 +662,7 @@ MeshCore-speaking peer node.
 
 ### 9.2 Blocked on missing code, not on missing hardware
 
-**These three do not close by running the kit.** They are listed here so the
+**These two do not close by running the kit.** They are listed here so the
 register is complete, and they are deliberately *not* filed as hardware
 deferrals — the distinction matters, because a hardware deferral is closed by
 the operator and these are closed by a maintainer first.
@@ -668,7 +671,6 @@ the operator and these are closed by a maintainer first.
 |---|---|---|---|
 | **D9** | SPI2 bus-hold behaviour under a *concurrent* full LCD repaint and radio TX, at 40 MHz and 8 MHz | A GPIO-toggle probe in `radio.rs` (bracket the SPI transaction with a scope-visible pin) — it does not exist | **Part F**, once the probe lands. Confirmatory only: §4.3's ≤12.8 µs bound is settled by source and datasheet |
 | **D11** | DIO1 GPIO ISR IRAM-safety confirmatory reading | The same probe as D9, plus a link-section audit | **Part F addendum**. The static audit already found no NO-GO condition; this is empirical margin |
-| **D-H** | Free internal-heap headroom after the split's +32 768 B of task stack | A `heap_caps_get_free_size(MALLOC_CAP_INTERNAL)` reading — the firmware logs none. One line in the diagnostics rollup would close it | Add the log line to `main.rs`'s 30 s diagnostics block, then read it in **Part C** |
 
 ### 9.3 One observation to fold into any Part G run
 
@@ -694,7 +696,7 @@ register:
 | D-E — device UI-unserviced gap vs. the model | **D4** |
 | D-F — device input-to-first-paint | **D10** (the automatic `PERF input-to-first-paint` half) |
 | D-G — splash-ripple visual confirmation on the concurrent boot path | **D10** (the stopwatch/video half) |
-| D-H — free internal-heap headroom after +32 768 B of stack | **D-H** (code-blocked, §9.2 — the one that keeps its ADR label, because nothing here supersedes it) |
+| D-H — free internal-heap headroom after +32 768 B of stack | **D-H** (§9.1 — no longer code-blocked; keeps its ADR label because nothing here supersedes it) |
 
 ### 9.5 Emulation does not close any of these
 
@@ -730,7 +732,7 @@ launders a deferred form into a met one.
 | 4 | **Both cores carry real work** | **MET.** Explicit affinities in code, both directions: `CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0=y` (`sdkconfig.defaults:94`) and `pin_to_core: Some(Core::Core1)` (`ui_task.rs:213`), cross-compiled green in CI on every merged change | **Open — D7.** Per-core utilization from `vTaskGetRunTimeStats()` |
 | 5 | **Functional parity** | **MET.** A 58-row static parity matrix covering every screen, navigation path, input, radio path, peripheral, persistence and boot item, each with a source-level preservation argument and citation (`task-split-host-validation.md` §5). All CI gates green, re-run at this commit: `cargo test --workspace` 63 binaries / **1134 passed / 0 failed**, `clippy -D warnings` clean, `fmt --check` clean, `xtask` glyph-coverage and ui-event-parity green. The firmware cross-compile gate is green on the last firmware-touching merged change (`firmware build gate (check-all-features.sh)`, 11 m 56 s, pass) | **Open — P1.** The hands-on sweep |
 | 6 | **Provenance on every number** | **MET.** This document. Five tags, defined in §0, exactly one per quantity; an untagged number is defined as a document bug. [SIM] is used, is defined as distinct from a device measurement, and closes no deferred row | — |
-| 7 | **The deferred set is complete and actionable** | **MET, with the boundary drawn explicitly.** §9 is one page: 12 hardware-only predicates each paired with the exact kit part that closes them, plus — separately and labelled as such — three that are blocked on *missing code* rather than missing hardware (§9.2), each with the specific change that unblocks it, plus one log line to watch (§9.3). A register that quietly listed the code-blocked three alongside the rest would have implied the kit closes them | — |
+| 7 | **The deferred set is complete and actionable** | **MET, with the boundary drawn explicitly.** §9 is one page: 13 hardware-only predicates each paired with the exact kit part that closes them (D-H moved here once `meshcadet-perf-diagnostics-heap-headroom` landed the missing log line), plus — separately and labelled as such — two that are still blocked on *missing code* rather than missing hardware (§9.2), each with the specific change that unblocks it, plus one log line to watch (§9.3). A register that quietly listed a code-blocked predicate alongside the rest would have implied the kit closes it | — |
 
 **What the review did not do.** It did not measure anything on silicon — by
 design, no hardware was in the loop at any point. It did not change airtime,
