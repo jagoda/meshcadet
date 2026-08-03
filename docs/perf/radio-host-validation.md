@@ -202,11 +202,13 @@ the correctness argument itself).
 | **Arm-failure ≠ timeout** | `arm_failure_is_reported_distinctly_from_a_timeout` | A failed `arm()` reports `ArmFailed`, a THIRD outcome distinct from `TimedOut` — the real caller's fallback branch (spin-poll fallback) reacts differently to the two; collapsing them would silently break it. |
 | **Re-arm ordering (fresh arm)** | `re_arm_after_a_timeout_arms_again_on_the_next_call` | A timed-out wait does not leave a stale armed state a later call silently relies on — each call arms fresh (`arm_calls == 2` after two calls). |
 | **Re-arm ordering (fast-path catch)** | `a_level_that_asserts_between_calls_is_caught_by_the_next_calls_fast_path` | An edge landing in the GAP between one call's timeout and the next call's start is still observed — via the FAST PATH specifically (`arm_calls` stays at 1, from the FIRST call only) — this is the state-machine-level proof of the re-arm race's resolution, not just prose (see §4.3). |
-| **Spurious wake, correctly handled** | `a_notification_pending_from_before_this_wait_began_is_observed_immediately` | A notification posted before THIS call even begins (a late ISR fire from a prior, already-abandoned wait cycle) is still observed as `Asserted` — the "Lost-wakeup semantics" doc's own claim, pinned as a runnable test, not left as an argument nobody can check. |
+| **Stale wake ⇒ keep waiting (the postcondition, fixed by `meshcadet-perf-radio-dio1-wait-postcondition`)** | `a_stale_pending_notification_with_the_line_low_keeps_waiting_and_can_time_out` | A notification pending from before this call began, observed while the line reads LOW, is stale — it must NOT be reported `Asserted`. The wait re-checks the line on every wake and keeps waiting out the remaining deadline instead, timing out (and disarming) if no genuine edge follows. This row previously pinned the OPPOSITE as intended behaviour — see this document's own §4.2/§4.3 corrections below. |
+| **Stale wake does not end the wait early** | `a_stale_pending_notification_does_not_prevent_a_later_genuine_edge_asserting` | A stale first wake does not consume the deadline: a genuine edge arriving afterward, within the same call, still asserts. |
+| **Genuine lost-wakeup preserved** | `a_pending_notification_whose_level_is_still_high_asserts_immediately` | A notification pending from before this call, whose assertion is STILL live (line reads high at the moment of the check), asserts immediately on the first wake — the "Lost-wakeup semantics" doc's claim, now correctly scoped: observed *because* it is still true, not merely because a notification fired at some point. |
 | **Exactly-once consumption** | `a_consumed_notification_does_not_bleed_into_a_second_unrelated_wait` | The OTHER half of "observed, not lost" — a consumed notification does not also satisfy a SECOND, later, unrelated call with no new edge (`TimedOut`, not `Asserted`). If this ever regressed, every subsequent DIO1 wait after one real edge would spuriously report Asserted forever. |
 
-[HOST]: `cargo test -p firmware-core --locked radio_wait` -> **13 passed, 0
-failed** (11 new `level_triggered_wait_tests` + 2 pre-existing
+[HOST]: `cargo test -p firmware-core --locked radio_wait` -> **15 passed, 0
+failed** (10 `level_triggered_wait_tests` + 5 pre-existing
 `quantize_spin_poll_ms`/`ScriptedWait` tests, unaffected). Full workspace:
 see §5.
 
@@ -429,6 +431,26 @@ rather than left as an unverified claim: **a notification posted at any
 time — including before the next `wait_high` call even begins — is
 observed, never lost, and consumed exactly once.**
 
+**Correction — "observed" is not "the line is still asserted" (fixed by
+`meshcadet-perf-radio-dio1-wait-postcondition`).** The paragraph above
+establishes that a notification is never lost; it does NOT establish that
+DIO1 is still high at the moment that notification is observed. Because
+`xTaskGenericNotifyWait` returns as soon as the sticky "notification
+received" state is set, a notification left over from an EARLIER,
+already-serviced-and-cleared DIO1 assertion — one whose line has since gone
+low again — satisfies a later `Notification::wait` call exactly as readily
+as a live one. The seed: a DIO1 edge landing in the window between an
+earlier wait's own timeout and the `disable_interrupt()` call that follows
+it (still armed, still listening) sets the notification for a wait nobody
+consumes; that notification survives, sticky, into the NEXT `wait_high`
+call. `GpioDio1Wait::wait_high` (and the `level_triggered_wait` reference
+model, §3.1) closes this by re-reading `is_high()` on every wake — genuine
+or stale — before reporting `Asserted`, looping on the remaining deadline
+if the line is not actually high (see `GpioDio1Wait`'s "Postcondition" doc
+and §3.2's stale-wake tests). The corrected, now-enforced invariant:
+**`Asserted` ⇒ DIO1 is asserted right now** — never merely "a notification
+fired at some point."
+
 ### 4.3 The re-arm race
 
 **Restated from `GpioDio1Wait`'s own doc, now with a state-machine proof,
@@ -467,6 +489,24 @@ strictly worse than a spin-poll that cannot, per the mission charter — and
 this design does not miss edges, by the level-triggered hardware property
 plus the fast-path software check that exploits it, both independently
 verified above and in §3. **Not a NO-GO condition.**
+
+**The other direction — a spurious `Asserted` is equally a defect, and was
+found (fixed by `meshcadet-perf-radio-dio1-wait-postcondition`).** Every
+argument above is one-sided: it proves DIO1 assertions are never MISSED. It
+says nothing about the wait reporting `Asserted` when DIO1 is not actually
+asserted, and that gap was real — not from the re-arm race itself, but from
+its interaction with the sticky notification (§4.2's correction): an edge
+landing in the gap between an EARLIER wait's timeout and its
+`disable_interrupt()` call sets a notification nobody consumes, which then
+satisfies a LATER, unrelated wait instantly, with the line already back to
+low. A wait site reading that as TxDone/RxDone/CadDone on a frame that is
+not actually done is a silently lost outbound message or a bypassed
+listen-before-talk check — the exact defect class this document's own
+"peek-not-take" framing (§3, `main.rs`) exists to prevent, just triggered
+from the DIO1 side instead. `GpioDio1Wait::wait_high` now closes it by
+re-checking `is_high()` on every wake rather than trusting the notification
+alone (§4.2's correction; §3.2's stale-wake tests). **Postcondition, now
+enforced:** `Asserted` ⇒ DIO1 is asserted right now.
 
 ### 4.4 Interaction with the M1 split — which core the ISR fires on, and R7's SMP rules
 
@@ -519,11 +559,18 @@ the primitive itself already guarantees.
 | Notification vs. queue vs. semaphore | Notification — the correct choice for the one-recipient shape this code has, with documented speed/RAM advantages over a semaphore, per FreeRTOS's own docs | §4.2 |
 | Wake latency / lost-wakeup | The faster primitive (no separate kernel object to allocate/lock); unconditional OR-set from ISR, never lost, consumed exactly once — proven as a runnable test, not just cited | §4.2, §3.2 |
 | Re-arm race | Cannot miss an edge — level-triggered hardware property + software fast path, both independently verified | §4.3 |
+| Spurious `Asserted` from a stale notification (fixed by `meshcadet-perf-radio-dio1-wait-postcondition`) | A wake — genuine or stale — is re-checked against the live line before being reported `Asserted`; a stale wake with the line low keeps waiting instead | §4.2 correction, §4.3 correction, §3.2 |
 | M1-split core interaction | ISR allocated on the calling core (core 0, by `Radio::init`'s call site) — same core as its sole waiter, by construction; R7 satisfied by the primitive's own cross-core-safe design regardless | §4.4 |
 
-**No NO-GO condition found.** Every question the mission charter posed is
-answered from source, with the one genuine open item (IRAM-safety) recorded
-as a deferred, device-confirmable follow-up rather than applied blind.
+**No NO-GO condition found within this mission's own charter.** Every
+question the mission charter posed is answered from source, with the one
+genuine open item (IRAM-safety) recorded as a deferred, device-confirmable
+follow-up rather than applied blind. **Historical note:** this analysis
+argued the missed-edge direction only and did not identify the spurious-
+`Asserted`-from-a-stale-notification defect above; that gap was found by a
+later audit (`meshcadet-perf-radio-checkpoint`, M2, NO-GO) and closed by
+`meshcadet-perf-radio-dio1-wait-postcondition` — see the §4.2/§4.3
+corrections and the updated §3.2 table.
 
 ## 5. Leg (d) — CI, all gates
 

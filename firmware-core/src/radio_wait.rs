@@ -33,7 +33,9 @@
 //! driven on host by a scriptable mock (`level_triggered_wait_tests`,
 //! below) — every doc claim `GpioDio1Wait` makes in prose (the re-arm race
 //! is self-correcting; a late notification is observed, not lost, and
-//! consumed exactly once; the timeout path disarms) is pinned there as a
+//! consumed exactly once; the timeout path disarms; **a wake — genuine or
+//! stale — never asserts unless the line reads high at the moment of the
+//! check**, `GpioDio1Wait`'s "Postcondition" doc) is pinned there as a
 //! runnable test, not left as an argument nobody can check.
 //! `firmware/src/radio.rs`'s `GpioDio1Wait` is NOT refactored to call this
 //! function — it is a proven-equivalent reference model, in the same spirit
@@ -200,17 +202,35 @@ pub enum LevelTriggeredOutcome {
 ///    call began is still observed.
 /// 2. **Arm**: if arming fails, return `ArmFailed` (caller's fallback
 ///    responsibility — see [`LevelTriggeredLine::arm`]'s doc).
-/// 3. **Wait**: block on the notification up to `timeout_ms`.
-///    - Notified (a fresh edge fired the ISR during this wait, OR a
-///      notification was already pending from before this call — see
-///      [`OneShotNotify`]'s doc, the "spurious wake is actually correct"
-///      case): `Asserted`. The interrupt is deliberately left armed (matches
-///      `GpioDio1Wait::wait_high`: no `disarm()` call on this branch — an
-///      already-fired level-triggered interrupt has nothing further to
-///      protect against until the caller explicitly re-arms via its NEXT
-///      `wait_high`-equivalent call).
-///    - Timed out: `disarm()`, then `TimedOut` — the timeout-path doc's
-///      "so a later, unrelated fire doesn't land on a wait no one issued".
+/// 3. **Wait, then re-check**: block on the notification. A notification is
+///    a HINT that something happened, not a snapshot of the line right now
+///    — [`OneShotNotify`]'s sticky, exactly-once-consumed state can wake
+///    this call on a notification left over from an earlier,
+///    already-serviced assertion whose line has since gone low again (see
+///    this module's doc and `GpioDio1Wait`'s "Lost-wakeup semantics"). So
+///    every wake — genuine or stale — is followed by re-reading the line
+///    before trusting it:
+///    - Line reads high: `Asserted`. The interrupt is deliberately left
+///      armed (matches `GpioDio1Wait::wait_high`: no `disarm()` call on
+///      this branch — an already-fired level-triggered interrupt has
+///      nothing further to protect against until the caller explicitly
+///      re-arms via its NEXT `wait_high`-equivalent call).
+///    - Line still reads low (the notification was stale): loop back and
+///      wait again. The notification has already been consumed
+///      (exactly-once), so this genuinely blocks for a fresh edge rather
+///      than spinning.
+///    - `notify.wait` itself times out: `disarm()`, then `TimedOut` — the
+///      timeout-path doc's "so a later, unrelated fire doesn't land on a
+///      wait no one issued".
+///
+/// **Postcondition**: `Asserted` is returned only when the line reads high
+/// at the moment of the check — never merely because a notification fired.
+/// This mirrors `GpioDio1Wait::wait_high`'s own "Postcondition" doc; unlike
+/// the production wait, this reference model has no clock primitive to
+/// shrink `timeout_ms` across re-waits (each `notify.wait` call below is
+/// still passed the caller's original `timeout_ms`) — deadline-honouring is
+/// exercised on the real implementation, not here; what this model pins is
+/// the *sequencing*, i.e. that a stale wake does not end the wait early.
 pub fn level_triggered_wait(
     line: &mut impl LevelTriggeredLine,
     notify: &mut impl OneShotNotify,
@@ -222,11 +242,17 @@ pub fn level_triggered_wait(
     if line.arm().is_err() {
         return LevelTriggeredOutcome::ArmFailed;
     }
-    if notify.wait(timeout_ms) {
-        LevelTriggeredOutcome::Asserted
-    } else {
-        line.disarm();
-        LevelTriggeredOutcome::TimedOut
+    loop {
+        if !notify.wait(timeout_ms) {
+            line.disarm();
+            return LevelTriggeredOutcome::TimedOut;
+        }
+        // A notification is a hint, not a snapshot of the line — re-check
+        // before trusting it (see this function's doc).
+        if line.is_high() {
+            return LevelTriggeredOutcome::Asserted;
+        }
+        // Stale: already consumed, loop back and genuinely wait again.
     }
 }
 
@@ -331,7 +357,10 @@ mod level_triggered_wait_tests {
 
     #[test]
     fn armed_then_fired_within_deadline_asserts() {
-        let mut line = ScriptedLine::always_low();
+        // The line goes high at the same moment the genuine edge fires the
+        // ISR (that is what a level-triggered interrupt IS): scripted as a
+        // second `is_high()` entry so the post-notify re-check observes it.
+        let mut line = ScriptedLine::with_levels([false, true]);
         let mut notify = ScriptedNotify {
             arrives_in_time: VecDeque::from([true]),
             ..Default::default()
@@ -379,7 +408,9 @@ mod level_triggered_wait_tests {
 
     #[test]
     fn re_arm_after_a_timeout_arms_again_on_the_next_call() {
-        let mut line = ScriptedLine::always_low();
+        // Third scripted level is the genuine edge's own `is_high()`
+        // observation, backing the second call's post-notify re-check.
+        let mut line = ScriptedLine::with_levels([false, false, true]);
         let mut notify = ScriptedNotify {
             arrives_in_time: VecDeque::from([false, true]),
             ..Default::default()
@@ -418,27 +449,74 @@ mod level_triggered_wait_tests {
         );
     }
 
-    // ── spurious wake (a late/stale notification is observed, not lost —
-    //    and is observed AT MOST ONCE) ─────────────────────────────────────
+    // ── spurious/stale wake (a wake is a hint, not a snapshot of the line —
+    //    but a wake that IS still live is observed, not lost) ─────────────
 
     #[test]
-    fn a_notification_pending_from_before_this_wait_began_is_observed_immediately() {
-        // Models the exact scenario `GpioDio1Wait`'s "Lost-wakeup
-        // semantics" doc names: "If the ISR fires between one wait_high
-        // call returning and the next one being called... the notification
-        // is not dropped: the very next Notification::wait call sees the
-        // already-set state and returns immediately." From THIS call's own
-        // narrow perspective the wake looks "spurious" (it never itself
-        // observed a fresh edge arrive during its OWN wait window) — but it
-        // is the CORRECT, intentional behaviour: the edge is real, just
-        // signalled late.
+    fn a_stale_pending_notification_with_the_line_low_keeps_waiting_and_can_time_out() {
+        // The defect this pins the fix for: a notification pending from
+        // BEFORE this call began (`ScriptedNotify::pending`) models a
+        // FreeRTOS task notification left over from an earlier,
+        // already-serviced-and-cleared DIO1 assertion — see
+        // `GpioDio1Wait`'s "Lost-wakeup semantics" doc for how that
+        // notification survives. If the line reads low when this call
+        // checks it, that notification is stale and must NOT be reported
+        // as `Asserted` — the wait must keep waiting for a genuine edge
+        // instead (`GpioDio1Wait`'s "Postcondition" doc: `Asserted` ⇒ DIO1
+        // is asserted right now).
         let mut line = ScriptedLine::always_low();
+        let mut notify = ScriptedNotify {
+            pending: true,
+            arrives_in_time: VecDeque::from([false]),
+            ..Default::default()
+        };
+        let outcome = level_triggered_wait(&mut line, &mut notify, 20);
+        assert_eq!(outcome, LevelTriggeredOutcome::TimedOut);
+        assert_eq!(
+            notify.wait_calls, 2,
+            "the stale pending notification must be consumed, then a fresh wait issued"
+        );
+        assert_eq!(
+            line.disarm_calls, 1,
+            "the eventual genuine timeout must still disarm"
+        );
+    }
+
+    #[test]
+    fn a_stale_pending_notification_does_not_prevent_a_later_genuine_edge_asserting() {
+        // Same stale start as above, but a genuine edge follows within the
+        // same call: the first, stale wake must not have ended the wait
+        // permanently.
+        let mut line = ScriptedLine::with_levels([false, false, true]);
+        let mut notify = ScriptedNotify {
+            pending: true,
+            arrives_in_time: VecDeque::from([true]),
+            ..Default::default()
+        };
+        let outcome = level_triggered_wait(&mut line, &mut notify, 20);
+        assert_eq!(outcome, LevelTriggeredOutcome::Asserted);
+        assert_eq!(notify.wait_calls, 2);
+    }
+
+    #[test]
+    fn a_pending_notification_whose_level_is_still_high_asserts_immediately() {
+        // The genuine lost-wakeup property, preserved: an ISR that fired
+        // between the previous call ending and this one beginning, whose
+        // assertion is STILL live (line reads high right now), must be
+        // reported `Asserted` on this call's first wake — not require a
+        // second, redundant edge. This is the case `GpioDio1Wait`'s
+        // "Lost-wakeup semantics" doc names directly.
+        let mut line = ScriptedLine::with_levels([false, true]);
         let mut notify = ScriptedNotify {
             pending: true,
             ..Default::default()
         };
         let outcome = level_triggered_wait(&mut line, &mut notify, 20);
         assert_eq!(outcome, LevelTriggeredOutcome::Asserted);
+        assert_eq!(
+            notify.wait_calls, 1,
+            "a still-high pending notification must assert on the first wait, not require a second"
+        );
         assert_eq!(
             line.arm_calls, 1,
             "must still arm before consulting the notifier"
@@ -452,8 +530,9 @@ mod level_triggered_wait_tests {
         // `pending = false` reset, modelling the real primitive's state
         // reset on every successful receipt — see `OneShotNotify`'s doc)
         // ever regressed to "sticky forever", this second, unrelated call
-        // (no new edge scripted) would incorrectly also report Asserted.
-        let mut line = ScriptedLine::always_low();
+        // (no new edge scripted, line back to low) would incorrectly also
+        // report Asserted.
+        let mut line = ScriptedLine::with_levels([false, true, false]);
         let mut notify = ScriptedNotify {
             pending: true,
             arrives_in_time: VecDeque::from([false]),
