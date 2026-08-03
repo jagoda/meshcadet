@@ -138,32 +138,47 @@ const UI_TASK_STACK_SIZE: usize = 32_768;
 /// different cores never compete for a run slot.
 const UI_TASK_PRIORITY: u8 = 5;
 
+/// Bundled `ui_task`-owned peripherals `main.rs` constructs (fallibly, via
+/// `?`, or gracefully-degrading to `None`) before calling [`spawn`] — see
+/// `main.rs::run()`'s "Touch UI" bring-up section. `i2c1`/`lcd_spi` are the
+/// `Result`s of the SPI/I2C device REGISTRATION `main.rs` already attempted
+/// on its own task (D2's corollary); `spawn` does not retry them, it only
+/// decides what to do with the outcome.
+///
+/// Bundled into one struct — rather than passed as nine separate by-value
+/// parameters, as `spawn` used to take them — and handed to `spawn` behind a
+/// single `Box`. That prior twelve-parameter call (nine of these plus
+/// `provisioned`/`pubkey_hex`/`self_name`) was the single largest combined
+/// by-value argument list anywhere in this crate, several of the parameters
+/// multi-word aggregates (`lcd_spi` alone is 16 bytes), and is the exact
+/// call a DWARF- and LLVM-IR-correlated investigation traced a `Core 0`
+/// `LoadProhibited` fault to — reading ESP-IDF's uninitialised/free-poison
+/// fill pattern (`0xa5a5a5a5`) while binding `spawn`'s own `i2c1`/`lcd_spi`
+/// parameters, immediately on entry, before the UI thread is ever created.
+/// Collapsing the call to a single indirect argument removes that
+/// stack-argument pressure; see the PR description this landed on for the
+/// full diagnosis and the residual uncertainty this fix does not fully
+/// resolve.
+pub(crate) struct UiHardware<C: LedcChannel, D> {
+    pub i2c1: Result<I2cDriver<'static>, EspError>,
+    pub lcd_spi: Result<SpiDeviceDriver<'static, &'static SpiDriver<'static>>, EspError>,
+    pub dc: PinDriver<'static, Output>,
+    pub rst: PinDriver<'static, Output>,
+    pub backlight_channel: C,
+    pub backlight_timer: LedcTimerDriver<'static, C::SpeedMode>,
+    pub backlight_pin: D,
+    pub buzzer: Option<BuzzerDriver<'static>>,
+    pub trackball: Option<TrackballDriver<'static>>,
+}
+
 /// Spawn `ui_task`, pinned to core 1 (D1), and return the dispatcher's own
 /// halves of the two boundary channels (D3): a `SyncSender<UiEvent>` to post
 /// radio/state events, and a `Receiver<UiCommand>` to drain UI-initiated
 /// sends. See this module's doc for the full ownership/boot-sequencing
 /// contract, including the headless-fallback behaviour on `i2c1`/`lcd_spi`
 /// registration failure or a bring-up failure inside the spawned thread.
-///
-/// `i2c1`/`lcd_spi` are the `Result`s of the SPI/I2C device REGISTRATION
-/// `main.rs` already attempted on its own task (D2's corollary) — this
-/// function does not retry them, it only decides what to do with the
-/// outcome. `dc`/`rst`/`backlight_channel`/`backlight_timer`/
-/// `backlight_pin`/`buzzer`/`trackball` are `ui_task`-owned peripherals
-/// `main.rs` constructed (fallibly, via `?`, or gracefully-degrading to
-/// `None`) before calling this function — see `main.rs::run()`'s "Touch UI"
-/// bring-up section.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn<C>(
-    i2c1: Result<I2cDriver<'static>, EspError>,
-    lcd_spi: Result<SpiDeviceDriver<'static, &'static SpiDriver<'static>>, EspError>,
-    dc: PinDriver<'static, Output>,
-    rst: PinDriver<'static, Output>,
-    backlight_channel: C,
-    backlight_timer: LedcTimerDriver<'static, C::SpeedMode>,
-    backlight_pin: impl OutputPin + Send + 'static,
-    buzzer: Option<BuzzerDriver<'static>>,
-    trackball: Option<TrackballDriver<'static>>,
+pub(crate) fn spawn<C, D>(
+    hardware: Box<UiHardware<C, D>>,
     provisioned: bool,
     pubkey_hex: String,
     self_name: String,
@@ -178,7 +193,20 @@ where
     // from the HAL's own `impl_peripheral!` macro; this bound just makes
     // that fact visible to the generic function.
     C: LedcChannel + Send + 'static,
+    D: OutputPin + Send + 'static,
 {
+    let UiHardware {
+        i2c1,
+        lcd_spi,
+        dc,
+        rst,
+        backlight_channel,
+        backlight_timer,
+        backlight_pin,
+        buzzer,
+        trackball,
+    } = *hardware;
+
     let (evt_tx, evt_rx) = sync_channel::<UiEvent>(EVENT_QUEUE_CAP);
     let (cmd_tx, cmd_rx) = sync_channel::<UiCommand>(COMMAND_QUEUE_CAP);
 
