@@ -191,9 +191,19 @@ changes, Slint marks `must_refresh_children` for the whole subtree — "this
 will impact all the children … regardless if they are themselves dirty or
 not". A near-full-window `VerticalLayout { opacity: content_opacity; … }`
 therefore re-dirties its **entire** bounding region on every tick the fade is
-still interpolating. `ui.step()` runs once per dispatcher iteration, which
-idles near `RX_POLL_YIELD_MS` (5 ms, ~200 Hz), so an unthrottled render
-flushed the full region ~40 times for one 200 ms transition.
+still interpolating. When this was measured `ui.step()` ran once per
+dispatcher iteration, which idled near `RX_POLL_YIELD_MS` (then 5 ms,
+~200 Hz), so an unthrottled render flushed the full region ~40 times for one
+200 ms transition.
+
+**Post-split (`meshcadet-perf-ui-residual-opt`, §9):** `step()` now runs on
+`ui_task`, whose `recv_timeout` ceiling `UI_TICK_MS` is **16 ms** —
+*identical* to `RENDER_MIN_INTERVAL_MS` below. The split therefore supplies
+the same cadence cap by construction in a quiet steady state, and the
+`40 → 11` win is now overwhelmingly attributable to M1 rather than to the
+throttle. The throttle is still load-bearing under an event burst (`ui_task`
+also wakes per queued event) and must not be removed;
+`docs/perf/ui-residual-opt-r1.md` §4.1/§5 carries the full argument.
 
 ```
 [entry-fade] unthrottled: 40 frames rendered, 40 of them full-window (320x240)
@@ -297,6 +307,16 @@ Everything in §3.4, plus the demotions that measurement produced:
   its own dedicated render loop, analysed and accepted in that method's doc
   (RX stays correct — continuous-RX latching — only a bounded, boot-only
   polling gap).
+- **The two residual UI-side items are CLOSED and DEMOTED respectively — M3
+  landed no optimization, deliberately.** `meshcadet-perf-ui-residual-opt`
+  re-ran both host instruments against the post-split tree and re-ranked:
+  the per-dirty-line `Vec<Rgb565>` is measurably at **zero** (nothing left to
+  do), and the fade's repaint scope is demoted on three grounds — the split
+  already supplies the cadence cap, `RENDER_MIN_INTERVAL_MS` is provably
+  un-tightenable (a full-window flush is longer than any cap worth setting),
+  and post-split the fade's worst-case cost to the *radio* is **12.8 µs**,
+  not 30.7 ms. Full argument and verdict table:
+  `docs/perf/ui-residual-opt-r1.md`.
 
 ### 5.2 OPEN — the structural item, and it dwarfs everything above
 
@@ -544,3 +564,19 @@ resurrected from an old harness output, not as a second narrative.
   landed fixes unrecorded. That is the failure mode this consolidated record
   exists to prevent — **when a number here changes, edit the body; do not
   append a layer.**
+- **§3.3's "the throttle bought 40 → 11" attribution is superseded, not
+  retracted.** The measurement is exactly reproducible and unchanged; what
+  changed is who deserves the credit. `ui_task::UI_TICK_MS` (16 ms) now
+  equals `RENDER_MIN_INTERVAL_MS` (16 ms), so M1's split supplies the same
+  cap by construction in a quiet steady state. §3.3's body is edited;
+  `meshcadet-perf-ui-residual-opt` (`docs/perf/ui-residual-opt-r1.md`) carries
+  the derivation, and §5.1's last bullet the verdict.
+- **"Radio timeliness can only improve from a UI render throttle" is
+  retracted as a *magnitude* claim.** It survives only as a sign claim. Post
+  ADR-0012 the LCD and the radio are on different tasks and cores, SPI2 is
+  re-arbitrated after every elementary transaction, and the worst case a
+  full-window flush can impose on a radio SPI command is one 64-byte chunk at
+  40 MHz — **12.8 µs**, not the flush's ~30.7 ms
+  (`spi2-arbitration-r1.md` Q5). Any reasoning that treats UI render cost as
+  a first-order input to radio timeliness is reasoning from the pre-split
+  world.
