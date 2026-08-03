@@ -1143,6 +1143,62 @@ impl<'d> UiRuntime<'d> {
         // cooperative rendering handle for the single shared software window.
         let window = platform::install();
 
+        // BUG FIX (boot splash renders nothing — every frame silently
+        // dropped for the splash's entire lifetime, no panic): warm
+        // `backdrop_asset::shared_backdrop_image()`'s cache HERE, before ANY
+        // real screen (splash included) is constructed.
+        //
+        // ROOT CAUSE: `shared_backdrop_image()` (`backdrop_asset.rs`) lazily
+        // constructs `BackdropAsset` — itself a `Window`-inheriting Slint
+        // component, per that module's own doc — on its FIRST-EVER call,
+        // then caches only the decoded `Image` it extracts and drops the
+        // `BackdropAsset` value. That module's doc says "it is never
+        // `.show()`n" as the reason it never becomes on-screen content, but
+        // that reasoning has a gap: Slint's generated `X::new()` (any
+        // `Window`-inheriting component, `BackdropAsset` included) calls
+        // `WindowInner::set_component()` UNCONDITIONALLY as part of
+        // construction itself — see `i-slint-compiler`'s generated
+        // `window_adapter_ref()`, "ensure that the window exists at this
+        // point so further call to window() don't panic" — `.show()` is a
+        // separate, later step that is NOT what associates a component with
+        // the shared window. Every screen's own constructor
+        // (`SplashScreen::new()` included) calls `shared_backdrop_image()`
+        // to set its `backdrop_image` property BETWEEN building its own
+        // component and calling `.show()` on it — so on the very first
+        // screen ever constructed each boot (always the splash — see this
+        // method's own "Boot splash" doc below), that call's cache-miss
+        // path constructs `BackdropAsset`, silently REPOINTING the shared
+        // window's component away from the splash's own (already-built,
+        // already-`set_component`ed) root back to `BackdropAsset` — which
+        // is then immediately dropped (only the extracted `Image` is
+        // cached), leaving the shared window's component reference
+        // dangling. The splash's OWN subsequent `.show()` call does not
+        // fix this: `.show()` only re-attaches a component on that
+        // component's OWN first-ever call (Slint's `window_adapter_ref()`
+        // is a `OnceCell`, permanently cached after that first call) — it
+        // never calls `set_component()` again on a later invocation. From
+        // that point until `dismiss_splash()` swaps in a freshly
+        // `set_component()`-ed screen, EVERY `render_if_needed()` call hits
+        // `TDeckWindowAdapter::render_if_needed`'s own guard (added for the
+        // unset-component boot panic — see that method's doc) and silently
+        // skips the frame — the splash's timers/dismissal logic still run
+        // to completion regardless (they don't depend on a frame having
+        // actually painted), which is exactly the reported symptom: the
+        // ripple "ran to completion" per its own log lines while every
+        // frame was dropped.
+        //
+        // FIX: force the cache-populating (`BackdropAsset`-constructing)
+        // call to happen HERE, before the splash — or any other screen —
+        // ever calls `set_component()` for itself, so the steal-and-drop
+        // above lands on nothing of consequence (the shared window has no
+        // real component yet) instead of on the splash. Every screen
+        // constructed afterward (splash included, and every screen
+        // `dismiss_splash()`/`navigate_to_*` build later) hits the CACHED
+        // branch of `shared_backdrop_image()` — a plain `Image` handle
+        // clone, no component construction, no further steals — so this is
+        // a one-time, boot-only fix, not a per-navigation one.
+        let _ = backdrop_asset::shared_backdrop_image();
+
         // BUG FIX: create the initial Slint screen component and call show() on it.
         // The previous implementation created only a ScreenState enum (navigation
         // stack) but never instantiated a Slint component, leaving the renderer

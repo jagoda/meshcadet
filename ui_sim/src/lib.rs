@@ -147,6 +147,14 @@ pub mod compose_promo;
 /// screen. See `contact_list_promo`'s module doc for the shared rationale.
 pub mod splash_promo;
 
+/// Host-native regression guard for `meshcadet-boot-splash-renders-no-
+/// component-set` — isolates the `backdrop_asset.rs::shared_backdrop_image()`
+/// component-steal mechanism that silently dropped every boot-splash
+/// render, independent of the full splash markup (already covered by
+/// `splash_promo`'s own test). See that module's own doc for the full
+/// root-cause writeup.
+pub mod splash_backdrop_steal_probe;
+
 /// Host-sim render rig — proves `protocol::emoji::normalize_inbound`
 /// actually closes the "blank cell" defect on a REAL Slint render, not just
 /// in `protocol`'s own host unit tests. See that module's own doc for the

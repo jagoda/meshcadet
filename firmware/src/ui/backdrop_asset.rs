@@ -48,11 +48,38 @@
 //!
 //! `BackdropAsset` `inherits Window` (rather than being a bare
 //! non-visual component) solely to avoid `slint::slint!{}`'s "doesn't
-//! inherit Window" deprecation warning — it is never `.show()`n, so it
-//! never becomes the on-screen content of the single shared
+//! inherit Window" deprecation warning — it is never `.show()`n, so its
+//! CONTENT never becomes what actually paints to the single shared
 //! `MinimalSoftwareWindow` every real screen's `Window` component draws
 //! into (see `platform.rs`'s `TDeckPlatform::create_window_adapter`, which
 //! hands out clones of that one adapter to every constructed `Window`).
+//!
+//! GOTCHA (see `meshcadet-boot-splash-renders-no-component-set` — the boot
+//! splash rendered nothing, every frame silently dropped, because of
+//! exactly this): "never `.show()`n" does NOT mean `BackdropAsset::new()`
+//! is free of side effects on the shared window. Slint's generated
+//! `X::new()`, for ANY `Window`-inheriting component, calls
+//! `WindowInner::set_component()` UNCONDITIONALLY as part of construction
+//! itself (`i-slint-compiler`'s generated `window_adapter_ref()` — "ensure
+//! that the window exist as this point so further call to window() don't
+//! panic") — `.show()` is a separate, later step that is NOT what
+//! associates a component with the shared window. So every
+//! `BackdropAsset::new()` call — even though the value is immediately
+//! dropped after this function extracts its `image` property, and even
+//! though it is never shown — REPOINTS the shared window's component
+//! reference to itself, then immediately orphans that reference when it
+//! drops (nothing else keeps `BackdropAsset` alive). If that happens
+//! WHILE a real screen is being constructed — i.e. this function's
+//! cache-miss (first-ever call) path runs from inside that screen's own
+//! constructor, between the screen setting its OWN component and calling
+//! its OWN `.show()` — it silently steals the shared window's component
+//! away from that screen, and nothing re-attaches it afterward (a
+//! component's `.show()` only calls `set_component()` on ITS OWN
+//! first-ever call — see the `window_adapter_ref()` `OnceCell` above — a
+//! later `.show()` call is a no-op with respect to `set_component()`).
+//! `UiRuntime::new()` closes this by calling this function once, up
+//! front, before any real screen is constructed — see that call site's
+//! own doc for the full mechanism and fix.
 
 slint::slint! {
     // Non-visual carrier: its only job is to hold the ONE compile-time
