@@ -903,18 +903,29 @@ pub struct UiRuntime<'d> {
     // `content_opacity`) and `motifs.slint` one-shot (`RocketOnSend`,
     // `CometOnNotify`, ...) drives a Slint `animate`, and `ui_perf`'s
     // `tests/entry_fade_repaint.rs` measurement (see `docs/perf/ui-perf-
-    // baseline.md` §10) confirms that WITHOUT a
-    // cadence cap, a shared-loop `step()` running near `RX_POLL_YIELD_MS`
-    // cadence (~5 ms, ~200 Hz) re-renders a full-window opacity fade's
-    // ENTIRE bounding region on every single dispatcher iteration for the
+    // baseline.md` §3.3) confirms that WITHOUT a
+    // cadence cap, a `step()` running at a few-millisecond cadence re-renders
+    // a full-window opacity fade's ENTIRE bounding region on every single
+    // iteration for the
     // whole animation — a 200 ms fade alone can cost dozens of full 240-line
     // `flush_line_range` sweeps instead of the one full paint navigation
-    // already requires, each one contending with the shared SPI2 bus's
-    // CAD/RX poll. These two fields cap the RENDER (not the input-poll or
-    // timer) cadence to `RENDER_MIN_INTERVAL_MS` — but ONLY while an
+    // already requires. These two fields cap the RENDER (not the input-poll
+    // or timer) cadence to `RENDER_MIN_INTERVAL_MS` — but ONLY while an
     // animation is still settling; see `RENDER_MIN_INTERVAL_MS`'s doc for
     // why a fresh one-off redraw (navigation, incoming message, model
     // update) is never delayed by this.
+    //
+    // POST-SPLIT RE-RANKING (`meshcadet-perf-ui-residual-opt`,
+    // `docs/perf/ui-residual-opt-r1.md` §4.1/§5). The "~5 ms, ~200 Hz shared
+    // dispatcher loop" this comment used to cite is gone: ADR-0012 moved
+    // `step()` onto `ui_task`, whose `recv_timeout` ceiling
+    // (`ui_task::UI_TICK_MS`) is 16 ms — the same value as
+    // `RENDER_MIN_INTERVAL_MS`, so the split alone now supplies the cadence
+    // cap in a quiet steady state and the measured `40 → 11` win is
+    // overwhelmingly attributable to it rather than to this throttle. These
+    // fields still earn their keep and must NOT be removed: `ui_task`'s loop
+    // also wakes on every queued event (`EVENT_QUEUE_CAP` = 32), and under
+    // such a burst this cap is the only thing bounding render cadence.
     /// `now_ms` of the last `step()` iteration that actually called
     /// `window.render_if_needed` (drew a frame). `0` at construction so the
     /// very first real render (the boot splash's first frame) is never
@@ -942,7 +953,9 @@ pub struct UiRuntime<'d> {
     /// `now_ms` is the same argument every input/render call in this module
     /// already reasons about (`last_render_ms`, `RENDER_MIN_INTERVAL_MS`
     /// above), and this module's own `step()` cadence — bounded by
-    /// `RX_POLL_YIELD_MS` in the dispatcher loop, ~5 ms when idle — already
+    /// `ui_task::UI_TICK_MS`, 16 ms when idle (post-ADR-0012; this used to
+    /// read `RX_POLL_YIELD_MS` in the dispatcher loop, ~5 ms, which no
+    /// longer describes anything) — already
     /// dominates the achievable precision; a microsecond read here would be
     /// false precision, not real signal.
     #[cfg(feature = "diagnostics")]
@@ -1060,7 +1073,7 @@ impl<'d> UiRuntime<'d> {
     /// Bound on how many touch events / keyboard bytes `step()` will drain
     /// from a single input source in one call.
     ///
-    /// `step()` runs once per dispatcher loop iteration, but the touch
+    /// `step()` runs once per `ui_task` loop iteration, but the touch
     /// controller and the keyboard co-processor can both have accumulated
     /// several events by the time a given `step()` runs (the keyboard
     /// co-processor explicitly buffers key-down bytes FIFO — see
@@ -1070,11 +1083,13 @@ impl<'d> UiRuntime<'d> {
     /// touch/keyboard poll loops below now drain everything ready, up to this
     /// bound. The bound itself is defensive, not load-bearing under normal
     /// use — it exists only so a stuck sensor or a flooded bus cannot spin
-    /// `step()` indefinitely and starve the radio RX poll / render pass later
-    /// in the same dispatcher loop iteration. 8 comfortably exceeds any
+    /// `step()` indefinitely and starve the render pass later in the same
+    /// `ui_task` iteration (pre-ADR-0012 it also protected the dispatcher's
+    /// radio RX poll, which now runs on a different task and core and is no
+    /// longer reachable from here). 8 comfortably exceeds any
     /// realistic single-iteration backlog (a human cannot generate 8 key-down
-    /// events between two ~5 ms loop iterations) while still bounding worst
-    /// case.
+    /// events between two ≤16 ms `ui_task` iterations) while still bounding
+    /// worst case.
     const MAX_INPUT_EVENTS_PER_STEP: u8 = 8;
 
     /// How long `step()` holds off the Compose → MessageView navigation
@@ -1625,8 +1640,10 @@ impl<'d> UiRuntime<'d> {
 
     /// One cooperative step: process events, tick Slint, redraw if needed.
     ///
-    /// Call once per dispatcher loop iteration.  Returns `Err` only on
-    /// unrecoverable display hardware failure.
+    /// Call once per `ui_task` loop iteration (ADR-0012 — this used to be
+    /// the dispatcher loop; `main.rs`'s loop can no longer even name
+    /// `UiRuntime`).  Returns `Err` only on unrecoverable display hardware
+    /// failure.
     pub fn step(&mut self, now_ms: u64) -> anyhow::Result<()> {
         // Seed the screen-sleep inactivity clock from the first call's `now_ms`
         // rather than from construction time — `UiRuntime::new` runs before
@@ -2141,12 +2158,11 @@ impl<'d> UiRuntime<'d> {
         //
         // Full-window screen-entry fades (`reveal_opacity`/`content_opacity`)
         // and `motifs.slint` one-shots animate every `step()` iteration by
-        // design — measurement (`docs/perf/ui-perf-baseline.md`) shows that
-        // at this loop's natural cadence
-        // (bounded by `RX_POLL_YIELD_MS` ≈ 5 ms when idle) an UNTHROTTLED
+        // design — measurement (`docs/perf/ui-perf-baseline.md` §3.3) shows
+        // that at a few-millisecond `step()` cadence an UNTHROTTLED
         // full-screen opacity fade re-flushes its ENTIRE bounding region —
         // for a near-full-window fade, effectively the whole 240-line
-        // display — on every one of those ~5 ms ticks for the fade's whole
+        // display — on every one of those ticks for the fade's whole
         // duration, not just once. `RENDER_MIN_INTERVAL_MS` caps how often
         // that expensive flush actually happens WHILE an animation is
         // settling, without adding any latency to a fresh one-off redraw
@@ -2161,9 +2177,29 @@ impl<'d> UiRuntime<'d> {
         // The animation's own timing is untouched (see
         // `RENDER_MIN_INTERVAL_MS`'s doc) — this changes ONLY how often an
         // already-identical curve gets sampled and flushed, never the curve,
-        // duration, easing, or settled end state. Radio timeliness can only
-        // improve: fewer/shorter SPI-bus-hold windows compete with the next
-        // CAD attempt / RX poll per unit of wall-clock time, never more.
+        // duration, easing, or settled end state.
+        //
+        // POST-SPLIT (`docs/perf/ui-residual-opt-r1.md` §4.2/§4.3). Two
+        // claims this block used to make are superseded:
+        //
+        //  * "Radio timeliness can only improve — fewer SPI-bus-hold windows
+        //    compete with the next CAD attempt / RX poll." Post-ADR-0012 the
+        //    radio runs on the dispatcher task on the other core, and SPI2 is
+        //    re-arbitrated after every elementary transaction, so a flush's
+        //    worst-case cost to the radio is ONE 64-byte LCD chunk at 40 MHz
+        //    — 12.8 µs, not the flush's ~30.7 ms
+        //    (`docs/perf/spi2-arbitration-r1.md` Q5). The throttle is a
+        //    UI-smoothness measure now, essentially not a radio one.
+        //  * That `RENDER_MIN_INTERVAL_MS` could usefully be RAISED to cut
+        //    fade cost further. It cannot: `render_if_needed` below blocks
+        //    for the flush it issues, and `last_render_ms` is stamped from
+        //    the `now_ms` captured at the TOP of this call, so the interval
+        //    observed on the next tick already includes that flush. A
+        //    full-window flush is ~30.7 ms (`ui-perf-baseline.md` §4.1) — it
+        //    already exceeds any cap worth setting, so the predicate below is
+        //    unconditionally true on the tick after one. Raising the constant
+        //    would only start dropping frames from the CHEAP motif
+        //    animations (14–28 lines, ~1.8–3.6 ms) it was never aimed at.
         let render_due = !self.render_settling
             || now_ms.saturating_sub(self.last_render_ms) >= Self::RENDER_MIN_INTERVAL_MS;
         if render_due {
