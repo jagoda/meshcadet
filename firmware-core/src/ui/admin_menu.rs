@@ -86,6 +86,7 @@ mod tests {
             charging: false,
             raw_mv: 0,
             held_raw_mv: 0,
+            level: crate::battery::BatteryLevel::Unknown,
         };
         assert_eq!(format_battery_display(s), "63%");
     }
@@ -97,6 +98,7 @@ mod tests {
             charging: true,
             raw_mv: 0,
             held_raw_mv: 0,
+            level: crate::battery::BatteryLevel::Unknown,
         };
         assert_eq!(format_battery_display(s), "9% (charging)");
     }
@@ -113,12 +115,14 @@ mod tests {
             charging: false,
             raw_mv: 3700,
             held_raw_mv: 3700,
+            level: crate::battery::BatteryLevel::Unknown,
         };
         let b = crate::battery::BatteryStatus {
             percent: 50,
             charging: false,
             raw_mv: 3712,
             held_raw_mv: 3705,
+            level: crate::battery::BatteryLevel::Unknown,
         };
         // raw_mv/held_raw_mv jitter (e.g. one ADC sample apart) must NOT count
         // as a display change — the row never renders either field.
@@ -132,12 +136,14 @@ mod tests {
             charging: false,
             raw_mv: 0,
             held_raw_mv: 0,
+            level: crate::battery::BatteryLevel::Unknown,
         };
         let b = crate::battery::BatteryStatus {
             percent: 49,
             charging: false,
             raw_mv: 0,
             held_raw_mv: 0,
+            level: crate::battery::BatteryLevel::Unknown,
         };
         assert!(battery_display_fields_changed(a, b));
     }
@@ -149,12 +155,14 @@ mod tests {
             charging: false,
             raw_mv: 0,
             held_raw_mv: 0,
+            level: crate::battery::BatteryLevel::Unknown,
         };
         let b = crate::battery::BatteryStatus {
             percent: 50,
             charging: true,
             raw_mv: 0,
             held_raw_mv: 0,
+            level: crate::battery::BatteryLevel::Unknown,
         };
         assert!(battery_display_fields_changed(a, b));
     }

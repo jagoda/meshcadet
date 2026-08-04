@@ -9,11 +9,24 @@
 //! written here would type-check but never run); see that module's doc for
 //! the full hardware-feasibility writeup, the charge-inflation bug/fix
 //! history, and the ADC-calibration notes. This file keeps only the real
-//! ADC1 read path (`BatteryDriver`), which needs actual hardware.
-//! `pub use firmware_core::battery::*;` below re-exports the pure half so
-//! every existing call site (`battery::BatteryStatus`,
-//! `crate::battery::clamp_raw_mv_for_wire`, …) resolves unchanged. See
-//! `docs/adr/0005-firmware-core-extraction.md`.
+//! ADC1 read path (`BatteryDriver`) and the NVS `settled_mv` persistence,
+//! both of which need actual hardware. `pub use firmware_core::battery::*;`
+//! below re-exports the pure half so every existing call site
+//! (`battery::BatteryStatus`, `crate::battery::clamp_raw_mv_for_wire`, …)
+//! resolves unchanged. See `docs/adr/0005-firmware-core-extraction.md`.
+//!
+//! # NVS layout (`settled_mv` persistence — see `firmware_core::battery`'s
+//! "(A)" doc section)
+//!
+//! | Namespace | Key        | Type | Contents                              |
+//! |-----------|------------|------|-----------------------------------------|
+//! | `mc_cfg`  | `batt_mv`  | u32  | Last CONFIRMED `settled_mv` (mV)       |
+//!
+//! Deliberately reuses `config_store`'s `mc_cfg` provisioning namespace (this
+//! mission's acceptance line: "reuse the provisioning namespace") rather than
+//! opening a new one — a plain typed scalar under its own key, same shape as
+//! `advert_ts_store.rs`'s `mc_adv`/`ts` u32 counter, just filed under the
+//! existing namespace instead of a fresh one.
 
 use std::rc::Rc;
 
@@ -22,6 +35,7 @@ use esp_idf_hal::adc::oneshot::config::{AdcChannelConfig, Calibration};
 use esp_idf_hal::adc::oneshot::{AdcChannelDriver, AdcDriver};
 use esp_idf_hal::adc::{ADCCH3, ADCU1, ADC1};
 use esp_idf_hal::gpio::Gpio4;
+use esp_idf_svc::nvs::{EspNvs, EspNvsPartition, NvsDefault};
 
 pub use firmware_core::battery::*;
 
@@ -37,8 +51,64 @@ const DIVIDER_RATIO: u32 = 2;
 
 /// Minimum interval between ADC samples. Battery state changes slowly; there
 /// is no reason to spend a multi-sample ADC read on every dispatcher-loop
-/// iteration (unlike GPS, which drains a UART byte stream every tick).
+/// iteration (unlike GPS, which drains a UART byte stream every tick). This
+/// is the per-SAMPLE cadence fed into [`PeakWindowSampler`] — the
+/// [`PEAK_WINDOW_MS`] (~30 s) peak-hold window sits above it (see module
+/// docs / `firmware_core::battery`'s "(B)" section).
 const BATTERY_POLL_INTERVAL_MS: u64 = 2_000;
+
+// ── NVS (settled_mv persistence — see module doc's "NVS layout" section) ────
+
+/// Reuses `config_store`'s provisioning namespace — see this file's module
+/// doc. `config_store::NVS_NAMESPACE` is private to that module, so this is
+/// its own copy of the same literal, not an import; keep the two in sync if
+/// either namespace is ever renamed.
+const NVS_NAMESPACE: &str = "mc_cfg";
+const NVS_KEY_SETTLED_MV: &str = "batt_mv";
+
+/// Load the last-persisted, CONFIRMED `settled_mv` from NVS.
+///
+/// Returns `None` on first boot, a missing key, or any NVS error (logged,
+/// non-fatal) — [`seed_boot_state`] treats `None` as "no prior confirmed
+/// basis," collapsing to the pre-persistence boot behavior.
+fn load_persisted_settled_mv(nvs_partition: &EspNvsPartition<NvsDefault>) -> Option<u32> {
+    let nvs = match EspNvs::new(nvs_partition.clone(), NVS_NAMESPACE, true) {
+        Ok(nvs) => nvs,
+        Err(e) => {
+            log::warn!(
+                "battery: failed to open NVS namespace for settled_mv read ({:?})",
+                e
+            );
+            return None;
+        }
+    };
+    match nvs.get_u32(NVS_KEY_SETTLED_MV) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("battery: NVS settled_mv read failed ({:?})", e);
+            None
+        }
+    }
+}
+
+/// Persist `mv` as the last CONFIRMED `settled_mv`, overwriting any previous
+/// value. Callers MUST only call this when [`should_persist_settled_mv`]
+/// says to (never for an unconfirmed basis — see module doc). A failed write
+/// here is logged and non-fatal; it only risks the NEXT boot restoring a
+/// stale (but never poisoned) prior value.
+fn persist_settled_mv(nvs_partition: &EspNvsPartition<NvsDefault>, mv: u32) {
+    match EspNvs::new(nvs_partition.clone(), NVS_NAMESPACE, true) {
+        Ok(nvs) => {
+            if let Err(e) = nvs.set_u32(NVS_KEY_SETTLED_MV, mv) {
+                log::warn!("battery: NVS settled_mv write failed ({:?})", e);
+            }
+        }
+        Err(e) => log::warn!(
+            "battery: failed to open NVS namespace for settled_mv write ({:?})",
+            e
+        ),
+    }
+}
 
 // ── BatteryDriver ─────────────────────────────────────────────────────────────
 
@@ -57,25 +127,63 @@ pub struct BatteryDriver<'d> {
     /// Percent basis — see [`battery_poll_step`]. Kept in lock-step with the
     /// live voltage while off external power; frozen at its last good value
     /// while [`EXTERNAL_POWER_MV_THRESHOLD`] is exceeded so the contaminated
-    /// charge-rail voltage never leaks into `status()`.
+    /// charge-rail voltage never leaks into `status()`. Fed a windowed PEAK
+    /// (see `peak_sampler` below), not the raw per-poll reading — see
+    /// `firmware_core::battery`'s "(B)" doc section.
     settled_mv: u32,
     /// Charging (external-power-present) state — see [`battery_poll_step`].
     cached_charging: bool,
+    /// Whether `settled_mv` is a trustworthy basis to persist — see
+    /// [`advance_settled_confirmed`] and `firmware_core::battery`'s "(A)"
+    /// doc section.
+    confirmed: bool,
+    /// Displayed percent — `settled_mv`'s target percent, slew-limited and
+    /// discharge-monotonic-latched. See [`slew_limit_percent`] and
+    /// `firmware_core::battery`'s "(C)" doc section.
+    displayed_percent: u8,
+    /// Coarse bucket, computed from `displayed_percent`/`cached_charging`
+    /// with hysteresis. See [`battery_level_bucket`] and
+    /// `firmware_core::battery`'s "(D)" doc section.
+    level: BatteryLevel,
+    /// Peak-over-window sampler feeding `settled_mv`'s update cadence — see
+    /// [`PeakWindowSampler`] and `firmware_core::battery`'s "(B)" doc
+    /// section.
+    peak_sampler: PeakWindowSampler,
     /// Last live (post-divider, averaged) ADC millivolt reading — diagnostic
     /// only, updated unconditionally on every poll, never frozen by the
-    /// charging latch. See module docs' "ADC calibration ... raw_mv" section.
+    /// charging latch and never filtered by the peak-window sampler above.
+    /// See module docs' "ADC calibration ... raw_mv" section.
     live_mv: u32,
     /// Uptime ms of the last ADC sample (poll throttling).
     last_poll_ms: u64,
+
+    /// NVS partition handle for `settled_mv` persistence — see module doc's
+    /// "NVS layout" section. Cheap to hold (reference-counted handle, same
+    /// pattern as `gps::GpsDriver`'s own `nvs_partition` field).
+    nvs_partition: EspNvsPartition<NvsDefault>,
+    /// Last `settled_mv` value actually written to flash (`None` if never
+    /// written this boot AND nothing was restored at construction).
+    last_persisted_mv: Option<u32>,
+    /// Uptime ms of the last successful NVS write — write-wear-bound
+    /// bookkeeping for [`should_persist_settled_mv`].
+    last_persist_ms: u64,
 }
 
 impl<'d> BatteryDriver<'d> {
     /// Construct the battery driver from the ADC1 peripheral and GPIO4.
     ///
     /// Takes one initial sample immediately so `status()` returns real data
-    /// from the first call rather than [`BatteryStatus::unknown`].  A failed
+    /// from the first call rather than [`BatteryStatus::unknown`]. A failed
     /// initial read falls back to the empty-pack floor rather than failing
     /// firmware bring-up over a non-critical status readout.
+    ///
+    /// Restores a persisted `settled_mv` from NVS (see module doc's "NVS
+    /// layout" section) and seeds boot state via [`seed_boot_state`] — this
+    /// is what closes the documented boot-while-plugged gap (see
+    /// `firmware_core::battery`'s "(A)" doc section): a device that boots
+    /// already on external power reports the last known GOOD off-power
+    /// reading, not the raw contaminated first sample, whenever a prior
+    /// confirmed value exists on flash.
     ///
     /// Channel construction itself (below) still propagates its error via
     /// `?`, matching this crate's boot-sequence convention for every other
@@ -88,7 +196,12 @@ impl<'d> BatteryDriver<'d> {
     /// considered and rejected because `AdcChannelDriver::new` consumes
     /// `pin` by value, so a first attempt's failure cannot hand it back for
     /// a second attempt with the pin type available at this call site.
-    pub fn new(adc1: ADC1<'d>, pin: Gpio4<'d>, now_ms: u64) -> anyhow::Result<Self> {
+    pub fn new(
+        adc1: ADC1<'d>,
+        pin: Gpio4<'d>,
+        now_ms: u64,
+        nvs_partition: EspNvsPartition<NvsDefault>,
+    ) -> anyhow::Result<Self> {
         let adc = Rc::new(
             AdcDriver::new(adc1).map_err(|e| anyhow::anyhow!("battery ADC unit init: {:?}", e))?,
         );
@@ -106,35 +219,49 @@ impl<'d> BatteryDriver<'d> {
             .map_err(|e| anyhow::anyhow!("battery ADC channel init: {:?}", e))?;
 
         let initial_mv = read_battery_mv(&mut chan).unwrap_or(BATTERY_EMPTY_MV);
-        log::info!(
-            "battery ADC initialised (curve-fitting calibration) — GPIO4 (ADC1_CH3), initial read {} mV ({}%)",
-            initial_mv,
-            percent_from_millivolts(initial_mv),
-        );
 
-        // Run the initial sample through the same state-transition logic as
-        // every later poll (rather than assuming "not charging"), so a device
-        // that happens to boot already on external power is correctly
-        // flagged `charging: true` immediately instead of only on the next
-        // poll — see module docs' "Fix" section residual-gap note for what
-        // this can and cannot recover about `percent` in that boot case.
-        let (settled_mv, cached_charging) = battery_poll_step(initial_mv, initial_mv);
+        let persisted_mv = load_persisted_settled_mv(&nvs_partition);
+        let (settled_mv, cached_charging, confirmed) = seed_boot_state(persisted_mv, initial_mv);
+        let displayed_percent = percent_from_millivolts(settled_mv);
+        let level = battery_level_bucket(BatteryLevel::Unknown, displayed_percent, cached_charging);
+
+        log::info!(
+            "battery ADC initialised (curve-fitting calibration) — GPIO4 (ADC1_CH3), initial read {} mV, restored settled_mv {:?} from NVS, basis now {} mV ({}%, {})",
+            initial_mv,
+            persisted_mv,
+            settled_mv,
+            displayed_percent,
+            if cached_charging { "charging" } else { "not charging" },
+        );
 
         Ok(BatteryDriver {
             _adc: adc,
             chan,
             settled_mv,
             cached_charging,
+            confirmed,
+            displayed_percent,
+            level,
+            peak_sampler: PeakWindowSampler::new(now_ms, initial_mv),
             live_mv: initial_mv,
             last_poll_ms: now_ms,
+            nvs_partition,
+            // A restored value is, by construction, already durably on
+            // flash: treat it as "just persisted" so construction doesn't
+            // immediately re-write the identical value back.
+            last_persisted_mv: persisted_mv,
+            last_persist_ms: now_ms,
         })
     }
 
     /// Poll the battery ADC — a throttled no-op between samples.
     ///
     /// Called on every dispatcher-loop iteration; only actually samples the
-    /// ADC every [`BATTERY_POLL_INTERVAL_MS`]. Drives [`battery_poll_step`] to
-    /// update the percent basis and the latched charging state.
+    /// ADC every [`BATTERY_POLL_INTERVAL_MS`]. Each sample is fed through
+    /// [`PeakWindowSampler`]; [`battery_poll_step`] (and everything derived
+    /// from it — `settled_mv`, `charging`, `confirmed`, `displayed_percent`,
+    /// `level`, NVS persistence) only actually updates once a ~30 s peak
+    /// window closes — see `firmware_core::battery`'s "(B)" doc section.
     pub fn poll(&mut self, now_ms: u64) {
         if now_ms.saturating_sub(self.last_poll_ms) < BATTERY_POLL_INTERVAL_MS {
             return;
@@ -153,22 +280,52 @@ impl<'d> BatteryDriver<'d> {
                 #[cfg(feature = "diagnostics")]
                 log::info!("battery raw read: {} mV", mv);
 
+                let Some(window_peak_mv) = self.peak_sampler.sample(now_ms, mv) else {
+                    // Still accumulating within the current ~30s window —
+                    // nothing else updates this poll.
+                    return;
+                };
+
                 let was_charging = self.cached_charging;
-                let (settled_mv, charging) = battery_poll_step(self.settled_mv, mv);
+                let (settled_mv, charging) = battery_poll_step(self.settled_mv, window_peak_mv);
                 self.settled_mv = settled_mv;
                 self.cached_charging = charging;
-                // Log the transition (not every poll) — the one field signal
-                // that lets a HIL run be diagnosed after the fact without a
-                // debugger: confirms whether a plug/unplug was actually seen
-                // by this heuristic, and at what basis it froze/resynced.
+                self.confirmed = advance_settled_confirmed(self.confirmed, charging);
+
+                let target_percent = percent_from_millivolts(settled_mv);
+                self.displayed_percent =
+                    slew_limit_percent(self.displayed_percent, target_percent, charging);
+                self.level = battery_level_bucket(self.level, self.displayed_percent, charging);
+
+                // Log the transition (not every window) — the one field
+                // signal that lets a HIL run be diagnosed after the fact
+                // without a debugger: confirms whether a plug/unplug was
+                // actually seen by this heuristic, and at what basis it
+                // froze/resynced.
                 if charging != was_charging {
                     log::info!(
-                        "battery charging state -> {} (live {} mV, percent basis now {} mV / {}%)",
+                        "battery charging state -> {} (window peak {} mV, percent basis now {} mV / {}%, displayed {}%)",
                         charging,
-                        mv,
+                        window_peak_mv,
                         settled_mv,
-                        percent_from_millivolts(settled_mv),
+                        target_percent,
+                        self.displayed_percent,
                     );
+                }
+
+                // Bounded-write-wear NVS persist — see module doc's "NVS
+                // layout" section and `firmware_core::battery`'s "(A)"
+                // section for the exact policy.
+                let ms_since_last_persist = now_ms.saturating_sub(self.last_persist_ms);
+                if should_persist_settled_mv(
+                    self.last_persisted_mv,
+                    settled_mv,
+                    ms_since_last_persist,
+                    self.confirmed,
+                ) {
+                    persist_settled_mv(&self.nvs_partition, settled_mv);
+                    self.last_persisted_mv = Some(settled_mv);
+                    self.last_persist_ms = now_ms;
                 }
             }
             Err(e) => {
@@ -178,20 +335,24 @@ impl<'d> BatteryDriver<'d> {
     }
 
     /// Return the current battery status snapshot (percent + charging +
-    /// diagnostic raw mV + held raw mV).
+    /// diagnostic raw mV + held raw mV + coarse level bucket).
     ///
-    /// `percent` is derived from `settled_mv` — the percent basis — never
-    /// from the raw live voltage, so a charge-inflated read never surfaces
-    /// here (see module docs). `raw_mv` IS the raw live voltage, unfrozen,
-    /// for diagnosis (see module docs' "raw_mv" section). `held_raw_mv` is
-    /// that same `settled_mv` basis, in millivolts rather than percent (see
-    /// module docs' "`held_raw_mv`" section).
+    /// `percent` is the slew-limited, discharge-monotonic-latched displayed
+    /// value derived from `settled_mv` — never the raw live voltage, so a
+    /// charge-inflated read never surfaces here (see module docs). `raw_mv`
+    /// IS the raw live voltage, unfrozen and unfiltered by the peak-window
+    /// sampler, for diagnosis (see module docs' "raw_mv" section).
+    /// `held_raw_mv` is the underlying `settled_mv` basis in millivolts
+    /// (unsmoothed by the slew limit — see `firmware_core::battery`'s "(C)"
+    /// section). `level` is the coarse bucket (data only — see that
+    /// module's "(D)" section).
     pub fn status(&self) -> BatteryStatus {
         BatteryStatus {
-            percent: percent_from_millivolts(self.settled_mv),
+            percent: self.displayed_percent,
             charging: self.cached_charging,
             raw_mv: self.live_mv,
             held_raw_mv: self.settled_mv,
+            level: self.level,
         }
     }
 }
