@@ -67,4 +67,27 @@ if ! EXEMPT_RELEASE_PLEASE=1 BRANCH_REF=release-please--branches--main "${check}
   exit 1
 fi
 
+# Case 4: a conventional-looking commit whose subject carries banned
+# internal-ops vocabulary still fails (this is the CHANGELOG.md:49 leak's
+# regression guard — release-please bakes subjects verbatim into
+# CHANGELOG.md, so this has to be caught before merge, not after).
+git checkout -q -b banned-vocab-subject "${base}"
+# Built from two halves at runtime, never written contiguously in this
+# file's source: a literal banned term here would trip ci.yml's own
+# "no internal-ops vocabulary leaks in public docs" job when it scans this
+# test file.
+banned_term="flight-manu"
+banned_term+="als"
+git commit -q --allow-empty -m "fix(ci): scrub ${banned_term} doc-path leak"
+if "${check}" "${base}" HEAD >"${tmpdir}/out.log" 2>&1; then
+  echo "FAIL: expected a commit subject with banned vocabulary to fail the check" >&2
+  cat "${tmpdir}/out.log" >&2
+  exit 1
+fi
+if ! grep -q "banned internal-ops vocabulary" "${tmpdir}/out.log"; then
+  echo "FAIL: expected failure output to name the banned-vocabulary reason" >&2
+  cat "${tmpdir}/out.log" >&2
+  exit 1
+fi
+
 echo "check-commit-format.test.sh: all cases passed"
