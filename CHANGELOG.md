@@ -46,7 +46,7 @@ The entry below documents everything landed before release-please's first
 ### Fixed
 
 * **ci:** run cargo fmt on splash_backdrop_steal_probe.rs ([2f02b3e](https://github.com/jagoda/meshcadet/commit/2f02b3e254d4b2783e52391272cd4715910d6015))
-* **ci:** scrub flight-manuals doc-path leak and apply cargo fmt ([f9fd86a](https://github.com/jagoda/meshcadet/commit/f9fd86a4d86fdbfd0939922bde58e0931c952079))
+* **ci:** scrub internal doc-path leak and apply cargo fmt ([f9fd86a](https://github.com/jagoda/meshcadet/commit/f9fd86a4d86fdbfd0939922bde58e0931c952079))
 * **docs:** drop internal-ops term from ui-residual-opt-r1.md ([d4b23d5](https://github.com/jagoda/meshcadet/commit/d4b23d52175cec04c62fe5730b7b4de7fec72b50))
 * **firmware:** add missing PerfRollup.ui_step field; scrub vocabulary leak ([aa0a1a4](https://github.com/jagoda/meshcadet/commit/aa0a1a4b60f76a594d8cf19bc44ffdae4d075473))
 * **firmware:** bundle ui_task::spawn's peripheral params behind one Box ([8df94bd](https://github.com/jagoda/meshcadet/commit/8df94bd52b5030f222bcffa7de9049b05be207a7))
