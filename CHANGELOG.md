@@ -8,6 +8,20 @@ Versioning is managed by [release-please](https://github.com/googleapis/release-
 The entry below documents everything landed before release-please's first
 `chore(release): vX.Y.Z` PR.
 
+## [0.7.0](https://github.com/jagoda/meshcadet/compare/v0.6.0...v0.7.0) (2026-08-04)
+
+
+### Added
+
+* **firmware:** stabilize battery SoC — NVS persistence, peak sampling, slew-limit + buckets ([2508553](https://github.com/jagoda/meshcadet/commit/250855365451d1279c19c942b6de46bfb9502ca1))
+
+
+### Fixed
+
+* **ci:** close the vocabulary-leak recurrence path at commit-subject time ([ba7a834](https://github.com/jagoda/meshcadet/commit/ba7a834220ce413cc0ef3d852e6e9a4751196a80))
+* **ci:** scrub internal doc-path leaks from battery.rs comments ([aa86dee](https://github.com/jagoda/meshcadet/commit/aa86dee5b84cfadbf032106d1330f05c3d08dc62))
+* **firmware:** accept pre-fix GPS RMC sync from the GNSS module's backup RTC ([f07eded](https://github.com/jagoda/meshcadet/commit/f07eded51db10edb5d3ff49137b98429ea5ae7cd))
+
 ## [0.6.0](https://github.com/jagoda/meshcadet/compare/v0.5.0...v0.6.0) (2026-08-04)
 
 
