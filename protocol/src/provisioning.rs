@@ -85,8 +85,11 @@ pub const FRAME_QUERY_CHANNELS: u8 = 0x03;
 
 /// Ask the device to build and return its self-advert "biz card"
 /// (see [`crate::advert::build_self_advert_card`]).  Payload: `u32` LE host
-/// unix time — the device has no RTC of its own and stamps the card with
-/// this value.  The device replies [`FRAME_RSP_ADVERT`].
+/// unix time — this is a USB-only, host-driven path with no dependence on
+/// GPS or the GPS shield's own battery-backed RTC (see
+/// `firmware::admin_server`'s `FRAME_QUERY_ADVERT` handler doc), so the
+/// device stamps the card with this host-supplied value instead.  The
+/// device replies [`FRAME_RSP_ADVERT`].
 pub const FRAME_QUERY_ADVERT: u8 = 0x04;
 
 /// Query the device's configured room-server contacts (streamed enumeration).

@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Persisted self-advert timestamp — NVS-backed anti-replay counter.
 //!
-//! MeshCadet has no RTC: `tx_epoch_base` in `main.rs` starts each boot as a
-//! random `esp_random()` value and — once `gps` GPS-syncs the system clock —
-//! is rebased every dispatcher-loop tick onto the real GPS wall-clock time
-//! (see `main.rs`'s dispatcher loop, right after `gps.poll`). Either way it
-//! is fine for the existing DM/channel traffic (only ever compared against
+//! The ESP32-S3 itself has no battery-backed RTC: `tx_epoch_base` in
+//! `main.rs` starts each boot as a random `esp_random()` value and — once
+//! `gps` GPS-syncs the system clock — is rebased every dispatcher-loop tick
+//! onto the real GPS wall-clock time (see `main.rs`'s dispatcher loop, right
+//! after `gps.poll`). The GPS shield's own GNSS module DOES carry a
+//! battery-backed RTC and can supply that sync within seconds of boot from a
+//! pre-fix sentence (see `gps`'s module doc "Clock sync" section) rather than
+//! only once a real fix lands outdoors — but that RTC-derived sync is marked
+//! unverified and is still just wall-clock time to `tx_epoch_base`, not a
+//! durable record of what THIS device has issued before: it is not
+//! guaranteed accurate to the second (a drifted or stale RTC content is
+//! exactly as plausible as a genuine one to `gps`'s plausibility gate), and
+//! it is not persisted by `gps` itself either way. So `tx_epoch_base` is
+//! fine for the existing DM/channel traffic (only ever compared against
 //! itself, never persisted) but unusable as-is for an advert's `timestamp`
-//! field — it is never persisted across a reboot, so even once GPS-synced it
-//! carries no memory of the highest timestamp this device has EVER issued a
-//! card with. A receiving peer replay-guards an incoming advert on
+//! field — it carries no memory of the highest timestamp this device has
+//! EVER issued a card with, GPS/RTC-synced or not. A receiving peer
+//! replay-guards an incoming advert on
 //! `timestamp <= from->last_advert_timestamp` already on file for that
 //! contact (`BaseChatMesh.cpp:124`), so a value that can regress across a
 //! reboot (a random reseed, or a fresh device power-on before GPS has

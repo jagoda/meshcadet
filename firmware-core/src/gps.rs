@@ -322,6 +322,14 @@ pub struct NmeaDateTime {
     pub hour: u8,
     pub minute: u8,
     pub second: u8,
+    /// `true` when this date+time came from an active fix (RMC status `A` —
+    /// the receiver's own satellite-derived time, trustworthy). `false` when
+    /// it came from a pre-fix sentence (status `V`) accepted only because it
+    /// carried a plausible date — see [`parse_rmc_datetime`]'s doc. Callers
+    /// use this to let a later verified sync override an earlier
+    /// RTC-derived one, but never the reverse — see
+    /// [`should_accept_clock_sync`].
+    pub verified: bool,
 }
 
 /// Convert a UTC civil date+time to a Unix timestamp (seconds since
@@ -372,9 +380,12 @@ pub fn civil_from_unix(unix_secs: i64) -> (i64, u32, u32, u32, u32, u32) {
 ///
 /// `sync_anchor` is `Some((sync_uptime_ms, sync_unix_secs))` — the monotonic
 /// uptime and the Unix time it corresponded to at the last successful GPS
-/// clock sync — or `None` if the clock has never been synced since boot
-/// (this device has no battery-backed RTC, so "never synced" is the normal
-/// power-on state; see `firmware::gps`'s module doc). Returns the CURRENT
+/// clock sync — or `None` if the clock has never been synced since boot.
+/// The ESP32-S3 SoC itself has no battery-backed RTC (system time resets on
+/// every power-off), so `None` at fresh boot is still the normal starting
+/// state; the GPS shield's own GNSS-module RTC (see `firmware::gps`'s module
+/// doc's "Clock sync" section) usually shortens how long that state lasts,
+/// not whether it occurs. Returns the CURRENT
 /// Unix time by adding elapsed uptime since that anchor: equivalent to
 /// re-reading the system RTC (which `settimeofday` set from the very same
 /// anchor) without a second syscall, and pure/host-testable either way.
@@ -386,9 +397,31 @@ pub fn synced_wall_clock_secs(now_ms: u64, sync_anchor: Option<(u64, i64)>) -> O
 
 /// Parse a `$GPRMC` or `$GNRMC` NMEA sentence for UTC date+time.
 ///
-/// Returns `Some(NmeaDateTime)` when the sentence reports an active fix
-/// (status field `A`) with a syntactically valid time+date. Returns `None`
-/// for a void fix (`V`), any other sentence type, or a parse error.
+/// Returns `Some(NmeaDateTime)` when the sentence carries a syntactically
+/// valid time+date AND either:
+/// - status field `A` (active fix) — [`NmeaDateTime::verified`] is `true`, or
+/// - status field `V` (void — no fix yet) with a *plausible* date (year >=
+///   [`MIN_PLAUSIBLE_RMC_YEAR`]) — `verified` is `false`.
+///
+/// The `V`-with-plausible-date case exists because the T-Deck Plus GPS
+/// shield's GNSS module (Quectel L76K or u-blox M10Q) carries a
+/// battery-backed RTC (MS412FE backup cell on VRTC via D1/R3) that retains
+/// wall-clock time across power-off: seconds after boot, well before a fix
+/// is acquired, the module emits `$..RMC` sentences with status `V` but a
+/// populated, RTC-derived date+time. Accepting those lets the system clock
+/// sync at boot instead of waiting minutes for a first fix — see
+/// `firmware::gps` module doc's "Clock sync" section. The plausibility gate
+/// (rather than accepting any `V` date unconditionally) rejects the
+/// zeroed/near-epoch date a module with a dead or never-charged backup cell
+/// reports (no reliable RTC content to trust). An RTC-derived sync is never
+/// authoritative the way a real fix is — the backup RTC can drift or have
+/// been set from a stale prior fix — so callers must let the first
+/// `verified` sync override it and never let a later `V` sentence downgrade
+/// an already-verified sync; see [`should_accept_clock_sync`].
+///
+/// Returns `None` for an implausible/blank date (either status), a
+/// syntactically invalid time/date, an unrecognized status field, or any
+/// other sentence type.
 ///
 /// # RMC format (fields, 0-indexed after the sentence id):
 /// ```text
@@ -446,9 +479,15 @@ pub fn parse_rmc_datetime(line: &[u8]) -> Option<NmeaDateTime> {
         }
     }
 
-    if status.first().copied() != Some(b'A') {
-        return None; // void fix — no reliable date/time
-    }
+    // `A` (active fix) is always accepted; `V` (void — no fix yet) is
+    // accepted provisionally, gated below on a plausible date — the
+    // pre-fix, RTC-derived sync case (see this function's doc). Any other
+    // status byte (missing/corrupt field) is rejected outright.
+    let verified = match status.first().copied() {
+        Some(b'A') => true,
+        Some(b'V') => false,
+        _ => return None,
+    };
 
     // Time: HHMMSS(.ss) — need at least 6 digits (fractional seconds ignored).
     if time_str.len() < 6 {
@@ -471,6 +510,19 @@ pub fn parse_rmc_datetime(line: &[u8]) -> Option<NmeaDateTime> {
         return None; // reject obviously malformed fields (defensive, not a full calendar check)
     }
 
+    // Plausibility gate: a blank/zeroed date (`date_str` all `0`s, e.g. a
+    // module with a dead or never-charged backup RTC cell reporting an
+    // unset clock) decodes to a year well before this firmware could
+    // possibly be running. Applied to BOTH `A` and `V` — a satellite fix
+    // reporting a pre-release year is exactly as untrustworthy as an RTC
+    // reporting one, so there is no reason to gate one status and not the
+    // other. This is deliberately a loose floor, not a full "not in the
+    // future either" check: the goal is catching an unset/dead clock, not
+    // second-guessing a genuinely synced one.
+    if year < MIN_PLAUSIBLE_RMC_YEAR {
+        return None;
+    }
+
     Some(NmeaDateTime {
         year,
         month,
@@ -478,7 +530,41 @@ pub fn parse_rmc_datetime(line: &[u8]) -> Option<NmeaDateTime> {
         hour,
         minute,
         second,
+        verified,
     })
+}
+
+/// Floor year [`parse_rmc_datetime`]'s plausibility gate accepts. Set to this
+/// firmware's approximate ship year floor: a decoded year below this means
+/// the reporting clock (satellite fix or backup RTC alike) is unset/dead,
+/// not that the calendar genuinely reads that year. Deliberately not tied to
+/// the build date (a `const` computed from it would need to be bumped by
+/// hand at every release anyway, and a slightly stale floor is harmless —
+/// it only ever makes the gate a little more permissive, never less).
+pub const MIN_PLAUSIBLE_RMC_YEAR: u16 = 2024;
+
+/// Whether a newly-parsed [`NmeaDateTime`] should replace the driver's
+/// current clock-sync state, given whether the CURRENT sync (if any) is
+/// itself verified.
+///
+/// `true` in exactly two cases:
+/// - the new sync is `verified` (a real fix always wins — refreshes the
+///   anchor even if the existing sync was already verified, since a fresh
+///   fix is strictly at least as good as the anchor it replaces), or
+/// - nothing verified has synced yet (`!already_verified`), in which case an
+///   unverified, RTC-derived sync is better than no sync at all.
+///
+/// `false` only when the new sync is unverified AND a verified sync is
+/// already in effect — an `A`-derived sync must never be downgraded back to
+/// RTC-derived by a later `V` sentence (e.g. the fix is temporarily lost
+/// again after the first lock).
+///
+/// `firmware::gps::GpsDriver::parse_line` is the sole caller: `new_sync
+/// .verified` and `already_verified` come from [`parse_rmc_datetime`]'s
+/// result and the driver's own persisted `last_clock_sync_verified` field,
+/// respectively. Pure so this decision is host-testable without hardware.
+pub fn should_accept_clock_sync(new_sync_verified: bool, already_verified: bool) -> bool {
+    new_sync_verified || !already_verified
 }
 
 // ── NMEA GGA parser (pure functions, no hardware dependency) ──────────────────
@@ -1087,7 +1173,8 @@ mod tests {
                 day: 1,
                 hour: 12,
                 minute: 35,
-                second: 19
+                second: 19,
+                verified: true,
             }
         );
     }
@@ -1098,9 +1185,55 @@ mod tests {
         assert!(parse_rmc_datetime(line).is_some());
     }
 
+    // ── pre-fix (status `V`) RTC-derived acceptance / plausibility gate ──────
+    //
+    // The T-Deck Plus GPS shield's GNSS module retains RTC+ephemeris across
+    // power-off (MS412FE backup cell on VRTC via D1/R3) and emits `$..RMC`
+    // with a populated, RTC-derived date+time seconds after boot — well
+    // before a fix (status `A`) is acquired. `parse_rmc_datetime` accepts
+    // that pre-fix date behind a plausibility gate (year >=
+    // `MIN_PLAUSIBLE_RMC_YEAR`) instead of discarding every `V` sentence
+    // outright, marking the result `verified: false` — see this function's
+    // doc and `should_accept_clock_sync` below.
+
     #[test]
-    fn parse_rmc_void_status_returns_none() {
-        let line = b"$GPRMC,123519,V,,,,,,,010180,,,N*53";
+    fn parse_rmc_void_status_with_plausible_date_is_accepted_unverified() {
+        // Pre-fix RTC-derived sentence: status `V`, but a plausible
+        // (>= MIN_PLAUSIBLE_RMC_YEAR) date from the backup RTC.
+        let line = b"$GPRMC,123519,V,,,,,,,010126,,,N*53";
+        let dt = parse_rmc_datetime(line).expect("plausible pre-fix RTC date should be accepted");
+        assert_eq!(dt.year, 2026);
+        assert!(
+            !dt.verified,
+            "pre-fix (status V) sync must be marked unverified"
+        );
+    }
+
+    #[test]
+    fn parse_rmc_void_status_with_implausible_date_returns_none() {
+        // Same shape as the accepted case above, but the date decodes to a
+        // year before MIN_PLAUSIBLE_RMC_YEAR (2023 < 2024) — the backup RTC
+        // cell is dead/never-charged and reporting stale/unset content, not
+        // a genuinely synced clock. Must be rejected, not accepted-unverified.
+        let line = b"$GPRMC,123519,V,,,,,,,010123,,,N*53";
+        assert!(parse_rmc_datetime(line).is_none());
+    }
+
+    #[test]
+    fn parse_rmc_void_status_with_blank_date_returns_none() {
+        // No RTC content at all (blank date field) — distinct code path
+        // (date_str.len() != 6) from the implausible-but-present-year case
+        // above, still must not produce a sync.
+        let line = b"$GPRMC,123519,V,,,,,,,,,,N*53";
+        assert!(parse_rmc_datetime(line).is_none());
+    }
+
+    #[test]
+    fn parse_rmc_active_status_with_implausible_date_returns_none() {
+        // The plausibility gate applies to status `A` too, not just `V` — a
+        // satellite fix reporting a pre-2024 year is exactly as
+        // untrustworthy as an RTC reporting one.
+        let line = b"$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,010123,003.1,W*6A";
         assert!(parse_rmc_datetime(line).is_none());
     }
 
@@ -1127,6 +1260,29 @@ mod tests {
     fn parse_rmc_rejects_short_time_field() {
         let line = b"$GPRMC,123,A,4807.038,N,01131.000,E,022.4,084.4,010180,003.1,W*6A";
         assert!(parse_rmc_datetime(line).is_none());
+    }
+
+    // ── should_accept_clock_sync (status-A override of an RTC-derived sync) ──
+
+    #[test]
+    fn should_accept_clock_sync_unverified_when_nothing_synced_yet() {
+        // Pre-fix RTC-derived sync arriving with no prior sync at all: accept.
+        assert!(should_accept_clock_sync(false, false));
+    }
+
+    #[test]
+    fn should_accept_clock_sync_verified_always_wins() {
+        // A real fix accepted whether or not anything was synced before.
+        assert!(should_accept_clock_sync(true, false));
+        assert!(should_accept_clock_sync(true, true));
+    }
+
+    #[test]
+    fn should_accept_clock_sync_rejects_downgrade_of_verified_sync() {
+        // Once a real fix (status A) has synced the clock, a later pre-fix
+        // (status V) RTC-derived sentence must not downgrade it back to
+        // unverified.
+        assert!(!should_accept_clock_sync(false, true));
     }
 
     // ── unix_timestamp ───────────────────────────────────────────────────────

@@ -352,12 +352,15 @@ fn handle_frame(
         // touches `txq`, the dispatcher, or any radio path, structurally,
         // not just by convention.
         //
-        // Timestamp: MeshCadet has no RTC, so `identity`'s card cannot use
-        // `main.rs`'s `tx_epoch_base` (a per-boot `esp_random()` value —
-        // useless here, see `firmware_core::advert` module docs: MeshCore's
-        // replay guard on the RECEIVING peer drops a re-imported advert when
-        // `timestamp <= last_advert_timestamp` already on file for that
-        // contact). `advert_ts_store` persists a durable, strictly
+        // Timestamp: this handler runs on the USB-only, host-driven
+        // provisioning path (see the GUARD above) with no dependence on GPS
+        // or the GPS shield's own battery-backed RTC, so `identity`'s card
+        // cannot use `main.rs`'s `tx_epoch_base` (a per-boot `esp_random()`
+        // value, rebased onto GPS wall-clock time only once/if `gps` syncs —
+        // useless here either way, see `firmware_core::advert` module docs:
+        // MeshCore's replay guard on the RECEIVING peer drops a re-imported
+        // advert when `timestamp <= last_advert_timestamp` already on file
+        // for that contact). `advert_ts_store` persists a durable, strictly
         // increasing counter across reboots instead; the NVS write happens
         // BEFORE the reply is sent (see `advert_ts_store::save_last_advert_ts`'s
         // doc) so a crash between the two cannot regress it.
