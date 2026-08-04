@@ -112,14 +112,28 @@
 //!
 //! # Clock sync
 //!
-//! The T-Deck Plus has no battery-backed RTC: system time is volatile and
-//! resets to the ESP-IDF epoch (boot = 1970-01-01T00:00:00Z) on every
-//! power-off.  [`GpsDriver::parse_line`] calls `settimeofday` on the first
-//! (and every subsequent) valid `$GPRMC`/`$GNRMC` fix, so wall-clock time is
-//! re-established shortly after boot once the GPS acquires a fix. Sync state
-//! (`synced` / `never-synced` + last-sync age) is exposed via
-//! [`GpsDriver::status`] for display (admin-menu GPS status view, host
-//! `status` command) — there are no time-sync *controls*, only status.
+//! The ESP32-S3 SoC itself has no battery-backed RTC: system time
+//! (`settimeofday`) is volatile and resets to the ESP-IDF epoch (boot =
+//! 1970-01-01T00:00:00Z) on every power-off. But the T-Deck Plus GPS
+//! shield's GNSS module (Quectel L76K or u-blox M10Q) DOES carry one — an
+//! MS412FE backup cell on VRTC via D1/R3 — so the module itself retains
+//! RTC+ephemeris across power-off and emits `$GPRMC`/`$GNRMC` with a
+//! populated, RTC-derived date+time within seconds of boot, well before a
+//! fix is acquired (status `V`, no fix yet, rather than `A`).
+//! [`firmware_core::gps::parse_rmc_datetime`] accepts that pre-fix date
+//! behind a plausibility gate (rejects an implausible/blank year — a dead
+//! or never-charged backup cell) and marks it `verified: false`;
+//! [`GpsDriver::parse_line`] calls `settimeofday` from it the same as a
+//! verified (status `A`) fix, so wall-clock time is typically established at
+//! boot rather than only once the GPS acquires a fix outdoors. An
+//! unverified sync is never allowed to regress once a verified one lands —
+//! [`firmware_core::gps::should_accept_clock_sync`] is the gate — so the
+//! first status-`A` sentence always overrides an RTC-derived sync, and a
+//! later loss of fix (a stray `V` sentence after lock) can never downgrade
+//! an already-verified sync back to unverified. Sync state (`synced` /
+//! `never-synced` + last-sync age) is exposed via [`GpsDriver::status`] for
+//! display (admin-menu GPS status view, host `status` command) — there are
+//! no time-sync *controls*, only status.
 //!
 //! # RX diagnostics (`--features diagnostics` only)
 //!
@@ -415,6 +429,14 @@ pub struct GpsDriver<'d> {
     /// [`status`](Self::status)'s `clock_unix_secs` (GPS status screen).
     /// `None` exactly when `last_clock_sync_uptime_ms` is.
     last_clock_sync_unix_secs: Option<i64>,
+    /// `true` if the current clock sync came from a verified fix (RMC status
+    /// `A`); `false` if it came from a pre-fix, RTC-derived sentence (status
+    /// `V`, accepted behind the plausibility gate — see the module doc's
+    /// "Clock sync" section). Meaningless while `last_clock_sync_uptime_ms`
+    /// is `None` (nothing synced yet). Gates
+    /// [`firmware_core::gps::should_accept_clock_sync`] so a later `V`
+    /// sentence can never downgrade an already-verified sync.
+    last_clock_sync_verified: bool,
 
     // ── Liveness / acquisition-status state ─────────────────────────────────
     /// Uptime ms of the most recently observed NMEA sentence (any talker, any
@@ -561,6 +583,7 @@ impl<'d> GpsDriver<'d> {
             cached_fix: None,
             last_clock_sync_uptime_ms: None,
             last_clock_sync_unix_secs: None,
+            last_clock_sync_verified: false,
             last_nmea_seen_uptime_ms: None,
             last_sat_count: 0,
             active: true,          // start active to obtain first fix quickly
@@ -1109,13 +1132,20 @@ impl<'d> GpsDriver<'d> {
             }
         }
         if let Some(dt) = parse_rmc_datetime(line) {
-            if let Some(unix_secs) = set_system_clock_from_utc(dt) {
-                log::info!(
-                    "GPS clock sync: {:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-                    dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second,
-                );
-                self.last_clock_sync_uptime_ms = Some(now_ms);
-                self.last_clock_sync_unix_secs = Some(unix_secs);
+            // Never let a pre-fix, RTC-derived sync (dt.verified == false)
+            // downgrade a clock already synced from a verified fix — see the
+            // module doc's "Clock sync" section.
+            if should_accept_clock_sync(dt.verified, self.last_clock_sync_verified) {
+                if let Some(unix_secs) = set_system_clock_from_utc(dt) {
+                    log::info!(
+                        "GPS clock sync ({}): {:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+                        if dt.verified { "fix" } else { "RTC, unverified" },
+                        dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second,
+                    );
+                    self.last_clock_sync_uptime_ms = Some(now_ms);
+                    self.last_clock_sync_unix_secs = Some(unix_secs);
+                    self.last_clock_sync_verified = dt.verified;
+                }
             }
         }
     }

@@ -402,9 +402,12 @@ impl<T: Transport> Session<T> {
     /// Ask the device to build and return its signed self-advert "biz card"
     /// (see `protocol::advert::build_self_advert_card`).
     ///
-    /// Sends `FRAME_QUERY_ADVERT` carrying the host's current unix time — the
-    /// device has no RTC of its own and stamps the card with this value —
-    /// and returns the raw card bytes from `FRAME_RSP_ADVERT` verbatim.
+    /// Sends `FRAME_QUERY_ADVERT` carrying the host's current unix time —
+    /// this USB-only, host-driven path has no dependence on GPS or the GPS
+    /// shield's own battery-backed RTC (see `protocol::provisioning`'s
+    /// `FRAME_QUERY_ADVERT` doc) and stamps the card with this
+    /// host-supplied value instead — and returns the raw card bytes from
+    /// `FRAME_RSP_ADVERT` verbatim.
     ///
     /// The host cannot build this card itself: the signature requires the
     /// device's Ed25519 private key, which never leaves the device (campaign

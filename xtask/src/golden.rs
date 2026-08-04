@@ -509,7 +509,8 @@ fn build_vectors() -> Vec<Vector> {
 
     {
         // Payload: `host_unix_time(4 LE)` — the browser sends its own wall-clock
-        // unix time here (the device has no RTC); see FRAME_QUERY_ADVERT's doc
+        // unix time here since this USB-only, host-driven path is independent
+        // of GPS/the GPS shield's RTC either way; see FRAME_QUERY_ADVERT's doc
         // comment in provisioning.rs.
         let host_unix_time: u32 = 0x6789_ABCD;
         let mut buf = [0u8; 4];

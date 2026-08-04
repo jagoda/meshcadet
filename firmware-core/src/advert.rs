@@ -9,14 +9,21 @@
 //!
 //! # Anti-replay timestamp policy
 //!
-//! MeshCadet has no RTC: `tx_epoch_base` (`firmware/src/main.rs`) starts each
-//! boot seeded from `esp_random()` and is later rebased onto real GPS
-//! wall-clock time once the system clock GPS-syncs — fine either way for the
-//! existing DM/channel traffic (only ever compared against itself, never
-//! persisted), but useless as-is for an advert's `timestamp` field, because
-//! it is never itself persisted across a reboot: even the GPS-synced case
-//! carries no memory of the highest timestamp this device has EVER issued a
-//! card with. MeshCore's own replay guard drops a re-imported advert when
+//! The ESP32-S3 itself has no battery-backed RTC: `tx_epoch_base`
+//! (`firmware/src/main.rs`) starts each boot seeded from `esp_random()` and
+//! is later rebased onto real GPS wall-clock time once the system clock
+//! GPS-syncs — including, now, a pre-fix sync from the GPS shield's own
+//! GNSS-module RTC (see `firmware::gps`'s module doc "Clock sync" section),
+//! which typically lands within seconds of boot rather than only once a real
+//! fix is acquired. That still doesn't help here: an RTC-derived sync is
+//! marked unverified (not guaranteed accurate to the second — a drifted or
+//! stale RTC read is exactly as plausible to the sync's own gate as a
+//! genuine one) and, either way, `tx_epoch_base` itself is never persisted
+//! across a reboot — fine for the existing DM/channel traffic (only ever
+//! compared against itself, never persisted), but useless as-is for an
+//! advert's `timestamp` field, because it carries no memory of the highest
+//! timestamp this device has EVER issued a card with, GPS/RTC-synced or not.
+//! MeshCore's own replay guard drops a re-imported advert when
 //! `timestamp <= from->last_advert_timestamp` already on file for that
 //! contact (`BaseChatMesh.cpp:124`). A value that can regress across a
 //! reboot (a random reseed, or a device power-on before GPS has re-synced)
@@ -42,9 +49,11 @@ use protocol::{build_self_advert_card, Identity};
 /// Compute the next self-advert timestamp.
 ///
 /// `host_ts` is the host/browser-supplied unix time carried in the
-/// `QUERY_ADVERT` payload — `0` is the "absent/unknown" sentinel (the
-/// firmware has no RTC of its own, so it never has a better guess than what
-/// the host reports). `nvs_last` is the timestamp persisted after the
+/// `QUERY_ADVERT` payload — `0` is the "absent/unknown" sentinel (this
+/// USB-only, host-driven path has no dependence on GPS or the GPS shield's
+/// own battery-backed RTC — see this module's "Anti-replay timestamp policy"
+/// doc — so it never has a better guess than what the host reports).
+/// `nvs_last` is the timestamp persisted after the
 /// previous call (`0` if no card has ever been generated on this device).
 ///
 /// Returns a value strictly greater than `nvs_last` in every case,

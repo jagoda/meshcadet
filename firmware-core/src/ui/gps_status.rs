@@ -49,8 +49,13 @@ pub fn format_coords(has_fix: bool, lat_e7: i32, lon_e7: i32, fix_age_secs: u32)
 
 /// Format the time-sync row's PRIMARY line: the actual GPS-synced absolute
 /// wall-clock date+time — `"2026-07-15 14:32:10 UTC"` — or `"Not synced"`
-/// when the system clock has never been set from a GPS fix since boot (this
-/// device has no battery-backed RTC; see `firmware::gps`'s module doc).
+/// when the system clock has never been set from a GPS date+time sentence
+/// since boot (the ESP32-S3 itself has no battery-backed RTC, so this
+/// resets to "not synced" every power-off from the SoC's own perspective —
+/// but the GPS shield's own GNSS module does carry one, so a sync often
+/// lands within seconds of boot from a pre-fix RTC-derived sentence rather
+/// than only once a real fix is acquired; see `firmware::gps`'s module doc's
+/// "Clock sync" section).
 ///
 /// Split from the relative-age line (see [`format_time_sync_age`]) so the
 /// screen can render them as two rows instead of one over-wide line — see

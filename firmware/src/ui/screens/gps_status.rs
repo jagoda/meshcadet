@@ -19,9 +19,13 @@
 //!    date+time on its own row (`"2026-07-15 14:32:10 UTC"`) plus how long
 //!    ago the sync happened on a second row underneath (`"synced 5s ago"`);
 //!    `"Not synced"` (no second row) if the system clock has never been set
-//!    from a valid GPS date+time sentence since boot (the T-Deck Plus has no
-//!    battery-backed RTC, so this resets to "not synced" every power-off —
-//!    see `gps::GpsDriver`'s module doc's "Clock sync" section). Two rows,
+//!    from a valid GPS date+time sentence since boot. The ESP32-S3 itself
+//!    has no battery-backed RTC, so this still resets to "not synced" every
+//!    power-off from the SoC's own perspective — but the GPS shield's GNSS
+//!    module DOES carry one, so a sync from its pre-fix, RTC-derived
+//!    sentence typically lands within seconds of boot rather than only once
+//!    a real fix is acquired — see `gps::GpsDriver`'s module doc's "Clock
+//!    sync" section. Two rows,
 //!    not one: a single line wide enough to hold both the absolute date+time
 //!    and the relative age overflowed off the T-Deck's 320px-wide display
 //!    (see git history for the one-line version this replaced). The full
