@@ -202,20 +202,30 @@ jobs:
     # intentional dark-space/cyan UI theme name (site/*.html, styles.css,
     # firmware/src/ui/theme.slint, firmware/src/ui/screens/splash.rs) — both
     # would false-positive if added here.
+    #
+    # This job alone only catches a leak once it's already landed in a
+    # generated file (e.g. CHANGELOG.md, which release-please bakes from
+    # commit subjects) — by which point the offending commit is already
+    # merged to `main` and un-rewritable. scripts/check-commit-format.sh's
+    # "Lint commit messages" CI job closes that recurrence path by rejecting
+    # any commit *subject* carrying one of these terms before it can merge;
+    # both jobs source the same scripts/banned-vocabulary.sh so the term
+    # list can't drift between them (2026-08-04, CHANGELOG.md:49 leak).
     steps:
       - uses: actions/checkout@v4
 
       - name: Grep for internal-ops vocabulary
         run: |
           set -euo pipefail
-          pattern='\b(dossier|commander|capcom|flight[- ]director|eecom|flight-manuals)\b'
-          # Exclude this workflow file itself: the comment above (and
-          # `pattern` right above this line) necessarily spells out every
+          # shellcheck source=scripts/banned-vocabulary.sh
+          source scripts/banned-vocabulary.sh
+          # Exclude this workflow file and scripts/banned-vocabulary.sh
+          # themselves: the comments in each necessarily spell out every
           # banned term to document why it's banned, which would otherwise
           # make this job flag itself on every run.
-          if hits=$(grep -rnoiE "$pattern" \
+          if hits=$(grep -rnoiE "$BANNED_VOCAB_PATTERN" \
               --exclude-dir=.git --exclude-dir=target --exclude-dir=node_modules \
-              --exclude=ci.yml \
+              --exclude=ci.yml --exclude=banned-vocabulary.sh \
               .); then
             echo "::error::Internal ops-automation vocabulary found in the public repo (see below). Rewrite these to plain language a repo outsider can follow — see docs/adr/0004-release-architecture.md and 0008-nondestructive-update-artifacts.md history for prior fixes of this exact class." >&2
             echo "$hits"

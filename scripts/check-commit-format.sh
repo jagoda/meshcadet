@@ -10,6 +10,16 @@
 # disagree about what passes. See docs/adr/0004-release-architecture.md §4
 # for the design this implements.
 #
+# Also rejects any commit subject carrying a banned internal-ops-vocabulary
+# term (scripts/banned-vocabulary.sh — the same list `ci.yml`'s "no
+# internal-ops vocabulary leaks in public docs" job scans the tree for).
+# That job alone only catches a leak once it's already landed in a
+# generated file: release-please bakes CHANGELOG.md entries straight from
+# commit subjects, so a banned term in a subject reaches CHANGELOG.md the
+# moment the commit merges to `main` — by which point it's un-rewritable
+# history. Checking the subject HERE, before merge, closes that recurrence
+# path (CHANGELOG.md:49 leak, 2026-08-04).
+#
 # Usage:
 #   scripts/check-commit-format.sh [<base-rev> [<head-rev>]]
 #
@@ -39,6 +49,10 @@
 # never carries release-please's own commits, so local runs leave this
 # exemption off and check every commit unconditionally.
 set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/banned-vocabulary.sh
+source "${script_dir}/banned-vocabulary.sh"
 
 # type(scope)!: subject — scope optional, "!" (breaking) optional. Kept
 # byte-identical to the regex `.github/workflows/commitlint.yml` used to
@@ -82,6 +96,20 @@ for sha in $(git rev-list "${base}..${head}"); do
     fi
     echo "  expected form: type(scope)!: subject" >&2
     echo "  type one of: feat fix docs style refactor perf test build ci chore revert" >&2
+    fail=1
+  fi
+
+  # Reject banned internal-ops vocabulary in the subject itself: release-please
+  # bakes commit subjects verbatim into CHANGELOG.md, so a banned term here
+  # reaches that generated, public file the moment this commit merges —
+  # after which it's un-rewritable history. See banned-vocabulary.sh.
+  if [[ "${subject}" =~ ${BANNED_VOCAB_PATTERN} ]]; then
+    if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+      echo "::error::Commit ${sha} subject carries banned internal-ops vocabulary: \"${subject}\"" >&2
+    else
+      echo "error: commit ${sha} subject carries banned internal-ops vocabulary: \"${subject}\"" >&2
+    fi
+    echo "  release-please bakes this subject into CHANGELOG.md verbatim — rewrite it to plain language a repo outsider can follow before merging." >&2
     fail=1
   fi
 done
