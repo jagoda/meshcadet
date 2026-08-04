@@ -8,6 +8,127 @@ Versioning is managed by [release-please](https://github.com/googleapis/release-
 The entry below documents everything landed before release-please's first
 `chore(release): vX.Y.Z` PR.
 
+## [0.6.0](https://github.com/jagoda/meshcadet/compare/v0.5.0...v0.6.0) (2026-08-04)
+
+
+### Added
+
+* **firmware:** add diagnostics-gated on-device perf instrumentation ([764ac91](https://github.com/jagoda/meshcadet/commit/764ac91c530dcd8e96d6d179511a429c94711038))
+* **firmware:** add diagnostics-gated on-device perf instrumentation ([d1db0ec](https://github.com/jagoda/meshcadet/commit/d1db0ec7735d920c7160836067a9e878f64613d0))
+* **firmware:** curate RENDER_EXTRA_CPS to the campaign's 600-entry target ([1fff506](https://github.com/jagoda/meshcadet/commit/1fff50622a3aa5398075f1e5d7d7238590f6bf13))
+* **firmware:** curate RENDER_EXTRA_CPS to the campaign's 600-entry target ([82dbdaf](https://github.com/jagoda/meshcadet/commit/82dbdaf5680e3fb1d30508772df117504a80b7da))
+* **firmware:** grow emoji picker to 96 entries with category tabs ([8fdc078](https://github.com/jagoda/meshcadet/commit/8fdc078e931a92776a82792a14aa8a925ce2ee1b))
+* **firmware:** grow emoji picker to 96 entries with category tabs ([e04da64](https://github.com/jagoda/meshcadet/commit/e04da64eee4c492a7fdb8d7107a1c1396a63045a))
+* **firmware:** implement ADR-0012 dispatcher/UI task split (M1) ([713b3dc](https://github.com/jagoda/meshcadet/commit/713b3dc6f2010d889022630dda62dcfbbf4cbf44))
+* **firmware:** implement ADR-0012 dispatcher/UI task split (M1) ([af448df](https://github.com/jagoda/meshcadet/commit/af448df4a14cea149c4461991f9c8f8522a7dcc3))
+* **firmware:** introduce RENDER_EXTRA_CPS render-only codepoint table ([669dd2f](https://github.com/jagoda/meshcadet/commit/669dd2fefd5832f1abd4c52437ad6ae6e8e43f00))
+* **firmware:** introduce render-only emoji tier with EMOJI_TABLE subset invariant ([07116d2](https://github.com/jagoda/meshcadet/commit/07116d2c6af55d924c348e01483022319a2a959d))
+* **firmware:** recompute app-image size against a committed baseline ([cd08085](https://github.com/jagoda/meshcadet/commit/cd080851235442bb94095ff292ad93bbc2bdb34d))
+* **firmware:** recompute app-image size against a committed baseline ([ca0a4bf](https://github.com/jagoda/meshcadet/commit/ca0a4bf257d206dbe71fe075637a41dcf32accd9))
+* **firmware:** restore ui_step/ui-starvation instrumentation on ui_task ([148fcc6](https://github.com/jagoda/meshcadet/commit/148fcc69287acd83c3537cd1d1b86d379d1006e9))
+* **firmware:** restore ui_step/ui-starvation instrumentation on ui_task ([231ad56](https://github.com/jagoda/meshcadet/commit/231ad56fbf11c9c6bf593ba42a7bf594e89eeb16))
+* **perf-device-report:** add the collection-kit ingest path ([e04f69d](https://github.com/jagoda/meshcadet/commit/e04f69d69e0879fc3da2108bb3071b642c2204b1))
+* **perf-loop-model:** expose device-report re-calibration hook ([3e47008](https://github.com/jagoda/meshcadet/commit/3e47008fdafcbb0131216ed59286072c3a764409))
+* **perf:** add host discrete-event model of the dispatcher superloop ([19626df](https://github.com/jagoda/meshcadet/commit/19626dfbddf6cac8f9a071dc71cd9b324d740fa7))
+* **perf:** host discrete-event model of the dispatcher superloop ([8f37a4d](https://github.com/jagoda/meshcadet/commit/8f37a4d2f31e8744a6d5bef8e4b2494992c82fa3))
+* **perf:** log free internal-heap headroom in the 30s diagnostics rollup ([65dbdd9](https://github.com/jagoda/meshcadet/commit/65dbdd995ac0f6ce9edb22fb4cf29e3e4408102b))
+* **perf:** M1 task-split host validation — as-built loop model, parity matrix, kit regen ([0c72fe9](https://github.com/jagoda/meshcadet/commit/0c72fe987517a5e888c65ffc8bf2648cf0dc5a59))
+* **protocol/firmware-core/ui_sim:** normalize inbound emoji so VS16/skin-tone/ZWJ no longer render blank cells ([29cec59](https://github.com/jagoda/meshcadet/commit/29cec59a0dbaf915110379359d1ccd82806f9e05))
+* **protocol/firmware-core/ui_sim:** normalize inbound emoji so VS16/skin-tone/ZWJ no longer render blank cells ([1abad3e](https://github.com/jagoda/meshcadet/commit/1abad3e8e419d6aec1c9871091d2c3a03f025ef6))
+* **radio:** land D9/D11 SPI2 bus-hold GPIO-toggle probe in radio.rs ([7e8dfc8](https://github.com/jagoda/meshcadet/commit/7e8dfc84d8b0e2e7bc05b7e1fe43fcfeba81dcb9))
+* **ui:** render the emoji picker's 96 grid cells in full color ([9bf1a82](https://github.com/jagoda/meshcadet/commit/9bf1a8234c408e157311e83d96c86bb41a7c133a))
+* **ui:** render the emoji picker's 96 grid cells in full color ([8684097](https://github.com/jagoda/meshcadet/commit/8684097c44a1e9ada2808c0672178adfad458863))
+* **xtask:** add static guard for ADR-0012 R8 Slint thread-affinity barrier ([b4af00c](https://github.com/jagoda/meshcadet/commit/b4af00cd9f37ee4833beedbfca91543cac2eaba7))
+* **xtask:** make ADR-0012 R8's Slint thread-affinity barrier mechanical ([e007445](https://github.com/jagoda/meshcadet/commit/e007445e3087a76cc9ecd2307c4165fcbf76020b))
+* **xtask:** rewrite the picker/render sync guard from equality to subset ([aa550af](https://github.com/jagoda/meshcadet/commit/aa550afa122e5499b37a9daac5385be20e1e68f2))
+
+
+### Fixed
+
+* **ci:** run cargo fmt on splash_backdrop_steal_probe.rs ([2f02b3e](https://github.com/jagoda/meshcadet/commit/2f02b3e254d4b2783e52391272cd4715910d6015))
+* **ci:** scrub internal doc-path leak and apply cargo fmt ([f9fd86a](https://github.com/jagoda/meshcadet/commit/f9fd86a4d86fdbfd0939922bde58e0931c952079))
+* **docs:** drop internal-ops term from ui-residual-opt-r1.md ([d4b23d5](https://github.com/jagoda/meshcadet/commit/d4b23d52175cec04c62fe5730b7b4de7fec72b50))
+* **firmware:** add missing PerfRollup.ui_step field; scrub vocabulary leak ([aa0a1a4](https://github.com/jagoda/meshcadet/commit/aa0a1a4b60f76a594d8cf19bc44ffdae4d075473))
+* **firmware:** bundle ui_task::spawn's peripheral params behind one Box ([8df94bd](https://github.com/jagoda/meshcadet/commit/8df94bd52b5030f222bcffa7de9049b05be207a7))
+* **firmware:** bundle ui_task::spawn's peripheral params behind one Box ([5070c35](https://github.com/jagoda/meshcadet/commit/5070c354c789443c541060aed26deda149605c1c))
+* **firmware:** derive Clone for BootSeed ([af86319](https://github.com/jagoda/meshcadet/commit/af863193304b85a2275678b7d6688a0943b1e241))
+* **firmware:** drive emoji wght axis + alpha gamma boost for crisp mono glyphs ([d2ce8ea](https://github.com/jagoda/meshcadet/commit/d2ce8ea0d23db767d271125039c4850afe1213fc))
+* **firmware:** drive emoji wght axis + alpha gamma boost for crisp mono glyphs ([3f2400d](https://github.com/jagoda/meshcadet/commit/3f2400d9da27c86382973de21d44ff6f7ad21427))
+* **firmware:** recompute app-image baseline against main, correct its method provenance ([dcc8242](https://github.com/jagoda/meshcadet/commit/dcc82429c2bbcdccc7bc909341cff94c9f858864))
+* **firmware:** recompute app-image baseline against main, correct its method provenance ([c0a45c0](https://github.com/jagoda/meshcadet/commit/c0a45c047a2340158a12e20cfc20385dcd72575c))
+* **protocol:** drop internal-ops term from emoji.rs doc comment ([2b2cf8e](https://github.com/jagoda/meshcadet/commit/2b2cf8eef370df9b867c94ad3bc3c7d9fbaef1cd))
+* **provisioner:** make generated channel secrets recoverable before add ([d94c84e](https://github.com/jagoda/meshcadet/commit/d94c84e56053f66670d712caa44b573a9fc45e7f))
+* **provisioner:** make generated channel secrets recoverable before add ([9e3f66e](https://github.com/jagoda/meshcadet/commit/9e3f66e8783f9294638eae09c0bcd07bf1ae1f12))
+* **radio:** re-check DIO1 level after a wake before reporting Asserted ([5bcb3d8](https://github.com/jagoda/meshcadet/commit/5bcb3d8921eab5b0c7e1b5341d01ad93138aa499))
+* **radio:** re-check DIO1 level after a wake before reporting Asserted ([251e53b](https://github.com/jagoda/meshcadet/commit/251e53bedbc92ce221c7aa9f38b1c5bd29099a31))
+* **release:** parse a multi-line members = [...] array in sync-cargo-lock-versions.sh ([5d97014](https://github.com/jagoda/meshcadet/commit/5d970144ce7aa3cc8f9a9be085e1e8b4a29296ae))
+* **release:** parse a multi-line members array in sync-cargo-lock-versions.sh ([a3574e1](https://github.com/jagoda/meshcadet/commit/a3574e1fc010e1f33ffa7401182b5fdbccb9ba65))
+* **ui:** dedupe the 7x embedded starfield backdrop texture ([9637838](https://github.com/jagoda/meshcadet/commit/9637838021a2678fc5426962e4092a8f381fdc38))
+* **ui:** dedupe the 7x embedded starfield backdrop texture ([7d73a41](https://github.com/jagoda/meshcadet/commit/7d73a416fef949b534404cde93418079dc307f3b))
+* **ui:** guard render_if_needed against Slint's unset-component boot panic ([9e20f11](https://github.com/jagoda/meshcadet/commit/9e20f112a26366097f8cfaf3b61b20502e95aa84))
+* **ui:** guard render_if_needed against Slint's unset-component panic ([689691d](https://github.com/jagoda/meshcadet/commit/689691d911701ea0f0d62ec7b18fb1331046d53d))
+* **ui:** warm the shared backdrop-image cache before the boot splash's own component ([e7f7235](https://github.com/jagoda/meshcadet/commit/e7f7235d0cd31d94614e481a124824e7618922bc))
+* **ui:** warm the shared backdrop-image cache before the boot splash's own component ([4f5f330](https://github.com/jagoda/meshcadet/commit/4f5f330ab9995ea403766bf86c306b4c4479f7fc))
+* **xtask:** drop inherited RUSTUP_TOOLCHAIN before nested firmware release build ([7600fcb](https://github.com/jagoda/meshcadet/commit/7600fcbf06ac0d2afa1bcdaf94d3598d4c556f2c))
+* **xtask:** fail loud instead of silently skipping an unreadable directory in the Slint-affinity guard ([1a3084c](https://github.com/jagoda/meshcadet/commit/1a3084cbdcc74d1de4dd179e9fc6f7bd2e8f44d9))
+
+
+### Performance
+
+* **device-report-ingest:** build the collection-kit ingest path (no data yet) ([9be53e1](https://github.com/jagoda/meshcadet/commit/9be53e1b21eeb435e679752e864ea03d8b604d62))
+* **diagnostics:** log free internal-heap headroom (closes ADR-0012 D-H) ([5ddafdd](https://github.com/jagoda/meshcadet/commit/5ddafdd3cfa10eead61a8b2dc368d4b00c818200))
+* land D9/D11 SPI2 GPIO-toggle probe in radio.rs ([d1654b0](https://github.com/jagoda/meshcadet/commit/d1654b0eae505881af1bf454dd2d6541313dfbab))
+* M1 task-split host validation — as-built loop model, parity matrix, kit regen ([f278ed0](https://github.com/jagoda/meshcadet/commit/f278ed0a2dca81e71417746da6506396eebe6304))
+* **M3:** re-rank the residual UI-side items post-split — both closed/demoted, no optimization landed ([c58d617](https://github.com/jagoda/meshcadet/commit/c58d617b99263323c9bdd735b6d0132751e29b02))
+* **radio:** interrupt/notification-driven DIO1 waits (M2) ([e11c4a0](https://github.com/jagoda/meshcadet/commit/e11c4a073578f239ab97ef7d874b4af5008e9976))
+* **radio:** M2 host validation — DIO1 wait quantization, wait-abstraction state machine, ISR-safety audit ([f7a8c10](https://github.com/jagoda/meshcadet/commit/f7a8c1029fcf26edb93a5ad31b872de617bab916))
+* **radio:** M2 host validation — DIO1 wait quantization, wait-abstraction state machine, ISR-safety audit ([896aa7c](https://github.com/jagoda/meshcadet/commit/896aa7c06ab3493da0339a07dccaae7a2bfc7638))
+* **radio:** post-green review — observability log + stale-doc corrections ([458441c](https://github.com/jagoda/meshcadet/commit/458441c40dcf2fb454f554e02d4453edc802845b))
+* **radio:** replace DIO1 spin-polls with interrupt/notification-driven waits ([7c3ee48](https://github.com/jagoda/meshcadet/commit/7c3ee48c9ddcd9b5bf22212871cc37367a3bb766))
+
+
+### Changed
+
+* **perf-device-report:** dedupe payload_bytes field formatting ([532141a](https://github.com/jagoda/meshcadet/commit/532141afa2eaa0bbf075bd894c73b97c3a5a1d37))
+* **perf:** tighten loop-model report + document backoff simplification ([6aa7290](https://github.com/jagoda/meshcadet/commit/6aa72900ead6cd91bf1683aaa913270b35abf7b3))
+
+
+### Documentation
+
+* **adr:** ADR-0012 dispatcher/UI task split design ([2a64163](https://github.com/jagoda/meshcadet/commit/2a64163eaff6e14e87ad0df73efd0b94eea256b1))
+* **adr:** ADR-0012 dispatcher/UI task split design ([5a878ca](https://github.com/jagoda/meshcadet/commit/5a878ca5e25a5e87d5abd1991abe756f3698adb4))
+* **adr:** sharpen ADR-0012's Sync auto-derivation argument ([d5e39e4](https://github.com/jagoda/meshcadet/commit/d5e39e4b1ad029894519772bd734fedb444c816c))
+* **firmware:** correct ADR-0012 R8's mechanical-enforcement claim and stale SPI2 comment ([ca4d8bf](https://github.com/jagoda/meshcadet/commit/ca4d8bf7da9288dd14a7024464301eabb25ed1df))
+* **firmware:** fix stale equality claim in EMOJI_CPS's own local comment ([ddaf1b9](https://github.com/jagoda/meshcadet/commit/ddaf1b9550f1ad2c7881d7785cb4f337c3c66b79))
+* **firmware:** note expected run-to-run noise in the app-image baseline ([54909c9](https://github.com/jagoda/meshcadet/commit/54909c967ad6f116968a1b820bca532e276219c5))
+* **perf:** author on-device performance collection kit (M0) ([710a7d1](https://github.com/jagoda/meshcadet/commit/710a7d1e472d02d88cea441aabd72e4a88a1927c))
+* **perf:** author the on-device performance collection kit (M0) ([1e75ee8](https://github.com/jagoda/meshcadet/commit/1e75ee83c4929cbd8f47fb15cd9f8b6a87e45964))
+* **perf:** consolidate ui-perf-baseline into one provenance-tagged record ([d7d6bc2](https://github.com/jagoda/meshcadet/commit/d7d6bc282daeb6fce0f05f178195f9d7ebbf6573))
+* **perf:** consolidate ui-perf-baseline into one provenance-tagged record ([493ced6](https://github.com/jagoda/meshcadet/commit/493ced604f8962c03286245974b9ae3ab30c42e5))
+* **perf:** correct display SPI-line-floor comment and re-anchor ui_step ([d5069cc](https://github.com/jagoda/meshcadet/commit/d5069ccdf58a6a16916a20d0ccb92cbe1f8dfbef))
+* **perf:** correct the 10x-low display SPI floor and its derived numbers ([b5f12af](https://github.com/jagoda/meshcadet/commit/b5f12af319a81708738c6489b7419b615f0029a4))
+* **perf:** document the device-report archive schema ([ac86d9b](https://github.com/jagoda/meshcadet/commit/ac86d9b3a10201ffc0b8673b182c6a8a50f76f84))
+* **perf:** drop internal-ops vocabulary from device-report ingest docs ([fa324b7](https://github.com/jagoda/meshcadet/commit/fa324b75b008635564827d77e424e35ae9c609a2))
+* **perf:** drop internal-ops vocabulary from SPI2 arbitration doc ([5587936](https://github.com/jagoda/meshcadet/commit/55879362546e716b506dac50e32b07c4838eba81))
+* **perf:** drop internal-ops vocabulary from task-split host validation doc ([501df74](https://github.com/jagoda/meshcadet/commit/501df74a192bcd2da6da3d3b85f8b701941aa098))
+* **perf:** fix collection-kit.md ref check, CLI naming, and port fallback ([5259e81](https://github.com/jagoda/meshcadet/commit/5259e81b61847f828672413b89cb98d7a1ea2f07))
+* **perf:** fix collection-kit.md's dead ref-check grep, vague CLI ref, and broken --port fallback ([8199b5d](https://github.com/jagoda/meshcadet/commit/8199b5ddec6d60307cb1af03981646ed20d5e6a8))
+* **perf:** land the performance review — one state-of-record document ([3fa905f](https://github.com/jagoda/meshcadet/commit/3fa905fe4b665d13489a05ade408bd29cfd43cf5))
+* **perf:** M3 re-ranking — both residual UI items closed/demoted, no optimization landed ([ec2d5e4](https://github.com/jagoda/meshcadet/commit/ec2d5e492d14fb0788c2b3be2bffdfcffd29a469))
+* **perf:** recompute ui-perf-baseline.md SPI-floor table and derived claims ([8ee62aa](https://github.com/jagoda/meshcadet/commit/8ee62aa7b96c698161679953e1354c76a5dc2a3f))
+* **perf:** record the UI_TICK_MS / RENDER_MIN_INTERVAL_MS coupling at both constants ([738b7e0](https://github.com/jagoda/meshcadet/commit/738b7e0a7dae9054f8c2f4c967e16bcb91daa52d))
+* **perf:** regenerate perf-loop-model-baseline.md report with corrected ui_step ([efd7cf9](https://github.com/jagoda/meshcadet/commit/efd7cf9b808e87a394db5f4968ea2b15a0915883))
+* **perf:** repoint code comments at the renumbered baseline sections ([3db0f38](https://github.com/jagoda/meshcadet/commit/3db0f38b1c8f8d519a260dc8641dadfbb7ac4a11))
+* **perf:** resolve ADR-0012's D-A..D-H labels into the one register ([757b36f](https://github.com/jagoda/meshcadet/commit/757b36fcd4fc2b787b6d30b877447bd117aa8d16))
+* **perf:** resolve M0 checkpoint's R2 doc-consistency findings ([5f89284](https://github.com/jagoda/meshcadet/commit/5f89284c2a2dc0598b8c27a887e7baf7879fb445))
+* **perf:** resolve M0 checkpoint's R2 doc-consistency findings ([fd6c1cc](https://github.com/jagoda/meshcadet/commit/fd6c1cc73ab77ab6ef2ea82bdd80e0ae3158ee65))
+* **perf:** rewrite the performance record as the post-review state of record ([68c520b](https://github.com/jagoda/meshcadet/commit/68c520b8f921d9a11889375fa38158207bf76a1d))
+* **perf:** settle R1 (SPI2 bus arbitration) by static analysis ([bed3bc3](https://github.com/jagoda/meshcadet/commit/bed3bc3fb396bccf44dc398a18495e4e9e0ad4d9))
+* **perf:** settle R1 (SPI2 bus arbitration) by static analysis ([306b556](https://github.com/jagoda/meshcadet/commit/306b55629b4cfa9cc7cbc3dc734a8ea004e4ad1e))
+* **perf:** strip internal-ops vocabulary from radio host-validation doc ([085307e](https://github.com/jagoda/meshcadet/commit/085307ed6ba0be777e98ef3b973af0b2ec55cb8b))
+* **perf:** unblock D9/D11 now that the SPI2 GPIO-toggle probe exists ([94759a5](https://github.com/jagoda/meshcadet/commit/94759a5f472ed8f2e045896e899dad490f2f42bd))
+* **radio:** rewrite internal-ops term in DIO1 wait-safety doc comment ([8269bd0](https://github.com/jagoda/meshcadet/commit/8269bd0ed48dba33af2bca1acd9fc4f19d8718c8))
+
 ## [0.5.0](https://github.com/jagoda/meshcadet/compare/v0.4.0...v0.5.0) (2026-08-01)
 
 
