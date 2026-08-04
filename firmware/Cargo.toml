@@ -133,6 +133,25 @@ embuild = "0.33"
 # fonts.rs:193 panic.
 slint-build = { version = "=1.16.1" }
 
+# ── Color-emoji picker-cell asset pipeline (build-time only) ─────────────────
+# `build_emoji_color.rs` decodes `assets/NotoColorEmoji.ttf`'s CBDT color
+# bitmap strikes into the 96 palette-indexed picker-cell rasters emitted to
+# `$OUT_DIR/emoji_color.rs` (`src/ui/emoji_color.rs`'s `include!`). None of
+# these three crates, nor the multi-MB font asset they parse, end up in the
+# firmware binary — only the small generated const arrays do. All three are
+# permissively licensed (MIT/Apache-2.0/MIT) host build tools, same footing
+# as `embuild`/`slint-build` above.
+ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+color_quant = "1.1"
+# `protocol` is ALSO a normal (firmware-target) dependency above — this
+# duplicate entry resolves it for the HOST build-script compilation instead,
+# so `build_emoji_color.rs` can read the real `EMOJI_TABLE`/codepoint list
+# straight from source rather than hand-duplicating it a third time (the C
+# generator's `gen_emoji_font.c` has to hand-duplicate EMOJI_CPS/
+# RENDER_EXTRA_CPS because it's C; this one doesn't need to, being Rust).
+protocol = { path = "../protocol" }
+
 [profile.release]
 opt-level = "s"
 

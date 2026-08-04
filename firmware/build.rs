@@ -24,6 +24,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
+#[path = "build_emoji_color.rs"]
+mod build_emoji_color;
+
 /// True when `output` exists and is at least as new as every `input`.
 /// A missing output, or any input we cannot stat, forces regeneration
 /// (fail-safe: we would rather rebuild than serve a stale artifact).
@@ -189,6 +192,36 @@ fn build_emoji_font() {
     );
 }
 
+/// Runs `build_emoji_color::generate` to produce `$OUT_DIR/emoji_color.rs`
+/// (the picker's color-cell raster assets — see that module's doc), guarded
+/// by the same incremental mtime check `build_emoji_font()` uses above: skip
+/// regeneration (a multi-glyph decode+quantize pass) when the output is
+/// already newer than every input. `emoji_table_src` is an input here in a
+/// way `build_emoji_font()`'s equivalent guard doesn't need: this generator
+/// reads `protocol::emoji::EMOJI_TABLE` directly (see `build_emoji_color.rs`'s
+/// doc — deliberately NOT a hand-duplicated codepoint list), so a future
+/// EMOJI_TABLE edit is a real input change even though it lands in a
+/// different crate/package than this one. Cargo's own default rerun trigger
+/// (absent `rerun-if-changed`, "any file in THIS package changes" — see
+/// `main()`'s doc) does not by itself cover a sibling package's source, so
+/// without this explicit check, an EMOJI_TABLE-only edit could leave a stale
+/// `emoji_color.rs` silently missing the new codepoints.
+fn build_emoji_color() {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+
+    let generator_src = manifest_dir.join("build_emoji_color.rs");
+    let color_ttf = manifest_dir.join("assets/NotoColorEmoji.ttf");
+    let emoji_table_src = manifest_dir.join("../protocol/src/emoji.rs");
+    let out_rs = out_dir.join("emoji_color.rs");
+
+    if is_up_to_date(&out_rs, &[&generator_src, &color_ttf, &emoji_table_src]) {
+        return;
+    }
+
+    build_emoji_color::generate(&out_rs, &color_ttf);
+}
+
 fn main() {
     // NOTE: this build script intentionally emits NO `cargo:rerun-if-changed`
     // directives. Cargo therefore re-runs it whenever any file in the firmware
@@ -197,8 +230,10 @@ fn main() {
     // used to leave the boot version tag frozen — see `emit_build_version`).
     // The emoji-font generation stays incremental via its own mtime guard
     // (`is_up_to_date`), so this broader re-run does not regenerate the font
-    // unless its inputs actually changed.
+    // unless its inputs actually changed. `build_emoji_color()` uses the same
+    // guard for the same reason.
     embuild::espidf::sysenv::output();
     emit_build_version();
     build_emoji_font();
+    build_emoji_color();
 }

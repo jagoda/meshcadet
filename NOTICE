@@ -134,7 +134,9 @@ License:    Triple-licensed by the Slint project; MeshCadet uses it under
 Bundled/embedded font assets
 --------------------------------------------------------------------------
 `firmware/gen_emoji_font.c` (invoked from `firmware/build.rs`) rasterizes a
-combined bitmap font, baked into the firmware binary, from two source fonts:
+combined bitmap font, baked into the firmware binary, from two source fonts.
+A separate build-time pipeline, `firmware/build_emoji_color.rs`, generates
+the emoji picker's color-cell rasters from a third, independent font asset:
 
 Noto Emoji
   File:       firmware/assets/NotoEmoji-Regular.ttf (bundled in this repo;
@@ -145,6 +147,20 @@ Noto Emoji
   License:    SIL Open Font License, Version 1.1 (OFL 1.1) — full text
               accompanies the font at
               firmware/assets/NotoEmoji-LICENSE.txt, per the OFL's own
+              redistribution condition (license + copyright notice must
+              travel with the font).
+
+Noto Color Emoji
+  File:       firmware/assets/NotoColorEmoji.ttf (bundled in this repo;
+              pulled 2026-08-03 from googlefonts/noto-emoji,
+              fonts/NotoColorEmoji.ttf, Version 2.051). Build-time-only
+              source for the emoji picker's color-cell rasters
+              (firmware/build_emoji_color.rs) — a separate pipeline from,
+              and additional to, the Noto Emoji mono font above.
+  Copyright:  Copyright 2022 Google Inc.
+  License:    SIL Open Font License, Version 1.1 (OFL 1.1) — full text
+              accompanies the font at
+              firmware/assets/NotoColorEmoji-LICENSE.txt, per the OFL's own
               redistribution condition (license + copyright notice must
               travel with the font).
 
