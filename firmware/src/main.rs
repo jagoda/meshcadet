@@ -1518,8 +1518,16 @@ fn run() -> anyhow::Result<()> {
     // module docs for the hardware-feasibility rationale: plain ADC voltage
     // divider, no PMU/fuel-gauge IC, no pin collision). Propagates on failure,
     // matching this boot sequence's existing convention for peripheral
-    // bring-up (SPI2, GPS UART1 above both do the same via `?`).
-    let mut battery = BatteryDriver::new(peripherals.adc1, peripherals.pins.gpio4, now0)?;
+    // bring-up (SPI2, GPS UART1 above both do the same via `?`). Passes
+    // `nvs_partition` so `settled_mv` can be restored/persisted under the
+    // `mc_cfg` provisioning namespace (see `battery.rs`'s "NVS layout"
+    // section) — same `.clone()` convention as `GpsDriver::new` above.
+    let mut battery = BatteryDriver::new(
+        peripherals.adc1,
+        peripherals.pins.gpio4,
+        now0,
+        nvs_partition.clone(),
+    )?;
 
     // 2.7. History store init + admin USB-serial server thread (production only).
     //
