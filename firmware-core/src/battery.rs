@@ -251,8 +251,7 @@
 //! first sample through as `percent` — this is the residual gap the "Fix"
 //! section above documented as out of scope; it's in scope now.
 //!
-//! **Bound-at-entry, not repair-at-rest**
-//! (`flight-manuals/library/bound-at-entry-not-repair-at-rest.md`):
+//! **Bound-at-entry, not repair-at-rest:**
 //! `settled_mv` is only ever written by [`battery_poll_step`], which already
 //! applies the one plausibility bound that matters
 //! ([`EXTERNAL_POWER_MV_THRESHOLD`]) at the point the raw ADC reading first
@@ -260,8 +259,7 @@
 //! does NOT re-apply a second, storage-side plausibility check — there is
 //! nothing to repair, because nothing that reaches NVS was ever unbounded.
 //!
-//! **Latched trust flag, not a load-time repair**
-//! (`flight-manuals/library/persist-before-clock-confirmed-watermark-poisoning.md`):
+//! **Latched trust flag, not a load-time repair:**
 //! the one case where `settled_mv` legitimately holds an untrustworthy value
 //! is a VIRGIN device (no persisted value yet) whose very first sample is
 //! already on external power — [`battery_poll_step`]'s documented residual
@@ -274,7 +272,7 @@
 //! boot's restore.
 //!
 //! **Bounded write-wear, quantified** (mirrors the write-frequency budgeting
-//! in `flight-manuals/library/watermark-write-behind-regression.md`):
+//! used for a comparable NVS-backed watermark elsewhere in this firmware):
 //! [`should_persist_settled_mv`] persists the very first confirmed sample
 //! immediately (closes the gap on the NEXT reboot as soon as possible), then
 //! gates every later write on BOTH a minimum `settled_mv` movement
@@ -286,7 +284,7 @@
 //! bounds the OTHER direction — how stale a restored value can be relative
 //! to true `settled_mv` at any instant — to at most `PERSIST_MIN_DELTA_MV`
 //! worth of drift plus one poll's additional movement, never an unbounded
-//! write-behind window (`flight-manuals/library/watermark-write-behind-regression.md`).
+//! write-behind window.
 //!
 //! ### (B) Peak-over-window sampling — LoRa-TX/backlight rail sags stop dragging the reading down
 //!
@@ -317,8 +315,7 @@
 //! still reflects the raw resting reading immediately, same as `percent`
 //! used to before this change.
 //!
-//! **The latch's closer, named and bounded per
-//! `flight-manuals/library/deferral-bound-is-load-bearing.md`:** the
+//! **The latch's closer, named and bounded:** the
 //! "self-resolves once charging is detected" claim's closer is
 //! [`battery_poll_step`]'s stateless, per-poll [`EXTERNAL_POWER_MV_THRESHOLD`]
 //! check (this same module, see the "Fix" section above) — re-evaluated
@@ -750,8 +747,7 @@ pub fn slew_limit_percent(prev: u8, target: u8, charging: bool) -> u8 {
 
 // ── settled_mv persistence — confirmed latch, boot seed, write-wear policy (A) ──
 
-/// Advance the `confirmed` latch — see module docs' "(A)" section and
-/// `flight-manuals/library/persist-before-clock-confirmed-watermark-poisoning.md`.
+/// Advance the `confirmed` latch — see module docs' "(A)" section.
 /// Latches `true` forever the first time a poll observes the pack off
 /// external power (a genuine, trustworthy resting sample); never clears
 /// once set.
