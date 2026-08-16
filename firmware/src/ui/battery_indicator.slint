@@ -1,0 +1,114 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// battery_indicator.slint — phone-style glanceable battery-level widget.
+//
+// Consumes `meshcadet-battery-soc-filtering`'s coarse
+// `firmware_core::battery::BatteryLevel` bucket via a plain `0..=5` int
+// (`firmware_core::ui::battery_indicator::level_to_indicator_level` converts
+// the enum on the Rust side before it ever reaches this markup — Slint
+// properties can't carry a Rust enum directly, same convention
+// `signal_meter.slint`'s own doc establishes):
+//   - `0` = `Unknown`  — no sample taken yet (fresh boot): renders an
+//              outline-only shell, no fill.
+//   - `1` = `Charging` — external power present (`battery.rs`'s freeze/latch
+//              logic): renders a full body in a distinct accent color, NOT
+//              one of the percent-bucket colors below — charging is a MODE,
+//              not a percent reading (the frozen `percent` basis underneath
+//              it may read anywhere from 0-100%; showing it as a percent-
+//              bucket color would misrepresent that basis as live).
+//   - `2..=5` = `Critical`/`Low`/`Medium`/`High` — ascending fill fraction
+//              AND ascending color (red -> yellow -> green -> green),
+//              mirroring a real phone's battery-icon convention.
+//
+// # No text glyphs
+//
+// Every stroke here is a `Rectangle` (body shell, terminal nub, fill) — no
+// `Text` glyph is used, for the exact reason `signal_meter.slint`'s own doc
+// gives: `gen_emoji_font.c`'s own SYNC INVARIANT comments document the
+// historical 🔋 blank-glyph defect (among others) this widget must never
+// reintroduce by falling back to an emoji glyph.
+//
+// # Sizing
+//
+// Declared at its natural ~20x12 px default; every geometry expression below
+// is a FRACTION of `root.width`/`root.height` (never a hardcoded pixel),
+// same convention `signal_meter.slint` establishes, so an embedding screen
+// can override `width`/`height` and the shell/nub/fill scale
+// proportionally. Every screen this campaign embeds `BatteryIndicator` on
+// (`contact_list`, `message_view`, `compose`, `gps_status`) overrides it
+// down to a small footprint that fits beside that header's existing
+// `SignalMeter` — see each screen's own placement comment for the exact box
+// and why.
+import { Theme } from "theme.slint";
+
+export component BatteryIndicator {
+    in property <int> battery-level: 0;
+
+    width: 20px;
+    height: 12px;
+
+    // Defensive clamp — same rationale as `SignalMeter`'s `filled-bars`: the
+    // property is Rust-driven (`level_to_indicator_level` only ever emits
+    // `0..=5`), but clamping means a future out-of-range value degrades to
+    // the nearest valid state instead of this widget indexing past its own
+    // branch set.
+    property <int> level: max(0, min(5, battery-level));
+
+    // Shared shell geometry — the body occupies the left ~82% of the
+    // widget's width, leaving room for the terminal nub on the right (a
+    // real single-cell battery's characteristic silhouette).
+    property <length> body-w: 0.82 * root.width;
+    property <length> shell-border: max(1px, 0.1 * root.height);
+
+    // ── Body outline ────────────────────────────────────────────────────
+    // Unknown (level 0) reads dim/muted (no reading yet — the same
+    // "aspirational, not alarming" honest framing `SignalMeter`'s
+    // direct-only ring doc establishes, not an error state); every other
+    // level reads at full `text-secondary` contrast, since a bucket IS an
+    // established reading.
+    Rectangle {
+        width: body-w;
+        height: root.height;
+        border-width: shell-border;
+        border-color: level == 0 ? Theme.text-muted : Theme.text-secondary;
+        border-radius: 0.15 * root.height;
+        background: transparent;
+    }
+
+    // ── Terminal nub ────────────────────────────────────────────────────
+    Rectangle {
+        x: body-w + 0.03 * root.width;
+        y: 0.28 * root.height;
+        width: 0.12 * root.width;
+        height: 0.44 * root.height;
+        border-radius: 0.04 * root.height;
+        background: level == 0 ? Theme.text-muted : Theme.text-secondary;
+    }
+
+    // ── Fill ────────────────────────────────────────────────────────────
+    // Fraction of the body's INNER area (inset by the shell's own
+    // `border-width` so the fill never paints over the outline stroke).
+    // `Charging` (1) and `High` (5) both read full; `Critical`/`Low`/
+    // `Medium` step up through three ascending fractions — this is a coarse
+    // BUCKET indicator, not a second percent gauge, so the fractions are
+    // deliberately round numbers, not pixel-exact against the firmware
+    // `percent` value, but ordered so "more bucket" always reads as "more
+    // fill" and "more color-urgency" (`alert` red -> `warn` yellow -> `ok`
+    // green).
+    property <float> fill-fraction: level == 0 ? 0.0 : (
+        level == 1 ? 1.0 : (
+        level == 2 ? 0.28 : (
+        level == 3 ? 0.52 : (
+        level == 4 ? 0.76 : 1.0))));
+    property <color> fill-color: level == 1 ? Theme.brand-signal : (
+        level == 2 ? Theme.alert : (
+        level == 3 ? Theme.warn : Theme.ok)); // levels 4 (Medium)/5 (High)
+
+    if fill-fraction > 0 : Rectangle {
+        x: shell-border;
+        y: shell-border;
+        width: (body-w - 2 * shell-border) * fill-fraction;
+        height: root.height - 2 * shell-border;
+        border-radius: max(0px, 0.15 * root.height - shell-border);
+        background: fill-color;
+    }
+}

@@ -37,6 +37,7 @@ slint::slint! {
     import { Theme } from "../theme.slint";
     import { Starfield, CometOnNotify, SpaceBackdrop } from "../motifs.slint";
     import { SignalMeter } from "../signal_meter.slint";
+    import { BatteryIndicator } from "../battery_indicator.slint";
 
     // A single row in the Contacts or Groups list.
     component ContactRow {
@@ -259,6 +260,12 @@ slint::slint! {
         // 1..=5 = bars. Pushed by `ContactListScreen::set_signal_level`; see
         // `SignalMeter`'s embedding below.
         in property <int> signal_level: 0;
+        // Coarse battery-level bucket (`meshcadet-battery-soc-filtering` /
+        // `meshcadet-battery-glanceable-indicator`): 0 = Unknown, 1 =
+        // Charging, 2..=5 = Critical/Low/Medium/High. Pushed by
+        // `ContactListScreen::set_battery_level`; see `BatteryIndicator`'s
+        // embedding below.
+        in property <int> battery_level: 0;
 
         // Trackball-driven row highlight, index into whichever list
         // (contacts/channels) `show_contacts` currently selects. `-1` = no
@@ -421,14 +428,16 @@ slint::slint! {
                         icon: "⚙";
                         clicked => { root.settings_pressed(); }
                     }
-                    // `SignalMeter` (ADR-0010) — this header has no existing
-                    // trailing spacer to nest into (unlike `gps_status.rs`/
-                    // `message_view.rs`). Declared AFTER the gear button (it
-                    // previously sat before it, which read as part of the
-                    // "Groups" tab beside it) so it now renders as the
-                    // rightmost header element, clear of the gear's touch
-                    // target. A small new flow child reserves its own
-                    // non-overlapping slot — the two tabs' `horizontal-
+                    // `SignalMeter` + `BatteryIndicator` (ADR-0010 /
+                    // `meshcadet-battery-glanceable-indicator`) — this header
+                    // has no existing trailing spacer to nest into (unlike
+                    // `gps_status.rs`/`message_view.rs`). Declared AFTER the
+                    // gear button (it previously sat before it, which read as
+                    // part of the "Groups" tab beside it) so both render as
+                    // the rightmost header elements, clear of the gear's
+                    // touch target. This one flow child reserves a slightly
+                    // wider slot (36px, was 26px before the battery indicator
+                    // landed) for the pair — the two tabs' `horizontal-
                     // stretch: 1.0` simply divide the slightly-reduced
                     // remaining width evenly (each still comfortably wider
                     // than its "Contacts"/"Groups" label), so neither
@@ -436,12 +445,19 @@ slint::slint! {
                     // disturbed beyond that width recompute — nothing here
                     // is repositioned relative to its own parent.
                     Rectangle {
-                        width: 26px; height: 36px;
+                        width: 36px; height: 36px;
                         SignalMeter {
                             signal-level: root.signal_level;
                             width: 16px;
                             height: 14px;
-                            x: (parent.width - self.width) / 2;
+                            x: 2px;
+                            y: (parent.height - self.height) / 2;
+                        }
+                        BatteryIndicator {
+                            battery-level: root.battery_level;
+                            width: 14px;
+                            height: 9px;
+                            x: 20px;
                             y: (parent.height - self.height) / 2;
                         }
                     }
@@ -592,6 +608,13 @@ impl ContactListScreen {
     /// identical doc for the `bars` contract.
     pub fn set_signal_level(&self, bars: i32) {
         self.component.set_signal_level(bars);
+    }
+
+    /// Push a fresh coarse battery-level bucket into the header's
+    /// `BatteryIndicator` — see `GpsStatusScreen::set_battery_level`'s
+    /// identical doc for the `level` contract.
+    pub fn set_battery_level(&self, level: i32) {
+        self.component.set_battery_level(level);
     }
 
     /// Replace the full contact list model.

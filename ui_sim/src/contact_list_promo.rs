@@ -42,6 +42,7 @@ slint::slint! {
     import { Theme } from "../../firmware/src/ui/theme.slint";
     import { Starfield, CometOnNotify, SpaceBackdrop } from "../../firmware/src/ui/motifs.slint";
     import { SignalMeter } from "../../firmware/src/ui/signal_meter.slint";
+    import { BatteryIndicator } from "../../firmware/src/ui/battery_indicator.slint";
 
     // Verbatim copy of `contact_list.rs`'s markup — see this file's module
     // doc for why a copy (not an import) is used here.
@@ -212,6 +213,10 @@ slint::slint! {
         // Repeater signal-meter reading (ADR-0010): 0 = direct-only,
         // 1..=5 = bars. See `SignalMeter`'s embedding below.
         in property <int> signal_level: 0;
+        // Coarse battery-level bucket (`meshcadet-battery-glanceable-
+        // indicator`): 0 = Unknown, 1 = Charging, 2..=5 =
+        // Critical/Low/Medium/High. See `BatteryIndicator`'s embedding below.
+        in property <int> battery_level: 0;
 
         in property <int> selected_index: -1;
 
@@ -318,16 +323,26 @@ slint::slint! {
                         icon: "⚙";
                         clicked => { root.settings_pressed(); }
                     }
-                    // `SignalMeter` moved to AFTER the gear — mirrors
-                    // `contact_list.rs`'s real-screen header reposition (this
-                    // module is a verbatim copy; see this file's module doc).
+                    // `SignalMeter` + `BatteryIndicator` moved to AFTER the
+                    // gear — mirrors `contact_list.rs`'s real-screen header
+                    // (this module is a verbatim copy; see this file's module
+                    // doc). Slot widened 26px -> 36px to fit both widgets —
+                    // see `contact_list.rs`'s identical widen for the pixel
+                    // math.
                     Rectangle {
-                        width: 26px; height: 36px;
+                        width: 36px; height: 36px;
                         SignalMeter {
                             signal-level: root.signal_level;
                             width: 16px;
                             height: 14px;
-                            x: (parent.width - self.width) / 2;
+                            x: 2px;
+                            y: (parent.height - self.height) / 2;
+                        }
+                        BatteryIndicator {
+                            battery-level: root.battery_level;
+                            width: 14px;
+                            height: 9px;
+                            x: 20px;
                             y: (parent.height - self.height) / 2;
                         }
                     }
@@ -462,6 +477,13 @@ impl ContactListPromoFrame {
     /// direct-only ring, 1..=5 = filled-bar count.
     pub fn set_signal_level(&self, bars: i32) {
         self.ui.set_signal_level(bars);
+    }
+
+    /// Set the header's coarse battery-level bucket
+    /// (`meshcadet-battery-glanceable-indicator`): 0 = Unknown, 1 =
+    /// Charging, 2..=5 = Critical/Low/Medium/High.
+    pub fn set_battery_level(&self, level: i32) {
+        self.ui.set_battery_level(level);
     }
 
     /// Seed the Contacts tab with `contacts` and compute the aggregate

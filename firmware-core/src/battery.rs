@@ -139,15 +139,24 @@
 //! now carries a third field, `raw_mv`: the last live (post-divider, still
 //! averaged over [`BATTERY_SAMPLES`]) ADC millivolt reading, updated on every
 //! poll regardless of the charging latch above — i.e. it is NOT frozen at
-//! `settled_mv` while charging, unlike `percent`. This is a deliberate,
-//! temporary relaxation of the 2026-07-03 "expose only percent+charging"
-//! scoping, for diagnosis only: `raw_mv` is wired into the host CLI's
-//! `status` command (`protocol::provisioning::RspStatusPayload`) and this
-//! module's own init/poll log lines, but neither the on-device admin-menu
-//! screen (`ui/screens/admin_menu.rs::format_battery_display`) nor the
-//! over-the-air telemetry RESPONSE (`main.rs::build_telemetry_response`)
-//! reads this field — both consume only `percent`/`charging` from this same
-//! struct, so raw mV never reaches the on-device UI or the air.
+//! `settled_mv` while charging, unlike `percent`. This started as a
+//! deliberate, temporary relaxation of the 2026-07-03 "expose only
+//! percent+charging" scoping, for diagnosis only: `raw_mv` was wired into
+//! the host CLI's `status` command (`protocol::provisioning::
+//! RspStatusPayload`) and this module's own init/poll log lines, but not
+//! the on-device UI.
+//!
+//! **`meshcadet-battery-glanceable-indicator` (2026-08-04) update:** the
+//! on-device admin-menu row (`ui/admin_menu.rs::format_battery_display`) now
+//! renders `raw_mv` too, alongside `percent` — the diagnosis-only scoping
+//! above is accordingly no longer accurate for that one consumer (the row's
+//! `format!`+Slint-push is delta-gated on `raw_mv`, not exact-equality
+//! gated, so this doesn't reintroduce the allocation churn the row's own
+//! dedup guard exists to prevent — see `battery_display_fields_changed`'s
+//! doc). `held_raw_mv` (below) remains diagnostic-only, read only by the
+//! host CLI. The over-the-air telemetry RESPONSE
+//! (`main.rs::build_telemetry_response`) still reads neither raw field —
+//! only `percent`/`charging` reach the air.
 //!
 //! ### Reconciliation with the charge-inflation "hold last unplugged SoC" fix
 //!
@@ -328,17 +337,24 @@
 //! contaminated reading to become that window's peak and for the window to
 //! close — never later, and never gated on any OTHER event's precondition.
 //!
-//! ### (D) Coarse bucket level — data only, no UI wiring
+//! ### (D) Coarse bucket level
 //!
 //! [`BatteryLevel`] (`Unknown` / `Charging` / `Critical` / `Low` / `Medium` /
 //! `High`) is computed by [`battery_level_bucket`] from the displayed
 //! `percent` and `charging`, with hysteresis at each of the three internal
 //! boundaries ([`BUCKET_HYSTERESIS_PCT`]) so a `percent` value oscillating
 //! right at a boundary doesn't visibly flap the bucket every poll. Exposed
-//! as [`BatteryStatus::level`] — a new DATA field only. No consumer
-//! (on-device admin-menu screen, over-the-air telemetry, host CLI `status`)
-//! is wired to read it in this mission; that is explicitly out of scope (see
-//! this mission's acceptance line) and left to the dependent UI mission.
+//! as [`BatteryStatus::level`] — landed here (2026-08-04) as a DATA field
+//! only, with no consumer, deliberately left to a dependent UI mission (see
+//! this module's original acceptance line). **`meshcadet-battery-
+//! glanceable-indicator` (the dependent mission) wired it**: `level` now
+//! drives the header `BatteryIndicator` widget on the four operational
+//! screens (`ContactList`/`MessageView`/`Compose`/`GpsStatus` — see
+//! `ui::battery_indicator`'s doc) via a simple bucket-equality gate
+//! (`UiRuntime::set_battery_level`) — no additional hysteresis/delta-gating
+//! needed there beyond what `battery_level_bucket` already applies above.
+//! The on-device admin-menu row and the over-the-air telemetry RESPONSE
+//! still don't read it.
 
 // This module is pure Rust with no ADC/hardware dependency — see
 // `firmware::battery` for `BatteryDriver` (the real ADC1 read path), which
@@ -448,32 +464,37 @@ pub const PERSIST_MIN_INTERVAL_MS: u64 = 5 * 60_000;
 
 // ── BatteryStatus — the ONE shared representation ────────────────────────────
 
-/// Battery status: charge percentage, charging state, and (diagnostic-only)
-/// raw millivolts.
+/// Battery status: charge percentage, charging state, raw millivolts, and a
+/// coarse bucketed level.
 ///
 /// `percent`/`charging` are the two fields originally scoped in
-/// (2026-07-03); `raw_mv` is a temporary, diagnosis-only relaxation of that
-/// scoping added 2026-07-05 for the ADC-calibration investigation — see this
-/// module's "ADC calibration ... raw_mv" doc section.
+/// (2026-07-03); `raw_mv` was added 2026-07-05 for the ADC-calibration
+/// investigation (originally diagnosis-only — see this module's "ADC
+/// calibration ... raw_mv" doc section for how that scoping later widened);
+/// `level` was added 2026-08-04 as data-only, then wired to the header
+/// `BatteryIndicator` widget by `meshcadet-battery-glanceable-indicator`.
 ///
-/// This is the single representation wired into all three consumers: the
-/// radio telemetry RESPONSE (`main.rs::build_telemetry_response`), the host
-/// `status` command (via `protocol::provisioning::RspStatusPayload`), and the
-/// on-device admin-menu display — so all three report the same numbers by
-/// construction rather than three independent reads/formats. Only the host
-/// `status` command reads `raw_mv`; the other two consume solely
-/// `percent`/`charging`.
+/// This is the single representation wired into every consumer: the radio
+/// telemetry RESPONSE (`main.rs::build_telemetry_response`, `percent`/
+/// `charging` only), the host `status` command (`protocol::provisioning::
+/// RspStatusPayload`, every field), the on-device admin-menu row
+/// (`percent`/`charging`/`raw_mv` — see `raw_mv`'s own field doc for how
+/// that widened), and the on-device header `BatteryIndicator` widget on the
+/// four operational screens (`level` only) — so every consumer reports the
+/// same numbers by construction rather than independent reads/formats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BatteryStatus {
     /// Charge percentage, `0..=100`.
     pub percent: u8,
     /// `true` if the pack is inferred to be charging (see module docs).
     pub charging: bool,
-    /// Last live (post-divider, averaged) ADC millivolt reading — diagnostic
-    /// only, NOT frozen by the charging latch that `percent` is (see module
-    /// docs' "ADC calibration ... raw_mv" section). Surfaced via the host CLI
-    /// `status` command; deliberately not read by the on-device admin-menu
-    /// screen or the over-the-air telemetry RESPONSE.
+    /// Last live (post-divider, averaged) ADC millivolt reading — NOT frozen
+    /// by the charging latch that `percent` is (see module docs' "ADC
+    /// calibration ... raw_mv" section). Surfaced via the host CLI `status`
+    /// command AND (as of `meshcadet-battery-glanceable-indicator`) the
+    /// on-device admin-menu row, delta-gated there rather than exact-equality
+    /// gated (see `ui::admin_menu::battery_display_fields_changed`'s doc);
+    /// not read by the over-the-air telemetry RESPONSE.
     pub raw_mv: u32,
     /// Last known non-charge-inflated ("resting") millivolt reading — the
     /// same `settled_mv` basis `percent` is derived from (before the
@@ -481,12 +502,18 @@ pub struct BatteryStatus {
     /// docs' "(C)" section), but exposed as raw millivolts instead of a
     /// lossy-rounded percentage. Unlike `raw_mv`, this is frozen while
     /// charging (contamination-free by construction) — see module docs'
-    /// "`held_raw_mv`" section. Surfaced via the host CLI `status` command
-    /// only, same scoping as `raw_mv`.
+    /// "`held_raw_mv`" section. Diagnostic only: surfaced via the host CLI
+    /// `status` command only — the on-device admin-menu row does NOT render
+    /// this field (only `raw_mv`, above).
     pub held_raw_mv: u32,
     /// Coarse bucketed level — see [`BatteryLevel`] and module docs' "(D)"
-    /// section. DATA only: no consumer in this codebase reads this field yet
-    /// (see that section for the explicit no-UI-wiring scoping).
+    /// section. Drives the header `BatteryIndicator` widget on the four
+    /// operational screens (`ContactList`/`MessageView`/`Compose`/
+    /// `GpsStatus` — ADR-0010 D5), wired by
+    /// `meshcadet-battery-glanceable-indicator` via
+    /// `ui::battery_indicator::level_to_indicator_level`; not read by the
+    /// admin-menu row (which renders `percent`/`raw_mv` instead) or the
+    /// over-the-air telemetry RESPONSE.
     pub level: BatteryLevel,
 }
 

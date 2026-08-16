@@ -61,16 +61,21 @@ fn tab_badge_paints_when_seeded_unread_is_nonzero_and_rows_are_visible() {
     );
 
     // Tab badge box: header HorizontalLayout is [Contacts tab: stretch]
-    // [Groups tab: stretch][SignalMeter slot: 26px fixed][gear button:
-    // 44px fixed] across 320px (the ADR-0010 signal-meter slot — see
-    // contact_list_promo.rs's copied markup — narrows each tab rect from
-    // the original (320-44)/2 = 138px), so each tab rect is
-    // (320-44-26)/2 = 125px wide; the badge sits at
-    // `x: parent.width - 18px, y: 3px, width: 14px, height: 14px` inside the
-    // Contacts tab rect. Center measured empirically against this rig at
-    // (115, 9) (not re-derived by hand — antialiasing on a 14px disc makes
-    // the exact edge easy to get wrong).
-    let badge_cx = 115u32;
+    // [Groups tab: stretch][gear button: 44px fixed][SignalMeter+
+    // BatteryIndicator slot: 36px fixed] across 320px (the ADR-0010
+    // signal-meter slot — see contact_list_promo.rs's copied markup —
+    // narrows each tab rect from the original (320-44)/2 = 138px; widened
+    // 26px -> 36px by `meshcadet-battery-glanceable-indicator` to also fit
+    // the new `BatteryIndicator`), so each tab rect is (320-44-36)/2 = 120px
+    // wide; the badge sits at `x: parent.width - 18px, y: 3px, width: 14px,
+    // height: 14px` inside the Contacts tab rect. (110, 9) measured
+    // empirically against this rig as a solid, non-antialiased interior
+    // point (not re-derived by hand — antialiasing on a 14px disc, plus the
+    // "2" unread-count glyph painted on top of it, makes the exact interior
+    // easy to get wrong; a scratch probe dumped every exact brand-signal
+    // pixel in the badge's neighborhood and this point sits solidly inside
+    // that set, clear of the glyph's anti-aliased strokes).
+    let badge_cx = 110u32;
     let badge_cy = 9u32;
     assert_ne!(
         rgb8_at(&img0, badge_cx, badge_cy),

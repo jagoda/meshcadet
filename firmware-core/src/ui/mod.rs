@@ -29,6 +29,7 @@
 //! `docs/adr/0005-firmware-core-extraction.md`.
 
 pub mod admin_menu;
+pub mod battery_indicator;
 pub mod buzzer;
 pub mod compose;
 pub mod contact_list;

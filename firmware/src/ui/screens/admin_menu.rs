@@ -324,9 +324,11 @@ slint::slint! {
         in property <bool>   notif_audible: true;
         in property <int>    screen_sleep_timeout_s: 30;
         in property <string> screen_sleep_display: "30s";
-        // Precomputed Rust-side (`"<n>%"` / `"<n>% (charging)"`) — same
-        // "format on the Rust side, pass a plain string" convention as
-        // `screen_sleep_display` above.
+        // Precomputed Rust-side (`"~<n>% (<mv>mV)"` / `"~<n>% (<mv>mV,
+        // charging)"` — `meshcadet-battery-glanceable-indicator` added the
+        // raw mV reading alongside the percent) — same "format on the Rust
+        // side, pass a plain string" convention as `screen_sleep_display`
+        // above.
         in property <string> battery_display: "—";
         // Trackball-driven row highlight: 0=visual toggle, 1=audible toggle,
         // 2=screen-sleep stepper, 3=GPS status row. `-1` = no highlight yet
@@ -503,11 +505,12 @@ impl AdminMenuScreen {
         self.component.set_screen_sleep_display(format_screen_sleep(seconds).into());
     }
 
-    /// Set the displayed battery row (`"<n>%"` / `"<n>% (charging)"`),
-    /// precomputed Rust-side by [`format_battery_display`] from the shared
-    /// `battery::BatteryStatus` snapshot — the same source the host `status`
-    /// command and the radio telemetry RESPONSE read (single shared source;
-    /// see the firmware `battery` module docs).
+    /// Set the displayed battery row (`"~<n>% (<mv>mV)"` / `"~<n>%
+    /// (<mv>mV, charging)"`), precomputed Rust-side by
+    /// [`format_battery_display`] from the shared `battery::BatteryStatus`
+    /// snapshot — the same source the host `status` command and the radio
+    /// telemetry RESPONSE read (single shared source; see the firmware
+    /// `battery` module docs).
     pub fn set_battery_display(&self, text: &str) {
         self.component.set_battery_display(text.into());
     }

@@ -65,36 +65,49 @@ fn signal_meter_renders_right_of_the_gear_button_not_left() {
         ui_sim::contact_list_promo::HEIGHT,
     );
 
-    // Header HorizontalLayout is now [Contacts tab: stretch][Groups tab:
-    // stretch][gear: 44px fixed][SignalMeter slot: 26px fixed] across 320px,
-    // so the gear occupies x: 250..294 and the meter slot occupies
-    // x: 294..320 (tab rects each narrow to (320-44-26)/2 = 125px — same
-    // total fixed width as before the reorder; declaration ORDER, not
-    // width, is what changed). (305, 20) sits inside the meter's tallest
-    // (5th) bar; empirically confirmed against this rig (a scratch probe
-    // dumped every brand-signal pixel in the header band at
-    // signal_level=5: all of them fall inside x: 299..313, y: 11..25 —
-    // comfortably inside the meter slot and nowhere in the gear's 250..294
-    // span).
-    assert_eq!(
-        rgb8_at(&img, 305, 20),
-        brand_signal,
-        "expected a filled signal-meter bar to the RIGHT of the gear button \
-         (x: 294..320) at signal_level=5 — the meter did not render in its \
-         post-reorder slot"
+    // Header HorizontalLayout is [Contacts tab: stretch][Groups tab:
+    // stretch][gear: 44px fixed][SignalMeter+BatteryIndicator slot: 36px
+    // fixed] across 320px (slot widened 26px -> 36px by
+    // `meshcadet-battery-glanceable-indicator` to fit the new
+    // `BatteryIndicator` beside the meter — see `contact_list_promo.rs`'s
+    // own comment), so the gear occupies x: 240..284 and the
+    // meter+battery slot occupies x: 284..320 (tab rects each narrow to
+    // (320-44-36)/2 = 120px — same total fixed width on both sides,
+    // declaration ORDER is what keeps the meter right of the gear).
+    //
+    // Scanned by REGION rather than a single hardcoded pixel (the meter's
+    // exact bar position shifts with slot width, and a scan is robust to
+    // that the way a single coordinate isn't — see this test's own history:
+    // the slot widened once already, for the battery indicator, and a
+    // single-pixel assertion would have needed hand-recomputing again).
+    const GEAR_END_X: u32 = 284;
+
+    let mut found_brand_signal_right_of_gear = false;
+    for y in 0..36u32 {
+        for x in GEAR_END_X..ui_sim::contact_list_promo::WIDTH {
+            if rgb8_at(&img, x, y) == brand_signal {
+                found_brand_signal_right_of_gear = true;
+            }
+        }
+    }
+    assert!(
+        found_brand_signal_right_of_gear,
+        "expected a filled signal-meter bar somewhere to the RIGHT of the \
+         gear button (x: {GEAR_END_X}..320) at signal_level=5 — the meter \
+         did not render in its slot"
     );
 
-    // The meter's OLD slot (x: 250..276, immediately left of where the tab
-    // rects used to end) must now be entirely free of brand-signal pixels —
-    // it's part of the gear button's own 250..294 span post-reorder, and the
-    // gear glyph paints in `Theme.text-secondary`, never brand-signal.
+    // The gear button's own span (x: 240..284) must be entirely free of
+    // brand-signal pixels — the gear glyph paints in `Theme.text-secondary`,
+    // never brand-signal, so any brand-signal pixel found there means the
+    // meter (or something else) bled into the gear's box.
     for y in 0..36u32 {
-        for x in 250..276u32 {
+        for x in 240..GEAR_END_X {
             let px = rgb8_at(&img, x, y);
             assert_ne!(
                 px, brand_signal,
-                "found a brand-signal pixel at ({x}, {y}), inside the \
-                 signal-meter's PRE-reorder slot (x: 250..276) — the meter \
+                "found a brand-signal pixel at ({x}, {y}), inside the gear \
+                 button's own span (x: 240..{GEAR_END_X}) — the meter \
                  regressed back to the left of the gear button"
             );
         }

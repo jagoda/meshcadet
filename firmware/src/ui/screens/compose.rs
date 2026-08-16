@@ -165,6 +165,7 @@ slint::slint! {
     import { Theme } from "../theme.slint";
     import { RocketOnSend, SpaceBackdrop } from "../motifs.slint";
     import { SignalMeter } from "../signal_meter.slint";
+    import { BatteryIndicator } from "../battery_indicator.slint";
 
     // ── Emoji picker overlay ──────────────────────────────────────────────────
 
@@ -419,6 +420,12 @@ slint::slint! {
         // 1..=5 = bars. Pushed by `ComposeScreen::set_signal_level`; see
         // `SignalMeter`'s embedding below.
         in property <int>               signal_level: 0;
+        // Coarse battery-level bucket (`meshcadet-battery-soc-filtering` /
+        // `meshcadet-battery-glanceable-indicator`): 0 = Unknown, 1 =
+        // Charging, 2..=5 = Critical/Low/Medium/High. Pushed by
+        // `ComposeScreen::set_battery_level`; see `BatteryIndicator`'s
+        // embedding below.
+        in property <int>               battery_level: 0;
         // Shared full-window starfield texture, set once by Rust right after
         // construction (`ui::backdrop_asset::shared_backdrop_image()`) — see
         // that module's doc for why this isn't a `SpaceBackdrop` default.
@@ -546,23 +553,33 @@ slint::slint! {
                         vertical-alignment: center;
                     }
 
-                    // `SignalMeter` (ADR-0010) — this header has no existing
-                    // trailing spacer to nest into (unlike `gps_status.rs`/
-                    // `message_view.rs`, whose centered titles already carry
-                    // one for balance; "To: <name>" here is left-reading, not
-                    // centered, so there is nothing to balance). A small new
-                    // flow child at the end reserves just enough width for
-                    // the meter; the "To: <name>" Text above simply gets
-                    // `horizontal-stretch: 1.0`'s remaining space minus this
-                    // reservation — it stays left-aligned and un-clipped for
-                    // every contact/channel name this header has ever shown.
+                    // `SignalMeter` + `BatteryIndicator` (ADR-0010 /
+                    // `meshcadet-battery-glanceable-indicator`) — this header
+                    // has no existing trailing spacer to nest into (unlike
+                    // `gps_status.rs`/`message_view.rs`, whose centered
+                    // titles already carry one for balance; "To: <name>"
+                    // here is left-reading, not centered, so there is
+                    // nothing to balance). One flow child at the end
+                    // reserves just enough width for the pair (36px, was
+                    // 26px before the battery indicator landed); the "To:
+                    // <name>" Text above simply gets `horizontal-stretch:
+                    // 1.0`'s remaining space minus this reservation — it
+                    // stays left-aligned and un-clipped for every
+                    // contact/channel name this header has ever shown.
                     Rectangle {
-                        width: 26px; height: 36px;
+                        width: 36px; height: 36px;
                         SignalMeter {
                             signal-level: root.signal_level;
                             width: 16px;
                             height: 14px;
-                            x: (parent.width - self.width) / 2;
+                            x: 2px;
+                            y: (parent.height - self.height) / 2;
+                        }
+                        BatteryIndicator {
+                            battery-level: root.battery_level;
+                            width: 14px;
+                            height: 9px;
+                            x: 20px;
                             y: (parent.height - self.height) / 2;
                         }
                     }
@@ -820,6 +837,13 @@ impl ComposeScreen {
     /// identical doc for the `bars` contract.
     pub fn set_signal_level(&self, bars: i32) {
         self.component.set_signal_level(bars);
+    }
+
+    /// Push a fresh coarse battery-level bucket into the header's
+    /// `BatteryIndicator` — see `GpsStatusScreen::set_battery_level`'s
+    /// identical doc for the `level` contract.
+    pub fn set_battery_level(&self, level: i32) {
+        self.component.set_battery_level(level);
     }
 
     /// Phase B: render this screen read-only (disabled Send + banner) for a

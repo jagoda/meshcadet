@@ -108,6 +108,7 @@ slint::slint! {
     import { Theme } from "../theme.slint";
     import { RingedPlanetCorner, Comet, SpaceBackdrop } from "../motifs.slint";
     import { SignalMeter } from "../signal_meter.slint";
+    import { BatteryIndicator } from "../battery_indicator.slint";
 
     component StatusRow {
         in property <string> label;
@@ -242,6 +243,12 @@ slint::slint! {
         // (`UiRuntime::set_signal_level` in `ui/mod.rs`); see
         // `SignalMeter`'s embedding below.
         in property <int> signal_level: 0;
+        // Coarse battery-level bucket (`meshcadet-battery-soc-filtering` /
+        // `meshcadet-battery-glanceable-indicator`): 0 = Unknown, 1 =
+        // Charging, 2..=5 = Critical/Low/Medium/High. Pushed by
+        // `GpsStatusScreen::set_battery_level` (`UiRuntime::set_battery_level`
+        // in `ui/mod.rs`); see `BatteryIndicator`'s embedding below.
+        in property <int> battery_level: 0;
         // Shared full-window starfield texture, set once by Rust right after
         // construction (`ui::backdrop_asset::shared_backdrop_image()`) — see
         // that module's doc for why this isn't a `SpaceBackdrop` default.
@@ -341,7 +348,15 @@ slint::slint! {
                     // completely empty top-right corner — no existing motif
                     // or touch target to avoid here (unlike message_view.rs's
                     // header, which already carries a static `Comet` in this
-                    // same zone).
+                    // same zone). `BatteryIndicator`
+                    // (`meshcadet-battery-glanceable-indicator`) nests
+                    // immediately to the SignalMeter's LEFT, inside the same
+                    // 44px spacer — this screen's top-right corner has 44px
+                    // of reserved width and the meter+nub only needs ~24px of
+                    // it, so both widgets fit with no spacer resize needed
+                    // (unlike `message_view.rs`, whose spacer this same
+                    // change DOES widen — see that screen's own comment for
+                    // why).
                     Rectangle {
                         width: 44px; height: 36px;
                         SignalMeter {
@@ -349,6 +364,15 @@ slint::slint! {
                             width: 16px;
                             height: 14px;
                             x: parent.width - self.width - 4px;
+                            y: (parent.height - self.height) / 2;
+                        }
+                        BatteryIndicator {
+                            battery-level: root.battery_level;
+                            width: 14px;
+                            height: 9px;
+                            // Left of the SignalMeter (16px + 4px right
+                            // margin) with a 3px gap.
+                            x: parent.width - 16px - 4px - 3px - 14px;
                             y: (parent.height - self.height) / 2;
                         }
                     }
@@ -475,6 +499,19 @@ impl GpsStatusScreen {
     /// `int` conversion so every screen's wrapper takes the same plain type.
     pub fn set_signal_level(&self, bars: i32) {
         self.component.set_signal_level(bars);
+    }
+
+    /// Push a fresh coarse battery-level bucket into the header's
+    /// `BatteryIndicator` (`meshcadet-battery-soc-filtering` /
+    /// `meshcadet-battery-glanceable-indicator`). `level` is `0` (Unknown),
+    /// `1` (Charging), or `2..=5` (Critical/Low/Medium/High —
+    /// `firmware_core::ui::battery_indicator::level_to_indicator_level`'s
+    /// output) — the caller (`UiRuntime::set_battery_level`) owns the
+    /// `BatteryLevel` -> `int` conversion so every screen's wrapper takes the
+    /// same plain type, mirroring `set_signal_level`'s identical contract
+    /// above.
+    pub fn set_battery_level(&self, level: i32) {
+        self.component.set_battery_level(level);
     }
 
     pub fn on_back_pressed(&self, cb: impl Fn() + 'static) {

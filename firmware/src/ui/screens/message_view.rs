@@ -125,6 +125,7 @@ slint::slint! {
     import { Theme } from "../theme.slint";
     import { Comet, CometOnNotify, RocketOnSend, SpaceBackdrop } from "../motifs.slint";
     import { SignalMeter } from "../signal_meter.slint";
+    import { BatteryIndicator } from "../battery_indicator.slint";
 
     struct MessageEntry {
         text:         string,
@@ -394,6 +395,12 @@ slint::slint! {
         // 1..=5 = bars. Pushed by `MessageViewScreen::set_signal_level`; see
         // `SignalMeter`'s embedding below.
         in property <int>             signal_level: 0;
+        // Coarse battery-level bucket (`meshcadet-battery-soc-filtering` /
+        // `meshcadet-battery-glanceable-indicator`): 0 = Unknown, 1 =
+        // Charging, 2..=5 = Critical/Low/Medium/High. Pushed by
+        // `MessageViewScreen::set_battery_level`; see `BatteryIndicator`'s
+        // embedding below.
+        in property <int>             battery_level: 0;
         // Shared full-window starfield texture, set once by Rust right after
         // construction (`ui::backdrop_asset::shared_backdrop_image()`) — see
         // that module's doc for why this isn't a `SpaceBackdrop` default.
@@ -466,7 +473,11 @@ slint::slint! {
 
                     // Back button
                     HeaderIconButton {
-                        width: 44px;
+                        // 64px (was 44px) — widened in lockstep with the
+                        // balancing spacer below so the centered title stays
+                        // centered; see that spacer's own comment for why the
+                        // width grew.
+                        width: 64px;
                         icon: "‹";
                         icon_size: Theme.size-display;
                         icon_color: Theme.brand-signal;
@@ -496,19 +507,42 @@ slint::slint! {
                     // corner is already occupied by the static `Comet` motif
                     // floating just below, at this same Rectangle's
                     // `parent.width - 34px .. - 6px`, `y: 4px..18px` box (see
-                    // that `Comet` instance's own comment). So the meter is
-                    // pinned to the LEFT edge of this spacer instead of the
-                    // right, at `x: 1px..17px, y: 3px..17px` — clear of the
-                    // Comet's box AND the `CometOnNotify` sweep band
-                    // (`y: parent.height - 14px..`, i.e. `22px..36px`) below.
+                    // that `Comet` instance's own comment). So the meter
+                    // stays pinned to the LEFT edge of this spacer, at
+                    // `x: 1px..17px, y: 3px..17px` — clear of the Comet's box
+                    // AND the `CometOnNotify` sweep band (`y: parent.height -
+                    // 14px..`, i.e. `22px..36px`) below.
+                    //
+                    // `BatteryIndicator` (`meshcadet-battery-glanceable-
+                    // indicator`) needs its own 14px + a 2px gap immediately
+                    // right of the SignalMeter — there was no free room for
+                    // that in the ORIGINAL 44px spacer (its right ~27px were
+                    // already claimed by the independently-positioned static
+                    // `Comet` above, which floats relative to the header's
+                    // own 320px width, not this spacer's box, and so does not
+                    // shift when this spacer's width changes). Widened this
+                    // spacer to 64px (see the back button's matching widen
+                    // above) to open that room: the spacer's RIGHT edge stays
+                    // pinned at the same absolute position (`320 -
+                    // padding-right`, unaffected by its own declared width),
+                    // so growing the width only extends its LEFT edge
+                    // further left — into space the centered title's stretch
+                    // simply gives up, not into the Comet's box at all.
                     Rectangle {
-                        width: 44px; height: 36px;
+                        width: 64px; height: 36px;
                         SignalMeter {
                             signal-level: root.signal_level;
                             width: 16px;
                             height: 14px;
                             x: 1px;
                             y: 3px;
+                        }
+                        BatteryIndicator {
+                            battery-level: root.battery_level;
+                            width: 14px;
+                            height: 9px;
+                            x: 19px; // SignalMeter's 1px + 16px + 2px gap
+                            y: 5px; // vertically centered against the meter's 3px..17px box
                         }
                     }
                 }
@@ -699,6 +733,13 @@ impl MessageViewScreen {
     /// identical doc for the `bars` contract.
     pub fn set_signal_level(&self, bars: i32) {
         self.component.set_signal_level(bars);
+    }
+
+    /// Push a fresh coarse battery-level bucket into the header's
+    /// `BatteryIndicator` — see `GpsStatusScreen::set_battery_level`'s
+    /// identical doc for the `level` contract.
+    pub fn set_battery_level(&self, level: i32) {
+        self.component.set_battery_level(level);
     }
 
     pub fn set_messages(&self, messages: &[MessageItem]) {
