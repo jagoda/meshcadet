@@ -46,12 +46,11 @@
 //! already depends on (see `Cargo.toml`), so `BatteryStatus`,
 //! `format_battery_display`, and `battery_display_fields_changed` are
 //! imported directly from `firmware_core::battery`/`firmware_core::ui::
-//! admin_menu` below. This closes a drift risk a hand-port would carry
-//! (`flight-manuals/library/guard-baseline-ships-stale.md`): a threshold
-//! CONSTANT (`RAW_MV_DISPLAY_DELTA_MV`) is exactly the kind of value a
-//! parallel port can silently drift out of sync with, so this measurement
-//! now recomputes against the real implementation instead of a hand-copied
-//! rationale comment.
+//! admin_menu` below. This closes a drift risk a hand-port would carry: a
+//! threshold CONSTANT (`RAW_MV_DISPLAY_DELTA_MV`) is exactly the kind of
+//! value a parallel port can silently drift out of sync with, so this
+//! measurement now recomputes against the real implementation instead of a
+//! hand-copied rationale comment.
 //!
 //! Both halves then drive a realistic dispatcher-loop tick sequence through
 //! a global counting allocator and prove the guarded path allocates for only
