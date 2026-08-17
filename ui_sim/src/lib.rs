@@ -129,6 +129,15 @@ pub mod list_pane_backdrop;
 /// path.
 pub mod signal_meter;
 
+/// Host-sim render rig —
+/// proves the standalone `BatteryIndicator` widget
+/// (`ui/battery_indicator.slint`, `meshcadet-battery-glanceable-indicator`
+/// campaign) renders a distinct shape/color per `battery-level` state (0
+/// Unknown outline through 5 High fill). See that module's own doc for why
+/// it is a separate, narrower component/render path — same shape as its
+/// sibling `signal_meter`.
+pub mod battery_indicator;
+
 /// Promotional landing-page screenshot render rig for the contact-list
 /// screen (`site/index.html`'s screenshots gallery). See that module's own
 /// doc for why it copies the real screen's markup in full rather than a

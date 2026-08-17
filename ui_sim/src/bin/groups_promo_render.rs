@@ -51,6 +51,10 @@ fn main() {
     // Good repeater signal (ADR-0010) — a compelling, on-brand default for
     // the promo shot rather than the direct-only ring.
     frame.set_signal_level(4);
+    // Battery level 4 = Medium (3-of-4 percent buckets), not charging — same
+    // promo default as `contact_list_promo_render.rs`; see that binary's
+    // comment.
+    frame.set_battery_level(4);
     // Same wall-clock fade-in note as `contact_list_promo_render.rs` — the
     // screen's one-shot `content_opacity` fade animates over 200ms of REAL
     // WALL-CLOCK TIME from component construction; sleep past it before

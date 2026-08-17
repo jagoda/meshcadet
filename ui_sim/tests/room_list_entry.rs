@@ -84,16 +84,20 @@ fn room_and_channel_entries_render_distinguishably_in_the_groups_tab() {
     // Contacts-tab test uses for its tab. Tab rect geometry: see
     // `tab_badge_paints_...`'s comment in `ui_sim/tests/contact_list_promo.rs`
     // — the Groups tab occupies the second stretch rect, so its badge
-    // center is offset by one tab-width (125px) from the Contacts tab's
-    // (115, 9).
+    // center is offset by one tab-width (120px, was 125px before
+    // `meshcadet-battery-glanceable-indicator` widened the ADR-0010 slot
+    // 26px -> 36px) from the Contacts tab's (110, 9).
     //
     // `badge_cy` is deliberately NOT the disc's vertical center (9-10): see
     // this same note preserved verbatim from the prior version of this test
     // — a text-glyph-edge blend (not a settle-timing or handler-wiring bug)
     // made a center-row assertion flaky across font/version differences.
     // `badge_cy = 5` sits solidly inside the 14px disc, clear of the
-    // glyph's vertical band, so it still proves the badge painted.
-    let badge_cx = 115u32 + 125u32;
+    // glyph's vertical band, so it still proves the badge painted
+    // (re-confirmed empirically against this rig's current slot width via a
+    // scratch probe, same technique `contact_list_promo.rs`'s own badge
+    // point uses).
+    let badge_cx = 110u32 + 120u32;
     let badge_cy = 5u32;
     assert_eq!(
         rgb8_at(&img, badge_cx, badge_cy),

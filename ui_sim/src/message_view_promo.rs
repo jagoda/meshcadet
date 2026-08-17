@@ -33,6 +33,7 @@ slint::slint! {
     import { Theme } from "../../firmware/src/ui/theme.slint";
     import { Comet, CometOnNotify, RocketOnSend, SpaceBackdrop } from "../../firmware/src/ui/motifs.slint";
     import { SignalMeter } from "../../firmware/src/ui/signal_meter.slint";
+    import { BatteryIndicator } from "../../firmware/src/ui/battery_indicator.slint";
 
     // Verbatim copy of `message_view.rs`'s markup — see this file's module
     // doc for why a copy (not an import) is used here.
@@ -168,6 +169,10 @@ slint::slint! {
         // Repeater signal-meter reading (ADR-0010): 0 = direct-only,
         // 1..=5 = bars. See `SignalMeter`'s embedding below.
         in property <int>             signal_level: 0;
+        // Coarse battery-level bucket (`meshcadet-battery-glanceable-
+        // indicator`): 0 = Unknown, 1 = Charging, 2..=5 =
+        // Critical/Low/Medium/High. See `BatteryIndicator`'s embedding below.
+        in property <int>             battery_level: 0;
 
         callback back_pressed;
         callback compose_pressed;
@@ -202,7 +207,10 @@ slint::slint! {
                     spacing: 4px;
 
                     HeaderIconButton {
-                        width: 44px;
+                        // 64px (was 44px) — widened in lockstep with the
+                        // balancing spacer below; see `message_view.rs`'s
+                        // identical widen for the pixel math.
+                        width: 64px;
                         icon: "‹";
                         icon_size: Theme.size-display;
                         icon_color: Theme.brand-signal;
@@ -220,13 +228,20 @@ slint::slint! {
                     }
 
                     Rectangle {
-                        width: 44px; height: 36px;
+                        width: 64px; height: 36px;
                         SignalMeter {
                             signal-level: root.signal_level;
                             width: 16px;
                             height: 14px;
                             x: 1px;
                             y: 3px;
+                        }
+                        BatteryIndicator {
+                            battery-level: root.battery_level;
+                            width: 14px;
+                            height: 9px;
+                            x: 19px;
+                            y: 5px;
                         }
                     }
                 }
@@ -363,6 +378,13 @@ impl MessageViewPromoFrame {
     /// direct-only ring, 1..=5 = filled-bar count.
     pub fn set_signal_level(&self, bars: i32) {
         self.ui.set_signal_level(bars);
+    }
+
+    /// Set the header's coarse battery-level bucket
+    /// (`meshcadet-battery-glanceable-indicator`): 0 = Unknown, 1 =
+    /// Charging, 2..=5 = Critical/Low/Medium/High.
+    pub fn set_battery_level(&self, level: i32) {
+        self.ui.set_battery_level(level);
     }
 
     /// Seed the thread with `contact_name` + `messages`, and scroll to the

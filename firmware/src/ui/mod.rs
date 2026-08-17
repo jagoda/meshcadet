@@ -132,6 +132,7 @@ use crate::battery;
 // screens' `SignalMeter` widget renders; `level_to_bars` below converts it
 // to the plain `int` Slint property those screens expose.
 use crate::signal_tracker::SignalLevel;
+use firmware_core::ui::battery_indicator::level_to_indicator_level;
 use firmware_core::ui::signal_meter::level_to_bars;
 
 // The pure, host-testable half of this module's own `UiRuntime`-level logic
@@ -794,12 +795,33 @@ pub struct UiRuntime<'d> {
     /// tuple supports the same "skip an identical push" early return
     /// `set_gps_status` already uses.
     room_clock: (room_session::ClockSource, Option<u32>, u32),
-    /// Latest battery status snapshot (charge percentage + charging state),
-    /// refreshed every `main.rs` dispatcher-loop iteration via
-    /// [`Self::set_battery_status`]. Cached here for the same reason as
-    /// `gps_status`: an AdminMenu screen opened later reflects the current
-    /// reading immediately rather than a stale boot-time value.
+    /// Latest battery status snapshot (charge percentage + charging state +
+    /// raw mV + coarse bucket), refreshed every `main.rs` dispatcher-loop
+    /// iteration via [`Self::set_battery_status`]. Cached here for the same
+    /// reason as `gps_status`: an AdminMenu screen opened later reflects the
+    /// current reading immediately rather than a stale boot-time value.
     battery_status: battery::BatteryStatus,
+    /// The battery snapshot the AdminMenu row LAST ACTUALLY DISPLAYED —
+    /// `meshcadet-battery-glanceable-indicator`. Deliberately distinct from
+    /// `battery_status` above (which caches every poll's raw value, changed
+    /// or not): [`battery_display_fields_changed`]'s `raw_mv` delta-gate
+    /// must compare against what's actually ON SCREEN, not the previous
+    /// poll's value — comparing against the previous POLL instead would
+    /// silently defeat the delta-gate against a slow, continuous drift, since
+    /// each individual poll-to-poll step can stay under the threshold
+    /// forever even as the cumulative drift since the row last updated grows
+    /// past it. See [`Self::set_battery_status`].
+    battery_status_displayed: battery::BatteryStatus,
+    /// Latest coarse battery-level bucket (`meshcadet-battery-soc-
+    /// filtering`'s [`battery::BatteryLevel`]), refreshed every
+    /// `main.rs` dispatcher-loop iteration via [`Self::set_battery_status`]
+    /// (which calls [`Self::set_battery_level`]). Cached here for the same
+    /// "seed a freshly-navigated screen immediately" reason as
+    /// `signal_level` below — a `ContactList`/`MessageView`/`Compose`/
+    /// `GpsStatus` screen opened later seeds its header `BatteryIndicator`
+    /// from this value instead of showing the widget's declared `0`
+    /// (Unknown) default until the next dispatcher-loop push.
+    battery_level: battery::BatteryLevel,
     /// Latest repeater signal-meter reading (ADR-0010), refreshed every
     /// `main.rs` dispatcher-loop iteration via [`Self::set_signal_level`].
     /// Cached here for the same reason as `gps_status`/`battery_status`: a
@@ -1281,6 +1303,8 @@ impl<'d> UiRuntime<'d> {
             gps_status: gps::GpsStatus::never(),
             room_clock: (room_session::ClockSource::None, None, 0),
             battery_status: battery::BatteryStatus::unknown(),
+            battery_status_displayed: battery::BatteryStatus::unknown(),
+            battery_level: battery::BatteryLevel::Unknown,
             // Matches `SignalTracker::new`'s own boot default (see that
             // constructor's doc) — device-just-booted, no repeater heard yet.
             signal_level: SignalLevel::DirectOnly,
@@ -1646,28 +1670,68 @@ impl<'d> UiRuntime<'d> {
     }
 
     /// Refresh the cached battery status snapshot (charge percentage +
-    /// charging state). Called every `main.rs` dispatcher-loop iteration;
-    /// cheap (a `Copy` struct) even when the AdminMenu screen is not open.
-    /// If AdminMenu IS the active screen, also pushes the fresh value into
-    /// it so the displayed battery row updates live rather than freezing at
-    /// nav-open time.
+    /// charging state + raw mV + coarse bucket). Called every `main.rs`
+    /// dispatcher-loop iteration; cheap (a `Copy` struct) even when neither
+    /// the AdminMenu screen nor an operational screen is open. Also routes
+    /// the coarse bucket to whichever of the four operational screens'
+    /// header `BatteryIndicator` is active (see [`Self::set_battery_level`]),
+    /// and — if AdminMenu IS the active screen — pushes the fresh row text
+    /// into it so the displayed battery row updates live rather than
+    /// freezing at nav-open time.
     ///
-    /// PERF: the cache itself is
-    /// always refreshed (`raw_mv`/`held_raw_mv` are live diagnostic fields
-    /// read elsewhere — e.g. the host `status` command — even though the
-    /// on-device row never renders them), but the `format_battery_display`
-    /// call + Slint push are gated on [`battery_display_fields_changed`] —
-    /// only `percent`/`charging` (the two fields that row actually renders,
-    /// per `format_battery_display`'s doc) — so a `raw_mv`-only ADC jitter
+    /// PERF: the cache itself is always refreshed (`held_raw_mv` is a live
+    /// diagnostic field read elsewhere — e.g. the host `status` command —
+    /// even though the on-device row never renders it), but the
+    /// `format_battery_display` call + Slint push are gated on
+    /// [`battery_display_fields_changed`] against `battery_status_displayed`
+    /// (the last-DISPLAYED snapshot, NOT `battery_status`/`status` — see that
+    /// field's doc for why the distinction matters) — `percent`/`charging`
+    /// on exact equality, `raw_mv` on a `RAW_MV_DISPLAY_DELTA_MV`-magnitude
+    /// move, `held_raw_mv` excluded outright — so a sub-threshold ADC jitter
     /// tick (frequent) no longer allocates a fresh `String` and re-pushes it
     /// for a row that would render pixel-identically.
     pub fn set_battery_status(&mut self, status: battery::BatteryStatus) {
-        let display_changed = battery_display_fields_changed(self.battery_status, status);
+        self.set_battery_level(status.level);
+
+        let display_changed = battery_display_fields_changed(self.battery_status_displayed, status);
         self.battery_status = status;
         if display_changed {
+            self.battery_status_displayed = status;
             if let ActiveScreen::AdminMenu(ref scr) = self.active_screen {
                 scr.set_battery_display(&screens::admin_menu::format_battery_display(status));
             }
+        }
+    }
+
+    /// Refresh the cached battery-level bucket (`meshcadet-battery-soc-
+    /// filtering`'s [`battery::BatteryLevel`]) and route it to whichever of
+    /// the four operational screens — `ContactList`, `MessageView`,
+    /// `Compose`, `GpsStatus` — is currently active. A no-op for every
+    /// other screen (`Splash`, `Unprovisioned`, `PinEntry`, `AdminMenu`):
+    /// those carry no `BatteryIndicator` at all, same ADR-0010 D5 scoping
+    /// `set_signal_level` already applies to `SignalMeter`. Gated on exact
+    /// bucket equality (mirroring `set_signal_level`'s own "skip an
+    /// identical push" early return) — `BatteryLevel` is already a coarse,
+    /// hysteresis-debounced bucket (see `battery::battery_level_bucket`), so
+    /// unlike the AdminMenu row's `percent`/`raw_mv` this needs no
+    /// additional delta-gating of its own: gating on bucket rather than
+    /// percent is what keeps these four hot screens' Slint push rate well
+    /// under the (already-throttled) admin-only percent path's.
+    pub fn set_battery_level(&mut self, level: battery::BatteryLevel) {
+        if level == self.battery_level {
+            return;
+        }
+        self.battery_level = level;
+        let indicator_level = level_to_indicator_level(level);
+        match &self.active_screen {
+            ActiveScreen::ContactList(scr) => scr.set_battery_level(indicator_level),
+            ActiveScreen::MessageView(scr) => scr.set_battery_level(indicator_level),
+            ActiveScreen::Compose(scr) => scr.set_battery_level(indicator_level),
+            ActiveScreen::GpsStatus(scr) => scr.set_battery_level(indicator_level),
+            ActiveScreen::Splash(_)
+            | ActiveScreen::Unprovisioned(_)
+            | ActiveScreen::PinEntry(_)
+            | ActiveScreen::AdminMenu(_) => {}
         }
     }
 
@@ -3094,6 +3158,9 @@ impl<'d> UiRuntime<'d> {
         // Seed the header's SignalMeter — see `navigate_to_contact_list`'s
         // identical seeding comment.
         screen.set_signal_level(level_to_bars(self.signal_level));
+        // Seed the header's BatteryIndicator — see `navigate_to_contact_list`'s
+        // identical seeding comment.
+        screen.set_battery_level(level_to_indicator_level(self.battery_level));
 
         let pn_back = self.pending_nav.clone();
         screen.on_back_pressed(move || {
@@ -3188,6 +3255,8 @@ impl<'d> UiRuntime<'d> {
         // otherwise a freshly-built screen would show the widget's declared
         // `0` default until the next dispatcher-loop `set_signal_level` push.
         screen.set_signal_level(level_to_bars(self.signal_level));
+        // Same seeding, for the header's BatteryIndicator.
+        screen.set_battery_level(level_to_indicator_level(self.battery_level));
 
         // Re-wire the settings gear + row taps so repeated navigation keeps
         // working after a return to the list.
@@ -3379,6 +3448,9 @@ impl<'d> UiRuntime<'d> {
         // Seed the header's SignalMeter — see `navigate_to_contact_list`'s
         // identical seeding comment.
         screen.set_signal_level(level_to_bars(self.signal_level));
+        // Seed the header's BatteryIndicator — see `navigate_to_contact_list`'s
+        // identical seeding comment.
+        screen.set_battery_level(level_to_indicator_level(self.battery_level));
 
         let known = self.known_names();
         let items = self.messages.get(&hash)
@@ -3451,6 +3523,9 @@ impl<'d> UiRuntime<'d> {
         // Seed the header's SignalMeter — see `navigate_to_contact_list`'s
         // identical seeding comment.
         screen.set_signal_level(level_to_bars(self.signal_level));
+        // Seed the header's BatteryIndicator — see `navigate_to_contact_list`'s
+        // identical seeding comment.
+        screen.set_battery_level(level_to_indicator_level(self.battery_level));
         // Phase B: a room this session can't post to renders compose
         // disabled with an explicit read-only indicator — never present a
         // compose box for a message the server will silently swallow.

@@ -17,24 +17,50 @@
 //! THE FIX (landed in `firmware/src/ui/mod.rs`): both setters now early-return
 //! before formatting/pushing when the fields the screen actually renders
 //! haven't changed — full `GpsStatus` equality for the GPS row (the whole
-//! struct is exactly what the four rows render); `(percent, charging)` only
-//! for battery (`raw_mv`/`held_raw_mv` are live diagnostic-only fields the row
-//! never shows — comparing the whole struct would defeat the dedup, since
-//! those jitter every ADC sample independent of the displayed percentage).
+//! struct is exactly what the four rows render); for battery, `percent`/
+//! `charging` on exact equality plus `raw_mv` on a delta-gate (see
+//! `firmware_core::ui::admin_menu::battery_display_fields_changed`'s doc) —
+//! `held_raw_mv` stays a live diagnostic-only field the row never shows,
+//! excluded outright.
 //!
-//! This test cannot import firmware's types directly (`firmware` is a
-//! DETACHED xtensa-only workspace — see its `Cargo.toml`'s doc comment), so it
-//! PORTS the exact formatting/dedup logic host-side, pinned line-for-line
-//! against firmware's own fixtures (`gps_status.rs`'s and `admin_menu.rs`'s
-//! `#[cfg(test)]` modules — see each port function's doc for its firmware
-//! source), the same "host port pinned against firmware's never-executed-
-//! on-host fixtures" pattern the `profile-baseline` measurement rig
-//! established. It then drives a realistic dispatcher-loop tick sequence
-//! through a global counting allocator and proves the guarded path allocates
-//! for only the ticks that actually changed the display, not every tick.
+//! `meshcadet-battery-glanceable-indicator`: the AdminMenu row now also
+//! renders `raw_mv` (see `format_battery_display`'s doc), so `raw_mv` can no
+//! longer be excluded from the gate outright the way the original fix
+//! excluded it — comparing the whole struct on exact equality would defeat
+//! the dedup (raw_mv jitters on almost every ADC poll), but excluding it
+//! entirely would mean the displayed mV never updates at all. The delta-gate
+//! is the resolution; this measurement's tick sequence below is shaped to
+//! exercise both the "sub-threshold jitter absorbed" and "genuine movement
+//! gates a push" cases explicitly, not just "raw_mv never gates".
+//!
+//! This test cannot import `firmware`'s types directly (`firmware` is a
+//! DETACHED xtensa-only workspace — see its `Cargo.toml`'s doc comment), so
+//! the GPS half PORTS the exact formatting/dedup logic host-side, pinned
+//! line-for-line against firmware's own fixtures (`gps_status.rs`'s
+//! `#[cfg(test)]` module — see `build_gps_row_strings`'s doc), the same
+//! "host port pinned against firmware's never-executed-on-host fixtures"
+//! pattern the `profile-baseline` measurement rig established.
+//!
+//! The BATTERY half no longer ports anything — `firmware_core` (unlike
+//! `firmware`) is a plain host-buildable root-workspace member this crate
+//! already depends on (see `Cargo.toml`), so `BatteryStatus`,
+//! `format_battery_display`, and `battery_display_fields_changed` are
+//! imported directly from `firmware_core::battery`/`firmware_core::ui::
+//! admin_menu` below. This closes a drift risk a hand-port would carry: a
+//! threshold CONSTANT (`RAW_MV_DISPLAY_DELTA_MV`) is exactly the kind of
+//! value a parallel port can silently drift out of sync with, so this
+//! measurement now recomputes against the real implementation instead of a
+//! hand-copied rationale comment.
+//!
+//! Both halves then drive a realistic dispatcher-loop tick sequence through
+//! a global counting allocator and prove the guarded path allocates for only
+//! the ticks that actually changed the display, not every tick.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+
+use firmware_core::battery::{BatteryLevel, BatteryStatus};
+use firmware_core::ui::admin_menu::{battery_display_fields_changed, format_battery_display};
 
 // ── Counting allocator ──────────────────────────────────────────────────────
 //
@@ -178,37 +204,32 @@ fn build_gps_row_strings(status: &GpsStatus) -> [String; 4] {
     ]
 }
 
-// ── Ported formatting logic (pinned to firmware/src/ui/screens/admin_menu.rs) ─
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct BatteryStatus {
-    percent: u8,
-    charging: bool,
-    raw_mv: u32,
-    held_raw_mv: u32,
-}
-
-/// Port of `firmware/src/ui/screens/admin_menu.rs::format_battery_display`.
-fn format_battery_display(status: BatteryStatus) -> String {
-    if status.charging {
-        format!("{}% (charging)", status.percent)
-    } else {
-        format!("{}%", status.percent)
+// ── Battery: real firmware-core imports, not a port — see module doc ───────
+//
+// `BatteryStatus`, `format_battery_display`, `battery_display_fields_changed`
+// come from the `use firmware_core::...` lines at the top of this file — the
+// genuine implementation, not a hand-copy. A plain `Default`-ish helper
+// keeps the tick-sequence builder below readable.
+fn battery_status(percent: u8, charging: bool, raw_mv: u32, held_raw_mv: u32) -> BatteryStatus {
+    BatteryStatus {
+        percent,
+        charging,
+        raw_mv,
+        held_raw_mv,
+        // `level` doesn't participate in `battery_display_fields_changed` or
+        // `format_battery_display` (see both functions' docs) — a fixed
+        // placeholder is fine for this measurement.
+        level: BatteryLevel::Medium,
     }
 }
 
-/// Port of `battery_display_fields_changed` (`firmware/src/ui/mod.rs`) — the
-/// dedup predicate this fix adds: only `percent`/`charging` gate the row,
-/// NOT the live/noisy `raw_mv`/`held_raw_mv` diagnostic fields.
-fn battery_display_fields_changed(prev: BatteryStatus, new: BatteryStatus) -> bool {
-    prev.percent != new.percent || prev.charging != new.charging
-}
-
-// ── Parity: pin the ported strings against firmware's own fixtures ─────────
+// ── Parity: pin the GPS port against firmware's own fixtures ───────────────
 //
-// firmware/src/ui/screens/gps_status.rs's and admin_menu.rs's `#[cfg(test)]`
-// modules assert these exact expected strings against the real functions;
-// this proves the host port hasn't drifted from what's actually landed.
+// firmware/src/ui/screens/gps_status.rs's `#[cfg(test)]` module asserts
+// these exact expected strings against the real functions; this proves the
+// host port hasn't drifted from what's actually landed. (The battery half
+// needs no equivalent parity test now that it imports the real functions
+// directly — there is nothing to drift out of sync with.)
 
 #[test]
 fn ported_gps_formatters_match_firmware_fixtures() {
@@ -227,24 +248,6 @@ fn ported_gps_formatters_match_firmware_fixtures() {
         format_coords(true, -335_100_000, -1_511_200_000, 5),
         "-33.510000, -151.120000 (age 5s)"
     );
-}
-
-#[test]
-fn ported_battery_formatter_matches_firmware_fixtures() {
-    let not_charging = BatteryStatus {
-        percent: 63,
-        charging: false,
-        raw_mv: 0,
-        held_raw_mv: 0,
-    };
-    assert_eq!(format_battery_display(not_charging), "63%");
-    let charging = BatteryStatus {
-        percent: 9,
-        charging: true,
-        raw_mv: 0,
-        held_raw_mv: 0,
-    };
-    assert_eq!(format_battery_display(charging), "9% (charging)");
 }
 
 // ── THE MEASUREMENT ─────────────────────────────────────────────────────────
@@ -325,21 +328,40 @@ fn gps_status_push_allocates_only_on_genuine_change() {
     assert!(guarded_bytes < unconditional_bytes / 10);
 }
 
-#[test]
-fn battery_display_push_allocates_only_on_percent_or_charging_change() {
-    // Battery poll every tick, but percent/charging are stable while raw_mv
-    // jitters (live ADC noise) — the exact shape `battery.rs`'s live sampling
-    // produces. 3 genuine display changes over 50 ticks.
-    let ticks: Vec<BatteryStatus> = (0..50u32)
-        .map(|i| BatteryStatus {
-            percent: 80 - (i / 20) as u8, // changes at i=20, i=40
-            charging: i >= 45,            // changes at i=45
-            raw_mv: 3700 + i,             // jitters every tick — must NOT gate the row
-            held_raw_mv: 3690 + i,
+/// A dispatcher-loop tick sequence shaped like the real one: `raw_mv` carries
+/// small in-band ADC-noise jitter (magnitude <=4mV, per-tick, cycling
+/// through a fixed pattern rather than a monotonic ramp — real noise wobbles
+/// around a resting value, it doesn't drift continuously) on top of a
+/// baseline that steps ONCE, partway through, by a genuinely large amount
+/// (+60mV at `i=30`) — this is what exercises
+/// `battery_display_fields_changed`'s `raw_mv` delta-gate honestly: small
+/// per-tick jitter must never gate the row, but the single large step must,
+/// independent of whatever `percent`/`charging` are doing at that same tick.
+/// `percent` drops twice (`i=20`, `i=40`) and `charging` flips once
+/// (`i=45`), each at a DIFFERENT tick than the raw_mv step, so every push
+/// this test expects is attributable to exactly one cause.
+fn battery_ticks(n: usize) -> Vec<BatteryStatus> {
+    const JITTER_PATTERN_MV: [i32; 4] = [0, 3, -2, 1];
+    (0..n as u32)
+        .map(|i| {
+            let baseline_mv: i32 = if i < 30 { 3700 } else { 3760 };
+            let jitter_mv = JITTER_PATTERN_MV[(i as usize) % JITTER_PATTERN_MV.len()];
+            let raw_mv = (baseline_mv + jitter_mv) as u32;
+            battery_status(
+                80 - (i / 20) as u8, // percent: changes at i=20, i=40
+                i >= 45,             // charging: changes at i=45
+                raw_mv,
+                3690 + i, // held_raw_mv — diagnostic-only, never gates the row
+            )
         })
-        .collect();
+        .collect()
+}
 
-    // ── BEFORE: format + push every tick ────────────────────────────────────
+#[test]
+fn battery_display_push_allocates_only_on_genuine_change() {
+    let ticks = battery_ticks(60);
+
+    // ── BEFORE (old firmware behavior): format + push every single tick ────
     let before = alloc_snapshot();
     for status in &ticks {
         let s = format_battery_display(*status);
@@ -348,13 +370,13 @@ fn battery_display_push_allocates_only_on_percent_or_charging_change() {
     let after = alloc_snapshot();
     let unconditional_allocs = after.0 - before.0;
 
-    // ── AFTER: gate on (percent, charging) only ─────────────────────────────
-    let mut prev = BatteryStatus {
-        percent: 0,
-        charging: false,
-        raw_mv: 0,
-        held_raw_mv: 0,
-    };
+    // ── AFTER (this fix): skip format+push when the row wouldn't change ────
+    // `prev` tracks the last-DISPLAYED status, exactly like `UiRuntime`'s own
+    // `battery_status_displayed` (`firmware/src/ui/mod.rs`) — NOT the last
+    // status seen, which would silently defeat the delta-gate against a
+    // slow, continuous drift (see that field's doc). This loop only updates
+    // `prev` on an actual push, mirroring that same discipline.
+    let mut prev = battery_status(0, false, 0, 0);
     let before = alloc_snapshot();
     let mut pushes = 0usize;
     for status in &ticks {
@@ -362,21 +384,23 @@ fn battery_display_push_allocates_only_on_percent_or_charging_change() {
             let s = format_battery_display(*status);
             std::hint::black_box(&s);
             pushes += 1;
+            prev = *status;
         }
-        prev = *status;
     }
     let after = alloc_snapshot();
     let guarded_allocs = after.0 - before.0;
 
     println!(
         "[alloc-tick] battery row, {} ticks: UNCONDITIONAL {} allocs vs GUARDED {} allocs ({} pushes) \
-         — raw_mv jitters every tick and correctly does NOT gate the row",
+         — sub-threshold raw_mv jitter does NOT gate the row; the one genuine \
+         raw_mv step, and the percent/charging changes, each gate exactly once",
         ticks.len(), unconditional_allocs, guarded_allocs, pushes,
     );
 
     assert_eq!(
-        pushes, 4,
-        "expected 1 initial change + percent drop at 20 + percent drop at 40 + charging flip at 45"
+        pushes, 5,
+        "expected 1 initial change + percent drop at 20 + raw_mv step at 30 \
+         + percent drop at 40 + charging flip at 45"
     );
     assert!(
         unconditional_allocs >= ticks.len(),
@@ -384,8 +408,10 @@ fn battery_display_push_allocates_only_on_percent_or_charging_change() {
         ticks.len(),
         unconditional_allocs,
     );
-    // THE WIN: >80% fewer allocations by only formatting on the 4 ticks that
-    // actually moved the displayed percentage/charging state, out of 50.
+    // THE WIN: allocating on only the 5 ticks that actually moved the
+    // displayed text, out of 60 — still an order of magnitude fewer allocs
+    // than the unconditional path, even with raw_mv now a rendered (and
+    // therefore gate-participating) field.
     assert!(
         guarded_allocs * 5 < unconditional_allocs,
         "guarded allocs ({guarded_allocs}) should be under 20% of unconditional \

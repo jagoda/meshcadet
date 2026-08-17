@@ -64,6 +64,12 @@ fn main() {
     // Good repeater signal (ADR-0010) — a compelling, on-brand default for
     // the promo shot rather than the direct-only ring.
     frame.set_signal_level(4);
+    // Battery level 4 = Medium (3-of-4 percent buckets — Critical/Low/
+    // Medium/High), not charging — a clearly non-empty, non-alarming, non-
+    // full reading for the promo shot (`meshcadet-battery-glanceable-
+    // indicator`). Never leave this at the widget's `0` (Unknown) default,
+    // or the gallery renders an outline-only, empty-looking indicator.
+    frame.set_battery_level(4);
     // The screen's one-shot `content_opacity` fade-in (see
     // `ui_sim::contact_list_promo`'s copied markup) animates over 200ms of
     // REAL WALL-CLOCK TIME from component construction — sleep past it
