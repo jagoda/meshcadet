@@ -4275,8 +4275,7 @@ fn handle_req(
 /// Compare an inbound ACK hash (bare `Ack` frame, `handle_ack`; or bundled
 /// inside a PATH-return, `handle_path_return`'s `PathExtra::Ack` arm)
 /// against `outstanding`'s outstanding-sends table. BOTH dispatch sites that
-/// can receive an ACK call this SAME function — see
-/// `flight-manuals/library/dual-path-event-matcher-gap.md`: the room-post
+/// can receive an ACK call this SAME function: the room-post
 /// delivery-ack defect this table replaces was exactly a matcher wired into
 /// only ONE of those two call sites (a room post is sent flood-routed,
 /// `room_session::encode_room_post_checked`'s `RouteType::Flood`, so the

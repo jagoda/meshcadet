@@ -375,8 +375,7 @@ pub struct OutstandingSend {
 /// `resolve` is the ONE place an inbound ACK is matched against outstanding
 /// state, called identically from both dispatch sites that can receive one
 /// (`handle_ack`'s bare `Ack` datagram, and `handle_path_return`'s bundled
-/// `PathExtra::Ack`) — see
-/// `flight-manuals/library/dual-path-event-matcher-gap.md`: the room-post
+/// `PathExtra::Ack`): the room-post
 /// delivery-ack defect this table replaces was exactly a matcher wired into
 /// only ONE of those two call sites (a second, room-only `pending_post_ack`
 /// slot that `handle_path_return` never checked). Collapsing DM and
