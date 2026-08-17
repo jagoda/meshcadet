@@ -287,15 +287,25 @@ impl<'d> BatteryDriver<'d> {
                 };
 
                 let was_charging = self.cached_charging;
-                let (settled_mv, charging) = battery_poll_step(self.settled_mv, window_peak_mv);
+                let (settled_mv, charging, confirmed, displayed_percent, level) =
+                    battery_window_close_step(
+                        self.settled_mv,
+                        self.displayed_percent,
+                        self.level,
+                        self.confirmed,
+                        window_peak_mv,
+                    );
                 self.settled_mv = settled_mv;
                 self.cached_charging = charging;
-                self.confirmed = advance_settled_confirmed(self.confirmed, charging);
+                self.confirmed = confirmed;
+                self.displayed_percent = displayed_percent;
+                self.level = level;
 
+                // Diagnostic-only: this window's raw target percent, purely
+                // for the transition log line below (not otherwise used —
+                // `battery_window_close_step` already folded it into
+                // `displayed_percent`).
                 let target_percent = percent_from_millivolts(settled_mv);
-                self.displayed_percent =
-                    slew_limit_percent(self.displayed_percent, target_percent, charging);
-                self.level = battery_level_bucket(self.level, self.displayed_percent, charging);
 
                 // Log the transition (not every window) — the one field
                 // signal that lets a HIL run be diagnosed after the fact
