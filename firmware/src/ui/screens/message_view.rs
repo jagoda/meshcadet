@@ -66,14 +66,14 @@
 //!   tint"). The `mention_tier == 2` override (a literal, documented
 //!   exception to the frozen token contract — see that binding's own doc
 //!   comment above) still takes precedence over both; unchanged.
-//! - **Comet in header.** A static `Comet` accent (`ui/motifs.slint`) sits in
-//!   the header's dead space — the 44px zone the title-centering spacer
-//!   Rectangle already reserves on the right — so it adds a persistent celestial
-//!   motif without perturbing the back-chevron/centered-title/spacer
-//!   HorizontalLayout that bug-fix established. `CometOnNotify`
-//!   (same shared asset, animated) sweeps along the header's bottom 14px band
-//!   — same position convention `contact_list.rs`'s header comet uses —
-//!   whenever `notify_trigger` flips `false -> true`.
+//! - **Comet-on-notify only (static comet dropped 2026-08-17).** The static
+//!   `Comet` accent that used to sit in the header's top-right dead space
+//!   was removed as a UI trim: with the `SignalMeter`/`BatteryIndicator`
+//!   pair now also in this header, the extra motif read as too busy on
+//!   device. `CometOnNotify` (same shared asset, animated) is untouched — it
+//!   still sweeps along the header's bottom 14px band — same position
+//!   convention `contact_list.rs`'s header comet uses — whenever
+//!   `notify_trigger` flips `false -> true`.
 //! - **`notify_trigger` firing rule.** Mirrors `contact_list.rs`'s
 //!   `notify_trigger`/`maybe_fire_notify` mechanism exactly, but keyed off a
 //!   different quantity: the RECEIVED (`!is_ours`) message count in this
@@ -123,7 +123,7 @@
 
 slint::slint! {
     import { Theme } from "../theme.slint";
-    import { Comet, CometOnNotify, RocketOnSend, SpaceBackdrop } from "../motifs.slint";
+    import { CometOnNotify, RocketOnSend, SpaceBackdrop } from "../motifs.slint";
     import { SignalMeter } from "../signal_meter.slint";
     import { BatteryIndicator } from "../battery_indicator.slint";
 
@@ -502,32 +502,32 @@ slint::slint! {
                     //
                     // The `SignalMeter` (ADR-0010) nests INSIDE this spacer
                     // (same "don't touch the spacer's own reserved width"
-                    // reasoning as `gps_status.rs`'s identical placement),
-                    // but — unlike that screen — this header's top-right
-                    // corner is already occupied by the static `Comet` motif
-                    // floating just below, at this same Rectangle's
-                    // `parent.width - 34px .. - 6px`, `y: 4px..18px` box (see
-                    // that `Comet` instance's own comment). So the meter
+                    // reasoning as `gps_status.rs`'s identical placement). It
                     // stays pinned to the LEFT edge of this spacer, at
-                    // `x: 1px..17px, y: 3px..17px` — clear of the Comet's box
-                    // AND the `CometOnNotify` sweep band (`y: parent.height -
-                    // 14px..`, i.e. `22px..36px`) below.
+                    // `x: 1px..17px, y: 3px..17px` — clear of the
+                    // `CometOnNotify` sweep band (`y: parent.height - 14px..`,
+                    // i.e. `22px..36px`) below.
                     //
                     // `BatteryIndicator` (`meshcadet-battery-glanceable-
                     // indicator`) needs its own 14px + a 2px gap immediately
                     // right of the SignalMeter — there was no free room for
-                    // that in the ORIGINAL 44px spacer (its right ~27px were
-                    // already claimed by the independently-positioned static
-                    // `Comet` above, which floats relative to the header's
-                    // own 320px width, not this spacer's box, and so does not
-                    // shift when this spacer's width changes). Widened this
-                    // spacer to 64px (see the back button's matching widen
-                    // above) to open that room: the spacer's RIGHT edge stays
-                    // pinned at the same absolute position (`320 -
-                    // padding-right`, unaffected by its own declared width),
-                    // so growing the width only extends its LEFT edge
-                    // further left — into space the centered title's stretch
-                    // simply gives up, not into the Comet's box at all.
+                    // that in the ORIGINAL 44px spacer, so it was widened to
+                    // 64px (see the back button's matching widen above) to
+                    // open that room: the spacer's RIGHT edge stays pinned at
+                    // the same absolute position (`320 - padding-right`,
+                    // unaffected by its own declared width), so growing the
+                    // width only extends its LEFT edge further left — into
+                    // space the centered title's stretch simply gives up.
+                    //
+                    // This spacer's top-right corner used to also carry a
+                    // static `Comet` motif, floating independently at
+                    // `parent.width - 34px .. -6px`, `y: 4px..18px` — that
+                    // icon was dropped 2026-08-17 as a UI trim (see this
+                    // file's module doc). The spacer/back-button widths were
+                    // deliberately left at 64px rather than shrunk back: the
+                    // freed area is inert transparent header background with
+                    // no effect on this pair's own position or spacing, and
+                    // reclaiming it was out of scope for a pure icon trim.
                     Rectangle {
                         width: 64px; height: 36px;
                         SignalMeter {
@@ -545,20 +545,6 @@ slint::slint! {
                             y: 5px; // vertically centered against the meter's 3px..17px box
                         }
                     }
-                }
-
-                // Static comet motif — declared after the HorizontalLayout so it
-                // paints on top, but positioned with an explicit x/y (not a
-                // layout child) inside the dead space the balancing spacer
-                // Rectangle above already reserves on the right. This keeps
-                // the back-chevron/centered-title/spacer arrangement
-                // completely
-                // undisturbed while still giving this header a persistent
-                // celestial accent, per this screen's per-screen spec row
-                // ("comet in header").
-                Comet {
-                    x: parent.width - 34px;
-                    y: 4px;
                 }
 
                 // Comet-on-notify sweep — same shared asset, animated,
