@@ -115,9 +115,28 @@
 //! threshold check needs no prior sample — a strict improvement over the
 //! superseded rise trigger, which reported `false` in exactly that case. The
 //! residual `percent` gap is a direct consequence of "no power-present signal
-//! exists on this board other than the contaminated rail itself" above, and
-//! closing it fully would require persisting a last-known-good SoC across
-//! reboots — out of scope here.
+//! exists on this board other than the contaminated rail itself" above; the
+//! "(A)" section below closes most of it (persisting a last-known-good SoC
+//! across reboots) for a device with prior NVS history.
+//!
+//! **`meshcadet-battery-level-reads-full-when-depleted` (2026-08-17)
+//! follow-on — the gap was worse than this section originally described:**
+//! a VIRGIN device (no persisted `settled_mv` yet, so this exact residual
+//! gap applies) that boots already plugged in over a truly depleted pack
+//! did eventually see `percent` catch up once the pack was confirmed off
+//! power — but only by crawling down through [`slew_limit_percent`]'s
+//! discharge-monotonic cap ([`PERCENT_MAX_SLEW_PER_UPDATE_PCT`] per
+//! ~[`PEAK_WINDOW_MS`] window), the same limiter that smooths *legitimate*
+//! discharge noise once a basis is trustworthy. Applied to the FIRST
+//! correction of an unconfirmed, contaminated boot-time guess, that same cap
+//! meant up to ~25 minutes reading a near-full `percent`/`level` on a device
+//! that was, the whole time, sitting at its true depleted charge — for
+//! this board's plain-ADC design, effectively invisible to the user as
+//! "the indicator reads full when depleted, and doesn't change whether the
+//! cable is attached or not." [`battery_window_close_step`] is the fix:
+//! the slew limiter is skipped for the poll that first proves the basis
+//! confirmed, so the display snaps straight to the true reading instead of
+//! crawling toward it. See that function's own doc for the exact mechanism.
 //!
 //! ## ADC calibration (2026-07-05 redirect) and the diagnostic `raw_mv` field
 //!
@@ -835,6 +854,71 @@ pub fn should_persist_settled_mv(
     }
 }
 
+// ── battery_window_close_step — the full per-window pipeline (fix: depleted-reads-full) ──
+
+/// One full state transition for a just-closed [`PeakWindowSampler`] window —
+/// host-testable, no ADC dependency — the exact chain [`BatteryDriver::poll`]
+/// drives: [`battery_poll_step`] (settled_mv/charging) →
+/// [`advance_settled_confirmed`] (the confirmed latch) →
+/// [`percent_from_millivolts`] (this window's target percent) → the displayed
+/// percent (see the confirmed-basis note below) → [`battery_level_bucket`]
+/// (the coarse bucket). Returns the updated
+/// `(settled_mv, charging, confirmed, displayed_percent, level)`.
+///
+/// **Fixes `meshcadet-battery-level-reads-full-when-depleted`:** a VIRGIN
+/// device (no NVS-persisted `settled_mv` yet — see module docs' "(A)"
+/// section) that boots already on external power seeds `displayed_percent`
+/// at the contaminated, near-100% reading — the module's own documented
+/// "residual gap" (see the "Fix" section above). That write-up understated
+/// the gap's real severity: the FIRST time the pack is genuinely confirmed
+/// off external power (a real unplug), the raw chain used to run the fresh,
+/// correct-but-far-lower target straight through [`slew_limit_percent`] —
+/// whose whole premise is "protect a TRUSTWORTHY prior reading from an
+/// implausible jump." An unconfirmed basis is, by definition, not yet a
+/// trustworthy prior to protect, so limiting that first correction dragged
+/// the display from ~100% down to the pack's true depleted charge at
+/// [`PERCENT_MAX_SLEW_PER_UPDATE_PCT`] per ~[`PEAK_WINDOW_MS`] window — up to
+/// ~25 minutes (`100 / PERCENT_MAX_SLEW_PER_UPDATE_PCT` windows) of reading a
+/// near-full `percent`/`level` (`High`, or `Charging` while still plugged —
+/// both render as a visually "full" glanceable indicator) on a device that
+/// was, the entire time, sitting at its true, deeply-depleted charge. Fix:
+/// the slew limiter is skipped — `displayed_percent` snaps straight to
+/// `target_percent` — on any poll where `confirmed` was **not yet true
+/// BEFORE this poll**, which is exactly the poll that first proves the
+/// basis trustworthy (or any poll before that, where the display was never
+/// trustworthy to begin with and there is nothing to protect by smoothing
+/// it). Every already-working case is unaffected: a device that boots
+/// off-power, or boots on-power with a persisted (already-confirmed) basis,
+/// is `confirmed` from its very first sample (see [`seed_boot_state`]) and
+/// slew-limits every update exactly as before.
+pub fn battery_window_close_step(
+    settled_mv: u32,
+    displayed_percent: u8,
+    level: BatteryLevel,
+    confirmed: bool,
+    window_peak_mv: u32,
+) -> (u32, bool, bool, u8, BatteryLevel) {
+    let (new_settled_mv, charging) = battery_poll_step(settled_mv, window_peak_mv);
+    let was_confirmed = confirmed;
+    let new_confirmed = advance_settled_confirmed(confirmed, charging);
+    let target_percent = percent_from_millivolts(new_settled_mv);
+    let new_displayed_percent = if was_confirmed {
+        slew_limit_percent(displayed_percent, target_percent, charging)
+    } else {
+        // No trustworthy prior displayed value exists yet — nothing to
+        // protect via gradual movement, so show the truth immediately.
+        target_percent
+    };
+    let new_level = battery_level_bucket(level, new_displayed_percent, charging);
+    (
+        new_settled_mv,
+        charging,
+        new_confirmed,
+        new_displayed_percent,
+        new_level,
+    )
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
@@ -1464,5 +1548,187 @@ mod tests {
         // 12 writes/hour == one write every 5 minutes == PERSIST_MIN_INTERVAL_MS.
         const WRITES_PER_HOUR: u64 = 3_600_000 / PERSIST_MIN_INTERVAL_MS;
         assert_eq!(WRITES_PER_HOUR, 12);
+    }
+
+    // ── battery_window_close_step / full pipeline (fix: depleted-reads-full) ──
+    //
+    // A tiny host-side stand-in for `BatteryDriver` — the exact
+    // boot-then-poll sequence `firmware::battery::BatteryDriver` drives,
+    // built entirely from this module's own public pure functions so the
+    // full level pipeline (voltage in, `BatteryStatus::level` out) is
+    // exercised end to end without any ADC/hardware dependency. This is the
+    // mission's acceptance instrument: "an in-container test drives the
+    // level pipeline with synthetic depleted/full voltage-or-SoC inputs and
+    // with charging vs discharging state, asserting the reported level
+    // tracks the input in each case."
+    struct SimDriver {
+        settled_mv: u32,
+        charging: bool,
+        confirmed: bool,
+        displayed_percent: u8,
+        level: BatteryLevel,
+        peak_sampler: PeakWindowSampler,
+    }
+
+    impl SimDriver {
+        fn boot(persisted: Option<u32>, initial_mv: u32, now_ms: u64) -> Self {
+            let (settled_mv, charging, confirmed) = seed_boot_state(persisted, initial_mv);
+            let displayed_percent = percent_from_millivolts(settled_mv);
+            let level = battery_level_bucket(BatteryLevel::Unknown, displayed_percent, charging);
+            SimDriver {
+                settled_mv,
+                charging,
+                confirmed,
+                displayed_percent,
+                level,
+                peak_sampler: PeakWindowSampler::new(now_ms, initial_mv),
+            }
+        }
+
+        /// One ~2s ADC sample, mirroring `BatteryDriver::poll`'s cadence.
+        /// Only actually updates state once a peak window closes.
+        fn poll(&mut self, now_ms: u64, mv: u32) {
+            if let Some(window_peak_mv) = self.peak_sampler.sample(now_ms, mv) {
+                let (settled_mv, charging, confirmed, displayed_percent, level) =
+                    battery_window_close_step(
+                        self.settled_mv,
+                        self.displayed_percent,
+                        self.level,
+                        self.confirmed,
+                        window_peak_mv,
+                    );
+                self.settled_mv = settled_mv;
+                self.charging = charging;
+                self.confirmed = confirmed;
+                self.displayed_percent = displayed_percent;
+                self.level = level;
+            }
+        }
+
+        /// Drive `n` polls at the fixed ADC cadence, all reporting `mv`.
+        fn run(&mut self, now_ms: &mut u64, n: u32, mv: u32) {
+            for _ in 0..n {
+                *now_ms += 2_000;
+                self.poll(*now_ms, mv);
+            }
+        }
+    }
+
+    #[test]
+    fn pipeline_synthetic_full_voltage_discharging_reads_high_not_charging() {
+        let mut d = SimDriver::boot(None, RESTING_FULL_MV, 0);
+        let mut now = 0u64;
+        d.run(&mut now, 20, RESTING_FULL_MV);
+        assert!(!d.charging);
+        assert_eq!(d.level, BatteryLevel::High);
+        assert!(d.displayed_percent >= 90);
+    }
+
+    #[test]
+    fn pipeline_synthetic_depleted_voltage_discharging_reads_critical_not_charging() {
+        let mut d = SimDriver::boot(None, BATTERY_EMPTY_MV + 50, 0);
+        let mut now = 0u64;
+        d.run(&mut now, 20, BATTERY_EMPTY_MV + 50);
+        assert!(!d.charging);
+        assert_eq!(d.level, BatteryLevel::Critical);
+    }
+
+    #[test]
+    fn pipeline_synthetic_charging_voltage_reads_charging_regardless_of_underlying_soc() {
+        let mut d = SimDriver::boot(None, BATTERY_EMPTY_MV + 50, 0);
+        let mut now = 0u64;
+        // Confirm off-power first (a real prior basis), then plug in.
+        d.run(&mut now, 20, BATTERY_EMPTY_MV + 50);
+        d.run(&mut now, 20, EXTERNAL_POWER_MV_THRESHOLD + 500);
+        assert!(d.charging);
+        assert_eq!(d.level, BatteryLevel::Charging);
+    }
+
+    #[test]
+    fn pipeline_boot_already_plugged_virgin_device_over_depleted_pack_reaches_critical_within_one_window_of_confirming_not_a_25_minute_crawl(
+    ) {
+        // The exact regression this mission fixes: a VIRGIN device (no NVS
+        // basis yet) boots already on external power, over a truly
+        // depleted pack. `charging` is detected immediately; `percent`
+        // initially shows the documented residual-gap contaminated reading.
+        // The FIX under test: the instant the pack is genuinely confirmed
+        // off external power (a real unplug), the display must snap to the
+        // truth in that same window close, not crawl down at
+        // PERCENT_MAX_SLEW_PER_UPDATE_PCT/window (which would take ~25
+        // minutes from ~100%).
+        let depleted_mv = BATTERY_EMPTY_MV + 50; // deep in Critical range
+        let mut d = SimDriver::boot(None, EXTERNAL_POWER_MV_THRESHOLD + 500, 0);
+        assert!(
+            d.charging,
+            "boot-while-plugged must be flagged charging immediately"
+        );
+        assert_eq!(
+            d.displayed_percent, 100,
+            "documented residual gap: first contaminated reading leaks through until confirmed"
+        );
+
+        let mut now = 0u64;
+        // Genuinely unplugged from the very next sample onward. The FIRST
+        // window to close still carries the contaminated boot sample as its
+        // peak (`PeakWindowSampler` seeds a window's peak from the sample
+        // that opened it — see that struct's own settling-time doc note),
+        // so it takes a second window of all-low samples to see a peak
+        // that's actually low. That one-window peak-hold lag is
+        // pre-existing, documented, and NOT what this test is guarding —
+        // what matters is what happens the instant the peak genuinely goes
+        // low: a snap to truth, not a ~25-minute crawl.
+        d.run(&mut now, 15, depleted_mv); // closes the contaminated window
+        d.run(&mut now, 15, depleted_mv); // closes a genuinely-low window
+
+        assert!(
+            !d.charging,
+            "must detect the unplug once the peak is genuinely low"
+        );
+        assert!(d.confirmed, "an off-power sample must confirm the basis");
+        assert_eq!(
+            d.level,
+            BatteryLevel::Critical,
+            "must reflect the true depleted charge in the SAME window that first confirms it, \
+             not crawl down over many more windows"
+        );
+        assert!(
+            d.displayed_percent < 10,
+            "percent must snap to the true low reading immediately once confirmed, got {}%",
+            d.displayed_percent
+        );
+    }
+
+    #[test]
+    fn pipeline_boot_already_plugged_with_persisted_basis_shows_correct_percent_immediately() {
+        // The already-working case (NVS persistence closes this gap): a
+        // persisted, previously-confirmed low basis means `confirmed` is
+        // true from the very first sample, so this was never affected by
+        // the slew-limiter bug above — must keep working exactly as before.
+        let d = SimDriver::boot(Some(3_775), EXTERNAL_POWER_MV_THRESHOLD + 500, 0);
+        assert!(d.charging);
+        assert!(d.confirmed);
+        assert_eq!(d.displayed_percent, 36);
+        assert_eq!(d.level, BatteryLevel::Charging);
+    }
+
+    #[test]
+    fn pipeline_confirmed_normal_discharge_still_slew_limits_real_adc_jitter() {
+        // Regression guard for the fix above: once `confirmed`, ordinary
+        // discharge tracking must still be slew-limited (not snap
+        // instantly) — the fix only bypasses the limiter for the
+        // not-yet-confirmed case, never for a device that's already
+        // established a trustworthy basis.
+        let mut d = SimDriver::boot(None, 3_900, 0); // boots off-power: confirmed immediately
+        assert!(d.confirmed);
+        let mut now = 0u64;
+        // A big legitimate single-window drop (e.g. curve-breakpoint jitter
+        // plus a real step) must still be capped at PERCENT_MAX_SLEW_PER_UPDATE_PCT.
+        let before = d.displayed_percent;
+        d.run(&mut now, 15, 3_500); // much lower target
+        let after = d.displayed_percent;
+        assert!(
+            before - after <= PERCENT_MAX_SLEW_PER_UPDATE_PCT,
+            "already-confirmed basis must still slew-limit: {before}% -> {after}%"
+        );
     }
 }
