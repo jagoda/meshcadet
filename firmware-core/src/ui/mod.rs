@@ -42,6 +42,27 @@ pub mod theme;
 pub mod touch;
 pub mod ui_task_boundary;
 
+/// Delivery status of an outbound (`is_ours: true`) [`MessageRecord`] — the
+/// tri-state checkmark model `firmware`'s `MessageView` renders as grey
+/// (`Pending`) / blue (`Acked`) / red (`Undelivered`), the third state this
+/// mission adds alongside the pre-existing grey/blue pair. Meaningless for
+/// an inbound (`is_ours: false`) record (the renderer only shows the
+/// checkmark `if is_ours` — `firmware/src/ui/screens/message_view.rs`); kept
+/// at `Acked` for those by convention (matches the pre-tri-state `acked:
+/// true` default every inbound-record construction site already used) so
+/// there is exactly one representation, never an `Option`-wrapped one only
+/// half the records populate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeliveryState {
+    /// Sent, no ACK yet and its deadline hasn't passed — grey check.
+    Pending,
+    /// ACKed — blue check.
+    Acked,
+    /// No ACK arrived before its deadline, or its frame was evicted from the
+    /// TX queue before ever reaching the wire — red check.
+    Undelivered,
+}
+
 /// One stored message in a conversation — mirrors
 /// `firmware::ui::MessageRecord` exactly. `ts_ms` is captured at every
 /// construction site but not read by any pure helper here (no renderer
@@ -51,7 +72,24 @@ pub mod ui_task_boundary;
 pub struct MessageRecord {
     pub text: String,
     pub is_ours: bool,
-    pub acked: bool,
+    pub delivery: DeliveryState,
+    /// The wire ACK hash this outbound send is waiting on, if it is a DM or
+    /// room post tracked by the dispatcher's outstanding-sends table —
+    /// `None` for every inbound record, and for an outbound record this
+    /// table doesn't track (a channel/GRP_TXT send, still resolved via
+    /// [`mark_last_unacked_outbound`]'s heuristic below; or a DM/room-post
+    /// bubble not yet tagged — see `firmware/src/ui/mod.rs`'s
+    /// `UiEvent::DmQueued` doc).
+    ///
+    /// Exists so [`mark_delivery_by_ack_hash`] can flip the EXACT record a
+    /// given outstanding-sends table entry refers to, rather than guessing
+    /// via `mark_last_unacked_outbound`'s "newest pending" heuristic — that
+    /// heuristic silently picks the wrong record once more than one DM can
+    /// be outstanding to the same contact at once and their ACKs resolve
+    /// out of order, which is exactly the concurrency this mission
+    /// introduces (the single-slot `PendingAck` it replaces made that
+    /// ambiguity physically unreachable before now).
+    pub ack_hash: Option<[u8; 4]>,
     #[allow(dead_code)]
     pub ts_ms: u64,
 }
@@ -77,15 +115,21 @@ pub fn messages_insert_non_empty(
     messages.insert(hash, records);
 }
 
-/// Mark the most-recently-sent, still-unacked outbound `MessageRecord` to
+/// Mark the most-recently-sent, still-pending outbound `MessageRecord` to
 /// `to_hash` as acked (✓ → ✓✓). Returns `true` if a record was found and
 /// flipped, `false` if there was no matching pending outbound message.
 ///
-/// Searches newest-first (`.rev()`) and stops at the first unacked outbound
-/// hit — this is the "right message marked" invariant a confirmed-delivered
-/// DM depends on: `main.rs`'s `pending_ack` tracks only ONE outstanding ack at
-/// a time, for the most recently sent DM, so the newest unacked outbound
-/// record in this contact's thread is always the one a live match refers to.
+/// Searches newest-first (`.rev()`) and stops at the first `Pending` outbound
+/// hit. Channel/GRP_TXT sends (this function's only remaining caller —
+/// `UiEvent::ChannelAcked`, see its doc) stay on this "newest pending"
+/// heuristic rather than [`mark_delivery_by_ack_hash`]'s exact match: a
+/// broadcast has no wire ACK hash to correlate against at all (implicit
+/// "ack" = hearing our own transmission repeated back — see
+/// `main.rs::PendingChannelAck`'s doc), and — Channel/GRP_TXT sends are out
+/// of this mission's Objective scope — still only ever track one outstanding
+/// send at a time (`main.rs`'s single-slot `PendingChannelAck`), so the
+/// heuristic's "right message marked" assumption still holds for them
+/// exactly as it always did.
 ///
 /// Pulled out as a free function over a plain map for the same reason as
 /// `messages_insert_non_empty` above.
@@ -95,8 +139,68 @@ pub fn mark_last_unacked_outbound(
 ) -> bool {
     if let Some(msgs) = messages.get_mut(&to_hash) {
         for m in msgs.iter_mut().rev() {
-            if m.is_ours && !m.acked {
-                m.acked = true;
+            if m.is_ours && m.delivery == DeliveryState::Pending {
+                m.delivery = DeliveryState::Acked;
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Flip the outbound `MessageRecord` to `to_hash` whose `ack_hash` exactly
+/// matches `ack_hash` to `new_state` — the DM/room-post counterpart of
+/// `mark_last_unacked_outbound`'s heuristic, used once a contact can have
+/// more than one send outstanding at a time (this mission's whole point).
+/// Returns `true` if a record was found and flipped.
+///
+/// Exact match over the "newest pending" guess: if the SECOND of two
+/// outstanding DMs to the same contact is the one that gets ACKed first, the
+/// heuristic above would flip the wrong (newest) record — this looks up the
+/// specific record `ack_hash` was recorded on
+/// (`UiEvent::DmQueued`/`UiEvent::RoomPostSent`, see their docs) instead.
+pub fn mark_delivery_by_ack_hash(
+    messages: &mut std::collections::HashMap<u8, Vec<MessageRecord>>,
+    to_hash: u8,
+    ack_hash: [u8; 4],
+    new_state: DeliveryState,
+) -> bool {
+    if let Some(msgs) = messages.get_mut(&to_hash) {
+        for m in msgs.iter_mut() {
+            if m.is_ours && m.ack_hash == Some(ack_hash) {
+                m.delivery = new_state;
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Tag the OLDEST outbound `MessageRecord` to `to_hash` that has no
+/// `ack_hash` yet with `ack_hash` — how a DM's optimistically-rendered
+/// bubble (pushed by `on_send_message` before the dispatcher has even built
+/// the wire frame, let alone computed its ACK hash) later learns the hash
+/// [`mark_delivery_by_ack_hash`] will resolve it by by (`UiEvent::DmQueued`,
+/// raised once the dispatcher's `SendDm` handler computes it).
+///
+/// Oldest-first (NOT `.rev()`, unlike `mark_last_unacked_outbound`) is the
+/// correct search order here: `on_send_message` always pushes its optimistic
+/// bubble synchronously before queuing the matching `SendDm` command, and
+/// both the command channel (UI → dispatcher) and the event channel
+/// (dispatcher → UI) this tag arrives on preserve FIFO order, so untagged
+/// records and their `DmQueued` events are always in the same relative
+/// order — tagging the oldest untagged one first is what keeps two
+/// back-to-back DMs to the same contact each getting their OWN hash rather
+/// than both racing for the newest slot.
+pub fn tag_oldest_untagged_outbound(
+    messages: &mut std::collections::HashMap<u8, Vec<MessageRecord>>,
+    to_hash: u8,
+    ack_hash: [u8; 4],
+) -> bool {
+    if let Some(msgs) = messages.get_mut(&to_hash) {
+        for m in msgs.iter_mut() {
+            if m.is_ours && m.ack_hash.is_none() && m.delivery == DeliveryState::Pending {
+                m.ack_hash = Some(ack_hash);
                 return true;
             }
         }
@@ -149,13 +253,15 @@ mod tests {
             MessageRecord {
                 text: "inbound restored".into(),
                 is_ours: false,
-                acked: true,
+                delivery: DeliveryState::Acked,
+                ack_hash: None,
                 ts_ms: 0,
             },
             MessageRecord {
                 text: "outbound restored".into(),
                 is_ours: true,
-                acked: true,
+                delivery: DeliveryState::Acked,
+                ack_hash: None,
                 ts_ms: 0,
             },
         ];
@@ -166,7 +272,7 @@ mod tests {
         assert_eq!(seeded[0].text, "inbound restored");
         assert!(!seeded[0].is_ours);
         assert!(
-            seeded[0].acked,
+            seeded[0].delivery == DeliveryState::Acked,
             "restored records must never show perpetual pending"
         );
         assert!(seeded[1].is_ours);
@@ -196,13 +302,15 @@ mod tests {
                 MessageRecord {
                     text: "first".into(),
                     is_ours: true,
-                    acked: false,
+                    delivery: DeliveryState::Pending,
+                    ack_hash: None,
                     ts_ms: 0,
                 },
                 MessageRecord {
                     text: "second".into(),
                     is_ours: true,
-                    acked: false,
+                    delivery: DeliveryState::Pending,
+                    ack_hash: None,
                     ts_ms: 1,
                 },
             ],
@@ -216,11 +324,11 @@ mod tests {
         );
         let msgs = &messages[&0x42];
         assert!(
-            !msgs[0].acked,
+            msgs[0].delivery == DeliveryState::Pending,
             "the older unacked message must be left alone"
         );
         assert!(
-            msgs[1].acked,
+            msgs[1].delivery == DeliveryState::Acked,
             "the most recently sent unacked message is the one the ack refers to"
         );
     }
@@ -234,13 +342,15 @@ mod tests {
                 MessageRecord {
                     text: "outbound already delivered".into(),
                     is_ours: true,
-                    acked: true,
+                    delivery: DeliveryState::Acked,
+                    ack_hash: None,
                     ts_ms: 0,
                 },
                 MessageRecord {
                     text: "their reply".into(),
                     is_ours: false,
-                    acked: false,
+                    delivery: DeliveryState::Pending,
+                    ack_hash: None,
                     ts_ms: 1,
                 },
             ],
@@ -252,9 +362,9 @@ mod tests {
             !marked,
             "no unacked OUTBOUND message exists — an inbound record must never be flipped"
         );
-        assert!(messages[&0x42][0].acked);
+        assert!(messages[&0x42][0].delivery == DeliveryState::Acked);
         assert!(
-            !messages[&0x42][1].acked,
+            messages[&0x42][1].delivery == DeliveryState::Pending,
             "inbound records are never acked by this path"
         );
     }
@@ -267,7 +377,8 @@ mod tests {
             vec![MessageRecord {
                 text: "to alice".into(),
                 is_ours: true,
-                acked: false,
+                delivery: DeliveryState::Pending,
+                ack_hash: None,
                 ts_ms: 0,
             }],
         );
@@ -276,7 +387,8 @@ mod tests {
             vec![MessageRecord {
                 text: "to bob".into(),
                 is_ours: true,
-                acked: false,
+                delivery: DeliveryState::Pending,
+                ack_hash: None,
                 ts_ms: 0,
             }],
         );
@@ -285,11 +397,11 @@ mod tests {
 
         assert!(marked);
         assert!(
-            messages[&0x10][0].acked,
+            messages[&0x10][0].delivery == DeliveryState::Acked,
             "the addressed contact's message is marked"
         );
         assert!(
-            !messages[&0x20][0].acked,
+            messages[&0x20][0].delivery == DeliveryState::Pending,
             "an unrelated contact's pending message must be untouched"
         );
     }
@@ -299,6 +411,155 @@ mod tests {
         let mut messages: HashMap<u8, Vec<MessageRecord>> = HashMap::new();
         let marked = mark_last_unacked_outbound(&mut messages, 0x99);
         assert!(!marked);
+    }
+
+    // ── mark_delivery_by_ack_hash / tag_oldest_untagged_outbound ───────────
+    //
+    // Regression guard for this mission's whole point: once more than one DM
+    // can be outstanding to the same contact at once, resolving by exact
+    // `ack_hash` (not `mark_last_unacked_outbound`'s "newest pending" guess)
+    // is what lets each ACK flip the RIGHT record, even out of send order.
+
+    #[test]
+    fn mark_delivery_by_ack_hash_flips_the_exact_record_even_out_of_order() {
+        let mut messages: HashMap<u8, Vec<MessageRecord>> = HashMap::new();
+        messages.insert(
+            0x42,
+            vec![
+                MessageRecord {
+                    text: "first".into(),
+                    is_ours: true,
+                    delivery: DeliveryState::Pending,
+                    ack_hash: Some([1, 1, 1, 1]),
+                    ts_ms: 0,
+                },
+                MessageRecord {
+                    text: "second".into(),
+                    is_ours: true,
+                    delivery: DeliveryState::Pending,
+                    ack_hash: Some([2, 2, 2, 2]),
+                    ts_ms: 1,
+                },
+            ],
+        );
+
+        // The SECOND DM's ack arrives first — out of send order.
+        let flipped =
+            mark_delivery_by_ack_hash(&mut messages, 0x42, [2, 2, 2, 2], DeliveryState::Acked);
+        assert!(flipped);
+        let msgs = &messages[&0x42];
+        assert_eq!(
+            msgs[0].delivery,
+            DeliveryState::Pending,
+            "the FIRST DM's own ack hasn't arrived — it must stay pending, \
+             not get flipped by the second DM's ack (the bug a newest-pending \
+             heuristic would introduce here)"
+        );
+        assert_eq!(msgs[1].delivery, DeliveryState::Acked);
+    }
+
+    #[test]
+    fn mark_delivery_by_ack_hash_no_match_is_a_no_op() {
+        let mut messages: HashMap<u8, Vec<MessageRecord>> = HashMap::new();
+        messages.insert(
+            0x42,
+            vec![MessageRecord {
+                text: "first".into(),
+                is_ours: true,
+                delivery: DeliveryState::Pending,
+                ack_hash: Some([1, 1, 1, 1]),
+                ts_ms: 0,
+            }],
+        );
+        let flipped =
+            mark_delivery_by_ack_hash(&mut messages, 0x42, [9, 9, 9, 9], DeliveryState::Acked);
+        assert!(!flipped);
+        assert_eq!(messages[&0x42][0].delivery, DeliveryState::Pending);
+    }
+
+    #[test]
+    fn mark_delivery_by_ack_hash_can_mark_undelivered_too() {
+        let mut messages: HashMap<u8, Vec<MessageRecord>> = HashMap::new();
+        messages.insert(
+            0x42,
+            vec![MessageRecord {
+                text: "first".into(),
+                is_ours: true,
+                delivery: DeliveryState::Pending,
+                ack_hash: Some([1, 1, 1, 1]),
+                ts_ms: 0,
+            }],
+        );
+        let flipped = mark_delivery_by_ack_hash(
+            &mut messages,
+            0x42,
+            [1, 1, 1, 1],
+            DeliveryState::Undelivered,
+        );
+        assert!(flipped);
+        assert_eq!(messages[&0x42][0].delivery, DeliveryState::Undelivered);
+    }
+
+    #[test]
+    fn tag_oldest_untagged_outbound_tags_the_oldest_first() {
+        let mut messages: HashMap<u8, Vec<MessageRecord>> = HashMap::new();
+        messages.insert(
+            0x42,
+            vec![
+                MessageRecord {
+                    text: "first".into(),
+                    is_ours: true,
+                    delivery: DeliveryState::Pending,
+                    ack_hash: None,
+                    ts_ms: 0,
+                },
+                MessageRecord {
+                    text: "second".into(),
+                    is_ours: true,
+                    delivery: DeliveryState::Pending,
+                    ack_hash: None,
+                    ts_ms: 1,
+                },
+            ],
+        );
+
+        // Two DMs queued back-to-back — the dispatcher raises `DmQueued`
+        // once per send, in send order, tagging the oldest untagged record
+        // each time.
+        assert!(tag_oldest_untagged_outbound(
+            &mut messages,
+            0x42,
+            [1, 1, 1, 1]
+        ));
+        assert!(tag_oldest_untagged_outbound(
+            &mut messages,
+            0x42,
+            [2, 2, 2, 2]
+        ));
+
+        let msgs = &messages[&0x42];
+        assert_eq!(msgs[0].ack_hash, Some([1, 1, 1, 1]));
+        assert_eq!(msgs[1].ack_hash, Some([2, 2, 2, 2]));
+    }
+
+    #[test]
+    fn tag_oldest_untagged_outbound_skips_already_tagged_records() {
+        let mut messages: HashMap<u8, Vec<MessageRecord>> = HashMap::new();
+        messages.insert(
+            0x42,
+            vec![MessageRecord {
+                text: "first".into(),
+                is_ours: true,
+                delivery: DeliveryState::Pending,
+                ack_hash: Some([1, 1, 1, 1]),
+                ts_ms: 0,
+            }],
+        );
+        assert!(
+            !tag_oldest_untagged_outbound(&mut messages, 0x42, [2, 2, 2, 2]),
+            "no untagged record exists — must not overwrite an existing tag"
+        );
+        assert_eq!(messages[&0x42][0].ack_hash, Some([1, 1, 1, 1]));
     }
 
     // ── roll_selection ───────────────────────────────────────────────────

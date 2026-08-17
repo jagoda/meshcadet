@@ -142,8 +142,11 @@ use firmware_core::ui::signal_meter::level_to_bars;
 // execute under `cargo test --workspace`. Each import below is grouped by
 // its firmware-core home; see that module's doc for why it landed there.
 // See `docs/adr/0005-firmware-core-extraction.md`.
-use firmware_core::ui::{mark_last_unacked_outbound, messages_insert_non_empty, roll_selection};
-pub use firmware_core::ui::MessageRecord;
+use firmware_core::ui::{
+    mark_delivery_by_ack_hash, mark_last_unacked_outbound, messages_insert_non_empty,
+    roll_selection, tag_oldest_untagged_outbound,
+};
+pub use firmware_core::ui::{DeliveryState, MessageRecord};
 use firmware_core::ui::admin_menu::{battery_display_fields_changed, notif_prefs_from_toggles};
 use firmware_core::ui::buzzer::square_wave_sample;
 use firmware_core::ui::compose::{compose_return_should_send, send_nav_deferral_elapsed};
@@ -173,20 +176,22 @@ pub enum UiEvent {
     /// An outbound DM — or, per `is_channel` below, an outbound room post —
     /// was acknowledged.
     ///
-    /// `handle_event` below flips the last unacked outbound `MessageRecord`
-    /// to `acked: true`, refreshing the ✓→✓✓ indicator. Raised by
-    /// `main.rs::match_pending_ack` when an inbound ACK (bare `Ack` frame or
-    /// one bundled in a PATH-return) matches the `PendingAck` recorded when
-    /// the DM was sent — `PendingAck` pairs the expected ack hash with the
-    /// `to_hash` this variant needs (previously `pending_ack` was a
-    /// bare `[u8; 4]` with no `to_hash`, so a matching ACK was logged but
-    /// never reached this handler).
+    /// `handle_event` below flips the outbound `MessageRecord` `ack_hash`
+    /// tags to `DeliveryState::Acked`, refreshing the ✓ (grey) → ✓ (blue)
+    /// indicator. Raised by `main.rs::match_outstanding_ack` when an inbound
+    /// ACK (bare `Ack` frame or one bundled in a PATH-return) resolves an
+    /// entry in the dispatcher's `OutstandingSends` table — that table
+    /// replaced the single-slot `PendingAck`/`RoomRuntime::pending_post_ack`
+    /// this mission retired, so more than one DM/room-post can now be
+    /// outstanding at once; `ack_hash` here is what lets `handle_event`
+    /// resolve the EXACT record via `mark_delivery_by_ack_hash` rather than
+    /// guessing the newest pending one.
     ///
-    /// `main.rs::match_room_post_ack` raises this SAME variant for a room
-    /// post's ACK (`room_message_view.rs`'s module doc: a room's posts render
-    /// through the exact same hash-keyed message view a DM's do), which is
-    /// why this needs `is_channel` at all: `self.messages` is keyed by hash
-    /// alone so `mark_last_unacked_outbound` doesn't care, but
+    /// `main.rs::match_outstanding_ack` raises this SAME variant for a room
+    /// post's ACK too (`room_message_view.rs`'s module doc: a room's posts
+    /// render through the exact same hash-keyed message view a DM's do),
+    /// which is why this needs `is_channel` at all: `self.messages` is keyed
+    /// by hash alone so the delivery-flip helpers don't care, but
     /// `refresh_message_view_for`'s live-redraw guard checks the full
     /// `(hash, is_channel)` pair against `self.active_convo` — a room's
     /// entry is `(room_hash, true)` (rooms render as `is_channel: true`, see
@@ -198,6 +203,36 @@ pub enum UiEvent {
     DmAcked {
         to_hash: u8,
         is_channel: bool,
+        ack_hash: [u8; 4],
+    },
+    /// The symmetric undelivered (red check) counterpart to `DmAcked` above
+    /// — raised by `main.rs` when an outstanding DM/room-post send's
+    /// deadline passes with no ACK (`OutstandingSends::sweep_expired`), or
+    /// its frame is evicted from the TX queue before ever reaching the wire
+    /// (`log_tx_queue_eviction` resolving a tagged eviction against the
+    /// table). Same `(to_hash, is_channel, ack_hash)` shape as `DmAcked` —
+    /// `handle_event` flips the SAME exact record to
+    /// `DeliveryState::Undelivered` instead of `Acked`.
+    DmUndelivered {
+        to_hash: u8,
+        is_channel: bool,
+        ack_hash: [u8; 4],
+    },
+    /// The dispatcher's `SendDm` handler finished building and enqueuing the
+    /// wire frame for a DM `on_send_message` already rendered optimistically
+    /// (before the dispatcher — a separate task, ADR-0012 — even saw the
+    /// command), and computed its wire ACK hash. `handle_event` tags the
+    /// OLDEST still-untagged outbound `MessageRecord` for `to_hash` with
+    /// `ack_hash` (`tag_oldest_untagged_outbound`) so a later `DmAcked` /
+    /// `DmUndelivered` for this exact send can resolve the RIGHT record —
+    /// see `firmware_core::ui::tag_oldest_untagged_outbound`'s doc for why
+    /// oldest-first tagging is the correct order. Room posts don't need this
+    /// event: their `MessageRecord` is pushed post-hoc, by `RoomPostSent`
+    /// below, already carrying its `ack_hash` — there's no optimistic bubble
+    /// to retroactively tag.
+    DmQueued {
+        to_hash: u8,
+        ack_hash: [u8; 4],
     },
     /// An outbound channel/group message was implicitly acknowledged.
     ///
@@ -206,7 +241,8 @@ pub enum UiEvent {
     /// repeated back into the mesh by another node. `handle_event` reuses the
     /// same `mark_last_unacked_outbound` the DM path uses (`self.messages` is
     /// keyed by `u8` for both contacts and channels) to flip the newest
-    /// pending outbound `MessageRecord` for `channel_hash` to `acked: true`.
+    /// pending outbound `MessageRecord` for `channel_hash` to
+    /// `DeliveryState::Acked`.
     /// Raised by `main.rs::match_pending_channel_ack` when a duplicate-
     /// detected inbound frame's dedup key matches the `PendingChannelAck`
     /// recorded when the channel message was sent.
@@ -308,9 +344,16 @@ pub enum UiEvent {
     /// confirmation event closes that gap by construction: nothing is ever
     /// shown that wasn't actually sent, so `RoomPostRefused` below never has
     /// anything to retract.
+    ///
+    /// `ack_hash` is the wire ACK hash `room_session::encode_room_post_checked`
+    /// returned for this send — unlike a DM's optimistic bubble (see
+    /// `DmQueued`'s doc), this `MessageRecord` is pushed here, AFTER the hash
+    /// is already known, so it's set directly at push time rather than
+    /// needing a separate tagging event.
     RoomPostSent {
         room_hash: u8,
         text: String,
+        ack_hash: [u8; 4],
     },
     /// A room post `on_send_message` queued was refused before reaching the
     /// radio — see `RoomPostSent`'s doc for why no optimistic bubble exists
@@ -2397,7 +2440,7 @@ impl<'d> UiRuntime<'d> {
                     .push(MessageRecord {
                         text: text.clone(),
                         is_ours: false,
-                        acked: false,
+                        delivery: DeliveryState::Pending, ack_hash: None,
                         ts_ms: now_ms,
                     });
                 // Don't flag unread if this DM thread is the one currently open —
@@ -2438,7 +2481,7 @@ impl<'d> UiRuntime<'d> {
                     .push(MessageRecord {
                         text,
                         is_ours: false,
-                        acked: false,
+                        delivery: DeliveryState::Pending, ack_hash: None,
                         ts_ms: now_ms,
                     });
                 // Same "already reading it" guard as the DM branch above.
@@ -2486,7 +2529,7 @@ impl<'d> UiRuntime<'d> {
                     .push(MessageRecord {
                         text,
                         is_ours: false,
-                        acked: false,
+                        delivery: DeliveryState::Pending, ack_hash: None,
                         ts_ms: now_ms,
                     });
                 if let ActiveScreen::ContactList(ref screen) = self.active_screen {
@@ -2505,7 +2548,7 @@ impl<'d> UiRuntime<'d> {
                     .push(MessageRecord {
                         text,
                         is_ours: false,
-                        acked: false,
+                        delivery: DeliveryState::Pending, ack_hash: None,
                         ts_ms: now_ms,
                     });
                 if incoming_message_is_unread(self.active_convo, room_hash, true) {
@@ -2553,19 +2596,24 @@ impl<'d> UiRuntime<'d> {
                     }
                 }
             }
-            UiEvent::RoomPostSent { room_hash, text } => {
+            UiEvent::RoomPostSent { room_hash, text, ack_hash } => {
                 // The dispatcher confirmed this post actually reached the
                 // wire — only now does `on_send_message`'s queued room post
                 // get its bubble. See this variant's own doc + this
                 // mission's Objective (`meshcadet-room-post-refusal-
                 // surface`) for why it isn't rendered any earlier.
+                //
+                // `ack_hash` is already known at push time (unlike a DM's
+                // optimistic bubble — see `DmQueued`'s doc), so it's set
+                // directly here rather than needing a separate tagging step.
                 self.messages
                     .entry(room_hash)
                     .or_default()
                     .push(MessageRecord {
                         text,
                         is_ours: true,
-                        acked: false,
+                        delivery: DeliveryState::Pending,
+                        ack_hash: Some(ack_hash),
                         ts_ms: now_ms,
                     });
                 if let ActiveScreen::ContactList(ref screen) = self.active_screen {
@@ -2596,7 +2644,7 @@ impl<'d> UiRuntime<'d> {
                     .push(MessageRecord {
                         text: format!("System: {reason}"),
                         is_ours: false,
-                        acked: false,
+                        delivery: DeliveryState::Pending, ack_hash: None,
                         ts_ms: now_ms,
                     });
                 if let ActiveScreen::ContactList(ref screen) = self.active_screen {
@@ -2607,16 +2655,55 @@ impl<'d> UiRuntime<'d> {
                 }
                 self.refresh_message_view_for(room_hash, true);
             }
-            UiEvent::DmAcked { to_hash, is_channel } => {
-                // Mark the last outbound message to this contact (or room —
-                // see the variant's doc) as acked.
-                mark_last_unacked_outbound(&mut self.messages, to_hash);
+            UiEvent::DmAcked { to_hash, is_channel, ack_hash } => {
+                // Exact-match the record this specific ACK refers to
+                // (`mark_delivery_by_ack_hash`) — falling back to the
+                // "newest pending" heuristic only if nothing was tagged
+                // with this hash (a dropped `DmQueued`/`RoomPostSent`-race
+                // edge case; see `mark_delivery_by_ack_hash`'s doc for why
+                // exactness matters here and `mark_last_unacked_outbound`'s
+                // for why the fallback is still sound as a last resort).
+                if !mark_delivery_by_ack_hash(&mut self.messages, to_hash, ack_hash, DeliveryState::Acked) {
+                    mark_last_unacked_outbound(&mut self.messages, to_hash);
+                }
                 self.notif.fire(NotifEvent::DmAcked, now_ms, self.screen_asleep);
                 // Refresh the live MessageView so the ✓→✓✓ indicator updates
                 // immediately. Must pass the SAME `is_channel` the view was
                 // opened with (`self.active_convo`'s pair) or this is a
                 // silent no-op — see the variant's doc.
                 self.refresh_message_view_for(to_hash, is_channel);
+            }
+            UiEvent::DmUndelivered { to_hash, is_channel, ack_hash } => {
+                // Same exact-match-then-fallback resolution as `DmAcked`
+                // above, flipping to `Undelivered` (red) instead of `Acked`
+                // (blue) — see this variant's own doc for the two mechanisms
+                // that raise it (deadline timeout, TX-queue eviction).
+                if !mark_delivery_by_ack_hash(
+                    &mut self.messages, to_hash, ack_hash, DeliveryState::Undelivered,
+                ) {
+                    // No exact tag matched (dropped `DmQueued`/`RoomPostSent`
+                    // edge case) — fall back to the newest still-pending
+                    // record for this contact/room, same last-resort
+                    // reasoning as `DmAcked`'s fallback.
+                    if let Some(msgs) = self.messages.get_mut(&to_hash) {
+                        if let Some(m) = msgs.iter_mut().rev().find(|m| {
+                            m.is_ours && m.delivery == DeliveryState::Pending
+                        }) {
+                            m.delivery = DeliveryState::Undelivered;
+                        }
+                    }
+                }
+                // Deliberately no `notif.fire`/tone — an undelivered send is
+                // a silent, visual-only signal (the red check itself), not
+                // an event worth an audible/visual notification burst.
+                self.refresh_message_view_for(to_hash, is_channel);
+            }
+            UiEvent::DmQueued { to_hash, ack_hash } => {
+                // Tag the oldest still-untagged outbound DM record for this
+                // contact with its now-known wire ACK hash — see this
+                // variant's own doc for why oldest-first tagging is correct
+                // and why room posts don't need this event at all.
+                tag_oldest_untagged_outbound(&mut self.messages, to_hash, ack_hash);
             }
             UiEvent::ChannelAcked { channel_hash } => {
                 // Mark the last outbound message to this channel as acked —
@@ -2637,7 +2724,7 @@ impl<'d> UiRuntime<'d> {
                 self.messages
                     .entry(from_hash)
                     .or_default()
-                    .push(MessageRecord { text, is_ours: false, acked: false, ts_ms: now_ms });
+                    .push(MessageRecord { text, is_ours: false, delivery: DeliveryState::Pending, ack_hash: None, ts_ms: now_ms });
                 self.notif.fire(NotifEvent::TelemetryResponse, now_ms, self.screen_asleep);
                 // Refresh the live MessageView if this contact's conversation is currently open.
                 self.refresh_message_view_for(from_hash, false);
@@ -2795,7 +2882,7 @@ impl<'d> UiRuntime<'d> {
                 .push(MessageRecord {
                     text: "System: send queue is busy — try again in a moment".to_string(),
                     is_ours: false,
-                    acked: false,
+                    delivery: DeliveryState::Pending, ack_hash: None,
                     ts_ms: now_ms,
                 });
             if let ActiveScreen::ContactList(ref screen) = self.active_screen {
@@ -2894,7 +2981,13 @@ impl<'d> UiRuntime<'d> {
                 .push(MessageRecord {
                     text: text.clone(),
                     is_ours: true,
-                    acked: false,
+                    delivery: DeliveryState::Pending,
+                    // `ack_hash: None` here even for a DM: the dispatcher
+                    // hasn't built the wire frame yet, so the hash isn't
+                    // known until `UiEvent::DmQueued` tags this record
+                    // retroactively (see that variant's doc). Stays `None`
+                    // forever for a channel send — no wire ACK to tag with.
+                    ack_hash: None,
                     ts_ms: 0, // filled in by dispatcher
                 });
             if is_channel {

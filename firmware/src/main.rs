@@ -229,7 +229,10 @@ static ROOM_CLOCK_SOURCE: std::sync::Mutex<room_session::ClockSource> =
     std::sync::Mutex::new(room_session::ClockSource::None);
 
 use battery::BatteryDriver;
-use dispatcher::{AirtimeBudget, DuplicateFilter, TxQueue, lora_airtime_ms, tx_guard_allows};
+use dispatcher::{
+    AirtimeBudget, DELIVERY_ACK_DEADLINE_MS, DuplicateFilter, OutstandingKind, OutstandingSend,
+    OutstandingSends, TxQueue, lora_airtime_ms, tx_guard_allows,
+};
 use gps::GpsDriver;
 use radio::Radio;
 use signal_tracker::{SignalConfig, SignalLevel, SignalTracker};
@@ -262,21 +265,20 @@ macro_rules! rx_diag {
 const TX_INTERVAL_MS: u64 = 30_000;
 
 // ── Pending outbound ACK ──────────────────────────────────────────────────────
-
-/// The ACK hash we're waiting for on our most-recently-sent DM, together with
-/// the contact it was sent to.
-///
-/// Before this, the dispatcher tracked only the bare `[u8; 4]` ack hash — the
-/// value needed to recognise a matching inbound ACK/PATH-return, but nothing
-/// tying it back to *which contact's* pending message it belongs to. That was
-/// enough to log "ACK received: matches last-sent DM" but not enough to raise
-/// `ui::UiEvent::DmAcked { to_hash }`, which needs `to_hash` to find the right
-/// `MessageRecord` to flip in `UiRuntime::handle_event`. Pairing `to_hash`
-/// alongside the hash here at enqueue time is what closes that gap.
-struct PendingAck {
-    hash: [u8; 4],
-    to_hash: u8,
-}
+//
+// DM and room-post delivery tracking (the two ACKed send paths) now lives in
+// `dispatcher::OutstandingSends` — a fixed-size table keyed by wire ACK hash,
+// replacing what used to be two single-slot trackers here: a bare
+// `PendingAck { hash, to_hash }` for the DM path, and
+// `RoomRuntime::pending_post_ack: Option<[u8; 4]>` for the room-post path.
+// Both assumed only ONE outstanding send of their kind at a time (the
+// invariant `firmware_core::ui::mark_last_unacked_outbound`'s doc used to
+// document) — replaced so two DMs (or a DM and a room post) in flight
+// concurrently each track and resolve independently. See
+// `dispatcher::OutstandingSends`'s own doc for the table and
+// `main.rs::match_outstanding_ack` for the one shared ACK-resolution call
+// site (bare `Ack` datagram AND PATH-return-bundled `PathExtra::Ack` both
+// call it — see that function's doc for why that matters).
 
 // ── Pending outbound channel (GRP_TXT) ack ────────────────────────────────────
 
@@ -294,8 +296,11 @@ struct PendingAck {
 /// this struct reuses that exact key to recognise WHICH duplicate was our own
 /// pending send, rather than adding a second, parallel tracker.
 ///
-/// Single-slot, same known limitation as `PendingAck` above: only the most
-/// recently sent channel message's ack is ever recognised live.
+/// Single-slot — only the most recently sent channel message's ack is ever
+/// recognised live. Channel/GRP_TXT sends are out of this mission's
+/// Objective scope (no wire ACK to correlate against a table entry by), so
+/// this stays a single slot unlike the DM/room-post paths, which moved to
+/// `dispatcher::OutstandingSends` (see the section above).
 struct PendingChannelAck {
     hash: [u8; 4],
     channel_hash: u8,
@@ -387,11 +392,6 @@ struct RoomRuntime {
     /// otherwise).
     #[cfg_attr(feature = "hil", allow(dead_code))]
     sync_phase: room_session::RoomSyncPhase,
-    /// The ACK hash expected back for this room's one in-flight POST, if
-    /// any — Phase A's "the post round-trips and its ACK is matched"
-    /// acceptance bullet. `None` when no post is outstanding.
-    #[cfg_attr(feature = "hil", allow(dead_code))]
-    pending_post_ack: Option<[u8; 4]>,
     /// The ACK hash expected back for this room's one in-flight keep-alive,
     /// if any. `None` when no keep-alive is outstanding.
     #[cfg_attr(feature = "hil", allow(dead_code))]
@@ -1174,7 +1174,6 @@ fn run() -> anyhow::Result<()> {
                                             last_reflood_ms: 0,
                                             reflood_attempts: 0,
                                             sync_phase: room_session::RoomSyncPhase::new_after_login(uptime_ms()),
-                                            pending_post_ack: None,
                                             pending_keep_alive_ack: None,
                                             keep_alive_stall: room_session::RoomKeepAliveStall::new(),
                                             // The boot-time login below is itself
@@ -1615,7 +1614,27 @@ fn run() -> anyhow::Result<()> {
                                     // bit (`protocol::history_region::FLAG_ACKED`);
                                     // restore it as-is so the checkmark matches
                                     // whatever it showed before the power cycle.
-                                    acked,
+                                    //
+                                    // `Undelivered` (red) is never restored here — the
+                                    // flash slot only ever persists a 2-state ack bit
+                                    // (`acked`), and the dispatcher's outstanding-sends
+                                    // table that would know a send timed out or was
+                                    // evicted is in-memory only and empty again fresh
+                                    // off a reboot. A message that was red when the
+                                    // device powered off simply restores as `Pending`
+                                    // — no worse than the pre-tri-state behavior, which
+                                    // had no red state to lose at all.
+                                    delivery: if acked { ui::DeliveryState::Acked } else { ui::DeliveryState::Pending },
+                                    // `None`: the dispatcher's outstanding-sends table
+                                    // (and the wire ACK hash a live entry would carry)
+                                    // is in-memory only and starts empty every boot —
+                                    // there is no ack_hash left to restore from flash.
+                                    // A DM record restored here that was genuinely
+                                    // still pending pre-reboot simply stays `Pending`
+                                    // forever (matches the pre-tri-state "acked=false
+                                    // never re-checked" restore behavior — not a
+                                    // regression this mission introduces).
+                                    ack_hash: None,
                                     // NOTE: unused for rendering today (no message
                                     // view shows a timestamp — see `MessageRecord::
                                     // ts_ms`'s own doc comment). A future "time
@@ -1694,7 +1713,7 @@ fn run() -> anyhow::Result<()> {
     // hop>=1 packet is recorded by the RX-poll tap below.
     let mut signal_tracker = SignalTracker::new(SignalConfig::default());
 
-    let mut pending_ack: Option<PendingAck> = None;
+    let mut outstanding = OutstandingSends::new();
     let mut pending_channel_ack: Option<PendingChannelAck> = None;
 
     // ADR-0012 C4: per-iteration state snapshots become change-detected
@@ -1873,7 +1892,12 @@ fn run() -> anyhow::Result<()> {
                 &room.guest_password[..room.guest_password_len as usize],
                 &mut frame,
             );
-            log_tx_queue_eviction(txq.enqueue(&frame[..n]), "room login");
+            log_tx_queue_eviction(
+                txq.enqueue(&frame[..n], None),
+                "room login",
+                &mut outstanding,
+                |ev| send_ui_event(&evt_tx, &mut evt_dropped, ev),
+            );
             room.login_sent = true;
             room.session.record_sent_timestamp(boot_ts);
             // `meshcadet-room-ts-watermark-write-behind`: persist the
@@ -1931,6 +1955,24 @@ fn run() -> anyhow::Result<()> {
         // stall deeper in the loop (SPI/BUSY wait, crypto, NVS write) is
         // bounded by the TWDT timeout.
         unsafe { esp_idf_svc::sys::esp_task_wdt_reset(); }
+
+        // ── Outstanding-sends deadline sweep ──────────────────────────────────
+        // Every DM/room-post send whose `DELIVERY_ACK_DEADLINE_MS` has
+        // passed with no ACK is resolved to undelivered (red check) here —
+        // this is the ONLY place a send times out rather than sitting
+        // pending forever (a TX-queue eviction is the other undelivered
+        // path, resolved inline at each `log_tx_queue_eviction`/
+        // `insert_outstanding` call site instead). Bounded by
+        // `MAX_OUTSTANDING_SENDS` (8 slots), so scanning it every iteration
+        // is cheap — same cost class as `TxQueue::has_pending()`'s own
+        // per-iteration check just below.
+        outstanding.sweep_expired(now, |send| {
+            log::warn!(
+                "outstanding send timed out with no ACK ({:?}, ack {}) — marking undelivered",
+                send.kind, hex4(&send.ack_hash),
+            );
+            send_ui_event(&evt_tx, &mut evt_dropped, delivery_event(send, false));
+        });
 
         // ── GPS poll (duty-cycle NMEA read + fix cache refresh) ──────────────
         #[cfg(feature = "diagnostics")]
@@ -2104,8 +2146,22 @@ fn run() -> anyhow::Result<()> {
             if let Some((n, ack)) =
                 build_test_dm(now, tx_epoch_base, &identity, &peer_pubkey, &shared_secret, &mut frame_buf)
             {
-                log_tx_queue_eviction(txq.enqueue(&frame_buf[..n]), "test DM");
-                pending_ack = Some(PendingAck { hash: ack, to_hash: peer_pubkey[0] });
+                log_tx_queue_eviction(
+                    txq.enqueue(&frame_buf[..n], Some(ack)),
+                    "test DM",
+                    &mut outstanding,
+                    |ev| send_ui_event(&evt_tx, &mut evt_dropped, ev),
+                );
+                insert_outstanding(
+                    &mut outstanding,
+                    OutstandingSend {
+                        ack_hash: ack,
+                        kind: OutstandingKind::Dm { to_hash: peer_pubkey[0] },
+                        sent_at_ms: now,
+                        deadline_ms: now + DELIVERY_ACK_DEADLINE_MS,
+                    },
+                    |ev| send_ui_event(&evt_tx, &mut evt_dropped, ev),
+                );
                 log::debug!(
                     "dispatcher: enqueued TEST DM ({} bytes), expecting ack {}",
                     n,
@@ -2216,7 +2272,12 @@ fn run() -> anyhow::Result<()> {
                     &room.guest_password[..room.guest_password_len as usize],
                     &mut frame,
                 );
-                log_tx_queue_eviction(txq.enqueue(&frame[..n]), "room re-flood login");
+                log_tx_queue_eviction(
+                    txq.enqueue(&frame[..n], None),
+                    "room re-flood login",
+                    &mut outstanding,
+                    |ev| send_ui_event(&evt_tx, &mut evt_dropped, ev),
+                );
                 room.session.record_sent_timestamp(ts);
                 // `meshcadet-room-ts-watermark-write-behind`: same
                 // write-through as the boot login above — a reflood is
@@ -2380,7 +2441,12 @@ fn run() -> anyhow::Result<()> {
                 &mut frame,
             ) {
                 Some(n) => {
-                    log_tx_queue_eviction(txq.enqueue(&frame[..n]), "room keep-alive");
+                    log_tx_queue_eviction(
+                        txq.enqueue(&frame[..n], None),
+                        "room keep-alive",
+                        &mut outstanding,
+                        |ev| send_ui_event(&evt_tx, &mut evt_dropped, ev),
+                    );
                     room.pending_keep_alive_ack = Some(protocol::room::keep_alive_ack_hash(
                         ts,
                         force_since,
@@ -2677,7 +2743,7 @@ fn run() -> anyhow::Result<()> {
                             &identity,
                             &policy,
                             channel_secret,
-                            &mut pending_ack,
+                            &mut outstanding,
                             &mut txq,
                             gps_snapshot,
                             battery_snapshot,
@@ -2691,7 +2757,7 @@ fn run() -> anyhow::Result<()> {
                             &mut adopted_server_clock,
                         );
                         // Persist any DM ack flip to flash so it survives a
-                        // power-cycle — before this fix, `match_pending_ack`
+                        // power-cycle — before this fix, ACK matching
                         // (reached from both a bare ACK frame and a bundled
                         // PATH-return ACK) only raised `UiEvent::DmAcked` for
                         // the live in-memory UI/radio state; the flash-side
@@ -2711,7 +2777,7 @@ fn run() -> anyhow::Result<()> {
                             // rooms mirror a DM's history representation),
                             // so this persist step is correct for both
                             // shapes `DmAcked` now carries.
-                            if let ui::UiEvent::DmAcked { to_hash, is_channel: _ } = ev {
+                            if let ui::UiEvent::DmAcked { to_hash, is_channel: _, ack_hash: _ } = ev {
                                 let mut guard =
                                     HISTORY.lock().expect("HISTORY mutex should not be poisoned");
                                 if let Some(hs) = guard.as_mut() {
@@ -2951,8 +3017,32 @@ fn run() -> anyhow::Result<()> {
                                     text.as_bytes(), &mut frame_buf,
                                 ) {
                                     Some((n, ack)) => {
-                                        log_tx_queue_eviction(txq.enqueue(&frame_buf[..n]), "UI DM");
-                                        pending_ack = Some(PendingAck { hash: ack, to_hash });
+                                        log_tx_queue_eviction(
+                                            txq.enqueue(&frame_buf[..n], Some(ack)),
+                                            "UI DM",
+                                            &mut outstanding,
+                                            |ev| send_ui_event(&evt_tx, &mut evt_dropped, ev),
+                                        );
+                                        insert_outstanding(
+                                            &mut outstanding,
+                                            OutstandingSend {
+                                                ack_hash: ack,
+                                                kind: OutstandingKind::Dm { to_hash },
+                                                sent_at_ms: now,
+                                                deadline_ms: now + DELIVERY_ACK_DEADLINE_MS,
+                                            },
+                                            |ev| send_ui_event(&evt_tx, &mut evt_dropped, ev),
+                                        );
+                                        // Tag the optimistic bubble
+                                        // `on_send_message` already pushed
+                                        // (UI-side, before the dispatcher
+                                        // even saw this command) with the
+                                        // hash now that it's known — see
+                                        // `UiEvent::DmQueued`'s doc.
+                                        send_ui_event(
+                                            &evt_tx, &mut evt_dropped,
+                                            ui::UiEvent::DmQueued { to_hash, ack_hash: ack },
+                                        );
                                         log::info!(
                                             "TX UI DM to 0x{:02x}: {:?} ({} bytes)",
                                             to_hash, text, n,
@@ -3015,7 +3105,12 @@ fn run() -> anyhow::Result<()> {
                                 now, tx_epoch_base, channel_secret,
                                 sender_name.as_bytes(), text.as_bytes(), &mut frame_buf,
                             );
-                            log_tx_queue_eviction(txq.enqueue(&frame_buf[..n]), "UI channel message");
+                            log_tx_queue_eviction(
+                                txq.enqueue(&frame_buf[..n], None),
+                                "UI channel message",
+                                &mut outstanding,
+                                |ev| send_ui_event(&evt_tx, &mut evt_dropped, ev),
+                            );
                             // Record the dedup key of this send so a later heard repeat
                             // (this exact frame flooded back into the mesh by another
                             // node) can be recognised as the implicit channel ack —
@@ -3117,8 +3212,22 @@ fn run() -> anyhow::Result<()> {
                                         &mut frame_buf,
                                     ) {
                                         Ok((n, ack)) => {
-                                            log_tx_queue_eviction(txq.enqueue(&frame_buf[..n]), "room post");
-                                            room.pending_post_ack = Some(ack);
+                                            log_tx_queue_eviction(
+                                                txq.enqueue(&frame_buf[..n], Some(ack)),
+                                                "room post",
+                                                &mut outstanding,
+                                                |ev| send_ui_event(&evt_tx, &mut evt_dropped, ev),
+                                            );
+                                            insert_outstanding(
+                                                &mut outstanding,
+                                                OutstandingSend {
+                                                    ack_hash: ack,
+                                                    kind: OutstandingKind::RoomPost { room_hash: room.hash },
+                                                    sent_at_ms: now,
+                                                    deadline_ms: now + DELIVERY_ACK_DEADLINE_MS,
+                                                },
+                                                |ev| send_ui_event(&evt_tx, &mut evt_dropped, ev),
+                                            );
                                             room.session.record_sent_timestamp(candidate_ts);
                                             // `meshcadet-room-post-watermark-persist`: same
                                             // write-through as the boot/reflood login and
@@ -3184,6 +3293,7 @@ fn run() -> anyhow::Result<()> {
                                             send_ui_event(&evt_tx, &mut evt_dropped, ui::UiEvent::RoomPostSent {
                                                 room_hash: room.hash,
                                                 text,
+                                                ack_hash: ack,
                                             });
                                         }
                                         Err(e) => {
@@ -3306,6 +3416,25 @@ fn build_ack_frame(ack_hash: &[u8; 4], out: &mut [u8]) -> usize {
     6
 }
 
+/// Map a resolved [`OutstandingSend`] to the `ui::UiEvent` that flips its
+/// `MessageRecord` — `DmAcked` for a delivered send, `DmUndelivered` for one
+/// whose deadline passed or whose frame was evicted before ever reaching the
+/// wire. `OutstandingKind::RoomPost` maps to the SAME event shape as
+/// `OutstandingKind::Dm`, just with `is_channel: true` and `to_hash` set to
+/// the room's hash — see `ui::UiEvent::DmAcked`'s doc for why a room post
+/// rides the DM event rather than a bespoke one.
+fn delivery_event(send: OutstandingSend, delivered: bool) -> ui::UiEvent {
+    let (to_hash, is_channel) = match send.kind {
+        OutstandingKind::Dm { to_hash } => (to_hash, false),
+        OutstandingKind::RoomPost { room_hash } => (room_hash, true),
+    };
+    if delivered {
+        ui::UiEvent::DmAcked { to_hash, is_channel, ack_hash: send.ack_hash }
+    } else {
+        ui::UiEvent::DmUndelivered { to_hash, is_channel, ack_hash: send.ack_hash }
+    }
+}
+
 /// Log the eviction `TxQueue::enqueue` just reported (if any) — a full queue
 /// silently dropping the oldest pending frame is otherwise invisible: the
 /// call site's own "TX ... queued" log fires unconditionally right after,
@@ -3313,12 +3442,56 @@ fn build_ack_frame(ack_hash: &[u8; 4], out: &mut [u8]) -> usize {
 /// indistinguishable in the log. `what` names the frame that was just queued
 /// (the caller's own "TX ... queued" wording), for context on what pushed the
 /// queue over the edge.
-fn log_tx_queue_eviction(dropped: Option<usize>, what: &str) {
-    if let Some(dropped_len) = dropped {
+///
+/// If the evicted frame was tagged (a DM or room-post send `outstanding` was
+/// tracking), resolves it against `outstanding` and hands the resulting
+/// undelivered event to `emit` — a full TX queue silently dropping a frame
+/// before it ever reaches the wire is exactly as terminal for that send as a
+/// deadline timeout, so it must land in the same red/undelivered state
+/// rather than being left pending forever (this mission's Objective). `emit`
+/// is a closure rather than a fixed `&mut Vec<ui::UiEvent>` / `SyncSender`
+/// pair so this one function serves both calling conventions this file
+/// uses: `run()`'s own body sends straight to `evt_tx`, while the RX-handler
+/// functions (`handle_dm`, `handle_req`, `handle_room_push_frame`) batch into
+/// a `Vec<ui::UiEvent>` forwarded afterward.
+fn log_tx_queue_eviction(
+    dropped: Option<(usize, Option<[u8; 4]>)>,
+    what: &str,
+    outstanding: &mut OutstandingSends,
+    mut emit: impl FnMut(ui::UiEvent),
+) {
+    let Some((dropped_len, tag)) = dropped else {
+        return;
+    };
+    log::warn!(
+        "TX queue full: dropped a pending {}-byte frame to make room for {}",
+        dropped_len, what,
+    );
+    if let Some(send) = outstanding.resolve_evicted(tag) {
         log::warn!(
-            "TX queue full: dropped a pending {}-byte frame to make room for {}",
-            dropped_len, what,
+            "TX queue eviction dropped an outstanding {:?} send (ack {}) — marking undelivered",
+            send.kind, hex4(&send.ack_hash),
         );
+        emit(delivery_event(send, false));
+    }
+}
+
+/// Record a freshly-enqueued DM/room-post ACKed send in `outstanding`. If the
+/// table was already full, the oldest entry it evicted to make room is
+/// resolved to undelivered and handed to `emit` — same "an entry bumped out
+/// has just as definitively lost its chance to ever be matched" reasoning as
+/// a TX-queue eviction (see `log_tx_queue_eviction`'s doc).
+fn insert_outstanding(
+    outstanding: &mut OutstandingSends,
+    send: OutstandingSend,
+    mut emit: impl FnMut(ui::UiEvent),
+) {
+    if let Some(evicted) = outstanding.insert(send) {
+        log::warn!(
+            "outstanding-sends table full: evicted oldest entry ({:?}, ack {}) to make room",
+            evicted.kind, hex4(&evicted.ack_hash),
+        );
+        emit(delivery_event(evicted, false));
     }
 }
 
@@ -3573,7 +3746,7 @@ fn on_receive(
     our_id: &Identity,
     policy: &PolicyFilter,
     channel_secret: Option<&[u8]>,
-    pending_ack: &mut Option<PendingAck>,
+    outstanding: &mut OutstandingSends,
     txq: &mut TxQueue,
     gps_snapshot: Option<(i32, i32, u32)>,
     battery_snapshot: battery::BatteryStatus,
@@ -3629,6 +3802,7 @@ fn on_receive(
                     our_id,
                     room,
                     txq,
+                    outstanding,
                     ui_events,
                     nvs_partition.clone(),
                     contact_display_names,
@@ -3640,15 +3814,15 @@ fn on_receive(
                 }
             }
             handle_dm(
-                payload, our_id, policy, txq, gps_snapshot, now_ms, tx_epoch_base, ui_events,
-                nvs_partition.clone(),
+                payload, our_id, policy, txq, outstanding, gps_snapshot, now_ms, tx_epoch_base,
+                ui_events, nvs_partition.clone(),
             )
         }
         x if x == PayloadType::Req as u8 => {
-            handle_req(payload, our_id, policy, txq, gps_snapshot, battery_snapshot)
+            handle_req(payload, our_id, policy, txq, outstanding, ui_events, gps_snapshot, battery_snapshot)
         }
         x if x == PayloadType::Ack as u8 => {
-            handle_ack(payload, pending_ack, room_runtime, ui_events, now_ms)
+            handle_ack(payload, outstanding, room_runtime, ui_events, now_ms)
         }
         x if x == PayloadType::Response as u8 => {
             // A direct RESPONSE datagram: the non-flood room-login-reply leg
@@ -3679,7 +3853,7 @@ fn on_receive(
                 payload,
                 our_id,
                 policy,
-                pending_ack,
+                outstanding,
                 ui_events,
                 room_runtime,
                 nvs_partition,
@@ -3786,12 +3960,14 @@ fn append_history(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[cfg_attr(feature = "hil", allow(unused_variables))]
 fn handle_dm(
     payload: &[u8],
     our_id: &Identity,
     policy: &PolicyFilter,
     txq: &mut TxQueue,
+    outstanding: &mut OutstandingSends,
     gps_snapshot: Option<(i32, i32, u32)>,
     now_ms: u64,
     tx_epoch_base: u32,
@@ -3919,7 +4095,12 @@ fn handle_dm(
                     // Telemetry enabled: build and enqueue a location reply DM.
                     match build_telemetry_reply(now_ms, tx_epoch_base, our_id, contact_pubkey, gps_snapshot) {
                         Some((reply_frame, reply_len)) => {
-                            log_tx_queue_eviction(txq.enqueue(&reply_frame[..reply_len]), "telemetry reply");
+                            log_tx_queue_eviction(
+                                txq.enqueue(&reply_frame[..reply_len], None),
+                                "telemetry reply",
+                                outstanding,
+                                |ev| ui_events.push(ev),
+                            );
                             match gps_snapshot {
                                 Some((_, _, age_secs)) => log::info!(
                                     "TX telemetry reply to 0x{:02x}: location (age={}s)",
@@ -3943,7 +4124,12 @@ fn handle_dm(
             // fingerprint) — reused here rather than recomputed.
             let mut ack_frame = [0u8; 8];
             let n = build_ack_frame(&ack, &mut ack_frame);
-            log_tx_queue_eviction(txq.enqueue(&ack_frame[..n]), "DM ACK");
+            log_tx_queue_eviction(
+                txq.enqueue(&ack_frame[..n], None),
+                "DM ACK",
+                outstanding,
+                |ev| ui_events.push(ev),
+            );
             log::info!("TX ACK queued for 0x{:02x}: ack_hash={}", raw_src, hex4(&ack));
         }
         Err(protocol::CodecError::MacMismatch) => {
@@ -3977,11 +4163,14 @@ fn handle_dm(
 /// A non-enabled contact's request is silently dropped (no RESPONSE), preserving
 /// the "still dropped for non-enabled contacts" half of the acceptance contract.
 /// Unlike a DM, a REQ is not ACKed — MeshCore answers it with a RESPONSE only.
+#[allow(clippy::too_many_arguments)]
 fn handle_req(
     payload: &[u8],
     our_id: &Identity,
     policy: &PolicyFilter,
     txq: &mut TxQueue,
+    outstanding: &mut OutstandingSends,
+    ui_events: &mut Vec<ui::UiEvent>,
     gps_snapshot: Option<(i32, i32, u32)>,
     battery_snapshot: battery::BatteryStatus,
 ) {
@@ -4054,7 +4243,12 @@ fn handle_req(
             let gps = gps_snapshot.map(|(lat_e7, lon_e7, _age)| (lat_e7, lon_e7));
             match build_telemetry_response(our_id, contact_pubkey, req.tag, gps, battery_snapshot) {
                 Some((resp_frame, resp_len)) => {
-                    log_tx_queue_eviction(txq.enqueue(&resp_frame[..resp_len]), "telemetry RESPONSE");
+                    log_tx_queue_eviction(
+                        txq.enqueue(&resp_frame[..resp_len], None),
+                        "telemetry RESPONSE",
+                        outstanding,
+                        |ev| ui_events.push(ev),
+                    );
                     log::info!(
                         "TX telemetry RESPONSE to 0x{:02x} (tag={:#010x}): {}, battery={}%{}",
                         raw_src,
@@ -4078,60 +4272,59 @@ fn handle_req(
     }
 }
 
-/// Match an inbound 4-byte ACK hash against any room's outstanding
-/// `pending_post_ack` (Phase A post-send). Shared by both shapes a room
-/// post's ACK can arrive in: a bare `Ack` datagram (`handle_ack`) and an ACK
-/// bundled inside a PATH-return (`handle_path_return`'s `PathExtra::Ack`
-/// arm). A room post is sent flood-routed
-/// (`room_session::encode_room_post_checked`'s `RouteType::Flood`), so the
-/// responder often doesn't have a return route yet and teaches one back by
-/// bundling the ACK inside a PATH-return — the exact same "teach the route
-/// while replying" mechanism the flood-login's bundled `PathExtra::Response`
-/// uses (see `handle_path_return`'s doc). Before this fix only the bare-`Ack`
-/// shape ever consulted `room_runtime`; a post ACK arriving bundled fell
-/// through to `match_pending_ack`'s DM slot, found nothing pending, and was
-/// logged-and-dropped (`main.rs`'s `ACK received (no pending DM)` line) —
-/// the delivery check never flipped.
+/// Compare an inbound ACK hash (bare `Ack` frame, `handle_ack`; or bundled
+/// inside a PATH-return, `handle_path_return`'s `PathExtra::Ack` arm)
+/// against `outstanding`'s outstanding-sends table. BOTH dispatch sites that
+/// can receive an ACK call this SAME function — see
+/// `flight-manuals/library/dual-path-event-matcher-gap.md`: the room-post
+/// delivery-ack defect this table replaces was exactly a matcher wired into
+/// only ONE of those two call sites (a room post is sent flood-routed,
+/// `room_session::encode_room_post_checked`'s `RouteType::Flood`, so the
+/// responder often has no return route yet and teaches one back by bundling
+/// its ACK inside a PATH-return rather than sending a bare `Ack` — the exact
+/// "teach the route while replying" mechanism the flood-login's bundled
+/// `PathExtra::Response` uses too). Collapsing DM and room-post tracking
+/// into one table with one lookup here is what makes that class of bug
+/// structurally unreachable: there is no second matcher for a future
+/// call site to forget to wire up.
 ///
-/// On a match, clears `pending_post_ack` and raises `UiEvent::DmAcked` with
-/// `is_channel: true` (mirrors `DmAcked`'s "flip the sent-message checkmark",
-/// reusing that same UiEvent since a room's posts render through the exact
-/// same hash-keyed message view a DM's do — see `room_message_view.rs`'s
-/// module doc; `is_channel: true` is what lets the live-redraw guard in
-/// `UiRuntime::handle_event` find the room's currently-open MessageView
-/// rather than silently no-op — see `UiEvent::DmAcked`'s own doc). Room
-/// *keep-alive* ACKs are NOT matched here: a keep-alive is sent route-direct
-/// over an already-learned path (`room_session::encode_room_direct_prefix`'s
-/// doc), so its reply is always a bare `Ack`, never a PATH-return — that
-/// match stays local to `handle_ack`.
-#[cfg_attr(feature = "hil", allow(unused_variables))]
-fn match_room_post_ack(
-    got: [u8; 4],
-    room_runtime: &mut [RoomRuntime],
-    ui_events: &mut Vec<ui::UiEvent>,
-) -> bool {
-    #[cfg(not(feature = "hil"))]
-    for room in room_runtime.iter_mut() {
-        if room.pending_post_ack == Some(got) {
-            room.pending_post_ack = None;
-            log::info!("RX room post ACK for 0x{:02x}: matched", room.hash);
-            ui_events.push(ui::UiEvent::DmAcked { to_hash: room.hash, is_channel: true });
-            return true;
+/// Returns `true` if an outstanding entry matched `got` (resolved and
+/// evented); `false` otherwise. A bare `bool` rather than logging the
+/// non-match case itself: `handle_ack`'s caller still has its own keep-alive
+/// fallback to try before it's truly a "nothing matched" outcome, so ONLY
+/// the caller that's actually last in its own fallback chain is in a
+/// position to log that — same division of responsibility the old
+/// `match_room_post_ack` (bool, no log) / `match_pending_ack` (the true
+/// final fallback, DOES log) pair drew, just collapsed onto one table.
+#[must_use]
+fn match_outstanding_ack(got: [u8; 4], outstanding: &mut OutstandingSends, ui_events: &mut Vec<ui::UiEvent>) -> bool {
+    match outstanding.resolve(got) {
+        Some(send) => {
+            log::info!(
+                "ACK received: matches outstanding {:?} (ack_hash={})",
+                send.kind, hex4(&got),
+            );
+            ui_events.push(delivery_event(send, true));
+            true
         }
+        None => false,
     }
-    false
 }
 
-/// Match an inbound ACK against the pending ACK for our last-sent DM, OR —
-/// checked first, before falling through to the DM slot — a room's
-/// in-flight post ([`match_room_post_ack`]) or keep-alive ACK (Phase C). A
-/// room keep-alive ACK additionally carries the appended unsynced-count byte
-/// (`payload[4]`) that closes Phase D's drain window — see
-/// `firmware_core::room_session::RoomSyncPhase::on_keep_alive_ack`.
+/// Match an inbound ACK against `outstanding` ([`match_outstanding_ack`] —
+/// covers both the DM and room-post paths, checked FIRST), OR a room's
+/// in-flight keep-alive ACK (Phase C). A room keep-alive ACK additionally
+/// carries the appended unsynced-count byte (`payload[4]`) that closes Phase
+/// D's drain window — see
+/// `firmware_core::room_session::RoomSyncPhase::on_keep_alive_ack`. A
+/// keep-alive is sent route-direct over an already-learned path
+/// (`room_session::encode_room_direct_prefix`'s doc), so its reply is always
+/// a bare `Ack`, never a PATH-return — that match stays local to this
+/// function; `handle_path_return`'s `PathExtra::Ack` arm never needs it.
 #[cfg_attr(feature = "hil", allow(unused_variables))]
 fn handle_ack(
     payload: &[u8],
-    pending_ack: &mut Option<PendingAck>,
+    outstanding: &mut OutstandingSends,
     room_runtime: &mut [RoomRuntime],
     ui_events: &mut Vec<ui::UiEvent>,
     now_ms: u64,
@@ -4143,7 +4336,7 @@ fn handle_ack(
     let mut got = [0u8; 4];
     got.copy_from_slice(&payload[..4]);
 
-    if match_room_post_ack(got, room_runtime, ui_events) {
+    if match_outstanding_ack(got, outstanding, ui_events) {
         return;
     }
 
@@ -4199,35 +4392,10 @@ fn handle_ack(
         }
     }
 
-    match_pending_ack(got, pending_ack, ui_events);
-}
-
-/// Compare an inbound ACK hash (bare `Ack` frame or bundled in a PATH-return)
-/// against the outstanding `pending_ack`. On a match, clears `pending_ack` and
-/// raises `UiEvent::DmAcked { to_hash }` so the touch UI can flip the sender's
-/// indicator from single-grey to double-check (previously this only logged
-/// the match and never told the UI which contact's message it was for).
-fn match_pending_ack(got: [u8; 4], pending_ack: &mut Option<PendingAck>, ui_events: &mut Vec<ui::UiEvent>) {
-    match pending_ack {
-        Some(expected) if expected.hash == got => {
-            log::info!(
-                "ACK received: matches last-sent DM (ack_hash={}, to_hash=0x{:02x})",
-                hex4(&got), expected.to_hash,
-            );
-            ui_events.push(ui::UiEvent::DmAcked { to_hash: expected.to_hash, is_channel: false });
-            *pending_ack = None;
-        }
-        Some(expected) => {
-            log::warn!(
-                "ACK received but no match (got {}, expected {})",
-                hex4(&got),
-                hex4(&expected.hash),
-            );
-        }
-        None => {
-            log::info!("ACK received (no pending DM): ack_hash={}", hex4(&got));
-        }
-    }
+    // Nothing matched: not an outstanding DM/room-post send, and not a room
+    // keep-alive either — the true "nothing left to try" fallback (see
+    // `match_outstanding_ack`'s doc for why it doesn't log this itself).
+    log::info!("ACK received (no outstanding send): ack_hash={}", hex4(&got));
 }
 
 /// Compare a duplicate-detected inbound frame's dedup key
@@ -4236,8 +4404,8 @@ fn match_pending_ack(got: [u8; 4], pending_ack: &mut Option<PendingAck>, ui_even
 /// `UiEvent::ChannelAcked { channel_hash }`, and returns `Some(channel_hash)`
 /// so the caller can also persist the flip to flash.
 ///
-/// Mirrors `match_pending_ack`'s DM counterpart, but keyed on the packet
-/// dedup hash rather than a v1.15 ACK hash: a GRP_TXT has no per-recipient
+/// Mirrors `match_outstanding_ack`'s DM/room-post counterpart, but keyed on
+/// the packet dedup hash rather than a v1.15 ACK hash: a GRP_TXT has no per-recipient
 /// delivery ACK on the wire at all, so hearing our own prior send repeated
 /// back into the mesh — already recognised via the existing dedup ring (see
 /// `dispatcher.rs`'s module doc) — IS the implicit ack. Matches at most once per
@@ -4542,6 +4710,7 @@ fn handle_room_push_frame(
     our_id: &Identity,
     room: &mut RoomRuntime,
     txq: &mut TxQueue,
+    outstanding: &mut OutstandingSends,
     ui_events: &mut Vec<ui::UiEvent>,
     nvs_partition: EspDefaultNvsPartition,
     contact_display_names: &std::collections::HashMap<u8, String>,
@@ -4586,7 +4755,12 @@ fn handle_room_push_frame(
             // duplicate (`outcome.entry: None`) — see that function's doc.
             let mut ack_frame = [0u8; 8];
             let n = build_ack_frame(&outcome.ack_hash, &mut ack_frame);
-            log_tx_queue_eviction(txq.enqueue(&ack_frame[..n]), "room-push ACK");
+            log_tx_queue_eviction(
+                txq.enqueue(&ack_frame[..n], None),
+                "room-push ACK",
+                outstanding,
+                |ev| ui_events.push(ev),
+            );
             log::info!(
                 "TX room-push ACK queued for 0x{:02x}: ack_hash={}",
                 room.hash,
@@ -4791,7 +4965,7 @@ fn handle_path_return(
     payload: &[u8],
     our_id: &Identity,
     policy: &PolicyFilter,
-    pending_ack: &mut Option<PendingAck>,
+    outstanding: &mut OutstandingSends,
     ui_events: &mut Vec<ui::UiEvent>,
     room_runtime: &mut [RoomRuntime],
     nvs_partition: EspDefaultNvsPartition,
@@ -4829,12 +5003,15 @@ fn handle_path_return(
             match rp.extra {
                 PathExtra::Ack(got) => {
                     // A room post's ACK often arrives bundled here rather
-                    // than as a bare `Ack` datagram (this mission's
-                    // Objective) — check `room_runtime` before falling
-                    // through to the DM slot; see `match_room_post_ack`'s
-                    // doc.
-                    if !match_room_post_ack(got, room_runtime, ui_events) {
-                        match_pending_ack(got, pending_ack, ui_events);
+                    // than as a bare `Ack` datagram — see
+                    // `match_outstanding_ack`'s doc for why this call
+                    // MUST be (and is) the exact same matching logic
+                    // `handle_ack` uses for a bare `Ack` frame.
+                    if !match_outstanding_ack(got, outstanding, ui_events) {
+                        log::info!(
+                            "RX PATH: bundled ACK but no outstanding send matched (ack_hash={})",
+                            hex4(&got),
+                        );
                     }
                 }
                 PathExtra::None => {
@@ -5070,11 +5247,10 @@ mod heapless_hex {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 //
-// FINAL TRIAGE (firmware-core-extract-ui-runtime increment): these 7 tests
+// FINAL TRIAGE (firmware-core-extract-ui-runtime increment): these tests
 // stay here, device-only/compile-only — leave-as-is, per this campaign's
-// bucket (c). `match_pending_ack`/`match_pending_channel_ack` themselves are
-// in fact pure (`PendingAck`/`PendingChannelAck` are plain structs local to
-// this file, and `log::info!`/`log::warn!` are the only side effects), so
+// bucket (c). `match_outstanding_ack`/`match_pending_channel_ack` themselves
+// are in fact pure (`log::info!`/`log::warn!` are the only side effects), so
 // the block on this pair is narrower than a hardware dependency: their sole
 // non-primitive argument, `ui::UiEvent`, is the radio→UI event bridge type
 // still defined in `firmware/src/ui/mod.rs`, and moving IT into
@@ -5086,30 +5262,46 @@ mod heapless_hex {
 // runtime pure helpers" mandate, so per this campaign's own abort clause the
 // un-extractable remainder is filed here, explicitly, rather than forced.
 // See `docs/adr/0005-firmware-core-extraction.md` for the extraction pattern
-// this campaign follows.
+// this campaign follows. `dispatcher::OutstandingSends` itself (the
+// underlying table `match_outstanding_ack` calls into) is fully covered by
+// `firmware-core`'s own host-executed test suite — see that type's doc; the
+// tests below exercise `main.rs`'s glue around it, not the table itself.
 //
 // Regression guard for "live ACK never advances the ✓→✓✓ indicator":
-// `match_pending_ack` is the site where
-// a confirmed-delivered DM must both clear `pending_ack` AND raise
-// `UiEvent::DmAcked { to_hash }` for the UI to act on — before this fix it did
-// the former but never the latter, so `ui::UiRuntime::handle_event`'s
-// otherwise-correct `DmAcked` handler (mod.rs) simply never fired.
+// `match_outstanding_ack` is the site where a confirmed-delivered DM must
+// both resolve its outstanding-sends entry AND raise
+// `UiEvent::DmAcked { to_hash, .. }` for the UI to act on — before this
+// mission's predecessor fix it did the former but never the latter, so
+// `ui::UiRuntime::handle_event`'s otherwise-correct `DmAcked` handler
+// (mod.rs) simply never fired.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn dm_send(ack_hash: [u8; 4], to_hash: u8, sent_at_ms: u64) -> OutstandingSend {
+        OutstandingSend {
+            ack_hash,
+            kind: OutstandingKind::Dm { to_hash },
+            sent_at_ms,
+            deadline_ms: sent_at_ms + DELIVERY_ACK_DEADLINE_MS,
+        }
+    }
+
     #[test]
-    fn matching_ack_clears_pending_and_raises_dm_acked_with_right_contact() {
-        let mut pending = Some(PendingAck { hash: [1, 2, 3, 4], to_hash: 0x42 });
+    fn matching_ack_resolves_and_raises_dm_acked_with_right_contact() {
+        let mut outstanding = OutstandingSends::new();
+        assert!(outstanding.insert(dm_send([1, 2, 3, 4], 0x42, 0)).is_none());
         let mut ui_events: Vec<ui::UiEvent> = Vec::new();
 
-        match_pending_ack([1, 2, 3, 4], &mut pending, &mut ui_events);
+        let matched = match_outstanding_ack([1, 2, 3, 4], &mut outstanding, &mut ui_events);
 
-        assert!(pending.is_none(), "a matched ack must clear pending_ack");
+        assert!(matched, "a matched ack must report matched");
+        assert!(outstanding.resolve([1, 2, 3, 4]).is_none(), "a matched ack must resolve the entry");
         assert_eq!(ui_events.len(), 1, "a matched ack must raise exactly one UI event");
         match &ui_events[0] {
-            ui::UiEvent::DmAcked { to_hash, is_channel } => {
+            ui::UiEvent::DmAcked { to_hash, is_channel, ack_hash } => {
                 assert_eq!(*to_hash, 0x42);
+                assert_eq!(*ack_hash, [1, 2, 3, 4]);
                 // A genuine DM ack must NOT claim `is_channel: true` — that
                 // flag is what `UiRuntime::handle_event` uses to find the
                 // right open `MessageView` to redraw (see the variant's
@@ -5121,25 +5313,55 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_ack_leaves_pending_and_raises_no_event() {
-        let mut pending = Some(PendingAck { hash: [1, 2, 3, 4], to_hash: 0x42 });
+    fn mismatched_ack_leaves_entry_outstanding_and_raises_no_event() {
+        let mut outstanding = OutstandingSends::new();
+        assert!(outstanding.insert(dm_send([1, 2, 3, 4], 0x42, 0)).is_none());
         let mut ui_events: Vec<ui::UiEvent> = Vec::new();
 
-        match_pending_ack([9, 9, 9, 9], &mut pending, &mut ui_events);
+        let matched = match_outstanding_ack([9, 9, 9, 9], &mut outstanding, &mut ui_events);
 
-        assert!(pending.is_some(), "a mismatched ack must not clear pending_ack");
+        assert!(!matched);
+        assert!(outstanding.resolve([1, 2, 3, 4]).is_some(), "a mismatched ack must not resolve the entry");
         assert!(ui_events.is_empty(), "a mismatched ack must not raise a UI event");
     }
 
     #[test]
-    fn ack_with_no_pending_dm_raises_no_event() {
-        let mut pending: Option<PendingAck> = None;
+    fn ack_with_nothing_outstanding_raises_no_event() {
+        let mut outstanding = OutstandingSends::new();
         let mut ui_events: Vec<ui::UiEvent> = Vec::new();
 
-        match_pending_ack([1, 2, 3, 4], &mut pending, &mut ui_events);
+        let matched = match_outstanding_ack([1, 2, 3, 4], &mut outstanding, &mut ui_events);
 
-        assert!(pending.is_none());
+        assert!(!matched);
         assert!(ui_events.is_empty(), "an unexpected ack must not raise a UI event");
+    }
+
+    /// REGRESSION (this mission's acceptance criterion): two DMs sent
+    /// back-to-back to the SAME contact must each track and resolve
+    /// independently — the SECOND DM's ack arriving first must flip only
+    /// the second send, leaving the first genuinely outstanding.
+    #[test]
+    fn two_dms_to_the_same_contact_resolve_independently_out_of_order() {
+        let mut outstanding = OutstandingSends::new();
+        assert!(outstanding.insert(dm_send([1, 1, 1, 1], 0x42, 0)).is_none());
+        assert!(outstanding.insert(dm_send([2, 2, 2, 2], 0x42, 1)).is_none());
+        let mut ui_events: Vec<ui::UiEvent> = Vec::new();
+
+        // The SECOND DM's ack arrives first.
+        assert!(match_outstanding_ack([2, 2, 2, 2], &mut outstanding, &mut ui_events));
+        assert_eq!(ui_events.len(), 1);
+        assert!(
+            matches!(&ui_events[0], ui::UiEvent::DmAcked { ack_hash, .. } if *ack_hash == [2, 2, 2, 2]),
+        );
+
+        // The first DM is still genuinely outstanding — this is exactly the
+        // ambiguity a single-slot `PendingAck` made unreachable and this
+        // table must not reintroduce.
+        assert!(match_outstanding_ack([1, 1, 1, 1], &mut outstanding, &mut ui_events));
+        assert_eq!(ui_events.len(), 2);
+        assert!(
+            matches!(&ui_events[1], ui::UiEvent::DmAcked { ack_hash, .. } if *ack_hash == [1, 1, 1, 1]),
+        );
     }
 
     /// Forward-compat regression: a v1.16 node emits a 6-byte ACK payload
@@ -5148,21 +5370,150 @@ mod tests {
     /// it does for a v1.15 4-byte payload.
     #[test]
     fn handle_ack_accepts_and_prefix_matches_a_6_byte_v1_16_ack() {
-        let mut pending = Some(PendingAck { hash: [1, 2, 3, 4], to_hash: 0x42 });
+        let mut outstanding = OutstandingSends::new();
+        assert!(outstanding.insert(dm_send([1, 2, 3, 4], 0x42, 0)).is_none());
         let mut ui_events: Vec<ui::UiEvent> = Vec::new();
 
         // [ack_hash(4)] [extended-attempt byte] [random byte]
         let payload_6_byte = [1u8, 2, 3, 4, 0x07, 0xFE];
-        handle_ack(&payload_6_byte, &mut pending, &mut [], &mut ui_events, 0);
+        handle_ack(&payload_6_byte, &mut outstanding, &mut [], &mut ui_events, 0);
 
-        assert!(pending.is_none(), "a prefix-matched 6-byte ack must clear pending_ack");
+        assert!(
+            outstanding.resolve([1, 2, 3, 4]).is_none(),
+            "a prefix-matched 6-byte ack must resolve the outstanding entry"
+        );
         assert_eq!(ui_events.len(), 1, "a prefix-matched 6-byte ack must raise exactly one UI event");
         match &ui_events[0] {
-            ui::UiEvent::DmAcked { to_hash, is_channel } => {
+            ui::UiEvent::DmAcked { to_hash, is_channel, .. } => {
                 assert_eq!(*to_hash, 0x42);
                 assert!(!is_channel, "a DM ack must raise DmAcked with is_channel: false");
             }
             other => panic!("expected DmAcked, got {:?}", other),
+        }
+    }
+
+    /// An evicted or deadline-expired outstanding send raises `DmUndelivered`
+    /// (red check), not `DmAcked` — the tri-state model's third state.
+    #[test]
+    fn delivery_event_undelivered_raises_dm_undelivered_not_dm_acked() {
+        let send = dm_send([1, 2, 3, 4], 0x42, 0);
+        match delivery_event(send, false) {
+            ui::UiEvent::DmUndelivered { to_hash, is_channel, ack_hash } => {
+                assert_eq!(to_hash, 0x42);
+                assert!(!is_channel);
+                assert_eq!(ack_hash, [1, 2, 3, 4]);
+            }
+            other => panic!("expected DmUndelivered, got {:?}", other),
+        }
+    }
+
+    /// A room-post `OutstandingSend` maps to the SAME `DmAcked`/
+    /// `DmUndelivered` event shape as a DM, with `is_channel: true` and
+    /// `to_hash` set to the room's hash — see `delivery_event`'s doc.
+    #[test]
+    fn delivery_event_room_post_sets_is_channel_true() {
+        let send = OutstandingSend {
+            ack_hash: [5, 6, 7, 8],
+            kind: OutstandingKind::RoomPost { room_hash: 0x99 },
+            sent_at_ms: 0,
+            deadline_ms: DELIVERY_ACK_DEADLINE_MS,
+        };
+        match delivery_event(send, true) {
+            ui::UiEvent::DmAcked { to_hash, is_channel, ack_hash } => {
+                assert_eq!(to_hash, 0x99);
+                assert!(is_channel, "a room post ack must raise DmAcked with is_channel: true");
+                assert_eq!(ack_hash, [5, 6, 7, 8]);
+            }
+            other => panic!("expected DmAcked, got {:?}", other),
+        }
+    }
+
+    // ── log_tx_queue_eviction / insert_outstanding — main.rs's own eviction
+    // wiring, not just the underlying `OutstandingSends` primitives ─────────
+    //
+    // Acceptance criterion: "an evicted frame renders red." The table-level
+    // mechanics (`resolve_evicted`) are pinned in `firmware-core`; these two
+    // tests pin the GLUE in THIS file — that a real `TxQueue` eviction (or a
+    // full outstanding-sends table) actually reaches `delivery_event` and
+    // produces a `DmUndelivered` the caller's `emit` closure receives.
+
+    #[test]
+    fn log_tx_queue_eviction_of_a_tagged_frame_raises_dm_undelivered() {
+        let mut outstanding = OutstandingSends::new();
+        assert!(outstanding.insert(dm_send([1, 2, 3, 4], 0x42, 0)).is_none());
+        let mut txq = TxQueue::new();
+        // Fill the queue, then enqueue one more untagged frame to evict the
+        // oldest — which happens to be the tagged one enqueued first.
+        assert_eq!(txq.enqueue(&[0xAA], Some([1, 2, 3, 4])), None);
+        for i in 0..(dispatcher::TX_QUEUE_SLOTS - 1) {
+            assert_eq!(txq.enqueue(&[i as u8], None), None);
+        }
+        let mut ui_events: Vec<ui::UiEvent> = Vec::new();
+        log_tx_queue_eviction(
+            txq.enqueue(&[0xFF], None),
+            "test frame",
+            &mut outstanding,
+            |ev| ui_events.push(ev),
+        );
+
+        assert_eq!(ui_events.len(), 1, "the evicted tagged frame must raise exactly one event");
+        match &ui_events[0] {
+            ui::UiEvent::DmUndelivered { to_hash, ack_hash, .. } => {
+                assert_eq!(*to_hash, 0x42);
+                assert_eq!(*ack_hash, [1, 2, 3, 4]);
+            }
+            other => panic!("expected DmUndelivered, got {:?}", other),
+        }
+        assert!(
+            outstanding.resolve([1, 2, 3, 4]).is_none(),
+            "the evicted entry must be resolved (removed), not left dangling"
+        );
+    }
+
+    #[test]
+    fn log_tx_queue_eviction_of_an_untagged_frame_raises_no_event() {
+        let mut outstanding = OutstandingSends::new();
+        let mut txq = TxQueue::new();
+        for i in 0..dispatcher::TX_QUEUE_SLOTS {
+            assert_eq!(txq.enqueue(&[i as u8], None), None);
+        }
+        let mut ui_events: Vec<ui::UiEvent> = Vec::new();
+        log_tx_queue_eviction(
+            txq.enqueue(&[0xFF], None),
+            "test frame",
+            &mut outstanding,
+            |ev| ui_events.push(ev),
+        );
+        assert!(ui_events.is_empty(), "an untagged eviction (e.g. a room login) has nothing to resolve");
+    }
+
+    #[test]
+    fn insert_outstanding_full_table_evicts_oldest_and_raises_dm_undelivered() {
+        let mut outstanding = OutstandingSends::new();
+        for i in 0..dispatcher::MAX_OUTSTANDING_SENDS {
+            let mut evicted_events: Vec<ui::UiEvent> = Vec::new();
+            insert_outstanding(
+                &mut outstanding,
+                dm_send([i as u8, 0, 0, 0], i as u8, i as u64),
+                |ev| evicted_events.push(ev),
+            );
+            assert!(evicted_events.is_empty(), "table not yet full at entry {}", i);
+        }
+        // One more: the table is full, so the OLDEST (sent_at_ms == 0) is
+        // evicted and must raise `DmUndelivered`.
+        let mut ui_events: Vec<ui::UiEvent> = Vec::new();
+        insert_outstanding(
+            &mut outstanding,
+            dm_send([0xFF, 0, 0, 0], 0xFF, 1000),
+            |ev| ui_events.push(ev),
+        );
+        assert_eq!(ui_events.len(), 1);
+        match &ui_events[0] {
+            ui::UiEvent::DmUndelivered { to_hash, ack_hash, .. } => {
+                assert_eq!(*to_hash, 0);
+                assert_eq!(*ack_hash, [0, 0, 0, 0]);
+            }
+            other => panic!("expected DmUndelivered, got {:?}", other),
         }
     }
 
@@ -5231,68 +5582,44 @@ mod tests {
 
     // ── Room post-ACK regression guard ──────────────────────────────────────
     //
-    // This mission's defect: a room post's ACK routinely arrives bundled
-    // inside a PATH-return (`handle_path_return`'s `PathExtra::Ack` arm),
-    // not just as a bare `Ack` datagram (`handle_ack`) — see
-    // `match_room_post_ack`'s doc for why (posts are flood-routed, so the
-    // responder often teaches its return route back by bundling the ACK,
-    // exactly like the flood-login's bundled `PathExtra::Response`). Before
-    // this fix only `handle_ack` ever consulted `room_runtime`; a bundled
-    // ACK fell straight through to `match_pending_ack`'s DM-only slot,
-    // matched nothing, and was logged-and-dropped ("ACK received (no
-    // pending DM)") — the delivery check never flipped.
-    //
-    // `handle_ack` and `handle_path_return`'s `PathExtra::Ack` arm now BOTH
-    // delegate to `match_room_post_ack`, so exercising that one function
-    // (plus `handle_ack`'s dispatch order below) is the shared regression
-    // guard for both call sites — `handle_path_return`'s own arm is a single
-    // line forwarding to the exact same function.
+    // The predecessor defect this table's design closes structurally: a room
+    // post's ACK routinely arrives bundled inside a PATH-return
+    // (`handle_path_return`'s `PathExtra::Ack` arm), not just as a bare
+    // `Ack` datagram (`handle_ack`) — see `match_outstanding_ack`'s doc for
+    // why (posts are flood-routed, so the responder often teaches its
+    // return route back by bundling the ACK, exactly like the flood-login's
+    // bundled `PathExtra::Response`). `handle_ack` and
+    // `handle_path_return`'s `PathExtra::Ack` arm now BOTH delegate to
+    // `match_outstanding_ack`, so exercising that one function is the shared
+    // regression guard for both call sites.
 
-    /// Minimal `RoomRuntime` fixture — only `hash` and `pending_post_ack`
-    /// matter to these tests; every other field takes its boot-time-empty
-    /// default.
-    ///
-    /// `allow(dead_code)`: this `[[bin]]` sets `harness = false` (see
-    /// Cargo.toml), so `#[test]` functions are compiled but never invoked by
-    /// any generated dispatcher (CONTRIBUTING.md: they "only run on real
-    /// hardware") — `#[test]` items themselves are lint-exempted as
-    /// live roots, but a plain helper only reachable through them, like this
-    /// one, is not.
-    #[allow(dead_code)]
-    fn test_room(hash: u8, pending_post_ack: Option<[u8; 4]>) -> RoomRuntime {
-        RoomRuntime {
-            pubkey: [0u8; 32],
-            hash,
-            guest_password: [0u8; MAX_LOGIN_PASSWORD_LEN],
-            guest_password_len: 0,
-            session: room_session::PersistedRoomSession::EMPTY,
-            session_epoch: 0,
-            login_sent: true,
-            last_keep_alive_ms: 0,
-            last_reflood_ms: 0,
-            reflood_attempts: 0,
-            sync_phase: room_session::RoomSyncPhase::new_after_login(0),
-            pending_post_ack,
-            pending_keep_alive_ack: None,
-            keep_alive_stall: room_session::RoomKeepAliveStall::new(),
-            resync_pending: false,
-            recent: Vec::new(),
+    fn room_post_send(ack_hash: [u8; 4], room_hash: u8, sent_at_ms: u64) -> OutstandingSend {
+        OutstandingSend {
+            ack_hash,
+            kind: OutstandingKind::RoomPost { room_hash },
+            sent_at_ms,
+            deadline_ms: sent_at_ms + DELIVERY_ACK_DEADLINE_MS,
         }
     }
 
     #[test]
-    fn matching_room_post_ack_clears_pending_and_raises_dm_acked_for_room_hash() {
-        let mut rooms = [test_room(0x99, Some([5, 6, 7, 8]))];
+    fn matching_room_post_ack_resolves_and_raises_dm_acked_for_room_hash() {
+        let mut outstanding = OutstandingSends::new();
+        assert!(outstanding.insert(room_post_send([5, 6, 7, 8], 0x99, 0)).is_none());
         let mut ui_events: Vec<ui::UiEvent> = Vec::new();
 
-        let matched = match_room_post_ack([5, 6, 7, 8], &mut rooms, &mut ui_events);
+        let matched = match_outstanding_ack([5, 6, 7, 8], &mut outstanding, &mut ui_events);
 
         assert!(matched, "a matching room post ack must report matched");
-        assert!(rooms[0].pending_post_ack.is_none(), "a matched ack must clear pending_post_ack");
+        assert!(
+            outstanding.resolve([5, 6, 7, 8]).is_none(),
+            "a matched ack must resolve the entry"
+        );
         assert_eq!(ui_events.len(), 1, "a matched room post ack must raise exactly one UI event");
         match &ui_events[0] {
-            ui::UiEvent::DmAcked { to_hash, is_channel } => {
+            ui::UiEvent::DmAcked { to_hash, is_channel, ack_hash } => {
                 assert_eq!(*to_hash, 0x99);
+                assert_eq!(*ack_hash, [5, 6, 7, 8]);
                 // Regression guard for `meshcadet-room-ack-check-no-live-
                 // redraw`: a room post's ack must set `is_channel: true` or
                 // `UiRuntime::handle_event`'s live-redraw guard silently
@@ -5306,44 +5633,47 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_room_post_ack_leaves_pending_and_reports_unmatched() {
-        let mut rooms = [test_room(0x99, Some([5, 6, 7, 8]))];
+    fn mismatched_room_post_ack_leaves_entry_outstanding_and_reports_unmatched() {
+        let mut outstanding = OutstandingSends::new();
+        assert!(outstanding.insert(room_post_send([5, 6, 7, 8], 0x99, 0)).is_none());
         let mut ui_events: Vec<ui::UiEvent> = Vec::new();
 
-        let matched = match_room_post_ack([1, 2, 3, 4], &mut rooms, &mut ui_events);
+        let matched = match_outstanding_ack([1, 2, 3, 4], &mut outstanding, &mut ui_events);
 
         assert!(!matched);
-        assert!(rooms[0].pending_post_ack.is_some());
+        assert!(outstanding.resolve([5, 6, 7, 8]).is_some());
         assert!(ui_events.is_empty());
     }
 
+    /// REGRESSION: a room post and a DM can be outstanding at the same time
+    /// (this mission's whole point — the old design had two SEPARATE
+    /// single-slot trackers, `PendingAck` and `RoomRuntime::pending_post_ack`,
+    /// which happened to make this case untestable-as-a-collision by
+    /// construction; the new shared table must not reintroduce cross-talk
+    /// between kinds). Drives `handle_ack`'s full dispatch order: a room
+    /// post ack must be matched and must NOT disturb the unrelated
+    /// outstanding DM.
     #[test]
-    fn no_pending_room_post_ack_reports_unmatched() {
-        let mut rooms = [test_room(0x99, None)];
+    fn handle_ack_matches_room_post_ack_without_disturbing_an_unrelated_outstanding_dm() {
+        let mut outstanding = OutstandingSends::new();
+        assert!(outstanding.insert(dm_send([9, 9, 9, 9], 0x11, 0)).is_none());
+        assert!(outstanding.insert(room_post_send([5, 6, 7, 8], 0x99, 0)).is_none());
+        let mut rooms: [RoomRuntime; 0] = [];
         let mut ui_events: Vec<ui::UiEvent> = Vec::new();
 
-        let matched = match_room_post_ack([5, 6, 7, 8], &mut rooms, &mut ui_events);
+        handle_ack(&[5, 6, 7, 8], &mut outstanding, &mut rooms, &mut ui_events, 0);
 
-        assert!(!matched);
-        assert!(ui_events.is_empty());
-    }
-
-    /// Drives `handle_ack`'s full dispatch order: a room post ack must be
-    /// matched and must NOT fall through to (or disturb) the DM slot, even
-    /// when an unrelated DM ack is also pending.
-    #[test]
-    fn handle_ack_matches_room_post_ack_before_falling_through_to_dm_slot() {
-        let mut pending_dm = Some(PendingAck { hash: [9, 9, 9, 9], to_hash: 0x11 });
-        let mut rooms = [test_room(0x99, Some([5, 6, 7, 8]))];
-        let mut ui_events: Vec<ui::UiEvent> = Vec::new();
-
-        handle_ack(&[5, 6, 7, 8], &mut pending_dm, &mut rooms, &mut ui_events, 0);
-
-        assert!(rooms[0].pending_post_ack.is_none(), "the room's post ack must be matched");
-        assert!(pending_dm.is_some(), "the unrelated DM pending ack must be untouched");
+        assert!(
+            outstanding.resolve([5, 6, 7, 8]).is_none(),
+            "the room's post ack must be resolved"
+        );
+        assert!(
+            outstanding.resolve([9, 9, 9, 9]).is_some(),
+            "the unrelated outstanding DM must be untouched"
+        );
         assert_eq!(ui_events.len(), 1);
         match &ui_events[0] {
-            ui::UiEvent::DmAcked { to_hash, is_channel } => {
+            ui::UiEvent::DmAcked { to_hash, is_channel, .. } => {
                 assert_eq!(*to_hash, 0x99);
                 assert!(is_channel, "a room post ack must raise DmAcked with is_channel: true");
             }

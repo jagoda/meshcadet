@@ -202,7 +202,7 @@ pub fn route_contact(hash: u8, is_room: bool, display_name: &str) -> ContactRout
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::MessageRecord;
+    use crate::ui::{DeliveryState, MessageRecord};
     use std::collections::HashMap;
 
     #[test]
@@ -303,13 +303,15 @@ mod tests {
                 MessageRecord {
                     text: "first".into(),
                     is_ours: false,
-                    acked: false,
+                    delivery: DeliveryState::Pending,
+                    ack_hash: None,
                     ts_ms: 0,
                 },
                 MessageRecord {
                     text: "latest".into(),
                     is_ours: false,
-                    acked: false,
+                    delivery: DeliveryState::Pending,
+                    ack_hash: None,
                     ts_ms: 1,
                 },
             ],
@@ -368,7 +370,8 @@ mod tests {
             vec![MessageRecord {
                 text: "welcome back".into(),
                 is_ours: false,
-                acked: true,
+                delivery: DeliveryState::Acked,
+                ack_hash: None,
                 ts_ms: 0,
             }],
         );

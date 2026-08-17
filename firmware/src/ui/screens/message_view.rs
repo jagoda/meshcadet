@@ -8,8 +8,9 @@
 //! - Text with inline emoji rendered natively by Slint (UTF-8 code points)
 //! - Sent/received indicator (alignment: right=ours, left=theirs)
 //! - Timestamp (absolute or relative)
-//! - ACK indicator (always a single ✓; grey when unacked, accent-blue when
-//!   acked — color is the sole ack signal, there is no double-check glyph)
+//! - Delivery indicator (always a single ✓; grey = pending, accent-blue =
+//!   acked, `Theme.alert` red = undelivered — color is the sole delivery
+//!   signal, there is no double-check glyph or separate in-flight indicator)
 //!
 //! The "📝 Write" button at the bottom navigates to [`ComposeScreen`].
 //!
@@ -31,8 +32,9 @@
 //! `contact_list.rs`. Two more `animate` clauses apply the same "smooth
 //! transition on an existing state-driven binding, never an infinite loop"
 //! language `compose.rs` established, to this screen's own two live-state
-//! transitions: the ack checkmark's grey→accent color flip (fires whenever a
-//! DM's `acked` bit flips live, per `notification.rs`'s inbound-ACK wiring)
+//! transitions: the ack checkmark's grey/accent/red color flip (fires
+//! whenever a DM's `delivery_state` flips live, per `notification.rs`'s
+//! inbound-ACK wiring)
 //! and the header/compose-button hover backgrounds. This is presentation-only:
 //! no Rust wrapper method below was touched.
 //!
@@ -86,13 +88,15 @@
 //!   (`None` on construction, so the initial populate never fires it, exactly
 //!   like the contact-list precedent). Since `refresh_message_view_for` is
 //!   only ever invoked from the `IncomingDm`/`IncomingGroupMsg`/`DmAcked`/
-//!   `ChannelAcked`/`TelemetryResponse` branches of `UiRuntime::handle_event`
-//!   (`ui/mod.rs`) — none of which this change touches — and only the first
-//!   three of those five ever append a new `!is_ours` record (the Ack
-//!   branches only flip an existing record's `acked` bit; `TelemetryResponse`
-//!   injects a system-authored, received-style row), an Ack-only refresh
-//!   changes nothing about the received count and correctly never re-fires
-//!   the comet.
+//!   `DmUndelivered`/`ChannelAcked`/`TelemetryResponse` branches of
+//!   `UiRuntime::handle_event` (`ui/mod.rs`) — none of which this change
+//!   touches — and of those six, only `IncomingDm`/`IncomingGroupMsg`/
+//!   `TelemetryResponse` ever append a new `!is_ours` record (the
+//!   delivery-state branches, `DmAcked`/`DmUndelivered`/`ChannelAcked`, only
+//!   flip an existing record's `delivery` state; `TelemetryResponse`
+//!   injects a system-authored, received-style row), so a delivery-only
+//!   refresh changes nothing about the received count and correctly never
+//!   re-fires the comet.
 //! - **Rocket-on-send.** This screen has no send affordance of its own —
 //!   composing and the actual Send tap both live on a *different* screen
 //!   (`compose.rs`, which already carries its own `RocketOnSend` on its Send
@@ -128,12 +132,16 @@ slint::slint! {
     import { BatteryIndicator } from "../battery_indicator.slint";
 
     struct MessageEntry {
-        text:         string,
-        from_name:    string,
-        time_str:     string,
-        is_ours:      bool,
-        acked:        bool,
-        mention_tier: int,
+        text:           string,
+        from_name:      string,
+        time_str:       string,
+        is_ours:        bool,
+        // Tri-state delivery status: 0 = Pending (grey), 1 = Acked (blue),
+        // 2 = Undelivered (red) — see `firmware_core::ui::message_view::
+        // MessageItem::delivery_state`'s doc for why this crosses the Rust/
+        // Slint boundary as a plain `int` rather than a Rust enum.
+        delivery_state: int,
+        mention_tier:   int,
     }
 
     component MessageBubble {
@@ -148,7 +156,10 @@ slint::slint! {
         in property <string>  from_name;
         in property <string>  time_str;
         in property <bool>    is_ours;
-        in property <bool>    acked;
+        // Tri-state delivery status — see `MessageEntry.delivery_state`'s
+        // doc for the 0/1/2 numbering. Only meaningful when `is_ours` (the
+        // ack glyph itself is gated on `is_ours` below).
+        in property <int>     delivery_state;
         // Highest `protocol::mention::MentionTier` found in `text` (Rust-side
         // `build_message_items`/`render_mentions`): 0 = no mention, 1 = an
         // other-node `@name` mention, 2 = a mention of THIS node's own name.
@@ -292,19 +303,28 @@ slint::slint! {
                     // sibling of the Rectangle — outside the colored box —
                     // in the same row as the bubble, so it adds no extra
                     // height and stays beside (not below) the message. The
-                    // glyph is always a single check — color is the sole ack
-                    // signal (grey unacked -> accent-blue acked), there is no
-                    // double-check state.
+                    // glyph is always a single check — color is the sole
+                    // delivery signal: grey (pending) -> accent-blue (acked)
+                    // -> `Theme.alert` red (undelivered — no ACK before its
+                    // deadline, or its frame was evicted from the TX queue
+                    // before ever reaching the wire), the SAME red the
+                    // low-battery indicator uses (`battery_indicator.slint`'s
+                    // `level == 2 ? Theme.alert` arm) — no separate glyph for
+                    // any of the three states, no in-flight-attempt
+                    // indicator; color alone carries the state.
                     if is_ours : Text {
                         text: "✓";
                         font-size: Theme.size-caption;
-                        color: acked ? Theme.brand-signal : Theme.text-secondary;
-                        // Smooth grey->accent transition when a live inbound
-                        // ACK flips this bit (see `notification.rs`), instead
-                        // of an instant color snap — the theme's "animate an
-                        // existing state-driven binding" language
-                        // (`compose.rs`'s send-button precedent), not a
-                        // screen-entry animation.
+                        color: delivery_state == 1 ? Theme.brand-signal : (
+                            delivery_state == 2 ? Theme.alert : Theme.text-secondary
+                        );
+                        // Smooth color transition when a live inbound ACK or
+                        // an undelivered timeout/eviction flips this state
+                        // (see `notification.rs`), instead of an instant
+                        // color snap — the theme's "animate an existing
+                        // state-driven binding" language (`compose.rs`'s
+                        // send-button precedent), not a screen-entry
+                        // animation.
                         animate color { duration: 150ms; easing: ease-out; }
                     }
                 }
@@ -578,12 +598,12 @@ slint::slint! {
                 VerticalLayout {
                     padding: 4px;
                     for m[i] in messages : MessageBubble {
-                        text:         m.text;
-                        from_name:    m.from_name;
-                        time_str:     m.time_str;
-                        is_ours:      m.is_ours;
-                        acked:        m.acked;
-                        mention_tier: m.mention_tier;
+                        text:           m.text;
+                        from_name:      m.from_name;
+                        time_str:       m.time_str;
+                        is_ours:        m.is_ours;
+                        delivery_state: m.delivery_state;
+                        mention_tier:   m.mention_tier;
                     }
                 }
             }
@@ -758,12 +778,12 @@ impl MessageViewScreen {
                 received_count += 1;
             }
             let entry = MessageEntry {
-                text:         m.text.clone().into(),
-                from_name:    m.from_name.clone().into(),
-                time_str:     m.time_str.clone().into(),
-                is_ours:      m.is_ours,
-                acked:        m.acked,
-                mention_tier: m.mention_tier,
+                text:           m.text.clone().into(),
+                from_name:      m.from_name.clone().into(),
+                time_str:       m.time_str.clone().into(),
+                is_ours:        m.is_ours,
+                delivery_state: m.delivery_state,
+                mention_tier:   m.mention_tier,
             };
             if i < old_len {
                 // Only write (and thus dirty) a row whose content actually
