@@ -115,11 +115,23 @@ pub fn format_time_sync_age(clock_unix_secs: Option<u32>, clock_sync_age_secs: u
 /// wording — [`format_time_sync_date`] already renders "Not synced" for
 /// that case, so the row reads identically to before this mission on a
 /// device that has never synced either way.
+///
+/// `ClockSource::GpsUnverified` (`meshcadet-clock-source-provenance-and-
+/// sync-age`) gets its own distinct label, "GPS RTC" — never "GPS time",
+/// which is reserved for a real, verified fix. Before this field existed,
+/// a no-fix device running purely off the GNSS module's pre-fix backup-RTC
+/// sentence still showed "GPS time" (the same label as a real fix),
+/// dishonestly implying the clock was independently confirmed — this
+/// mission's Objective. "GPS RTC" keeps the row's provenance label
+/// self-explanatory at a glance without a companion glossary: it names both
+/// the source (GPS shield) and why it's marked apart (a hardware RTC
+/// reading, not a satellite fix).
 pub fn format_clock_source_label(source: crate::room_session::ClockSource) -> &'static str {
     use crate::room_session::ClockSource;
     match source {
         ClockSource::None => "Time sync",
         ClockSource::Gps => "GPS time",
+        ClockSource::GpsUnverified => "GPS RTC",
         ClockSource::RoomServer => "Room time",
     }
 }
@@ -216,9 +228,10 @@ mod tests {
         );
     }
 
-    /// Acceptance (`meshcadet-room-clock-ux`): the GPS status screen's
-    /// Time-sync row label covers all three `ClockSource` provenance
-    /// values, so "why does this say no fix but the time is right?" always
+    /// Acceptance (`meshcadet-room-clock-ux`, extended by `meshcadet-clock-
+    /// source-provenance-and-sync-age` to four values): the GPS status
+    /// screen's Time-sync row label covers every `ClockSource` provenance
+    /// value, so "why does this say no fix but the time is right?" always
     /// has a visible answer.
     #[test]
     fn clock_source_label_none_keeps_the_original_wording() {
@@ -242,6 +255,19 @@ mod tests {
             format_clock_source_label(crate::room_session::ClockSource::RoomServer),
             "Room time"
         );
+    }
+
+    /// Acceptance (`meshcadet-clock-source-provenance-and-sync-age`): the
+    /// GNSS-RTC-derived (pre-fix, unverified) source must render a label
+    /// distinct from both a real fix ("GPS time") and "Time sync" — the
+    /// exact defect this mission's Objective names ("GPS status screen
+    /// reports 'GPS time' with no fix").
+    #[test]
+    fn clock_source_label_gps_unverified_is_distinct_from_a_real_fix() {
+        let label = format_clock_source_label(crate::room_session::ClockSource::GpsUnverified);
+        assert_ne!(label, "GPS time");
+        assert_ne!(label, "Time sync");
+        assert_eq!(label, "GPS RTC");
     }
 
     #[test]

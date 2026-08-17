@@ -264,6 +264,19 @@ pub struct GpsStatus {
     /// `true` if the system clock has been set from a valid GPS date+time
     /// sentence since boot.
     pub clock_synced: bool,
+    /// `true` if the CURRENT clock sync (`clock_synced`) came from a real
+    /// fix (RMC status `A`); `false` if it came from the GNSS module's
+    /// pre-fix, battery-backed-RTC-derived sentence (status `V`, accepted
+    /// behind [`parse_rmc_datetime`]'s plausibility gate — see
+    /// `firmware::gps`'s module doc's "Clock sync" section). Mirrors
+    /// `firmware::gps::GpsDriver`'s own `last_clock_sync_verified` field.
+    /// Meaningless while `clock_synced` is `false` (nothing has synced at
+    /// all). This is the provenance distinction the admin-menu GPS status
+    /// screen's Time-sync row surfaces ("GPS time" vs. an RTC-derived
+    /// label) — added by `meshcadet-clock-source-provenance-and-sync-age`,
+    /// which found the underlying [`NmeaDateTime::verified`] distinction
+    /// already tracked internally but never reaching this struct.
+    pub clock_sync_verified: bool,
     /// Seconds since the last successful clock sync. Only meaningful when
     /// `clock_synced`.
     pub clock_sync_age_secs: u32,
@@ -288,6 +301,7 @@ impl GpsStatus {
             fix_age_secs: 0,
             sat_count: 0,
             clock_synced: false,
+            clock_sync_verified: false,
             clock_sync_age_secs: 0,
             clock_unix_secs: None,
         }
@@ -544,27 +558,44 @@ pub fn parse_rmc_datetime(line: &[u8]) -> Option<NmeaDateTime> {
 pub const MIN_PLAUSIBLE_RMC_YEAR: u16 = 2024;
 
 /// Whether a newly-parsed [`NmeaDateTime`] should replace the driver's
-/// current clock-sync state, given whether the CURRENT sync (if any) is
-/// itself verified.
+/// current clock-sync state, given whether ANYTHING has synced the clock
+/// since boot yet (`already_synced`) — regardless of whether that prior sync
+/// was itself verified.
 ///
 /// `true` in exactly two cases:
 /// - the new sync is `verified` (a real fix always wins — refreshes the
 ///   anchor even if the existing sync was already verified, since a fresh
 ///   fix is strictly at least as good as the anchor it replaces), or
-/// - nothing verified has synced yet (`!already_verified`), in which case an
+/// - nothing has synced at all yet (`!already_synced`), in which case an
 ///   unverified, RTC-derived sync is better than no sync at all.
 ///
-/// `false` only when the new sync is unverified AND a verified sync is
-/// already in effect — an `A`-derived sync must never be downgraded back to
-/// RTC-derived by a later `V` sentence (e.g. the fix is temporarily lost
-/// again after the first lock).
+/// `false` whenever the new sync is unverified AND something has already
+/// synced — verified or not. This single condition covers two distinct
+/// cases that used to require separate handling:
+/// - the ORIGINAL downgrade guard: an `A`-derived sync must never be
+///   downgraded back to RTC-derived by a later `V` sentence (e.g. the fix is
+///   temporarily lost again after the first lock), and
+/// - the ZERO-AGE DEFECT FIX (`meshcadet-clock-source-provenance-and-sync-
+///   age`): gating on `already_verified` (the old second parameter) instead
+///   of `already_synced` meant `should_accept_clock_sync(false, false)`
+///   stayed `true` forever once the FIRST unverified sync landed, because
+///   `last_clock_sync_verified` never becomes `true` from an unverified
+///   sync — so EVERY subsequent `V` sentence (the GNSS module emits one
+///   roughly once a second while it holds no fix) re-passed the gate and
+///   re-latched the caller's `last_clock_sync_uptime_ms` anchor to "now".
+///   That pinned `GpsStatus::clock_sync_age_secs` at ~0 on every poll on a
+///   no-fix device — the "synced 0s ago" symptom. Gating on `already_synced`
+///   instead means the anchor is set exactly once from the first unverified
+///   sync and then holds steady (so the age line finally advances) until
+///   either a real fix overrides it or the device reboots.
 ///
 /// `firmware::gps::GpsDriver::parse_line` is the sole caller: `new_sync
-/// .verified` and `already_verified` come from [`parse_rmc_datetime`]'s
-/// result and the driver's own persisted `last_clock_sync_verified` field,
-/// respectively. Pure so this decision is host-testable without hardware.
-pub fn should_accept_clock_sync(new_sync_verified: bool, already_verified: bool) -> bool {
-    new_sync_verified || !already_verified
+/// .verified` comes from [`parse_rmc_datetime`]'s result; `already_synced`
+/// from the driver's own `last_clock_sync_uptime_ms.is_some()` (has
+/// anything synced since boot at all, independent of provenance). Pure so
+/// this decision is host-testable without hardware.
+pub fn should_accept_clock_sync(new_sync_verified: bool, already_synced: bool) -> bool {
+    new_sync_verified || !already_synced
 }
 
 // ── NMEA GGA parser (pure functions, no hardware dependency) ──────────────────
@@ -1262,7 +1293,8 @@ mod tests {
         assert!(parse_rmc_datetime(line).is_none());
     }
 
-    // ── should_accept_clock_sync (status-A override of an RTC-derived sync) ──
+    // ── should_accept_clock_sync (status-A override of an RTC-derived sync,
+    // and the zero-age-defect fix — see this function's doc) ────────────────
 
     #[test]
     fn should_accept_clock_sync_unverified_when_nothing_synced_yet() {
@@ -1282,6 +1314,21 @@ mod tests {
         // Once a real fix (status A) has synced the clock, a later pre-fix
         // (status V) RTC-derived sentence must not downgrade it back to
         // unverified.
+        assert!(!should_accept_clock_sync(false, true));
+    }
+
+    #[test]
+    fn should_accept_clock_sync_rejects_repeat_unverified_sync_once_synced() {
+        // Regression pin for the "synced 0s ago" defect
+        // (`meshcadet-clock-source-provenance-and-sync-age`): once an
+        // UNVERIFIED (RTC-derived) sync has already landed, a SECOND
+        // unverified sentence must be rejected too — not just a downgrade of
+        // an already-VERIFIED sync (the sibling test above). The old
+        // `already_verified`-gated predicate returned `true` here forever
+        // (`last_clock_sync_verified` never becomes `true` from an
+        // unverified sync), re-latching the caller's sync anchor to "now" on
+        // every ~1 Hz `V` sentence a no-fix device receives and pinning
+        // `clock_sync_age_secs` at 0 indefinitely.
         assert!(!should_accept_clock_sync(false, true));
     }
 

@@ -130,10 +130,19 @@
 //! [`firmware_core::gps::should_accept_clock_sync`] is the gate — so the
 //! first status-`A` sentence always overrides an RTC-derived sync, and a
 //! later loss of fix (a stray `V` sentence after lock) can never downgrade
-//! an already-verified sync back to unverified. Sync state (`synced` /
-//! `never-synced` + last-sync age) is exposed via [`GpsDriver::status`] for
-//! display (admin-menu GPS status view, host `status` command) — there are
-//! no time-sync *controls*, only status.
+//! an already-verified sync back to unverified. The SAME gate also refuses
+//! every REPEAT unverified `V` sentence once the first one has synced the
+//! clock (`already_synced`, not `already_verified`, is what it checks —
+//! see that function's doc): the GNSS module emits an RMC sentence roughly
+//! once a second while it holds no fix, and accepting each one would
+//! re-latch the sync anchor to "now" every time, permanently pinning the
+//! reported sync age at 0 on a no-fix device
+//! (`meshcadet-clock-source-provenance-and-sync-age`). Sync state (`synced` /
+//! `never-synced` + last-sync age + [`GpsDriver::clock_sync_verified`]
+//! provenance) is exposed via [`GpsDriver::status`] for display (admin-menu
+//! GPS status view; the host `status` command mirrors `synced`/age only, not
+//! provenance — see `GpsStatus::clock_sync_verified`'s doc for why that stays
+//! UI-local) — there are no time-sync *controls*, only status.
 //!
 //! # RX diagnostics (`--features diagnostics` only)
 //!
@@ -433,9 +442,17 @@ pub struct GpsDriver<'d> {
     /// `A`); `false` if it came from a pre-fix, RTC-derived sentence (status
     /// `V`, accepted behind the plausibility gate — see the module doc's
     /// "Clock sync" section). Meaningless while `last_clock_sync_uptime_ms`
-    /// is `None` (nothing synced yet). Gates
-    /// [`firmware_core::gps::should_accept_clock_sync`] so a later `V`
-    /// sentence can never downgrade an already-verified sync.
+    /// is `None` (nothing synced yet) — see [`clock_sync_verified`](Self::
+    /// clock_sync_verified) for a getter that folds that in. Surfaced to
+    /// display via [`status`](Self::status)'s `GpsStatus::clock_sync_
+    /// verified` field (the clock-source provenance the GPS status screen's
+    /// Time-sync row distinguishes). `parse_line` no longer reads this
+    /// field to decide whether to ACCEPT a new sync (that gate now checks
+    /// `last_clock_sync_uptime_ms.is_some()` instead — see `should_accept_
+    /// clock_sync`'s doc for why); this field still records what the
+    /// CURRENT sync's provenance was, and a later verified fix still
+    /// overwrites it — an already-verified sync can never be downgraded back
+    /// to unverified.
     last_clock_sync_verified: bool,
 
     // ── Liveness / acquisition-status state ─────────────────────────────────
@@ -996,9 +1013,32 @@ impl<'d> GpsDriver<'d> {
             fix_age_secs,
             sat_count: self.last_sat_count,
             clock_synced,
+            // Meaningless (and `false`) while `clock_synced` is `false` —
+            // `last_clock_sync_verified` starts `false` and is only ever
+            // written alongside `last_clock_sync_uptime_ms` in `parse_line`,
+            // so the two fields stay in lockstep by construction.
+            clock_sync_verified: self.last_clock_sync_verified,
             clock_sync_age_secs,
             clock_unix_secs,
         }
+    }
+
+    /// Whether the CURRENT clock sync (if any) came from a real fix (RMC
+    /// status `A`) rather than the GNSS module's pre-fix, RTC-derived
+    /// sentence (status `V`). `false` both when nothing has synced yet and
+    /// when the current sync is RTC-derived — callers that need to
+    /// distinguish "nothing synced" from "synced but unverified" should
+    /// consult [`Self::status`]'s `clock_synced` alongside this.
+    ///
+    /// Exposed as its own cheap getter (rather than requiring a full
+    /// [`Self::status`] snapshot) for call sites that only need this one bit
+    /// — e.g. `main.rs`'s room-server clock-adoption gate
+    /// (`room_session::adopt_server_clock`), which must not let an
+    /// unconfirmed RTC-derived sync block adopting a room server's own
+    /// clock — see `firmware_core::room_session`'s "Clock provenance"
+    /// section doc for the policy this decides.
+    pub fn clock_sync_verified(&self) -> bool {
+        self.last_clock_sync_uptime_ms.is_some() && self.last_clock_sync_verified
     }
 
     // ── Private: UART drain + NMEA accumulation ───────────────────────────────
@@ -1132,10 +1172,20 @@ impl<'d> GpsDriver<'d> {
             }
         }
         if let Some(dt) = parse_rmc_datetime(line) {
-            // Never let a pre-fix, RTC-derived sync (dt.verified == false)
-            // downgrade a clock already synced from a verified fix — see the
-            // module doc's "Clock sync" section.
-            if should_accept_clock_sync(dt.verified, self.last_clock_sync_verified) {
+            // Gate on `already_synced` (has ANYTHING synced the clock since
+            // boot yet), not `last_clock_sync_verified` — see
+            // `firmware_core::gps::should_accept_clock_sync`'s doc for why:
+            // gating on verified-ness alone let every subsequent unverified
+            // `V` sentence re-latch the sync anchor to "now" once the FIRST
+            // one landed, permanently pinning `GpsStatus::clock_sync_age_
+            // secs` at 0 on a no-fix device
+            // (`meshcadet-clock-source-provenance-and-sync-age`). This also
+            // still rejects a later `V` sentence downgrading an
+            // already-verified sync — `already_synced` is `true` in both
+            // cases, so `should_accept_clock_sync` returns the same `false`
+            // either way; see that function's doc.
+            let already_synced = self.last_clock_sync_uptime_ms.is_some();
+            if should_accept_clock_sync(dt.verified, already_synced) {
                 if let Some(unix_secs) = set_system_clock_from_utc(dt) {
                     log::info!(
                         "GPS clock sync ({}): {:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",

@@ -233,10 +233,12 @@ slint::slint! {
         // Time-sync row LABEL — `meshcadet-room-clock-ux`: was a static
         // "Time sync" literal on the row instantiation below; now driven by
         // `GpsStatusScreen::set_clock_source` so the row reads "GPS time" /
-        // "Room time" / "Time sync" depending on which clock source is
-        // currently in effect (`firmware_core::ui::gps_status::format_
-        // clock_source_label`'s doc explains why this answers "why does
-        // this say no fix but the time is right?").
+        // "GPS RTC" / "Room time" / "Time sync" depending on which clock
+        // source is currently in effect (`firmware_core::ui::gps_status::
+        // format_clock_source_label`'s doc explains why this answers "why
+        // does this say no fix but the time is right?" — "GPS RTC"
+        // additionally answers "why does this say GPS time with no fix?",
+        // `meshcadet-clock-source-provenance-and-sync-age`'s Objective).
         in property <string> time_sync_label_text: "Time sync";
         // Repeater signal-meter reading (ADR-0010): 0 = direct-only,
         // 1..=5 = bars. Pushed by `GpsStatusScreen::set_signal_level`
@@ -467,13 +469,17 @@ impl GpsStatusScreen {
     }
 
     /// Push a fresh room-clock-provenance snapshot into the Time-sync row —
-    /// `meshcadet-room-clock-ux`'s Objective item 3. `source` picks the row's
-    /// label (`format_clock_source_label`: "GPS time" / "Room time" / "Time
-    /// sync"); `unix_secs`/`age_secs` are the SAME combined "whichever clock
-    /// is trusted right now" reading `room_session::trusted_wall_clock_secs`
-    /// produces (GPS while synced, else an adopted room-server clock, else
-    /// `None`) — not raw `GpsStatus` fields, so the row stays populated on a
-    /// GPS-denied device once a room server's clock has been adopted.
+    /// `meshcadet-room-clock-ux`'s Objective item 3. `source` picks the
+    /// row's label (`format_clock_source_label`: "GPS time" / "GPS RTC" /
+    /// "Room time" / "Time sync" — the `GpsUnverified` variant added by
+    /// `meshcadet-clock-source-provenance-and-sync-age`); `unix_secs`/
+    /// `age_secs` are the SAME combined "whichever clock is trusted right
+    /// now" reading `room_session::trusted_wall_clock_secs` produces
+    /// (verified GPS first, then an adopted room-server clock, then an
+    /// unverified GPS sync, else `None` — see that function's doc for the
+    /// full priority order) — not raw `GpsStatus` fields, so the row stays
+    /// populated on a GPS-denied device once a room server's clock has been
+    /// adopted.
     ///
     /// Safe to call repeatedly while the screen is open, same "cheap no-op
     /// on an unchanged reading" caller discipline `UiRuntime::set_room_

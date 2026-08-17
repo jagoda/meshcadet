@@ -567,17 +567,44 @@ pub fn room_tx_timestamp(trusted_wall_clock_secs: Option<u32>, last_room_ts: u32
 /// Where the device's current trusted wall-clock reading comes from — the
 /// provenance `meshcadet-room-clock-ux` surfaces on the GPS status screen so
 /// "why does this say no fix but the time is right?" has a visible answer.
+///
+/// # `Gps` vs. `GpsUnverified` (`meshcadet-clock-source-provenance-and-
+/// sync-age`)
+///
+/// GPS itself has two provenances (`gps::NmeaDateTime::verified`): a real
+/// fix (RMC status `A`, satellite-derived, trustworthy), or the GNSS
+/// module's pre-fix battery-backed-RTC-derived sentence (status `V`,
+/// accepted behind a plausibility gate but never independently confirmed —
+/// the backup RTC can drift, or have been set from a stale prior fix).
+/// Before this mission, both collapsed into a single `Gps` variant here, so
+/// the GPS status screen's Time-sync row read "GPS time" even on a no-fix
+/// device running purely off the RTC-derived guess — dishonest provenance,
+/// this mission's Objective. `GpsUnverified` gives that case its own
+/// variant, and [`trusted_wall_clock_secs`]'s priority order changes to
+/// match: a *verified* GPS sync still always wins, but an *unverified* one
+/// no longer automatically outranks an adopted room-server clock — see that
+/// function's doc for the decided policy.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ClockSource {
     /// No trusted wall clock at all — neither a GPS fix nor an adopted room-
     /// server reading has ever landed since boot.
     #[default]
     None,
-    /// The device's own GPS has synced the clock. Always wins over
-    /// [`Self::RoomServer`] — see [`adopt_server_clock`]'s doc.
+    /// The device's own GPS has synced the clock from a real, verified fix
+    /// (RMC status `A`). Always wins over every other source — see
+    /// [`trusted_wall_clock_secs`]'s doc.
     Gps,
-    /// No GPS sync, but a room server's own clock (`server_ts` from a login
-    /// reply, or `post_ts` from an inbound push) has been adopted instead.
+    /// The device's own GPS clock is synced, but only from the GNSS
+    /// module's pre-fix, battery-backed-RTC-derived sentence (RMC status
+    /// `V`) — never independently confirmed. Outranks [`Self::None`] (some
+    /// clock beats none) but NOT [`Self::RoomServer`] — see
+    /// [`trusted_wall_clock_secs`]'s doc for the room-server-vs-drifted-
+    /// GNSS-RTC policy this decides.
+    GpsUnverified,
+    /// No verified GPS sync, but a room server's own clock (`server_ts` from
+    /// a login reply, or `post_ts` from an inbound push) has been adopted
+    /// instead. Outranks [`Self::GpsUnverified`] — see
+    /// [`trusted_wall_clock_secs`]'s doc.
     RoomServer,
 }
 
@@ -613,7 +640,8 @@ impl AdoptedServerClock {
     /// screen surfaces this as the Time-sync row's relative-age line
     /// (`"synced Ns ago"`) whenever [`ClockSource::RoomServer`] is the
     /// active provenance, mirroring what `gps::GpsStatus::clock_sync_age_
-    /// secs` already provides while [`ClockSource::Gps`] is active.
+    /// secs` already provides while [`ClockSource::Gps`]/[`ClockSource::
+    /// GpsUnverified`] is active.
     pub fn age_secs(&self, now_ms: u64) -> u32 {
         (now_ms.saturating_sub(self.anchor_uptime_ms) / 1000) as u32
     }
@@ -637,13 +665,22 @@ impl AdoptedServerClock {
 ///   otherwise poison via `room_tx_timestamp`) matters because the adopted
 ///   clock is device-WIDE, not per-room — see that constant's doc for the
 ///   full mechanism this closes.
-/// - **GPS outranks server time.** `gps_synced` true means the device
-///   already has a genuine GPS-synced wall clock right now; a room server's
-///   reading must never displace it, so `current` is returned unchanged
+/// - **Only a VERIFIED GPS sync outranks server time**
+///   (`meshcadet-clock-source-provenance-and-sync-age` — before this
+///   mission `gps_verified` was `gps_synced`, true for an unverified,
+///   RTC-derived GPS sync too). `gps_verified` true means the device already
+///   has a genuine, fix-derived GPS wall clock right now; a room server's
+///   reading must never displace THAT, so `current` is returned unchanged
 ///   (whatever it was — including `None`, which is fine: [`Self`]-adjacent
-///   callers only ever consult an [`AdoptedServerClock`] when GPS is
-///   *not* synced, via [`trusted_wall_clock_secs`] below, so a stale one
-///   left in place here is simply never read while GPS remains synced).
+///   callers only ever consult an [`AdoptedServerClock`] when GPS is *not*
+///   verified-synced, via [`trusted_wall_clock_secs`] below, so a stale one
+///   left in place here is simply never read while a verified GPS sync
+///   remains active). An UNVERIFIED (RTC-derived) GPS sync no longer blocks
+///   adoption here — see [`trusted_wall_clock_secs`]'s doc for why a room
+///   server's continuously-refreshed, externally-stamped clock is preferred
+///   over a GNSS backup RTC reading that is captured once at boot and never
+///   independently re-confirmed (it can drift, or have been set from a
+///   stale prior fix).
 /// - **Never move a trusted clock backwards.** Adopting into `current: None`
 ///   is always allowed (there is nothing to regress). Once a server clock is
 ///   already adopted, a new reading is adopted only if it is not a
@@ -652,11 +689,11 @@ impl AdoptedServerClock {
 ///   login-retry racing a newer push) must not drag the clock backwards.
 pub fn adopt_server_clock(
     current: Option<AdoptedServerClock>,
-    gps_synced: bool,
+    gps_verified: bool,
     now_ms: u64,
     server_ts: u32,
 ) -> Option<AdoptedServerClock> {
-    if gps_synced {
+    if gps_verified {
         return current;
     }
     if server_ts >= ROOM_CLOCK_PLAUSIBILITY_CEILING_SECS {
@@ -748,23 +785,46 @@ pub fn reconcile_sync_since(sync_since: u32, server_ts: u32) -> Option<u32> {
 }
 
 /// The single wall-clock reading (and its provenance) in effect right now,
-/// combining GPS and an adopted room-server clock per this mission's
-/// priority rule: GPS wins whenever it is synced; the adopted server clock
-/// (if any) is the fallback; `None`/[`ClockSource::None`] only when neither
-/// source has ever synced.
+/// combining GPS and an adopted room-server clock per a THREE-tier priority
+/// rule (`meshcadet-clock-source-provenance-and-sync-age` decided the
+/// room-server-vs-drifted-GNSS-RTC policy this mission's Objective calls
+/// out — previously GPS unconditionally outranked the room server whether
+/// or not it was verified):
+///
+/// 1. A *verified*, fix-derived GPS sync ([`ClockSource::Gps`]) always wins
+///    — a real satellite fix is the one source here with an independent
+///    external confirmation.
+/// 2. Otherwise, an adopted room-server clock ([`ClockSource::RoomServer`])
+///    if one exists — also externally stamped (by the room server), and
+///    continuously re-confirmed on every login/push
+///    ([`adopt_server_clock`]'s monotonic-advance rule), unlike a GNSS
+///    backup RTC reading captured once at boot and never re-checked
+///    against anything.
+/// 3. Otherwise, an *unverified*, RTC-derived GPS sync
+///    ([`ClockSource::GpsUnverified`]) if one exists — still better than no
+///    clock at all, just outranked by a room server's fresher, externally-
+///    confirmed reading when both are available.
+/// 4. [`ClockSource::None`] only when none of the above has ever landed.
 ///
 /// `gps_secs` is the caller's own `gps::synced_wall_clock_secs(now_ms)`
-/// reading — `Some` exactly when GPS is genuinely synced right now.
+/// reading — `Some` exactly when GPS is synced right now, verified or not.
+/// `gps_verified` distinguishes which (`gps::GpsDriver::clock_sync_
+/// verified`/`GpsStatus::clock_sync_verified`) — meaningless when `gps_secs`
+/// is `None`.
 pub fn trusted_wall_clock_secs(
     gps_secs: Option<u32>,
+    gps_verified: bool,
     server_clock: Option<AdoptedServerClock>,
     now_ms: u64,
 ) -> (Option<u32>, ClockSource) {
-    match gps_secs {
-        Some(secs) => (Some(secs), ClockSource::Gps),
-        None => match server_clock {
+    match (gps_secs, gps_verified) {
+        (Some(secs), true) => (Some(secs), ClockSource::Gps),
+        _ => match server_clock {
             Some(clock) => (Some(clock.now_secs(now_ms)), ClockSource::RoomServer),
-            None => (None, ClockSource::None),
+            None => match gps_secs {
+                Some(secs) => (Some(secs), ClockSource::GpsUnverified),
+                None => (None, ClockSource::None),
+            },
         },
     }
 }
@@ -2935,8 +2995,8 @@ mod tests {
         // Acceptance: a login reply carrying a server timestamp establishes
         // a trusted wall clock on a device with no GPS sync.
         let now_ms = 60_000;
-        let clock = adopt_server_clock(None, /* gps_synced */ false, now_ms, 1_800_000_000);
-        let (secs, source) = trusted_wall_clock_secs(None, clock, now_ms);
+        let clock = adopt_server_clock(None, /* gps_verified */ false, now_ms, 1_800_000_000);
+        let (secs, source) = trusted_wall_clock_secs(None, false, clock, now_ms);
         assert_eq!(secs, Some(1_800_000_000));
         assert_eq!(source, ClockSource::RoomServer);
     }
@@ -2960,19 +3020,29 @@ mod tests {
     }
 
     #[test]
-    fn gps_outranks_server_time_and_adoption_never_regresses() {
-        // Acceptance: GPS outranks server time (adopting server time never
-        // overrides a GPS-synced clock, and never moves a trusted clock
-        // backwards).
+    fn verified_gps_outranks_server_time_and_adoption_never_regresses() {
+        // Acceptance: a VERIFIED GPS sync outranks server time (adopting
+        // server time never overrides a verified-GPS-synced clock, and
+        // never moves a trusted clock backwards).
         let now_ms = 0;
 
-        // GPS is synced right now: a server_ts reply must not displace it —
-        // `adopt_server_clock` leaves `current` untouched, and even if a
-        // stale adopted clock were passed in, `trusted_wall_clock_secs`
-        // reports GPS's own reading, not the server's.
-        let unchanged = adopt_server_clock(None, /* gps_synced */ true, now_ms, 1_900_000_000);
-        assert_eq!(unchanged, None, "GPS-synced must not adopt a server clock");
-        let (secs, source) = trusted_wall_clock_secs(Some(1_800_000_000), unchanged, now_ms);
+        // Verified GPS is synced right now: a server_ts reply must not
+        // displace it — `adopt_server_clock` leaves `current` untouched,
+        // and even if a stale adopted clock were passed in,
+        // `trusted_wall_clock_secs` reports GPS's own reading, not the
+        // server's.
+        let unchanged =
+            adopt_server_clock(None, /* gps_verified */ true, now_ms, 1_900_000_000);
+        assert_eq!(
+            unchanged, None,
+            "verified GPS must not adopt a server clock"
+        );
+        let (secs, source) = trusted_wall_clock_secs(
+            Some(1_800_000_000),
+            /* gps_verified */ true,
+            unchanged,
+            now_ms,
+        );
         assert_eq!(secs, Some(1_800_000_000), "GPS's own reading wins");
         assert_eq!(source, ClockSource::Gps);
 
@@ -2983,7 +3053,7 @@ mod tests {
         // retry) must never drag the adopted clock backwards.
         let later_ms = 10_000; // 10s elapsed => existing anchor now reports 1_800_000_010
         let regressed = adopt_server_clock(clock, false, later_ms, 1_700_000_000);
-        let (secs, source) = trusted_wall_clock_secs(None, regressed, later_ms);
+        let (secs, source) = trusted_wall_clock_secs(None, false, regressed, later_ms);
         assert_eq!(
             secs,
             Some(1_800_000_010),
@@ -2994,8 +3064,71 @@ mod tests {
         // A genuine advance (a later login/push, further in real time) is
         // adopted, moving the clock forward.
         let advanced = adopt_server_clock(regressed, false, later_ms, 1_800_000_500);
-        let (secs, _) = trusted_wall_clock_secs(None, advanced, later_ms);
+        let (secs, _) = trusted_wall_clock_secs(None, false, advanced, later_ms);
         assert_eq!(secs, Some(1_800_000_500));
+    }
+
+    // ── Unverified GPS vs. room server (`meshcadet-clock-source-provenance-
+    // and-sync-age`): the decided room-server-vs-drifted-GNSS-RTC policy ──
+
+    #[test]
+    fn unverified_gps_does_not_block_room_server_adoption() {
+        // Acceptance: unlike a VERIFIED GPS sync, an UNVERIFIED (RTC-
+        // derived) GPS sync must not block `adopt_server_clock` from
+        // adopting a room server's own clock — only a real fix does.
+        let now_ms = 0;
+        let adopted =
+            adopt_server_clock(None, /* gps_verified */ false, now_ms, 1_800_000_000);
+        assert!(
+            adopted.is_some(),
+            "an unverified GPS sync must not block room-server adoption"
+        );
+    }
+
+    #[test]
+    fn room_server_outranks_unverified_gps_but_not_verified_gps() {
+        // Acceptance: the three-tier priority order —
+        // verified GPS > adopted room server > unverified GPS > none.
+        let now_ms = 0;
+        let server_clock = adopt_server_clock(None, false, now_ms, 1_800_000_000);
+        assert!(server_clock.is_some());
+
+        // Unverified GPS + an adopted room server: the room server wins —
+        // it is externally-stamped and continuously refreshed, while the
+        // unverified GPS sync is a one-shot boot-time RTC reading that can
+        // drift or have been set from a stale prior fix.
+        let (secs, source) = trusted_wall_clock_secs(
+            Some(1_900_000_000),
+            /* gps_verified */ false,
+            server_clock,
+            now_ms,
+        );
+        assert_eq!(
+            secs,
+            Some(1_800_000_000),
+            "room server wins over unverified GPS"
+        );
+        assert_eq!(source, ClockSource::RoomServer);
+
+        // Verified GPS still wins over an adopted room server.
+        let (secs, source) = trusted_wall_clock_secs(
+            Some(1_900_000_000),
+            /* gps_verified */ true,
+            server_clock,
+            now_ms,
+        );
+        assert_eq!(
+            secs,
+            Some(1_900_000_000),
+            "verified GPS still wins over room server"
+        );
+        assert_eq!(source, ClockSource::Gps);
+
+        // Unverified GPS with NO adopted room server: still better than
+        // nothing.
+        let (secs, source) = trusted_wall_clock_secs(Some(1_900_000_000), false, None, now_ms);
+        assert_eq!(secs, Some(1_900_000_000));
+        assert_eq!(source, ClockSource::GpsUnverified);
     }
 
     // ── Clock plausibility bound (`meshcadet-room-clock-plausibility-bounds`,
@@ -3134,16 +3267,16 @@ mod tests {
         // `None` / `Gps` / `RoomServer`.
         let now_ms = 0;
 
-        let (secs, source) = trusted_wall_clock_secs(None, None, now_ms);
+        let (secs, source) = trusted_wall_clock_secs(None, false, None, now_ms);
         assert_eq!(secs, None);
         assert_eq!(source, ClockSource::None);
 
-        let (secs, source) = trusted_wall_clock_secs(Some(1_800_000_000), None, now_ms);
+        let (secs, source) = trusted_wall_clock_secs(Some(1_800_000_000), true, None, now_ms);
         assert_eq!(secs, Some(1_800_000_000));
         assert_eq!(source, ClockSource::Gps);
 
         let clock = adopt_server_clock(None, false, now_ms, 1_800_000_000);
-        let (secs, source) = trusted_wall_clock_secs(None, clock, now_ms);
+        let (secs, source) = trusted_wall_clock_secs(None, false, clock, now_ms);
         assert_eq!(secs, Some(1_800_000_000));
         assert_eq!(source, ClockSource::RoomServer);
     }
@@ -3161,13 +3294,13 @@ mod tests {
         // A later push, further in time, raises the bound.
         let after_push_ms = 5_000;
         let clock = adopt_server_clock(clock, false, after_push_ms, 1_800_000_100);
-        let (secs, source) = trusted_wall_clock_secs(None, clock, after_push_ms);
+        let (secs, source) = trusted_wall_clock_secs(None, false, clock, after_push_ms);
         assert_eq!(secs, Some(1_800_000_100));
         assert_eq!(source, ClockSource::RoomServer);
 
         // A stale/reordered push must not lower it.
         let clock = adopt_server_clock(clock, false, after_push_ms, 1_000);
-        let (secs, _) = trusted_wall_clock_secs(None, clock, after_push_ms);
+        let (secs, _) = trusted_wall_clock_secs(None, false, clock, after_push_ms);
         assert_eq!(
             secs,
             Some(1_800_000_100),
@@ -3196,9 +3329,13 @@ mod tests {
         );
 
         let now_ms = 0;
-        let clock =
-            adopt_server_clock(None, /* gps_synced */ false, now_ms, outcome.server_ts);
-        let (secs, source) = trusted_wall_clock_secs(None, clock, now_ms);
+        let clock = adopt_server_clock(
+            None,
+            /* gps_verified */ false,
+            now_ms,
+            outcome.server_ts,
+        );
+        let (secs, source) = trusted_wall_clock_secs(None, false, clock, now_ms);
         assert_eq!(secs, Some(1_800_000_000));
         assert_eq!(source, ClockSource::RoomServer);
     }
