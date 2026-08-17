@@ -131,7 +131,7 @@
 //! correction of an unconfirmed, contaminated boot-time guess, that same cap
 //! meant up to ~25 minutes reading a near-full `percent`/`level` on a device
 //! that was, the whole time, sitting at its true depleted charge — for
-//! this board's plain-ADC design, effectively invisible to the Commander as
+//! this board's plain-ADC design, effectively invisible to the user as
 //! "the indicator reads full when depleted, and doesn't change whether the
 //! cable is attached or not." [`battery_window_close_step`] is the fix:
 //! the slew limiter is skipped for the poll that first proves the basis
