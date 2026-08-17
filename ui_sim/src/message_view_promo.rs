@@ -31,7 +31,7 @@ pub const HEIGHT: u32 = 240;
 
 slint::slint! {
     import { Theme } from "../../firmware/src/ui/theme.slint";
-    import { Comet, CometOnNotify, RocketOnSend, SpaceBackdrop } from "../../firmware/src/ui/motifs.slint";
+    import { CometOnNotify, RocketOnSend, SpaceBackdrop } from "../../firmware/src/ui/motifs.slint";
     import { SignalMeter } from "../../firmware/src/ui/signal_meter.slint";
     import { BatteryIndicator } from "../../firmware/src/ui/battery_indicator.slint";
 
@@ -244,11 +244,6 @@ slint::slint! {
                             y: 5px;
                         }
                     }
-                }
-
-                Comet {
-                    x: parent.width - 34px;
-                    y: 4px;
                 }
 
                 CometOnNotify {
