@@ -276,13 +276,15 @@ slint::slint! {
                 height: 36px;
                 background: Theme.surface;
                 HorizontalLayout {
-                    padding-left: 4px;
-                    padding-right: 8px;
+                    // See `compose.rs`'s identical header for the
+                    // edge-alignment mission's 6px/6px convention.
+                    padding-left: 6px;
+                    padding-right: 6px;
                     spacing: 4px;
                     Rectangle {
                         width: 44px; height: 36px;
                         Text { text: "‹"; font-size: Theme.size-display; color: Theme.brand-signal;
-                               horizontal-alignment: center; vertical-alignment: center; }
+                               horizontal-alignment: left; vertical-alignment: center; }
                         back_touch := TouchArea {
                             width: parent.width;
                             height: parent.height;
@@ -297,20 +299,22 @@ slint::slint! {
                         vertical-alignment: center;
                     }
 
+                    // Right-pinned pair — see `compose.rs`'s identical
+                    // spacer for the edge-alignment mission's rationale.
                     Rectangle {
                         width: 36px; height: 36px;
-                        SignalMeter {
-                            signal-level: root.signal_level;
-                            width: 16px;
-                            height: 14px;
-                            x: 2px;
-                            y: (parent.height - self.height) / 2;
-                        }
                         BatteryIndicator {
                             battery-level: root.battery_level;
                             width: 14px;
                             height: 9px;
-                            x: 20px;
+                            x: parent.width - self.width;
+                            y: (parent.height - self.height) / 2;
+                        }
+                        SignalMeter {
+                            signal-level: root.signal_level;
+                            width: 16px;
+                            height: 14px;
+                            x: parent.width - self.width - 14px - 2px;
                             y: (parent.height - self.height) / 2;
                         }
                     }

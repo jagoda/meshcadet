@@ -518,13 +518,19 @@ slint::slint! {
                 height: 36px;
                 background: Theme.surface;
                 HorizontalLayout {
-                    padding-left: 4px;
-                    padding-right: 8px;
+                    // Equalized 4px/8px -> 6px/6px (header-icon-edge-
+                    // alignment mission) — see `message_view.rs`'s header
+                    // for the shared-inset convention this mirrors.
+                    padding-left: 6px;
+                    padding-right: 6px;
                     spacing: 4px;
                     Rectangle {
                         width: 44px; height: 36px;
+                        // Flush left (was `center`) so the glyph sits at the
+                        // slab's own left edge, the header's true outer edge
+                        // once `padding-left` above is applied.
                         Text { text: "‹"; font-size: Theme.size-display; color: Theme.brand-signal;
-                               horizontal-alignment: center; vertical-alignment: center; }
+                               horizontal-alignment: left; vertical-alignment: center; }
                         back_touch := TouchArea {
                             width: parent.width;
                             height: parent.height;
@@ -566,20 +572,26 @@ slint::slint! {
                     // 1.0`'s remaining space minus this reservation — it
                     // stays left-aligned and un-clipped for every
                     // contact/channel name this header has ever shown.
+                    //
+                    // Flush right (was a 2px baked-in left-pin margin) — the
+                    // uniform 6px edge inset now comes solely from the
+                    // header's own `padding-right` above, matching every
+                    // other in-scope screen's convention (header-icon-
+                    // edge-alignment mission).
                     Rectangle {
                         width: 36px; height: 36px;
-                        SignalMeter {
-                            signal-level: root.signal_level;
-                            width: 16px;
-                            height: 14px;
-                            x: 2px;
-                            y: (parent.height - self.height) / 2;
-                        }
                         BatteryIndicator {
                             battery-level: root.battery_level;
                             width: 14px;
                             height: 9px;
-                            x: 20px;
+                            x: parent.width - self.width;
+                            y: (parent.height - self.height) / 2;
+                        }
+                        SignalMeter {
+                            signal-level: root.signal_level;
+                            width: 16px;
+                            height: 14px;
+                            x: parent.width - self.width - 14px - 2px;
                             y: (parent.height - self.height) / 2;
                         }
                     }

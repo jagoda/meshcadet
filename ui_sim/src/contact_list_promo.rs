@@ -326,23 +326,24 @@ slint::slint! {
                     // `SignalMeter` + `BatteryIndicator` moved to AFTER the
                     // gear — mirrors `contact_list.rs`'s real-screen header
                     // (this module is a verbatim copy; see this file's module
-                    // doc). Slot widened 26px -> 36px to fit both widgets —
-                    // see `contact_list.rs`'s identical widen for the pixel
-                    // math.
+                    // doc). Slot widened 36px -> 38px, pair right-pinned with
+                    // a 6px edge inset — see `contact_list.rs`'s identical
+                    // widen for the pixel math (header-icon-edge-alignment
+                    // mission).
                     Rectangle {
-                        width: 36px; height: 36px;
-                        SignalMeter {
-                            signal-level: root.signal_level;
-                            width: 16px;
-                            height: 14px;
-                            x: 2px;
-                            y: (parent.height - self.height) / 2;
-                        }
+                        width: 38px; height: 36px;
                         BatteryIndicator {
                             battery-level: root.battery_level;
                             width: 14px;
                             height: 9px;
-                            x: 20px;
+                            x: parent.width - self.width - 6px;
+                            y: (parent.height - self.height) / 2;
+                        }
+                        SignalMeter {
+                            signal-level: root.signal_level;
+                            width: 16px;
+                            height: 14px;
+                            x: parent.width - self.width - 14px - 6px - 2px;
                             y: (parent.height - self.height) / 2;
                         }
                     }

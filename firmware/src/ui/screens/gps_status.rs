@@ -277,8 +277,11 @@ slint::slint! {
                 height: 36px;
                 background: Theme.surface;
                 HorizontalLayout {
-                    padding-left: 4px;
-                    padding-right: 8px;
+                    // Equalized 4px/8px -> 6px/6px (header-icon-edge-
+                    // alignment mission) — see `message_view.rs`'s header
+                    // for the shared-inset convention this mirrors.
+                    padding-left: 6px;
+                    padding-right: 6px;
                     spacing: 4px;
 
                     Rectangle {
@@ -287,7 +290,11 @@ slint::slint! {
                             text: "‹";
                             font-size: Theme.size-display; // 22px
                             color: Theme.brand-signal;
-                            horizontal-alignment: center;
+                            // Flush left (was `center`) so the glyph sits at
+                            // the slab's own left edge — the header's true
+                            // outer edge once `padding-left` above is
+                            // applied — instead of ~22px in from it.
+                            horizontal-alignment: left;
                             vertical-alignment: center;
                         }
                         TouchArea { clicked => { root.back_pressed(); } }
@@ -359,20 +366,24 @@ slint::slint! {
                     // why).
                     Rectangle {
                         width: 44px; height: 36px;
+                        // Flush right (was a 4px baked-in margin) — the
+                        // uniform 6px edge inset now comes solely from the
+                        // header's own `padding-right` above, matching every
+                        // other in-scope screen's convention (header-icon-
+                        // edge-alignment mission).
                         SignalMeter {
                             signal-level: root.signal_level;
                             width: 16px;
                             height: 14px;
-                            x: parent.width - self.width - 4px;
+                            x: parent.width - self.width;
                             y: (parent.height - self.height) / 2;
                         }
                         BatteryIndicator {
                             battery-level: root.battery_level;
                             width: 14px;
                             height: 9px;
-                            // Left of the SignalMeter (16px + 4px right
-                            // margin) with a 3px gap.
-                            x: parent.width - 16px - 4px - 3px - 14px;
+                            // Left of the SignalMeter (16px) with a 3px gap.
+                            x: parent.width - 16px - 3px - 14px;
                             y: (parent.height - self.height) / 2;
                         }
                     }

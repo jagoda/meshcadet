@@ -385,8 +385,11 @@ slint::slint! {
                 }
 
                 HorizontalLayout {
-                    padding-left: 4px;
-                    padding-right: 8px;
+                    // Equalized 4px/8px -> 6px/6px (header-icon-edge-
+                    // alignment mission) — see `message_view.rs`'s header
+                    // for the shared-inset convention this mirrors.
+                    padding-left: 6px;
+                    padding-right: 6px;
                     spacing: 4px;
 
                     Rectangle {
@@ -395,7 +398,11 @@ slint::slint! {
                             text: "‹";
                             font-size: Theme.size-display; // 22px
                             color: Theme.brand-signal;
-                            horizontal-alignment: center;
+                            // Flush left (was `center`) so the glyph sits at
+                            // the slab's own left edge, the header's true
+                            // outer edge once `padding-left` above is
+                            // applied.
+                            horizontal-alignment: left;
                             vertical-alignment: center;
                         }
                         TouchArea { clicked => { root.back_pressed(); } }
