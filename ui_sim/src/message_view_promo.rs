@@ -243,14 +243,14 @@ slint::slint! {
                             width: 14px;
                             height: 9px;
                             x: parent.width - self.width;
-                            y: 5px;
+                            y: (parent.height - self.height) / 2;
                         }
                         SignalMeter {
                             signal-level: root.signal_level;
                             width: 16px;
                             height: 14px;
                             x: parent.width - self.width - 14px - 2px;
-                            y: 3px;
+                            y: (parent.height - self.height) / 2;
                         }
                     }
                 }

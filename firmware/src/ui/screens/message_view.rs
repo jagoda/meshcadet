@@ -572,14 +572,14 @@ slint::slint! {
                             width: 14px;
                             height: 9px;
                             x: parent.width - self.width; // flush to the spacer's (and header's) right edge
-                            y: 5px;
+                            y: (parent.height - self.height) / 2;
                         }
                         SignalMeter {
                             signal-level: root.signal_level;
                             width: 16px;
                             height: 14px;
                             x: parent.width - self.width - 14px - 2px; // battery's width + 2px gap, left of it
-                            y: 3px;
+                            y: (parent.height - self.height) / 2;
                         }
                     }
                 }
