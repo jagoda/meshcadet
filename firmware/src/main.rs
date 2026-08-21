@@ -230,7 +230,7 @@ static ROOM_CLOCK_SOURCE: std::sync::Mutex<room_session::ClockSource> =
 
 use battery::BatteryDriver;
 use dispatcher::{
-    AirtimeBudget, DELIVERY_ACK_DEADLINE_MS, DuplicateFilter, OutstandingKind, OutstandingSend,
+    AirtimeBudget, DuplicateFilter, OutstandingKind, OutstandingSend,
     OutstandingSends, TxQueue, lora_airtime_ms, tx_guard_allows,
 };
 use gps::GpsDriver;
@@ -297,10 +297,11 @@ const TX_INTERVAL_MS: u64 = 30_000;
 /// pending send, rather than adding a second, parallel tracker.
 ///
 /// Single-slot — only the most recently sent channel message's ack is ever
-/// recognised live. Channel/GRP_TXT sends are out of this mission's
-/// Objective scope (no wire ACK to correlate against a table entry by), so
-/// this stays a single slot unlike the DM/room-post paths, which moved to
-/// `dispatcher::OutstandingSends` (see the section above).
+/// recognised live, and it is NEVER auto-retried: there is no wire ACK to
+/// correlate a retry against (only an implicit "heard our own repeat"
+/// signal), so a channel send never enters `dispatcher::OutstandingSends`
+/// (`meshcadet-dm-room-send-auto-retry`'s auto-retry sweep only ever walks
+/// that table) and this stays a single slot unlike the DM/room-post paths.
 struct PendingChannelAck {
     hash: [u8; 4],
     channel_hash: u8,
@@ -1956,23 +1957,78 @@ fn run() -> anyhow::Result<()> {
         // bounded by the TWDT timeout.
         unsafe { esp_idf_svc::sys::esp_task_wdt_reset(); }
 
-        // ── Outstanding-sends deadline sweep ──────────────────────────────────
-        // Every DM/room-post send whose `DELIVERY_ACK_DEADLINE_MS` has
-        // passed with no ACK is resolved to undelivered (red check) here —
-        // this is the ONLY place a send times out rather than sitting
-        // pending forever (a TX-queue eviction is the other undelivered
-        // path, resolved inline at each `log_tx_queue_eviction`/
-        // `insert_outstanding` call site instead). Bounded by
-        // `MAX_OUTSTANDING_SENDS` (8 slots), so scanning it every iteration
-        // is cheap — same cost class as `TxQueue::has_pending()`'s own
-        // per-iteration check just below.
-        outstanding.sweep_expired(now, |send| {
-            log::warn!(
-                "outstanding send timed out with no ACK ({:?}, ack {}) — marking undelivered",
-                send.kind, hex4(&send.ack_hash),
+        // ── Outstanding-sends deadline sweep (auto-retry) ─────────────────────
+        // Every DM/room-post send whose current deadline has passed with no
+        // ACK lands here — the ONLY place a send times out rather than
+        // sitting pending forever (a TX-queue eviction is the other
+        // undelivered path, resolved inline at each `log_tx_queue_eviction`/
+        // `insert_outstanding` call site instead). With attempts remaining
+        // (`dispatcher::MAX_SEND_RETRIES`, hard cap of 2), `retry_if`
+        // re-enqueues the BYTE-IDENTICAL cached frame from `send.frame` —
+        // NEVER re-encoded, see `OutstandingSend`'s doc for why a room-post
+        // re-encode would be a genuine duplicate post — and reports `true` to
+        // keep tracking it under `dispatcher::retry_backoff_ms`'s expanded,
+        // jittered deadline. A room post additionally checks the room's
+        // CURRENT session state before retrying (never blind-retry into a
+        // session that may have logged out / gone read-only since the
+        // original send); a DM has no such gate. Attempts exhausted, or
+        // `retry_if` declining, finalizes the record red (undelivered) via
+        // `on_undelivered`, same event `delivery_event` raises for a
+        // deadline timeout today. Bounded by `MAX_OUTSTANDING_SENDS` (8
+        // slots), so scanning it every iteration is cheap — same cost class
+        // as `TxQueue::has_pending()`'s own per-iteration check just below.
+        //
+        // A retry's own `txq.enqueue` can itself evict an unrelated queued
+        // frame (TX_QUEUE_SLOTS is small); `outstanding.resolve_evicted`
+        // can't be called from inside this closure (it would re-borrow
+        // `outstanding`, which `sweep_expired` already holds `&mut` for), so
+        // evictions are collected here and resolved in the follow-up loop
+        // below instead — the same "collect now, process after" idiom the
+        // UI-command drain above already uses.
+        let mut retry_evictions: Vec<(usize, Option<[u8; 4]>)> = Vec::new();
+        outstanding.sweep_expired(
+            now,
+            |send| {
+                if let OutstandingKind::RoomPost { room_hash } = send.kind {
+                    let can_post = room_runtime
+                        .iter()
+                        .find(|r| r.hash == room_hash)
+                        .map(|r| r.session.permission().can_post())
+                        .unwrap_or(false);
+                    if !can_post {
+                        log::warn!(
+                            "room 0x{:02x} session no longer postable — abandoning retry \
+                             of ack {} rather than blind-retrying into a stale session",
+                            room_hash, hex4(&send.ack_hash),
+                        );
+                        return false;
+                    }
+                }
+                log::info!(
+                    "retrying unacked send with no ACK yet ({:?}, ack {}, attempt {})",
+                    send.kind, hex4(&send.ack_hash), send.attempts + 1,
+                );
+                if let Some(dropped) = txq.enqueue(&send.frame[..send.frame_len], Some(send.ack_hash)) {
+                    retry_evictions.push(dropped);
+                }
+                true
+            },
+            |send| {
+                log::warn!(
+                    "outstanding send undelivered ({:?}, ack {}, {} attempt(s) made) — marking red",
+                    send.kind, hex4(&send.ack_hash), send.attempts + 1,
+                );
+                send_ui_event(&evt_tx, &mut evt_dropped, delivery_event(send, false));
+            },
+        );
+        for dropped in retry_evictions {
+            log_tx_queue_eviction(
+                Some(dropped),
+                "retry re-enqueue",
+                &mut outstanding,
+                |ev| send_ui_event(&evt_tx, &mut evt_dropped, ev),
             );
-            send_ui_event(&evt_tx, &mut evt_dropped, delivery_event(send, false));
-        });
+        }
 
         // ── GPS poll (duty-cycle NMEA read + fix cache refresh) ──────────────
         #[cfg(feature = "diagnostics")]
@@ -2165,12 +2221,12 @@ fn run() -> anyhow::Result<()> {
                 );
                 insert_outstanding(
                     &mut outstanding,
-                    OutstandingSend {
-                        ack_hash: ack,
-                        kind: OutstandingKind::Dm { to_hash: peer_pubkey[0] },
-                        sent_at_ms: now,
-                        deadline_ms: now + DELIVERY_ACK_DEADLINE_MS,
-                    },
+                    OutstandingSend::new(
+                        ack,
+                        OutstandingKind::Dm { to_hash: peer_pubkey[0] },
+                        now,
+                        &frame_buf[..n],
+                    ),
                     |ev| send_ui_event(&evt_tx, &mut evt_dropped, ev),
                 );
                 log::debug!(
@@ -3036,12 +3092,12 @@ fn run() -> anyhow::Result<()> {
                                         );
                                         insert_outstanding(
                                             &mut outstanding,
-                                            OutstandingSend {
-                                                ack_hash: ack,
-                                                kind: OutstandingKind::Dm { to_hash },
-                                                sent_at_ms: now,
-                                                deadline_ms: now + DELIVERY_ACK_DEADLINE_MS,
-                                            },
+                                            OutstandingSend::new(
+                                                ack,
+                                                OutstandingKind::Dm { to_hash },
+                                                now,
+                                                &frame_buf[..n],
+                                            ),
                                             |ev| send_ui_event(&evt_tx, &mut evt_dropped, ev),
                                         );
                                         // Tag the optimistic bubble
@@ -3231,12 +3287,12 @@ fn run() -> anyhow::Result<()> {
                                             );
                                             insert_outstanding(
                                                 &mut outstanding,
-                                                OutstandingSend {
-                                                    ack_hash: ack,
-                                                    kind: OutstandingKind::RoomPost { room_hash: room.hash },
-                                                    sent_at_ms: now,
-                                                    deadline_ms: now + DELIVERY_ACK_DEADLINE_MS,
-                                                },
+                                                OutstandingSend::new(
+                                                    ack,
+                                                    OutstandingKind::RoomPost { room_hash: room.hash },
+                                                    now,
+                                                    &frame_buf[..n],
+                                                ),
                                                 |ev| send_ui_event(&evt_tx, &mut evt_dropped, ev),
                                             );
                                             room.session.record_sent_timestamp(candidate_ts);
@@ -5301,12 +5357,7 @@ mod tests {
     use super::*;
 
     fn dm_send(ack_hash: [u8; 4], to_hash: u8, sent_at_ms: u64) -> OutstandingSend {
-        OutstandingSend {
-            ack_hash,
-            kind: OutstandingKind::Dm { to_hash },
-            sent_at_ms,
-            deadline_ms: sent_at_ms + DELIVERY_ACK_DEADLINE_MS,
-        }
+        OutstandingSend::new(ack_hash, OutstandingKind::Dm { to_hash }, sent_at_ms, b"stub dm frame")
     }
 
     #[test]
@@ -5434,12 +5485,7 @@ mod tests {
     /// `to_hash` set to the room's hash — see `delivery_event`'s doc.
     #[test]
     fn delivery_event_room_post_sets_is_channel_true() {
-        let send = OutstandingSend {
-            ack_hash: [5, 6, 7, 8],
-            kind: OutstandingKind::RoomPost { room_hash: 0x99 },
-            sent_at_ms: 0,
-            deadline_ms: DELIVERY_ACK_DEADLINE_MS,
-        };
+        let send = OutstandingSend::new([5, 6, 7, 8], OutstandingKind::RoomPost { room_hash: 0x99 }, 0, b"stub room frame");
         match delivery_event(send, true) {
             ui::UiEvent::DmAcked { to_hash, is_channel, ack_hash } => {
                 assert_eq!(to_hash, 0x99);
@@ -5616,12 +5662,7 @@ mod tests {
     // regression guard for both call sites.
 
     fn room_post_send(ack_hash: [u8; 4], room_hash: u8, sent_at_ms: u64) -> OutstandingSend {
-        OutstandingSend {
-            ack_hash,
-            kind: OutstandingKind::RoomPost { room_hash },
-            sent_at_ms,
-            deadline_ms: sent_at_ms + DELIVERY_ACK_DEADLINE_MS,
-        }
+        OutstandingSend::new(ack_hash, OutstandingKind::RoomPost { room_hash }, sent_at_ms, b"stub room frame")
     }
 
     #[test]

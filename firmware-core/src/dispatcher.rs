@@ -10,6 +10,10 @@
 //! - [`OutstandingSends`] — fixed-size table of in-flight DM/room-post sends
 //!   awaiting a wire ACK or their delivery deadline; backs the tri-state
 //!   grey/blue/red delivery indicator (`crate::ui::DeliveryState`).
+//!   [`OutstandingSends::sweep_expired`] auto-retries an unacked send (the
+//!   byte-identical cached frame, never re-encoded) with an expanding,
+//!   jittered backoff up to [`MAX_SEND_RETRIES`] attempts before giving up
+//!   and flipping the record red.
 //!
 //! Source reference: `src/Mesh.cpp` flood-relay logic @ dee3e26a.
 //!
@@ -328,7 +332,8 @@ impl Default for TxQueue {
 pub const MAX_OUTSTANDING_SENDS: usize = 2 * TX_QUEUE_SLOTS;
 
 /// How long an outstanding DM/room-post send waits for its ACK before
-/// [`OutstandingSends::sweep_expired`] marks it undelivered (red).
+/// [`OutstandingSends::sweep_expired`] either retries it (attempts remain)
+/// or marks it undelivered (red — attempts exhausted or the caller declined).
 ///
 /// A flood-routed frame's round trip carries per-hop randomized retransmit
 /// jitter (`rand(0,5) * airtime * 52/50 / 2` — `meshcore-wire-protocol.md`
@@ -341,6 +346,44 @@ pub const MAX_OUTSTANDING_SENDS: usize = 2 * TX_QUEUE_SLOTS;
 /// trip isn't marked red while its ACK is still legitimately en route.
 pub const DELIVERY_ACK_DEADLINE_MS: u64 = 30_000;
 
+/// Hard cap on retry attempts after the ORIGINAL send — 2 retries (3
+/// transmissions total: original + 2 replays) before a still-unacked send
+/// gives up and flips to the red undelivered state. Applies uniformly to
+/// both ACKed paths this table tracks (DM, room post); Channel/GRP_TXT sends
+/// are never inserted into this table at all (see [`OutstandingKind`]'s doc),
+/// so they structurally can never retry.
+pub const MAX_SEND_RETRIES: u8 = 2;
+
+/// Backoff step multiplied by the retry attempt number and added on top of
+/// [`DELIVERY_ACK_DEADLINE_MS`] itself — expanding, so the second retry
+/// waits longer than the first rather than hammering a merely-slow link at a
+/// fixed interval.
+pub const RETRY_BACKOFF_STEP_MS: u64 = 20_000;
+
+/// Jitter ceiling folded into every retry deadline. Deterministically
+/// derived from the frame's own ACK hash ([`retry_backoff_ms`]) rather than
+/// a runtime RNG — this table has no entropy source of its own, and the
+/// jitter here only needs to keep retries of DIFFERENT outstanding sends
+/// from clustering in lockstep, not resist prediction.
+pub const RETRY_JITTER_MAX_MS: u64 = 5_000;
+
+/// Retry deadline offset (from "now") for retry attempt `attempt` (1 = first
+/// retry, 2 = second/final retry, per [`MAX_SEND_RETRIES`]) of the send
+/// whose wire ACK hash is `ack_hash`.
+///
+/// Seeded above [`DELIVERY_ACK_DEADLINE_MS`] — even the first retry waits at
+/// least one full ACK-deadline's worth of extra slack beyond the deadline
+/// that just expired, on the theory that a link slow enough to miss the
+/// first (already generous) deadline needs materially more room, not a
+/// same-length second look. Expanding per attempt, jittered by a few bytes
+/// of the frame's own ACK hash so concurrent outstanding sends don't all
+/// retry on the same tick.
+fn retry_backoff_ms(attempt: u8, ack_hash: &[u8; 4]) -> u64 {
+    let jitter = (ack_hash[0] as u64 * 1103 + ack_hash[1] as u64 * 71 + ack_hash[2] as u64)
+        % RETRY_JITTER_MAX_MS;
+    DELIVERY_ACK_DEADLINE_MS + RETRY_BACKOFF_STEP_MS * attempt as u64 + jitter
+}
+
 /// Which kind of ACKed send an [`OutstandingSend`] tracks — the two paths
 /// this table covers (Channel/GRP_TXT stays on its own pre-existing
 /// single-slot `PendingChannelAck` in `firmware/src/main.rs`, unchanged: no
@@ -352,14 +395,53 @@ pub enum OutstandingKind {
 }
 
 /// One outstanding ACKed send: the wire ACK hash the sender is waiting for,
-/// which contact/room it belongs to, and the send/deadline timestamps
-/// (`uptime_ms()`-scale, matching every other `*_ms` field in this crate).
+/// which contact/room it belongs to, the send/deadline timestamps
+/// (`uptime_ms()`-scale, matching every other `*_ms` field in this crate),
+/// the retry attempt count, and the exact wire frame bytes originally sent.
+///
+/// `frame`/`frame_len` exist ONLY so a retry can re-enqueue the
+/// BYTE-IDENTICAL frame — never re-encode. This is non-negotiable for a room
+/// post: the server treats an equal timestamp as a retry (discarded, still
+/// ACKed) and a lesser one as a replay (no ACK) — see `protocol/src/room.rs`
+/// — but `record_sent_timestamp` has already advanced `last_room_ts` by the
+/// time a retry fires, so a re-encode would compute a FRESH `candidate_ts`
+/// and land as a genuine duplicate post visible to the whole room (and
+/// `encode_room_post_checked`'s monotonic gate would refuse the
+/// correct-for-retry original timestamp anyway, since it's no longer greater
+/// than the now-advanced watermark).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OutstandingSend {
     pub ack_hash: [u8; 4],
     pub kind: OutstandingKind,
     pub sent_at_ms: u64,
     pub deadline_ms: u64,
+    /// Number of retry attempts already made (0 = never retried yet; caps at
+    /// [`MAX_SEND_RETRIES`]).
+    pub attempts: u8,
+    /// Cached wire frame bytes (only `frame[..frame_len]` is meaningful).
+    pub frame: [u8; FRAME_BUF],
+    pub frame_len: usize,
+}
+
+impl OutstandingSend {
+    /// Build a fresh (never-yet-retried) outstanding send tracking `frame`
+    /// — copied byte-for-byte, the ONE copy ever made; every retry replays
+    /// these exact bytes — for `kind`, sent at `sent_at_ms` and due at
+    /// `sent_at_ms + DELIVERY_ACK_DEADLINE_MS`.
+    pub fn new(ack_hash: [u8; 4], kind: OutstandingKind, sent_at_ms: u64, frame: &[u8]) -> Self {
+        let mut buf = [0u8; FRAME_BUF];
+        let n = frame.len().min(FRAME_BUF);
+        buf[..n].copy_from_slice(&frame[..n]);
+        Self {
+            ack_hash,
+            kind,
+            sent_at_ms,
+            deadline_ms: sent_at_ms + DELIVERY_ACK_DEADLINE_MS,
+            attempts: 0,
+            frame: buf,
+            frame_len: n,
+        }
+    }
 }
 
 /// Fixed-size outstanding-sends table replacing the single-slot `PendingAck`
@@ -449,20 +531,45 @@ impl OutstandingSends {
         tag.and_then(|hash| self.resolve(hash))
     }
 
-    /// Invoke `on_expired` once for every entry whose `deadline_ms` has
-    /// passed as of `now_ms`, removing each from the table — called once per
-    /// dispatcher-loop iteration. A callback rather than a `Vec<_>` return
-    /// (unlike, say, `firmware/src/main.rs`'s `Vec<ui::UiEvent>` collectors)
-    /// keeps this table itself allocation-free, matching every sibling type
-    /// in this file; the caller pushes whatever `ui::UiEvent` it wants
-    /// straight from the closure.
-    pub fn sweep_expired(&mut self, now_ms: u64, mut on_expired: impl FnMut(OutstandingSend)) {
+    /// Sweep every entry whose `deadline_ms` has passed as of `now_ms` —
+    /// called once per dispatcher-loop iteration. For each matured entry
+    /// with attempts remaining (`attempts < MAX_SEND_RETRIES`), calls
+    /// `retry_if(&send)`: if it returns `true` (the caller re-enqueued the
+    /// cached `send.frame[..send.frame_len]` itself — this method never
+    /// touches the TX queue), the entry stays in its slot with `attempts`
+    /// bumped and `deadline_ms` pushed out by [`retry_backoff_ms`]. If
+    /// `retry_if` returns `false` (caller declined — e.g. a room session
+    /// that's no longer postable) OR attempts are already exhausted, the
+    /// entry is removed and handed to `on_undelivered` — the same red/
+    /// undelivered outcome a TX-queue eviction or a full-table eviction
+    /// raises elsewhere.
+    ///
+    /// Two callbacks rather than a `Vec<_>` return (unlike, say,
+    /// `firmware/src/main.rs`'s `Vec<ui::UiEvent>` collectors) keep this
+    /// table itself allocation-free, matching every sibling type in this
+    /// file. `retry_if` takes `&OutstandingSend` (not owned) specifically so
+    /// it can inspect `frame`/`kind`/`attempts` without this method losing
+    /// ownership before it knows whether to keep the slot.
+    pub fn sweep_expired(
+        &mut self,
+        now_ms: u64,
+        mut retry_if: impl FnMut(&OutstandingSend) -> bool,
+        mut on_undelivered: impl FnMut(OutstandingSend),
+    ) {
         for slot in self.slots.iter_mut() {
-            let expired = matches!(slot, Some(s) if now_ms >= s.deadline_ms);
-            if expired {
-                if let Some(send) = slot.take() {
-                    on_expired(send);
-                }
+            let matured = matches!(slot, Some(s) if now_ms >= s.deadline_ms);
+            if !matured {
+                continue;
+            }
+            let has_attempts_left = slot.as_ref().is_some_and(|s| s.attempts < MAX_SEND_RETRIES);
+            let retried =
+                has_attempts_left && retry_if(slot.as_ref().expect("matured implies Some"));
+            if retried {
+                let send = slot.as_mut().expect("matured implies Some");
+                send.attempts += 1;
+                send.deadline_ms = now_ms + retry_backoff_ms(send.attempts, &send.ack_hash);
+            } else if let Some(send) = slot.take() {
+                on_undelivered(send);
             }
         }
     }
@@ -792,12 +899,12 @@ mod tests {
     // ── OutstandingSends ─────────────────────────────────────────────────────
 
     fn dm_send(ack_hash: [u8; 4], to_hash: u8, sent_at_ms: u64) -> OutstandingSend {
-        OutstandingSend {
+        OutstandingSend::new(
             ack_hash,
-            kind: OutstandingKind::Dm { to_hash },
+            OutstandingKind::Dm { to_hash },
             sent_at_ms,
-            deadline_ms: sent_at_ms + DELIVERY_ACK_DEADLINE_MS,
-        }
+            b"stub dm frame",
+        )
     }
 
     #[test]
@@ -840,12 +947,12 @@ mod tests {
         let mut t = OutstandingSends::new();
         assert_eq!(t.insert(dm_send([1, 1, 1, 1], 0x42, 0)), None);
         assert_eq!(
-            t.insert(OutstandingSend {
-                ack_hash: [2, 2, 2, 2],
-                kind: OutstandingKind::RoomPost { room_hash: 0x99 },
-                sent_at_ms: 0,
-                deadline_ms: DELIVERY_ACK_DEADLINE_MS,
-            }),
+            t.insert(OutstandingSend::new(
+                [2, 2, 2, 2],
+                OutstandingKind::RoomPost { room_hash: 0x99 },
+                0,
+                b"stub room post frame",
+            )),
             None
         );
 
@@ -907,25 +1014,24 @@ mod tests {
         let mut t = OutstandingSends::new();
         assert_eq!(
             t.insert(OutstandingSend {
-                ack_hash: [1, 1, 1, 1],
-                kind: OutstandingKind::Dm { to_hash: 0x42 },
-                sent_at_ms: 0,
                 deadline_ms: 1_000,
+                ..OutstandingSend::new([1, 1, 1, 1], OutstandingKind::Dm { to_hash: 0x42 }, 0, b"a")
             }),
             None
         );
         assert_eq!(
             t.insert(OutstandingSend {
-                ack_hash: [2, 2, 2, 2],
-                kind: OutstandingKind::Dm { to_hash: 0x43 },
-                sent_at_ms: 0,
                 deadline_ms: 5_000,
+                ..OutstandingSend::new([2, 2, 2, 2], OutstandingKind::Dm { to_hash: 0x43 }, 0, b"b")
             }),
             None
         );
 
+        // `retry_if` declines every retry here — this test is pinning
+        // "which entries fire at all", not the retry mechanics (see the
+        // dedicated `outstanding_sweep_expired_retries_*` tests below).
         let mut expired = Vec::new();
-        t.sweep_expired(1_000, |s| expired.push(s.ack_hash));
+        t.sweep_expired(1_000, |_| false, |s| expired.push(s.ack_hash));
         assert_eq!(
             expired,
             vec![[1, 1, 1, 1]],
@@ -942,9 +1048,115 @@ mod tests {
         let mut t = OutstandingSends::new();
         assert_eq!(t.insert(dm_send([1, 1, 1, 1], 0x42, 1_000)), None);
         let mut expired = Vec::new();
-        t.sweep_expired(500, |s| expired.push(s.ack_hash));
+        t.sweep_expired(500, |_| false, |s| expired.push(s.ack_hash));
         assert!(expired.is_empty());
         assert!(t.resolve([1, 1, 1, 1]).is_some());
+    }
+
+    /// This mission's core acceptance criterion: a matured entry with
+    /// attempts remaining that `retry_if` accepts stays in the table,
+    /// `attempts` bumps, and `deadline_ms` moves out — it is NOT handed to
+    /// `on_undelivered`, and it is NOT removed (still resolvable by its
+    /// unchanged `ack_hash`, per the DM-retry acceptance criterion: the ACK
+    /// hash never changes across a retry).
+    #[test]
+    fn outstanding_sweep_expired_retry_keeps_entry_alive_with_bumped_attempts() {
+        let mut t = OutstandingSends::new();
+        assert_eq!(t.insert(dm_send([1, 1, 1, 1], 0x42, 0)), None);
+
+        let mut retried_frames = Vec::new();
+        let mut undelivered = Vec::new();
+        t.sweep_expired(
+            DELIVERY_ACK_DEADLINE_MS,
+            |s| {
+                retried_frames.push(s.frame[..s.frame_len].to_vec());
+                true
+            },
+            |s| undelivered.push(s.ack_hash),
+        );
+
+        assert_eq!(retried_frames, vec![b"stub dm frame".to_vec()]);
+        assert!(
+            undelivered.is_empty(),
+            "a retried entry must not finalize undelivered"
+        );
+
+        let still_outstanding = t.resolve([1, 1, 1, 1]);
+        assert!(
+            still_outstanding.is_some(),
+            "entry must still be resolvable under its original, unchanged ack hash"
+        );
+        let send = still_outstanding.unwrap();
+        assert_eq!(send.attempts, 1);
+        assert!(
+            send.deadline_ms > DELIVERY_ACK_DEADLINE_MS,
+            "retry deadline must be pushed out, not left at the just-passed deadline"
+        );
+    }
+
+    /// This mission's other core acceptance criterion: once `attempts`
+    /// reaches `MAX_SEND_RETRIES`, a matured entry is finalized undelivered
+    /// WITHOUT even asking `retry_if` — the cap is a hard, mechanical limit.
+    #[test]
+    fn outstanding_sweep_expired_exhausted_retries_flips_undelivered_without_asking() {
+        // Drive one entry through MAX_SEND_RETRIES accepted retries, each
+        // time sweeping at an ever-later `now_ms` guaranteed to be past the
+        // just-pushed-out deadline, then confirm the (MAX_SEND_RETRIES+1)th
+        // pass finalizes undelivered WITHOUT offering `retry_if` a vote.
+        let mut t = OutstandingSends::new();
+        assert_eq!(t.insert(dm_send([9, 9, 9, 9], 0x42, 0)), None);
+        let mut retry_offers = 0u32;
+        let mut undelivered = Vec::new();
+        let mut now_ms = DELIVERY_ACK_DEADLINE_MS;
+        for _ in 0..(MAX_SEND_RETRIES as u32 + 1) {
+            t.sweep_expired(
+                now_ms,
+                |_| {
+                    retry_offers += 1;
+                    true
+                },
+                |s| undelivered.push(s.ack_hash),
+            );
+            // Always overshoot the worst-case next deadline the sweep just
+            // set, so the following pass's `now_ms >= deadline_ms` holds.
+            now_ms += DELIVERY_ACK_DEADLINE_MS
+                + RETRY_BACKOFF_STEP_MS * (MAX_SEND_RETRIES as u64 + 1)
+                + RETRY_JITTER_MAX_MS;
+        }
+
+        assert_eq!(
+            retry_offers, MAX_SEND_RETRIES as u32,
+            "retry_if must be offered exactly MAX_SEND_RETRIES times, never on the cap-exhausted pass"
+        );
+        assert_eq!(
+            undelivered,
+            vec![[9, 9, 9, 9]],
+            "the cap-exhausted pass must finalize undelivered exactly once"
+        );
+        assert!(
+            t.resolve([9, 9, 9, 9]).is_none(),
+            "finalized entry is removed"
+        );
+    }
+
+    /// A caller can decline a retry even with attempts remaining (the
+    /// room-post "session may have expired" gate this mission adds in
+    /// `firmware/src/main.rs`) — the entry finalizes undelivered
+    /// immediately rather than waiting out the remaining attempts.
+    #[test]
+    fn outstanding_sweep_expired_declined_retry_finalizes_immediately() {
+        let mut t = OutstandingSends::new();
+        assert_eq!(t.insert(dm_send([1, 1, 1, 1], 0x42, 0)), None);
+
+        let mut undelivered = Vec::new();
+        t.sweep_expired(
+            DELIVERY_ACK_DEADLINE_MS,
+            |_| false,
+            |s| undelivered.push(s.ack_hash),
+        );
+
+        assert_eq!(undelivered, vec![[1, 1, 1, 1]]);
+        assert!(t.resolve([1, 1, 1, 1]).is_none());
     }
 
     // ── Airtime calculator ───────────────────────────────────────────────────
