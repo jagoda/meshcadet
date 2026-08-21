@@ -1965,32 +1965,40 @@ fn run() -> anyhow::Result<()> {
         if let Some(unix_secs) = gps.synced_wall_clock_secs(now) {
             tx_epoch_base = unix_secs.wrapping_sub((now / 1000) as u32);
         }
-        // Whether the wall clock is genuinely GPS-synced right now — the
-        // same source GPS Status reads. Feeds the room-post refusal message
-        // below (a real, still-relevant distinction: an unsynced clock is no
-        // longer a refusal reason at all — see `room_tx_timestamp`'s doc —
-        // vs. "clock hasn't advanced since the last send", the one refusal
-        // reason that remains) AND `room_session::adopt_server_clock`'s
-        // priority rule (GPS outranks an adopted room-server clock while
-        // synced). Computed
+        // Whether the wall clock is genuinely GPS-synced right now, from a
+        // real fix — the same source GPS Status reads. Feeds the room-post
+        // refusal message below (a real, still-relevant distinction: an
+        // unsynced clock is no longer a refusal reason at all — see
+        // `room_tx_timestamp`'s doc — vs. "clock hasn't advanced since the
+        // last send", the one refusal reason that remains) AND
+        // `room_session::adopt_server_clock`'s priority rule. This is
+        // deliberately `clock_sync_verified()`, NOT `synced_wall_clock_secs
+        // (now).is_some()` (which was this variable's definition before
+        // `meshcadet-clock-source-provenance-and-sync-age` decided the
+        // room-server-vs-drifted-GNSS-RTC policy): an UNVERIFIED, RTC-
+        // derived GPS sync must not block adopting a room server's own,
+        // externally-confirmed clock — only a real fix should. Computed
         // unconditionally (both `hil` and production, mirroring the rebase
         // just above) so `on_receive`'s room clock-adoption threading below
         // has a value in every build — a `hil` build never reaches the call
         // sites that actually consume it (`room_runtime` is empty there).
-        let gps_synced_now = gps.synced_wall_clock_secs(now).is_some();
+        let gps_verified_now = gps.clock_sync_verified();
 
         // Combine GPS with any adopted room-server clock
-        // (`meshcadet-room-adopt-server-time`): GPS always wins while synced
-        // (`room_session::trusted_wall_clock_secs`'s doc — same priority
-        // `gps_synced_now` above reflects); every room-scoped TX-timestamp
-        // call site below reads `room_wall_clock_secs` instead of
-        // `synced_wall_clock_secs` directly, so a GPS-denied device's room
-        // frames — and, once `meshcadet-room-clock-ux` lands, its rendered
-        // room timestamps — carry a real wall-clock reading as soon as any
-        // room server has answered, not only once GPS fixes.
+        // (`meshcadet-room-adopt-server-time`): a VERIFIED GPS sync always
+        // wins; otherwise an adopted room-server clock outranks an
+        // unverified, RTC-derived GPS sync (`room_session::trusted_wall_
+        // clock_secs`'s doc — same three-tier priority `gps_verified_now`
+        // above feeds); every room-scoped TX-timestamp call site below reads
+        // `room_wall_clock_secs` instead of `synced_wall_clock_secs`
+        // directly, so a GPS-denied device's room frames — and, once
+        // `meshcadet-room-clock-ux` lands, its rendered room timestamps —
+        // carry a real wall-clock reading as soon as any room server has
+        // answered, not only once GPS fixes.
         #[cfg(not(feature = "hil"))]
         let (room_wall_clock_secs, room_clock_source) = room_session::trusted_wall_clock_secs(
             synced_wall_clock_secs,
+            gps_verified_now,
             adopted_server_clock,
             now,
         );
@@ -2040,14 +2048,17 @@ fn run() -> anyhow::Result<()> {
             // clock_source`) — "why does this say no fix but the time is
             // right?" now has a visible answer. The relative-age half of
             // that row mirrors whichever source is actually active:
-            // `GpsStatus::clock_sync_age_secs` while GPS is synced (the row
-            // already read this before this mission), or
-            // `AdoptedServerClock::age_secs` once a room server's clock has
-            // been adopted instead — both answer the same "how long ago did
-            // THIS source last confirm the time" question, just for
-            // different sources.
+            // `GpsStatus::clock_sync_age_secs` while GPS (verified OR
+            // unverified — both tick off the same driver-side sync anchor,
+            // see `gps::GpsDriver::status`'s doc) is synced (the row already
+            // read this before this mission), or `AdoptedServerClock::
+            // age_secs` once a room server's clock has been adopted instead
+            // — both answer the same "how long ago did THIS source last
+            // confirm the time" question, just for different sources.
             let room_clock_age_secs = match room_clock_source {
-                room_session::ClockSource::Gps => gps_status.clock_sync_age_secs,
+                room_session::ClockSource::Gps | room_session::ClockSource::GpsUnverified => {
+                    gps_status.clock_sync_age_secs
+                }
                 room_session::ClockSource::RoomServer => {
                     adopted_server_clock.map(|c| c.age_secs(now)).unwrap_or(0)
                 }
@@ -2687,7 +2698,7 @@ fn run() -> anyhow::Result<()> {
                             &mut room_runtime,
                             nvs_partition.clone(),
                             &contact_display_names,
-                            gps_synced_now,
+                            gps_verified_now,
                             &mut adopted_server_clock,
                         );
                         // Persist any DM ack flip to flash so it survives a
@@ -3213,9 +3224,9 @@ fn run() -> anyhow::Result<()> {
                                                 .to_string();
                                             log::warn!(
                                                 "UI send room post to 0x{:02x} refused: \
-                                                 {:?} (clock_synced={}, candidate_ts={}, \
+                                                 {:?} (gps_clock_verified={}, candidate_ts={}, \
                                                  last_room_ts={})",
-                                                room.hash, e, gps_synced_now, candidate_ts, last_room_ts,
+                                                room.hash, e, gps_verified_now, candidate_ts, last_room_ts,
                                             );
                                             send_ui_event(&evt_tx, &mut evt_dropped, ui::UiEvent::RoomPostRefused {
                                                 room_hash: room.hash,
@@ -3583,7 +3594,7 @@ fn on_receive(
     room_runtime: &mut [RoomRuntime],
     nvs_partition: EspDefaultNvsPartition,
     contact_display_names: &std::collections::HashMap<u8, String>,
-    gps_synced: bool,
+    gps_verified: bool,
     adopted_server_clock: &mut Option<room_session::AdoptedServerClock>,
 ) {
     if frame.len() < 2 {
@@ -3633,7 +3644,7 @@ fn on_receive(
                     nvs_partition.clone(),
                     contact_display_names,
                     now_ms,
-                    gps_synced,
+                    gps_verified,
                     adopted_server_clock,
                 ) {
                     return;
@@ -3665,12 +3676,12 @@ fn on_receive(
                 nvs_partition.clone(),
                 ui_events,
                 now_ms,
-                gps_synced,
+                gps_verified,
                 adopted_server_clock,
             );
             #[cfg(feature = "hil")]
             {
-                let _ = (room_runtime, nvs_partition, gps_synced, adopted_server_clock);
+                let _ = (room_runtime, nvs_partition, gps_verified, adopted_server_clock);
                 rx_diag!("RX RESPONSE: ignored under hil (no rooms)");
             }
         }
@@ -3684,7 +3695,7 @@ fn on_receive(
                 room_runtime,
                 nvs_partition,
                 now_ms,
-                gps_synced,
+                gps_verified,
                 adopted_server_clock,
             )
         }
@@ -4293,11 +4304,14 @@ fn match_pending_channel_ack(
 ///
 /// Also adopts `outcome.server_ts` into `adopted_server_clock`
 /// (`meshcadet-room-adopt-server-time`) via
-/// `room_session::adopt_server_clock` — GPS-outranks-server-time and
-/// never-regresses are both enforced there, not here; this call site only
-/// supplies `gps_synced` (whether GPS is synced RIGHT NOW, so a later login
-/// reply never displaces a GPS clock that synced after adoption) and `now_ms`
-/// (the anchor's uptime reading).
+/// `room_session::adopt_server_clock` — verified-GPS-outranks-server-time
+/// and never-regresses are both enforced there, not here; this call site
+/// only supplies `gps_verified` (`GpsDriver::clock_sync_verified()` — whether
+/// GPS is synced from a REAL FIX right now, so a later login reply never
+/// displaces a verified GPS clock that synced after adoption; an
+/// unverified, RTC-derived GPS sync no longer blocks adoption here — see
+/// `meshcadet-clock-source-provenance-and-sync-age`, which renamed this
+/// parameter from `gps_synced`) and `now_ms` (the anchor's uptime reading).
 #[cfg(not(feature = "hil"))]
 fn apply_room_login_outcome(
     room: &mut RoomRuntime,
@@ -4305,7 +4319,7 @@ fn apply_room_login_outcome(
     nvs_partition: EspDefaultNvsPartition,
     ui_events: &mut Vec<ui::UiEvent>,
     now_ms: u64,
-    gps_synced: bool,
+    gps_verified: bool,
     adopted_server_clock: &mut Option<room_session::AdoptedServerClock>,
 ) {
     room.session.apply_login_outcome(outcome);
@@ -4316,14 +4330,20 @@ fn apply_room_login_outcome(
     let had_no_adopted_clock = adopted_server_clock.is_none();
     *adopted_server_clock = room_session::adopt_server_clock(
         *adopted_server_clock,
-        gps_synced,
+        gps_verified,
         now_ms,
         outcome.server_ts,
     );
     if had_no_adopted_clock && adopted_server_clock.is_some() {
+        // "(no verified GPS sync)", not "(no GPS sync)" — an unverified,
+        // RTC-derived GPS sync no longer blocks this adoption
+        // (`meshcadet-clock-source-provenance-and-sync-age`), so this log
+        // line can now fire while `gps_verified` is `false` but GPS is
+        // synced (just unverified); the old wording would misleadingly
+        // imply GPS was entirely unsynced.
         log::info!(
             "room: adopted server_ts={} from 0x{:02x}'s login reply as trusted wall clock \
-             (no GPS sync)",
+             (no verified GPS sync)",
             outcome.server_ts, room.hash,
         );
     }
@@ -4454,7 +4474,7 @@ fn handle_room_login_response(
     nvs_partition: EspDefaultNvsPartition,
     ui_events: &mut Vec<ui::UiEvent>,
     now_ms: u64,
-    gps_synced: bool,
+    gps_verified: bool,
     adopted_server_clock: &mut Option<room_session::AdoptedServerClock>,
 ) {
     let raw_src = payload.get(1).copied().unwrap_or(0);
@@ -4487,7 +4507,7 @@ fn handle_room_login_response(
             nvs_partition,
             ui_events,
             now_ms,
-            gps_synced,
+            gps_verified,
             adopted_server_clock,
         ),
         Err(e) => log::warn!(
@@ -4546,7 +4566,7 @@ fn handle_room_push_frame(
     nvs_partition: EspDefaultNvsPartition,
     contact_display_names: &std::collections::HashMap<u8, String>,
     now_ms: u64,
-    gps_synced: bool,
+    gps_verified: bool,
     adopted_server_clock: &mut Option<room_session::AdoptedServerClock>,
 ) -> bool {
     // `on_receive` routes here on `src_hash` (`payload[1] == room.hash`)
@@ -4739,8 +4759,9 @@ fn handle_room_push_frame(
             // it is equally server-stamped (`MyMesh.cpp:41-51`), just a
             // weaker/continuous source than a once-per-login `server_ts`.
             // Same priority + monotonicity rule as the login path (see
-            // `apply_room_login_outcome`'s doc): GPS still outranks it, and
-            // it can never regress the already-adopted clock. Log only the
+            // `apply_room_login_outcome`'s doc): a verified GPS sync still
+            // outranks it, and it can never regress the already-adopted
+            // clock. Log only the
             // FIRST transition into an adopted clock (a login reply may
             // never arrive in time to be first — a push is just as valid a
             // seed) — see `apply_room_login_outcome`'s identical log gate
@@ -4748,14 +4769,16 @@ fn handle_room_push_frame(
             let had_no_adopted_clock = adopted_server_clock.is_none();
             *adopted_server_clock = room_session::adopt_server_clock(
                 *adopted_server_clock,
-                gps_synced,
+                gps_verified,
                 now_ms,
                 outcome.post_ts,
             );
             if had_no_adopted_clock && adopted_server_clock.is_some() {
+                // "(no verified GPS sync)" — see `apply_room_login_outcome`'s
+                // identical log line for why.
                 log::info!(
                     "room: adopted post_ts={} from 0x{:02x}'s push as trusted wall clock \
-                     (no GPS sync)",
+                     (no verified GPS sync)",
                     outcome.post_ts, room.hash,
                 );
             }
@@ -4796,7 +4819,7 @@ fn handle_path_return(
     room_runtime: &mut [RoomRuntime],
     nvs_partition: EspDefaultNvsPartition,
     now_ms: u64,
-    gps_synced: bool,
+    gps_verified: bool,
     adopted_server_clock: &mut Option<room_session::AdoptedServerClock>,
 ) {
     let raw_src = payload.get(1).copied().unwrap_or(0);
@@ -4864,7 +4887,7 @@ fn handle_path_return(
                                         nvs_partition,
                                         ui_events,
                                         now_ms,
-                                        gps_synced,
+                                        gps_verified,
                                         adopted_server_clock,
                                     );
                                 }
@@ -4886,7 +4909,7 @@ fn handle_path_return(
                             nvs_partition,
                             bundled,
                             now_ms,
-                            gps_synced,
+                            gps_verified,
                             adopted_server_clock,
                         );
                         rx_diag!("RX PATH: bundled RESPONSE extra ignored under hil (no rooms)");
