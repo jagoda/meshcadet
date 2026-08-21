@@ -66,21 +66,22 @@ fn signal_meter_renders_right_of_the_gear_button_not_left() {
     );
 
     // Header HorizontalLayout is [Contacts tab: stretch][Groups tab:
-    // stretch][gear: 44px fixed][SignalMeter+BatteryIndicator slot: 36px
-    // fixed] across 320px (slot widened 26px -> 36px by
-    // `meshcadet-battery-glanceable-indicator` to fit the new
-    // `BatteryIndicator` beside the meter — see `contact_list_promo.rs`'s
-    // own comment), so the gear occupies x: 240..284 and the
-    // meter+battery slot occupies x: 284..320 (tab rects each narrow to
-    // (320-44-36)/2 = 120px — same total fixed width on both sides,
-    // declaration ORDER is what keeps the meter right of the gear).
+    // stretch][gear: 44px fixed][SignalMeter+BatteryIndicator slot: 38px
+    // fixed] across 320px (slot widened 36px -> 38px by
+    // `meshcadet-header-icon-edge-alignment` to fit the pair's new 6px
+    // right-pinned edge inset — see `contact_list_promo.rs`'s own comment),
+    // so the gear occupies x: 238..282 and the meter+battery slot occupies
+    // x: 282..320 (tab rects each narrow to (320-44-38)/2 = 119px — same
+    // total fixed width on both sides, declaration ORDER is what keeps the
+    // meter right of the gear).
     //
     // Scanned by REGION rather than a single hardcoded pixel (the meter's
     // exact bar position shifts with slot width, and a scan is robust to
     // that the way a single coordinate isn't — see this test's own history:
-    // the slot widened once already, for the battery indicator, and a
-    // single-pixel assertion would have needed hand-recomputing again).
-    const GEAR_END_X: u32 = 284;
+    // the slot has widened twice now, once for the battery indicator and
+    // once for the edge-alignment inset, and a single-pixel assertion would
+    // have needed hand-recomputing each time).
+    const GEAR_END_X: u32 = 282;
 
     let mut found_brand_signal_right_of_gear = false;
     for y in 0..36u32 {
@@ -97,18 +98,19 @@ fn signal_meter_renders_right_of_the_gear_button_not_left() {
          did not render in its slot"
     );
 
-    // The gear button's own span (x: 240..284) must be entirely free of
+    // The gear button's own span (x: 238..282) must be entirely free of
     // brand-signal pixels — the gear glyph paints in `Theme.text-secondary`,
     // never brand-signal, so any brand-signal pixel found there means the
     // meter (or something else) bled into the gear's box.
+    const GEAR_START_X: u32 = 238;
     for y in 0..36u32 {
-        for x in 240..GEAR_END_X {
+        for x in GEAR_START_X..GEAR_END_X {
             let px = rgb8_at(&img, x, y);
             assert_ne!(
                 px, brand_signal,
                 "found a brand-signal pixel at ({x}, {y}), inside the gear \
-                 button's own span (x: 240..{GEAR_END_X}) — the meter \
-                 regressed back to the left of the gear button"
+                 button's own span (x: {GEAR_START_X}..{GEAR_END_X}) — the \
+                 meter regressed back to the left of the gear button"
             );
         }
     }

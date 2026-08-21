@@ -327,6 +327,21 @@ slint::slint! {
     // Header icon button — forwarded `clicked` on a TouchArea that fills its
     // parent (mirrors the proven ContactRow pattern).  Replaces the inline raw
     // header TouchArea whose click did not complete on hardware.
+    //
+    // # Edge alignment (header-icon-edge-alignment mission)
+    //
+    // `root`'s own width is the full leading balance slab (64px here) — that
+    // width has to stay put so the centered title's balance math holds (see
+    // this screen's header `HorizontalLayout` below). The GLYPH, though,
+    // renders flush against the slab's own left edge (`horizontal-alignment:
+    // left`, moved off the prior `center`) so it sits at the header's true
+    // outer edge once `padding-left` is applied, not ~32px in from it. The
+    // hover highlight is deliberately NOT the same width as the touch
+    // target: a `parent.width`-wide highlight would visibly extend well past
+    // the now-flush-left glyph into dead space, so the highlight Rectangle
+    // is sized to hug the glyph (`icon_size` plus a small breathing margin)
+    // while `touch` still spans the FULL slab beneath it, unchanged — same
+    // physical tap target as before, just a tighter visible highlight.
     component HeaderIconButton {
         in property <string> icon;
         in property <color>  icon_color: Theme.text-secondary;
@@ -334,20 +349,23 @@ slint::slint! {
         callback clicked;
 
         Rectangle {
+            x: 0px;
+            width: min(parent.width, icon_size + 12px);
+            height: parent.height;
             background: touch.has-hover ? Theme.surface-raised : transparent;
             animate background { duration: 120ms; easing: ease-out; }
             Text {
                 text: icon;
                 font-size: icon_size;
                 color: icon_color;
-                horizontal-alignment: center;
+                horizontal-alignment: left;
                 vertical-alignment: center;
             }
-            touch := TouchArea {
-                width: parent.width;
-                height: parent.height;
-                clicked => { root.clicked(); }
-            }
+        }
+        touch := TouchArea {
+            width: parent.width;
+            height: parent.height;
+            clicked => { root.clicked(); }
         }
     }
 
@@ -467,8 +485,15 @@ slint::slint! {
                 background: Theme.surface;
 
                 HorizontalLayout {
-                    padding-left: 4px;
-                    padding-right: 8px;
+                    // Equalized 4px/8px -> 6px/6px (header-icon-edge-
+                    // alignment mission): a shared single-digit inset used
+                    // as the edge-alignment convention on every in-scope
+                    // header (see the leading/trailing pinning below), which
+                    // as a side effect also exact-balances the centered
+                    // title — the old 4/8 asymmetry left it ~4px off true
+                    // center (68px reserved left vs 72px reserved right).
+                    padding-left: 6px;
+                    padding-right: 6px;
                     spacing: 4px;
 
                     // Back button
@@ -502,47 +527,39 @@ slint::slint! {
                     //
                     // The `SignalMeter` (ADR-0010) nests INSIDE this spacer
                     // (same "don't touch the spacer's own reserved width"
-                    // reasoning as `gps_status.rs`'s identical placement). It
-                    // stays pinned to the LEFT edge of this spacer, at
-                    // `x: 1px..17px, y: 3px..17px` — clear of the
-                    // `CometOnNotify` sweep band (`y: parent.height - 14px..`,
-                    // i.e. `22px..36px`) below.
+                    // reasoning as `gps_status.rs`'s identical placement).
                     //
-                    // `BatteryIndicator` (`meshcadet-battery-glanceable-
-                    // indicator`) needs its own 14px + a 2px gap immediately
-                    // right of the SignalMeter — there was no free room for
-                    // that in the ORIGINAL 44px spacer, so it was widened to
-                    // 64px (see the back button's matching widen above) to
-                    // open that room: the spacer's RIGHT edge stays pinned at
-                    // the same absolute position (`320 - padding-right`,
-                    // unaffected by its own declared width), so growing the
-                    // width only extends its LEFT edge further left — into
-                    // space the centered title's stretch simply gives up.
+                    // # Edge alignment (header-icon-edge-alignment mission)
                     //
-                    // This spacer's top-right corner used to also carry a
-                    // static `Comet` motif, floating independently at
-                    // `parent.width - 34px .. -6px`, `y: 4px..18px` — that
-                    // icon was dropped 2026-08-17 as a UI trim (see this
-                    // file's module doc). The spacer/back-button widths were
-                    // deliberately left at 64px rather than shrunk back: the
-                    // freed area is inert transparent header background with
-                    // no effect on this pair's own position or spacing, and
-                    // reclaiming it was out of scope for a pure icon trim.
+                    // The pair now pins to the spacer's RIGHT edge instead of
+                    // its left — `BatteryIndicator` flush at `x: width -
+                    // self.width` (so its own right edge sits exactly at the
+                    // spacer's, and thus the header's, right edge once
+                    // `padding-right: 6px` is applied above), `SignalMeter`
+                    // immediately to its left with the same 2px gap the pair
+                    // has always used. This was previously left-pinned to
+                    // stay clear of the static `Comet` motif that used to
+                    // occupy this spacer's top-right corner; that motif was
+                    // dropped 2026-08-17 (see this file's module doc), which
+                    // is what freed this edge for the pair to move to. The
+                    // spacer stays 64px wide (unchanged, still balances the
+                    // back button's width for title centering) — only the
+                    // pair's position within it moved.
                     Rectangle {
                         width: 64px; height: 36px;
-                        SignalMeter {
-                            signal-level: root.signal_level;
-                            width: 16px;
-                            height: 14px;
-                            x: 1px;
-                            y: 3px;
-                        }
                         BatteryIndicator {
                             battery-level: root.battery_level;
                             width: 14px;
                             height: 9px;
-                            x: 19px; // SignalMeter's 1px + 16px + 2px gap
-                            y: 5px; // vertically centered against the meter's 3px..17px box
+                            x: parent.width - self.width; // flush to the spacer's (and header's) right edge
+                            y: 5px;
+                        }
+                        SignalMeter {
+                            signal-level: root.signal_level;
+                            width: 16px;
+                            height: 14px;
+                            x: parent.width - self.width - 14px - 2px; // battery's width + 2px gap, left of it
+                            y: 3px;
                         }
                     }
                 }

@@ -128,6 +128,8 @@ slint::slint! {
         }
     }
 
+    // See `message_view.rs`'s identical component for the edge-alignment
+    // mission's rationale (highlight hugs the glyph, touch target unchanged).
     component HeaderIconButton {
         in property <string> icon;
         in property <color>  icon_color: Theme.text-secondary;
@@ -135,20 +137,23 @@ slint::slint! {
         callback clicked;
 
         Rectangle {
+            x: 0px;
+            width: min(parent.width, icon_size + 12px);
+            height: parent.height;
             background: touch.has-hover ? Theme.surface-raised : transparent;
             animate background { duration: 120ms; easing: ease-out; }
             Text {
                 text: icon;
                 font-size: icon_size;
                 color: icon_color;
-                horizontal-alignment: center;
+                horizontal-alignment: left;
                 vertical-alignment: center;
             }
-            touch := TouchArea {
-                width: parent.width;
-                height: parent.height;
-                clicked => { root.clicked(); }
-            }
+        }
+        touch := TouchArea {
+            width: parent.width;
+            height: parent.height;
+            clicked => { root.clicked(); }
         }
     }
 
@@ -202,8 +207,10 @@ slint::slint! {
                 background: Theme.surface;
 
                 HorizontalLayout {
-                    padding-left: 4px;
-                    padding-right: 8px;
+                    // See `message_view.rs`'s identical header for the
+                    // edge-alignment mission's 6px/6px convention.
+                    padding-left: 6px;
+                    padding-right: 6px;
                     spacing: 4px;
 
                     HeaderIconButton {
@@ -227,21 +234,23 @@ slint::slint! {
                         vertical-alignment: center;
                     }
 
+                    // Right-pinned pair — see `message_view.rs`'s identical
+                    // spacer for the edge-alignment mission's rationale.
                     Rectangle {
                         width: 64px; height: 36px;
-                        SignalMeter {
-                            signal-level: root.signal_level;
-                            width: 16px;
-                            height: 14px;
-                            x: 1px;
-                            y: 3px;
-                        }
                         BatteryIndicator {
                             battery-level: root.battery_level;
                             width: 14px;
                             height: 9px;
-                            x: 19px;
+                            x: parent.width - self.width;
                             y: 5px;
+                        }
+                        SignalMeter {
+                            signal-level: root.signal_level;
+                            width: 16px;
+                            height: 14px;
+                            x: parent.width - self.width - 14px - 2px;
+                            y: 3px;
                         }
                     }
                 }

@@ -435,29 +435,45 @@ slint::slint! {
                     // gear button (it previously sat before it, which read as
                     // part of the "Groups" tab beside it) so both render as
                     // the rightmost header elements, clear of the gear's
-                    // touch target. This one flow child reserves a slightly
-                    // wider slot (36px, was 26px before the battery indicator
-                    // landed) for the pair — the two tabs' `horizontal-
-                    // stretch: 1.0` simply divide the slightly-reduced
-                    // remaining width evenly (each still comfortably wider
-                    // than its "Contacts"/"Groups" label), so neither
-                    // tab's touch target, badge, or underline position is
-                    // disturbed beyond that width recompute — nothing here
-                    // is repositioned relative to its own parent.
+                    // touch target. The two tabs' `horizontal-stretch: 1.0`
+                    // simply divide whatever width remains after the gear +
+                    // this slot evenly, so neither tab's touch target,
+                    // badge, or underline position is disturbed beyond a
+                    // width recompute — nothing here is repositioned
+                    // relative to its own parent.
+                    //
+                    // # Edge alignment (header-icon-edge-alignment mission)
+                    //
+                    // Slot widened 36px -> 38px (same "pin the true edge,
+                    // extend the OTHER edge to make room" technique
+                    // `message_view.rs`'s spacer already established for its
+                    // battery-indicator widen): this header has no
+                    // `padding-right` of its own, so this Rectangle's right
+                    // edge always sits exactly at the header's right edge
+                    // regardless of its declared width — widening it only
+                    // extends its LEFT edge (2px) further left, at the tabs'
+                    // expense (1px off each). `BatteryIndicator` is flush at
+                    // the slot's right edge minus the 6px edge-inset every
+                    // other in-scope screen now uses (`slot.width - self.
+                    // width - 6px` = 38 - 14 - 6 = 18); `SignalMeter` sits
+                    // immediately to its left with the pair's existing 2px
+                    // gap, landing flush at the slot's own left edge (x: 0)
+                    // — 16 + 2 + 18 = 36 < 38, so nothing bleeds into the
+                    // gear button's span to its left.
                     Rectangle {
-                        width: 36px; height: 36px;
-                        SignalMeter {
-                            signal-level: root.signal_level;
-                            width: 16px;
-                            height: 14px;
-                            x: 2px;
-                            y: (parent.height - self.height) / 2;
-                        }
+                        width: 38px; height: 36px;
                         BatteryIndicator {
                             battery-level: root.battery_level;
                             width: 14px;
                             height: 9px;
-                            x: 20px;
+                            x: parent.width - self.width - 6px;
+                            y: (parent.height - self.height) / 2;
+                        }
+                        SignalMeter {
+                            signal-level: root.signal_level;
+                            width: 16px;
+                            height: 14px;
+                            x: parent.width - self.width - 14px - 6px - 2px;
                             y: (parent.height - self.height) / 2;
                         }
                     }
