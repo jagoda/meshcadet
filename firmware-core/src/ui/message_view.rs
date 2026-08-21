@@ -70,7 +70,15 @@ pub struct MessageItem {
     pub from_name: String,
     pub time_str: String,
     pub is_ours: bool,
-    pub acked: bool,
+    /// Tri-state delivery status as `i32` for the same reason `mention_tier`
+    /// below is `i32` rather than a Rust enum: Slint properties bind plain
+    /// `int`/`bool`/`string`/`color`, not an arbitrary Rust type, so
+    /// [`super::DeliveryState`] is flattened here at the same crate boundary
+    /// `render_mentions`'s `MentionTier` already crosses. `0` = `Pending`
+    /// (grey check), `1` = `Acked` (blue check), `2` = `Undelivered` (red
+    /// check) — `firmware/src/ui/screens/message_view.rs`'s `MessageBubble`
+    /// ternary is the one place this numbering is consumed.
+    pub delivery_state: i32,
     /// Highest `protocol::mention::MentionTier` found in `text`, as `i32` (0
     /// = none, 1 = other-node mention, 2 = self-mention). Drives
     /// `MessageBubble`'s tint — see that property's doc.
@@ -186,12 +194,17 @@ pub fn build_message_items(
             };
             let (text, mention_tier) = render_mentions(&body, self_name, known);
             let text = normalize_emoji_for_display(&text);
+            let delivery_state = match m.delivery {
+                super::DeliveryState::Pending => 0,
+                super::DeliveryState::Acked => 1,
+                super::DeliveryState::Undelivered => 2,
+            };
             MessageItem {
                 text,
                 from_name,
                 time_str: String::new(),
                 is_ours: m.is_ours,
-                acked: m.acked,
+                delivery_state,
                 mention_tier,
             }
         })
@@ -206,7 +219,7 @@ pub fn build_message_items(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::MessageRecord;
+    use crate::ui::{DeliveryState, MessageRecord};
 
     #[test]
     fn received_total_increased_false_with_no_baseline() {
@@ -285,7 +298,8 @@ mod tests {
         let records = vec![MessageRecord {
             text: "Alice: hello there".into(),
             is_ours: false,
-            acked: false,
+            delivery: DeliveryState::Pending,
+            ack_hash: None,
             ts_ms: 0,
         }];
         let items = build_message_items(&records, /* is_channel */ true, "Self", &[]);
@@ -302,7 +316,8 @@ mod tests {
         let records = vec![MessageRecord {
             text: "Alice: hello there".into(),
             is_ours: true,
-            acked: false,
+            delivery: DeliveryState::Pending,
+            ack_hash: None,
             ts_ms: 0,
         }];
         let items = build_message_items(&records, /* is_channel */ true, "Self", &[]);
@@ -318,7 +333,8 @@ mod tests {
         let records = vec![MessageRecord {
             text: "Alice: hello there".into(),
             is_ours: false,
-            acked: false,
+            delivery: DeliveryState::Pending,
+            ack_hash: None,
             ts_ms: 0,
         }];
         let items = build_message_items(&records, /* is_channel */ false, "Self", &[]);
@@ -333,7 +349,8 @@ mod tests {
         let records = vec![MessageRecord {
             text: "no delimiter here".into(),
             is_ours: false,
-            acked: false,
+            delivery: DeliveryState::Pending,
+            ack_hash: None,
             ts_ms: 0,
         }];
         let items = build_message_items(&records, /* is_channel */ true, "Self", &[]);
@@ -354,7 +371,8 @@ mod tests {
         let records = vec![MessageRecord {
             text: ": hello".into(),
             is_ours: false,
-            acked: false,
+            delivery: DeliveryState::Pending,
+            ack_hash: None,
             ts_ms: 0,
         }];
         let items = build_message_items(&records, /* is_channel */ true, "Self", &[]);
@@ -420,7 +438,8 @@ mod tests {
         let records = vec![MessageRecord {
             text: "hey @[Bob] check this out".into(),
             is_ours: false,
-            acked: false,
+            delivery: DeliveryState::Pending,
+            ack_hash: None,
             ts_ms: 0,
         }];
         let items = build_message_items(&records, /* is_channel */ false, "Bob", &["Bob"]);
@@ -439,7 +458,8 @@ mod tests {
         let records = vec![MessageRecord {
             text: "Alice: hi @[Bob] check this out".into(),
             is_ours: false,
-            acked: false,
+            delivery: DeliveryState::Pending,
+            ack_hash: None,
             ts_ms: 0,
         }];
         let items = build_message_items(
@@ -458,7 +478,8 @@ mod tests {
         let records = vec![MessageRecord {
             text: "no mentions here".into(),
             is_ours: false,
-            acked: false,
+            delivery: DeliveryState::Pending,
+            ack_hash: None,
             ts_ms: 0,
         }];
         let items = build_message_items(&records, /* is_channel */ false, "Bob", &["Bob"]);
@@ -474,7 +495,8 @@ mod tests {
         let records = vec![MessageRecord {
             text: "hi @[Alice] it's Bob".into(),
             is_ours: true,
-            acked: false,
+            delivery: DeliveryState::Pending,
+            ack_hash: None,
             ts_ms: 0,
         }];
         let items = build_message_items(
@@ -501,7 +523,8 @@ mod tests {
         let records = vec![MessageRecord {
             text: "nice catch \u{2764}\u{FE0F}".into(),
             is_ours: false,
-            acked: false,
+            delivery: DeliveryState::Pending,
+            ack_hash: None,
             ts_ms: 0,
         }];
         let items = build_message_items(&records, /* is_channel */ false, "Self", &[]);
@@ -515,7 +538,8 @@ mod tests {
         let records = vec![MessageRecord {
             text: "Alice: \u{1F44D}\u{1F3FD} nice".into(),
             is_ours: false,
-            acked: false,
+            delivery: DeliveryState::Pending,
+            ack_hash: None,
             ts_ms: 0,
         }];
         let items = build_message_items(&records, /* is_channel */ true, "Self", &[]);
@@ -528,7 +552,8 @@ mod tests {
         let records = vec![MessageRecord {
             text: "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} home safe".into(),
             is_ours: false,
-            acked: false,
+            delivery: DeliveryState::Pending,
+            ack_hash: None,
             ts_ms: 0,
         }];
         let items = build_message_items(&records, /* is_channel */ false, "Self", &[]);
@@ -541,13 +566,15 @@ mod tests {
             MessageRecord {
                 text: "\u{1F600}".into(),
                 is_ours: false,
-                acked: false,
+                delivery: DeliveryState::Pending,
+                ack_hash: None,
                 ts_ms: 0,
             },
             MessageRecord {
                 text: "plain text, no emoji".into(),
                 is_ours: true,
-                acked: false,
+                delivery: DeliveryState::Pending,
+                ack_hash: None,
                 ts_ms: 0,
             },
         ];
@@ -565,10 +592,44 @@ mod tests {
         let records = vec![MessageRecord {
             text: "sending \u{2764}\u{FE0F} your way".into(),
             is_ours: true,
-            acked: false,
+            delivery: DeliveryState::Pending,
+            ack_hash: None,
             ts_ms: 0,
         }];
         let items = build_message_items(&records, /* is_channel */ false, "Self", &[]);
         assert_eq!(items[0].text, "sending \u{2764} your way");
+    }
+
+    // ── delivery_state — tri-state checkmark (grey/blue/red) ───────────────
+
+    #[test]
+    fn build_message_items_maps_delivery_state_to_the_int_code_the_slint_bubble_expects() {
+        let records = vec![
+            MessageRecord {
+                text: "pending".into(),
+                is_ours: true,
+                delivery: DeliveryState::Pending,
+                ack_hash: None,
+                ts_ms: 0,
+            },
+            MessageRecord {
+                text: "acked".into(),
+                is_ours: true,
+                delivery: DeliveryState::Acked,
+                ack_hash: None,
+                ts_ms: 1,
+            },
+            MessageRecord {
+                text: "undelivered".into(),
+                is_ours: true,
+                delivery: DeliveryState::Undelivered,
+                ack_hash: None,
+                ts_ms: 2,
+            },
+        ];
+        let items = build_message_items(&records, /* is_channel */ false, "Self", &[]);
+        assert_eq!(items[0].delivery_state, 0, "Pending -> grey (0)");
+        assert_eq!(items[1].delivery_state, 1, "Acked -> blue (1)");
+        assert_eq!(items[2].delivery_state, 2, "Undelivered -> red (2)");
     }
 }

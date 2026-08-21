@@ -388,14 +388,14 @@ pub(crate) fn simulate_core_with_dio1_wait(
         while let Some(payload_bytes) = grp_txt.fire_if_due(t) {
             t += r.frame_encode;
             traffic.frames_enqueued += 1;
-            if txq.enqueue(&synth_frame(payload_bytes)).is_some() {
+            if txq.enqueue(&synth_frame(payload_bytes), None).is_some() {
                 traffic.frames_dropped += 1;
             }
         }
         while let Some(payload_bytes) = keepalive.fire_if_due(t) {
             t += r.frame_encode;
             traffic.frames_enqueued += 1;
-            if txq.enqueue(&synth_frame(payload_bytes)).is_some() {
+            if txq.enqueue(&synth_frame(payload_bytes), None).is_some() {
                 traffic.frames_dropped += 1;
             }
         }
@@ -420,7 +420,7 @@ pub(crate) fn simulate_core_with_dio1_wait(
         while let Some(payload_bytes) = inbound_dm.fire_if_due(t) {
             t += r.frame_encode;
             traffic.frames_enqueued += 1;
-            if txq.enqueue(&synth_frame(payload_bytes)).is_some() {
+            if txq.enqueue(&synth_frame(payload_bytes), None).is_some() {
                 traffic.frames_dropped += 1;
             }
         }

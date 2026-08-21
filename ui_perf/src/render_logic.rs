@@ -21,14 +21,14 @@
 //! production logic.
 
 pub use firmware_core::ui::message_view::{build_message_items, render_mentions};
-pub use firmware_core::ui::MessageRecord;
+pub use firmware_core::ui::{DeliveryState, MessageRecord};
 
 /// Synthetic bench inputs — representative conversation shapes, not
 /// exercised by firmware-core's own correctness tests (those pin exact
 /// behavior on small fixtures; these exist purely to give `ui_perf_bench` a
 /// realistic distribution of plain/DM/channel/mention traffic at scale).
 pub mod bench_fixtures {
-    use super::MessageRecord;
+    use super::{DeliveryState, MessageRecord};
 
     /// One synthetic conversation of `n` records, cycling through: a plain
     /// DM, a channel message with a sender prefix, and a channel message
@@ -43,19 +43,22 @@ pub mod bench_fixtures {
                         "plain DM body number {i} with a little more text to size it realistically"
                     ),
                     is_ours: i % 2 == 0,
-                    acked: true,
+                    delivery: DeliveryState::Acked,
+                    ack_hash: None,
                     ts_ms: 0,
                 },
                 1 => MessageRecord {
                     text: format!("Alice: channel message number {i} reporting status normally"),
                     is_ours: false,
-                    acked: false,
+                    delivery: DeliveryState::Pending,
+                    ack_hash: None,
                     ts_ms: 0,
                 },
                 _ => MessageRecord {
                     text: format!("Bob: hey @[Carol] channel message number {i} needs your eyes"),
                     is_ours: false,
-                    acked: false,
+                    delivery: DeliveryState::Pending,
+                    ack_hash: None,
                     ts_ms: 0,
                 },
             })

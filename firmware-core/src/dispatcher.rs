@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! MeshCore dispatcher: duplicate suppression, airtime budget, CAD-gated TX queue.
+//! MeshCore dispatcher: duplicate suppression, airtime budget, CAD-gated TX
+//! queue, outstanding ACKed-send delivery tracking.
 //!
-//! Three independent pieces (all `no_std`-compatible; no ESP-IDF imports here):
+//! Four independent pieces (all `no_std`-compatible; no ESP-IDF imports here):
 //!
 //! - [`DuplicateFilter`] — ring buffer of 4-byte packet hashes; drops seen frames.
 //! - [`AirtimeBudget`] — sliding-window (60 s) duty-cycle enforcer (≤ 10 %).
 //! - [`TxQueue`] — small FIFO pending-TX queue; callers decide when to drain it.
+//! - [`OutstandingSends`] — fixed-size table of in-flight DM/room-post sends
+//!   awaiting a wire ACK or their delivery deadline; backs the tri-state
+//!   grey/blue/red delivery indicator (`crate::ui::DeliveryState`).
 //!
 //! Source reference: `src/Mesh.cpp` flood-relay logic @ dee3e26a.
 //!
@@ -199,6 +203,14 @@ pub const TX_QUEUE_SLOTS: usize = 4;
 pub struct TxQueue {
     bufs: [[u8; FRAME_BUF]; TX_QUEUE_SLOTS],
     lens: [usize; TX_QUEUE_SLOTS],
+    /// Caller-supplied tag for each pending frame (the wire ACK hash the
+    /// frame is expected to earn, for the two ACKed send paths
+    /// [`crate::ui`]'s outstanding-sends model tracks — `None` for every
+    /// other enqueued frame, e.g. an ACK reply or a room login). Carried
+    /// alongside `bufs`/`lens` purely so a caller can identify WHICH
+    /// outstanding send an eviction just dropped (see [`Self::enqueue`]'s
+    /// doc) — the TX queue itself never reads or interprets the tag.
+    tags: [Option<[u8; 4]>; TX_QUEUE_SLOTS],
     /// Index of the oldest pending frame.
     head: usize,
     /// Number of frames currently pending (0..=TX_QUEUE_SLOTS).
@@ -210,29 +222,41 @@ impl TxQueue {
         Self {
             bufs: [[0u8; FRAME_BUF]; TX_QUEUE_SLOTS],
             lens: [0usize; TX_QUEUE_SLOTS],
+            tags: [None; TX_QUEUE_SLOTS],
             head: 0,
             count: 0,
         }
     }
 
     /// Enqueue `frame` for transmission (FIFO order; drops the oldest pending
-    /// frame if the queue is already full).
+    /// frame if the queue is already full). `tag` is an opaque caller value
+    /// (the DM/room-post wire ACK hash this frame is expected to earn, or
+    /// `None` for a frame no outstanding-sends entry tracks) carried
+    /// alongside the frame purely so an eviction can report which send it
+    /// dropped.
     ///
-    /// Returns the byte length of the frame that was evicted to make room, or
-    /// `None` if the queue had a free slot and nothing was dropped. This is
-    /// `#[must_use]` — a caller that ignores it silently repeats the exact
-    /// defect shape this type's own doc above says is already fixed: a queued
-    /// frame vanishing with no log, no counter and no way for the call site to
-    /// know its own "queued" log line just lied.
+    /// Returns the byte length AND `tag` of the frame that was evicted to
+    /// make room, or `None` if the queue had a free slot and nothing was
+    /// dropped. This is `#[must_use]` — a caller that ignores it silently
+    /// repeats the exact defect shape this type's own doc above says is
+    /// already fixed: a queued frame vanishing with no log, no counter and
+    /// no way for the call site to know its own "queued" log line just
+    /// lied (and, for a tagged frame, no way to resolve its outstanding
+    /// send to undelivered either).
     #[must_use]
-    pub fn enqueue(&mut self, frame: &[u8]) -> Option<usize> {
+    pub fn enqueue(
+        &mut self,
+        frame: &[u8],
+        tag: Option<[u8; 4]>,
+    ) -> Option<(usize, Option<[u8; 4]>)> {
         let n = frame.len().min(FRAME_BUF);
         let (idx, dropped) = if self.count == TX_QUEUE_SLOTS {
             // Full: drop the oldest to make room for this one.
             let idx = self.head;
             let dropped_len = self.lens[idx];
+            let dropped_tag = self.tags[idx];
             self.head = (self.head + 1) % TX_QUEUE_SLOTS;
-            (idx, Some(dropped_len))
+            (idx, Some((dropped_len, dropped_tag)))
         } else {
             let idx = (self.head + self.count) % TX_QUEUE_SLOTS;
             self.count += 1;
@@ -240,6 +264,7 @@ impl TxQueue {
         };
         self.bufs[idx][..n].copy_from_slice(&frame[..n]);
         self.lens[idx] = n;
+        self.tags[idx] = tag;
         dropped
     }
 
@@ -279,6 +304,171 @@ impl TxQueue {
 }
 
 impl Default for TxQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── OutstandingSends (ACKed DM / room-post delivery state) ────────────────────
+
+/// Number of concurrent outstanding ACKed sends this device tracks at once —
+/// combined DM + room-post capacity, not per-kind (nothing on the wire or in
+/// this UI bounds how many sends a user can queue before their ACKs return,
+/// so splitting a fixed budget by kind would just be a second arbitrary
+/// number to justify).
+///
+/// Sized to `2 * TX_QUEUE_SLOTS` rather than against an unrelated constant
+/// like `MAX_CONTACTS` (16 — bounds how many contacts CAN exist, not how
+/// many sends are ever concurrently in flight): [`TX_QUEUE_SLOTS`] is the
+/// tighter upstream bound on how many NOT-YET-TRANSMITTED frames can be
+/// queued at once; once a frame is actually transmitted it leaves the TX
+/// queue but stays outstanding here until its ACK or deadline, so this table
+/// needs headroom for a full TX queue's worth already sent and awaiting ACK,
+/// PLUS a second full queue's worth still waiting to transmit behind them.
+pub const MAX_OUTSTANDING_SENDS: usize = 2 * TX_QUEUE_SLOTS;
+
+/// How long an outstanding DM/room-post send waits for its ACK before
+/// [`OutstandingSends::sweep_expired`] marks it undelivered (red).
+///
+/// A flood-routed frame's round trip carries per-hop randomized retransmit
+/// jitter (`rand(0,5) * airtime * 52/50 / 2` — `meshcore-wire-protocol.md`
+/// §5.2) on both the outbound leg and the ACK's own return leg, plus this
+/// device's own CAD-busy/airtime-budget backoff (1000-3000 ms per deferred
+/// attempt — see the CAD+TX block's `backoff_ms` in `firmware/src/main.rs`)
+/// if the channel is contended when either leg is ready to send. 30 s is a
+/// generous multiple of one hop's worst case (a few hundred ms of jitter
+/// plus up to ~3 s of CAD backoff) so a genuinely in-flight multi-hop round
+/// trip isn't marked red while its ACK is still legitimately en route.
+pub const DELIVERY_ACK_DEADLINE_MS: u64 = 30_000;
+
+/// Which kind of ACKed send an [`OutstandingSend`] tracks — the two paths
+/// this table covers (Channel/GRP_TXT stays on its own pre-existing
+/// single-slot `PendingChannelAck` in `firmware/src/main.rs`, unchanged: no
+/// wire ACK to correlate against at all — see that type's doc).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutstandingKind {
+    Dm { to_hash: u8 },
+    RoomPost { room_hash: u8 },
+}
+
+/// One outstanding ACKed send: the wire ACK hash the sender is waiting for,
+/// which contact/room it belongs to, and the send/deadline timestamps
+/// (`uptime_ms()`-scale, matching every other `*_ms` field in this crate).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutstandingSend {
+    pub ack_hash: [u8; 4],
+    pub kind: OutstandingKind,
+    pub sent_at_ms: u64,
+    pub deadline_ms: u64,
+}
+
+/// Fixed-size outstanding-sends table replacing the single-slot `PendingAck`
+/// (DM) / `RoomRuntime::pending_post_ack` (room post) this mission's
+/// Objective retires — see `firmware/src/main.rs`'s (former) `PendingAck`
+/// doc for the one-outstanding-at-a-time invariant this closes out. A fixed
+/// array of `Option<OutstandingSend>`, matching every other fixed-capacity
+/// dispatcher-state type in this file (`DuplicateFilter`, `AirtimeBudget`,
+/// `TxQueue`) — bounded memory, no heap allocation, `no_std`-compatible.
+///
+/// # The dual-path ACK-matching invariant
+///
+/// `resolve` is the ONE place an inbound ACK is matched against outstanding
+/// state, called identically from both dispatch sites that can receive one
+/// (`handle_ack`'s bare `Ack` datagram, and `handle_path_return`'s bundled
+/// `PathExtra::Ack`): the room-post
+/// delivery-ack defect this table replaces was exactly a matcher wired into
+/// only ONE of those two call sites (a second, room-only `pending_post_ack`
+/// slot that `handle_path_return` never checked). Collapsing DM and
+/// room-post tracking into one table with one lookup makes that class of
+/// bug structurally unreachable here: there is no second matcher to forget
+/// to wire up.
+pub struct OutstandingSends {
+    slots: [Option<OutstandingSend>; MAX_OUTSTANDING_SENDS],
+}
+
+impl OutstandingSends {
+    pub const fn new() -> Self {
+        Self {
+            slots: [None; MAX_OUTSTANDING_SENDS],
+        }
+    }
+
+    /// Record a freshly-enqueued ACKed send. If the table is already full,
+    /// evicts the OLDEST entry (lowest `sent_at_ms`) to make room — same
+    /// bounded-memory, sustained-overload policy as [`TxQueue::enqueue`]
+    /// (see that method's doc) — and returns the evicted entry so the
+    /// caller can resolve it to undelivered exactly like a TX-queue
+    /// eviction: an entry bumped out of THIS table has just as definitively
+    /// lost its chance to ever be matched again.
+    #[must_use]
+    pub fn insert(&mut self, send: OutstandingSend) -> Option<OutstandingSend> {
+        for slot in self.slots.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(send);
+                return None;
+            }
+        }
+        // Full: evict the entry with the oldest `sent_at_ms` (ties broken by
+        // table position — first one found scanning forward).
+        let mut oldest_idx = 0;
+        let mut oldest_sent_at = u64::MAX;
+        for (i, slot) in self.slots.iter().enumerate() {
+            if let Some(s) = slot {
+                if s.sent_at_ms < oldest_sent_at {
+                    oldest_sent_at = s.sent_at_ms;
+                    oldest_idx = i;
+                }
+            }
+        }
+        let evicted = self.slots[oldest_idx].take();
+        self.slots[oldest_idx] = Some(send);
+        evicted
+    }
+
+    /// Resolve an inbound ACK against `ack_hash`, removing and returning the
+    /// matching entry — `None` if nothing outstanding matches (already
+    /// resolved, already expired/evicted, or never existed; the caller logs
+    /// this as "ACK received, no outstanding send", same as the old
+    /// single-slot fallback did).
+    pub fn resolve(&mut self, ack_hash: [u8; 4]) -> Option<OutstandingSend> {
+        for slot in self.slots.iter_mut() {
+            if slot.map(|s| s.ack_hash) == Some(ack_hash) {
+                return slot.take();
+            }
+        }
+        None
+    }
+
+    /// Resolve a TX-queue eviction: `tag` is the evicted frame's tracked ACK
+    /// hash (`TxQueue::enqueue`'s tag) if the evicted frame was one of the
+    /// two ACKed send paths this table tracks, `None` otherwise (an evicted
+    /// ACK reply, room login, etc. — nothing to resolve). Removes and
+    /// returns the matching entry so the caller can raise the same
+    /// undelivered event a deadline timeout would.
+    pub fn resolve_evicted(&mut self, tag: Option<[u8; 4]>) -> Option<OutstandingSend> {
+        tag.and_then(|hash| self.resolve(hash))
+    }
+
+    /// Invoke `on_expired` once for every entry whose `deadline_ms` has
+    /// passed as of `now_ms`, removing each from the table — called once per
+    /// dispatcher-loop iteration. A callback rather than a `Vec<_>` return
+    /// (unlike, say, `firmware/src/main.rs`'s `Vec<ui::UiEvent>` collectors)
+    /// keeps this table itself allocation-free, matching every sibling type
+    /// in this file; the caller pushes whatever `ui::UiEvent` it wants
+    /// straight from the closure.
+    pub fn sweep_expired(&mut self, now_ms: u64, mut on_expired: impl FnMut(OutstandingSend)) {
+        for slot in self.slots.iter_mut() {
+            let expired = matches!(slot, Some(s) if now_ms >= s.deadline_ms);
+            if expired {
+                if let Some(send) = slot.take() {
+                    on_expired(send);
+                }
+            }
+        }
+    }
+}
+
+impl Default for OutstandingSends {
     fn default() -> Self {
         Self::new()
     }
@@ -452,7 +642,7 @@ mod tests {
         let mut q = TxQueue::new();
         assert!(!q.has_pending());
         assert_eq!(
-            q.enqueue(b"test frame"),
+            q.enqueue(b"test frame", None),
             None,
             "queue had room; nothing evicted"
         );
@@ -472,9 +662,9 @@ mod tests {
     #[test]
     fn txqueue_both_frames_enqueued_same_pass_survive_fifo_order() {
         let mut q = TxQueue::new();
-        assert_eq!(q.enqueue(b"first"), None);
+        assert_eq!(q.enqueue(b"first", None), None);
         assert_eq!(
-            q.enqueue(b"second"),
+            q.enqueue(b"second", None),
             None,
             "queue has 4 slots; two frames never evicts"
         );
@@ -497,14 +687,14 @@ mod tests {
         let mut q = TxQueue::new();
         // Fill to capacity with distinct single-byte frames.
         for i in 0..TX_QUEUE_SLOTS {
-            assert_eq!(q.enqueue(&[i as u8]), None, "queue not yet full");
+            assert_eq!(q.enqueue(&[i as u8], None), None, "queue not yet full");
         }
         // One more: queue is full, so the oldest (0) is dropped to make room —
         // and `enqueue` must report it, not swallow it silently (F3).
-        let dropped = q.enqueue(&[0xFFu8]);
+        let dropped = q.enqueue(&[0xFFu8], None);
         assert_eq!(
             dropped,
-            Some(1),
+            Some((1, None)),
             "eviction must be reported so a warn can be logged at the call site"
         );
         let mut buf = [0u8; 4];
@@ -532,7 +722,7 @@ mod tests {
     #[test]
     fn txqueue_peek_does_not_consume_frame() {
         let mut q = TxQueue::new();
-        assert_eq!(q.enqueue(b"channel reply"), None);
+        assert_eq!(q.enqueue(b"channel reply", None), None);
         let mut buf = [0u8; 32];
         let n = q.peek(&mut buf);
         assert_eq!(&buf[..n], b"channel reply");
@@ -550,8 +740,8 @@ mod tests {
     #[test]
     fn txqueue_pop_front_removes_peeked_frame() {
         let mut q = TxQueue::new();
-        let _ = q.enqueue(b"first");
-        let _ = q.enqueue(b"second");
+        let _ = q.enqueue(b"first", None);
+        let _ = q.enqueue(b"second", None);
         let mut buf = [0u8; 16];
         // Simulate a successful send of the head frame.
         let n = q.peek(&mut buf);
@@ -569,6 +759,192 @@ mod tests {
         let mut q = TxQueue::new();
         q.pop_front();
         assert!(!q.has_pending());
+    }
+
+    /// The tag (`OutstandingSends`'s correlation hook) rides along with the
+    /// frame through an eviction, so a caller can resolve exactly which
+    /// outstanding send just lost its chance to reach the wire.
+    #[test]
+    fn txqueue_eviction_reports_the_evicted_frames_tag() {
+        let mut q = TxQueue::new();
+        let tagged_ack = [0xAAu8, 0xBB, 0xCC, 0xDD];
+        assert_eq!(q.enqueue(b"tagged DM", Some(tagged_ack)), None);
+        for i in 1..TX_QUEUE_SLOTS {
+            assert_eq!(q.enqueue(&[i as u8], None), None, "queue not yet full");
+        }
+        // One more: the oldest (the tagged DM) is evicted — its tag must
+        // come back so the caller can resolve it against the
+        // outstanding-sends table.
+        let dropped = q.enqueue(&[0xFFu8], None);
+        assert_eq!(dropped, Some((9, Some(tagged_ack))));
+    }
+
+    #[test]
+    fn txqueue_untagged_eviction_reports_no_tag() {
+        let mut q = TxQueue::new();
+        for i in 0..TX_QUEUE_SLOTS {
+            assert_eq!(q.enqueue(&[i as u8], None), None);
+        }
+        let dropped = q.enqueue(&[0xFFu8], None);
+        assert_eq!(dropped, Some((1, None)));
+    }
+
+    // ── OutstandingSends ─────────────────────────────────────────────────────
+
+    fn dm_send(ack_hash: [u8; 4], to_hash: u8, sent_at_ms: u64) -> OutstandingSend {
+        OutstandingSend {
+            ack_hash,
+            kind: OutstandingKind::Dm { to_hash },
+            sent_at_ms,
+            deadline_ms: sent_at_ms + DELIVERY_ACK_DEADLINE_MS,
+        }
+    }
+
+    #[test]
+    fn outstanding_insert_then_resolve_roundtrip() {
+        let mut t = OutstandingSends::new();
+        assert_eq!(t.insert(dm_send([1, 1, 1, 1], 0x42, 0)), None);
+        let resolved = t.resolve([1, 1, 1, 1]);
+        assert!(matches!(
+            resolved,
+            Some(OutstandingSend {
+                kind: OutstandingKind::Dm { to_hash: 0x42 },
+                ..
+            })
+        ));
+        // Resolved entries are removed — resolving the same hash again finds
+        // nothing.
+        assert!(t.resolve([1, 1, 1, 1]).is_none());
+    }
+
+    /// REGRESSION: two DMs sent back-to-back (this mission's acceptance
+    /// criterion) must each track and resolve independently — resolving one
+    /// hash must not disturb the other, in either arrival order.
+    #[test]
+    fn outstanding_two_dms_to_the_same_contact_track_independently() {
+        let mut t = OutstandingSends::new();
+        assert_eq!(t.insert(dm_send([1, 1, 1, 1], 0x42, 0)), None);
+        assert_eq!(t.insert(dm_send([2, 2, 2, 2], 0x42, 1)), None);
+
+        // The SECOND DM's ack arrives first.
+        let second = t.resolve([2, 2, 2, 2]);
+        assert!(matches!(second, Some(s) if s.ack_hash == [2, 2, 2, 2]));
+
+        // The FIRST DM is still outstanding, untouched.
+        let first = t.resolve([1, 1, 1, 1]);
+        assert!(matches!(first, Some(s) if s.ack_hash == [1, 1, 1, 1]));
+    }
+
+    #[test]
+    fn outstanding_dm_and_room_post_track_independently() {
+        let mut t = OutstandingSends::new();
+        assert_eq!(t.insert(dm_send([1, 1, 1, 1], 0x42, 0)), None);
+        assert_eq!(
+            t.insert(OutstandingSend {
+                ack_hash: [2, 2, 2, 2],
+                kind: OutstandingKind::RoomPost { room_hash: 0x99 },
+                sent_at_ms: 0,
+                deadline_ms: DELIVERY_ACK_DEADLINE_MS,
+            }),
+            None
+        );
+
+        let room = t.resolve([2, 2, 2, 2]).unwrap();
+        assert_eq!(room.kind, OutstandingKind::RoomPost { room_hash: 0x99 });
+        let dm = t.resolve([1, 1, 1, 1]).unwrap();
+        assert_eq!(dm.kind, OutstandingKind::Dm { to_hash: 0x42 });
+    }
+
+    #[test]
+    fn outstanding_resolve_no_match_returns_none() {
+        let mut t = OutstandingSends::new();
+        assert_eq!(t.insert(dm_send([1, 1, 1, 1], 0x42, 0)), None);
+        assert!(t.resolve([9, 9, 9, 9]).is_none());
+    }
+
+    #[test]
+    fn outstanding_insert_evicts_oldest_when_full() {
+        let mut t = OutstandingSends::new();
+        for i in 0..MAX_OUTSTANDING_SENDS {
+            assert_eq!(
+                t.insert(dm_send([i as u8, 0, 0, 0], i as u8, i as u64)),
+                None,
+                "table not yet full"
+            );
+        }
+        // One more: the table is full, so the OLDEST (sent_at_ms == 0) is
+        // evicted to make room — and it must be reported, not swallowed.
+        let evicted = t.insert(dm_send([0xFF, 0, 0, 0], 0xFF, 1000));
+        assert!(matches!(evicted, Some(s) if s.sent_at_ms == 0));
+        // Nothing else was disturbed: entry 1 (the new oldest) is still
+        // resolvable.
+        assert!(t.resolve([1, 0, 0, 0]).is_some());
+    }
+
+    #[test]
+    fn outstanding_resolve_evicted_resolves_a_tagged_tx_queue_eviction() {
+        let mut t = OutstandingSends::new();
+        assert_eq!(t.insert(dm_send([1, 1, 1, 1], 0x42, 0)), None);
+        let resolved = t.resolve_evicted(Some([1, 1, 1, 1]));
+        assert!(resolved.is_some());
+        assert!(
+            t.resolve([1, 1, 1, 1]).is_none(),
+            "resolved entry is removed"
+        );
+    }
+
+    #[test]
+    fn outstanding_resolve_evicted_none_tag_is_a_no_op() {
+        let mut t = OutstandingSends::new();
+        assert_eq!(t.insert(dm_send([1, 1, 1, 1], 0x42, 0)), None);
+        assert!(t.resolve_evicted(None).is_none());
+        // The unrelated outstanding entry is untouched.
+        assert!(t.resolve([1, 1, 1, 1]).is_some());
+    }
+
+    #[test]
+    fn outstanding_sweep_expired_fires_only_for_passed_deadlines() {
+        let mut t = OutstandingSends::new();
+        assert_eq!(
+            t.insert(OutstandingSend {
+                ack_hash: [1, 1, 1, 1],
+                kind: OutstandingKind::Dm { to_hash: 0x42 },
+                sent_at_ms: 0,
+                deadline_ms: 1_000,
+            }),
+            None
+        );
+        assert_eq!(
+            t.insert(OutstandingSend {
+                ack_hash: [2, 2, 2, 2],
+                kind: OutstandingKind::Dm { to_hash: 0x43 },
+                sent_at_ms: 0,
+                deadline_ms: 5_000,
+            }),
+            None
+        );
+
+        let mut expired = Vec::new();
+        t.sweep_expired(1_000, |s| expired.push(s.ack_hash));
+        assert_eq!(
+            expired,
+            vec![[1, 1, 1, 1]],
+            "only the passed deadline fires"
+        );
+
+        // The expired entry is gone; the still-live one is untouched.
+        assert!(t.resolve([1, 1, 1, 1]).is_none());
+        assert!(t.resolve([2, 2, 2, 2]).is_some());
+    }
+
+    #[test]
+    fn outstanding_sweep_expired_no_entries_past_deadline_is_a_noop() {
+        let mut t = OutstandingSends::new();
+        assert_eq!(t.insert(dm_send([1, 1, 1, 1], 0x42, 1_000)), None);
+        let mut expired = Vec::new();
+        t.sweep_expired(500, |s| expired.push(s.ack_hash));
+        assert!(expired.is_empty());
+        assert!(t.resolve([1, 1, 1, 1]).is_some());
     }
 
     // ── Airtime calculator ───────────────────────────────────────────────────
