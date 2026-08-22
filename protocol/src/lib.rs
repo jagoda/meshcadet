@@ -22,6 +22,8 @@
 //! |--------|----------|
 //! | `constants`  | Wire constants mirrored from `src/MeshCore.h` |
 //! | `header`     | `Header` (1-byte packet header) and `PathLen` (path_len encoding) |
+//! | `frame`      | `parse_rx_frame_header` — shared RX header parse (transport-code branch), consumed by both `firmware_core::rx_frame` and `dedup` |
+//! | `dedup`      | Inbound-packet duplicate-detection key (payload-only hash) |
 //! | `crypto`     | AES-128-ECB, HMAC-SHA256-2, SHA-256, encrypt-then-MAC |
 //! | `identity`   | `Identity` (Ed25519 keypair), X25519 ECDH shared secret |
 //! | `advert`     | Self-advert "biz card" builder (signed ADVERT) + `meshcore://` URI rendering |
@@ -103,6 +105,7 @@ pub mod codec;
 pub mod crypto;
 pub mod dedup;
 pub mod emoji;
+pub mod frame;
 pub mod header;
 pub mod history;
 pub mod history_region;
@@ -131,6 +134,7 @@ pub use crypto::{
     hmac_sha256_2, mac_then_decrypt, mac_then_decrypt_var, sha256, sha256_2, MacError,
 };
 pub use dedup::{packet_dedup_key, packet_payload_view};
+pub use frame::{parse_rx_frame_header, RxFrameError, RxFrameHeader};
 pub use header::{Header, PathLen};
 pub use history::{
     decode_entry_blob, decode_rsp_history_entry, encode_entry_blob, encode_rsp_history_entry,

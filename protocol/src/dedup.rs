@@ -10,30 +10,46 @@
 //! copies of one logical packet. Hashing the whole frame instead (the bug this
 //! module fixes) gives each relayed copy a distinct key, so duplicates slip past
 //! the seen-packet ring and are displayed/ACKed repeatedly.
+//!
+//! # Transport-coded frames
+//!
+//! `packet_payload_view` locates the payload via
+//! [`crate::frame::parse_rx_frame_header`] — the SAME shared parse
+//! `firmware_core::rx_frame` uses ahead of `on_receive`'s own dispatch — so a
+//! `ROUTE_TYPE_TRANSPORT_FLOOD`/`ROUTE_TYPE_TRANSPORT_DIRECT` frame's 4
+//! transport-code bytes between the header and `path_len` are skipped here
+//! too. Before this, this function hand-rolled the same `payload_off = 2 +
+//! hop_count * hash_size` arithmetic `on_receive` used to (and PR #170 fixed
+//! there): correct for `ROUTE_TYPE_FLOOD`/`DIRECT`, but wrong for a
+//! transport-coded frame, where it read a transport-code byte as `path_len`
+//! and mis-sliced the payload — so every relay copy of ONE logical
+//! transport-coded packet hashed to a DIFFERENT dedup key, defeating
+//! duplicate suppression entirely for that route-type class. This function
+//! is called on EVERY received frame (`DuplicateFilter`, ahead of the
+//! allowlist gate), so the two call sites parsing the header differently was
+//! a second, independent instance of the identical defect: any wire event
+//! reachable through more than one parse site needs the SAME parse
+//! consulted at each one, not a second hand-rolled copy that can drift.
 
 use crate::crypto::sha256_2;
+use crate::frame::parse_rx_frame_header;
 
-/// Split a wire frame into `(payload_type, payload)`, skipping the 1-byte header
-/// and the variable path field (`hash_size × hop_count` bytes).
+/// Split a wire frame into `(payload_type, payload)`, skipping the 1-byte
+/// header, the optional 4-byte transport-code field, and the variable path
+/// field (`hash_size × hop_count` bytes) — see module doc.
 ///
-/// Frame layout: `header(1) | path_len(1) | path(hash_size × hop_count) | payload`.
-/// `hash_size = (path_len >> 6) + 1`, `hop_count = path_len & 0x3F`,
 /// `payload_type = (header >> 2) & 0x0F`.
 ///
-/// Returns `None` when the frame is shorter than its declared path (malformed).
+/// Returns `None` when the frame is malformed: shorter than its declared
+/// path, or the `path_len` byte itself is invalid (reserved `hash_size`, or
+/// an oversize path) — [`parse_rx_frame_header`]'s error cases all fall back
+/// to hashing the whole frame here, same as before this shared the parse.
 pub fn packet_payload_view(frame: &[u8]) -> Option<(u8, &[u8])> {
-    if frame.len() < 2 {
-        return None;
-    }
-    let header_byte = frame[0];
-    let path_len_byte = frame[1];
-    let hash_size = ((path_len_byte >> 6) + 1) as usize;
-    let hop_count = (path_len_byte & 0x3F) as usize;
-    let payload_off = 2 + hop_count * hash_size;
-    if frame.len() < payload_off {
-        return None;
-    }
-    Some(((header_byte >> 2) & 0x0F, &frame[payload_off..]))
+    let header = parse_rx_frame_header(frame).ok()?;
+    Some((
+        (header.header_byte >> 2) & 0x0F,
+        &frame[header.payload_off..],
+    ))
 }
 
 /// 4-byte duplicate-detection key: `SHA-256(payload_type || payload)[0:4]`.
@@ -117,6 +133,58 @@ mod tests {
             packet_dedup_key(&dm),
             "different payload types must hash differently",
         );
+    }
+
+    /// Build a `ROUTE_TYPE_TRANSPORT_FLOOD` frame: `header | transport_codes(4)
+    /// | path_len | path | payload`, with `hops` 2-byte path entries appended.
+    fn transport_flood_frame(hops: u8, payload: &[u8]) -> Vec<u8> {
+        // header = GRP_TXT(0x05)<<2 | TRANSPORT_FLOOD(0x00) = 0x14
+        let mut f = vec![0x14u8, 0xDE, 0xAD, 0xBE, 0xEF]; // transport codes
+        f.push(0x40 | hops); // path_len: 2-byte hash, `hops` hops
+        for h in 0..hops {
+            f.push(0xA0 + h);
+            f.push(0xB0 + h);
+        }
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// REGRESSION (GAP 1, second site of PR #170's on_receive fix): a
+    /// transport-coded (`ROUTE_TYPE_TRANSPORT_FLOOD`/`TRANSPORT_DIRECT`)
+    /// frame has 4 transport-code bytes between the header and `path_len`.
+    /// Before this fix, `packet_payload_view` hand-rolled `payload_off = 2 +
+    /// hop_count * hash_size` with no transport-code branch, so it read the
+    /// first transport-code byte as `path_len` and mis-sliced the frame —
+    /// every relayed copy of ONE logical transport-coded packet hashed to a
+    /// DIFFERENT dedup key, defeating duplicate suppression. The ordinary
+    /// (non-transport-coded) flood control case
+    /// (`dedup_key_invariant_under_path_mutation`) already collapsed
+    /// correctly; this proves the transport-coded route types now do too.
+    #[test]
+    fn dedup_key_invariant_under_path_mutation_transport_coded() {
+        let payload = b"\x6dchannel hello";
+        let direct = transport_flood_frame(0, payload);
+        let relay1 = transport_flood_frame(1, payload);
+        let relay3 = transport_flood_frame(3, payload);
+
+        assert_ne!(direct, relay1);
+        assert_ne!(relay1, relay3);
+
+        let k = packet_dedup_key(&direct);
+        assert_eq!(
+            packet_dedup_key(&relay1),
+            k,
+            "1-hop relay of a transport-coded frame must share key"
+        );
+        assert_eq!(
+            packet_dedup_key(&relay3),
+            k,
+            "3-hop relay of a transport-coded frame must share key"
+        );
+        // Sanity: the payload view actually lands past the transport codes,
+        // not on them (payload starts with 0x6d, the channel-text prefix).
+        let (_, view) = packet_payload_view(&direct).unwrap();
+        assert_eq!(view, payload);
     }
 
     #[test]
