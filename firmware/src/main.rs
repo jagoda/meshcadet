@@ -3925,10 +3925,13 @@ fn on_receive(
         x if x == PayloadType::Response as u8 => {
             // A direct RESPONSE datagram: the non-flood room-login-reply leg
             // (see `handle_room_login_response`'s doc). No other payload
-            // type reaches this arm — a stock companion's telemetry
-            // RESPONSE is unsolicited-request-only and MeshCadet never
-            // sends `PAYLOAD_TYPE_REQ` itself, so nothing legitimate besides
-            // a room login reply is expected here.
+            // type reaches this arm — MeshCadet DOES send `PAYLOAD_TYPE_REQ`
+            // itself (`room_session::encode_room_keep_alive_frame` emits a
+            // route-direct REQ_TYPE_KEEP_ALIVE probe), but a stock room
+            // server answers `REQ_TYPE_KEEP_ALIVE` with an ACK, never a
+            // RESPONSE (`examples/simple_room_server/MyMesh.cpp:550-575` @
+            // companion-v1.17.1), so nothing legitimate besides a room login
+            // reply is expected here.
             #[cfg(not(feature = "hil"))]
             handle_room_login_response(
                 payload,
