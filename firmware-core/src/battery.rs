@@ -173,9 +173,18 @@
 //! gated, so this doesn't reintroduce the allocation churn the row's own
 //! dedup guard exists to prevent — see `battery_display_fields_changed`'s
 //! doc). `held_raw_mv` (below) remains diagnostic-only, read only by the
-//! host CLI. The over-the-air telemetry RESPONSE
-//! (`main.rs::build_telemetry_response`) still reads neither raw field —
-//! only `percent`/`charging` reach the air.
+//! host CLI.
+//!
+//! **`meshcadet-telemetry-raw-mv-over-air` (2026-08-22) update:** the
+//! over-the-air telemetry RESPONSE (`main.rs::build_telemetry_response`) now
+//! reads `raw_mv` too, as a Cayenne `LPP_GENERIC_SENSOR` entry appended after
+//! the existing percent/charging pair (never inserted before it, so an older
+//! peer's decoder still recovers percent/charging on an unrecognised entry
+//! type). `held_raw_mv`/`level` still do not reach the air. Because `raw_mv`
+//! is not frozen by the charging latch, a contact's decoded reading can show
+//! `raw_mv` well above what `percent`/`charging` alone implies while charging
+//! — see `build_telemetry_response`'s own doc for that divergence spelled out
+//! at the call site.
 //!
 //! ### Reconciliation with the charge-inflation "hold last unplugged SoC" fix
 //!
@@ -495,7 +504,8 @@ pub const PERSIST_MIN_INTERVAL_MS: u64 = 5 * 60_000;
 ///
 /// This is the single representation wired into every consumer: the radio
 /// telemetry RESPONSE (`main.rs::build_telemetry_response`, `percent`/
-/// `charging` only), the host `status` command (`protocol::provisioning::
+/// `charging`/`raw_mv` — see `raw_mv`'s own field doc for how that widened),
+/// the host `status` command (`protocol::provisioning::
 /// RspStatusPayload`, every field), the on-device admin-menu row
 /// (`percent`/`charging`/`raw_mv` — see `raw_mv`'s own field doc for how
 /// that widened), and the on-device header `BatteryIndicator` widget on the
@@ -513,7 +523,11 @@ pub struct BatteryStatus {
     /// command AND (as of `meshcadet-battery-glanceable-indicator`) the
     /// on-device admin-menu row, delta-gated there rather than exact-equality
     /// gated (see `ui::admin_menu::battery_display_fields_changed`'s doc);
-    /// not read by the over-the-air telemetry RESPONSE.
+    /// also read by the over-the-air telemetry RESPONSE (as of
+    /// `meshcadet-telemetry-raw-mv-over-air`, appended as a Cayenne
+    /// `LPP_GENERIC_SENSOR` entry after the percent/charging pair — see
+    /// `main.rs::build_telemetry_response`'s doc for the charging-divergence
+    /// caveat that entails).
     pub raw_mv: u32,
     /// Last known non-charge-inflated ("resting") millivolt reading — the
     /// same `settled_mv` basis `percent` is derived from (before the

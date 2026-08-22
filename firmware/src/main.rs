@@ -3753,9 +3753,20 @@ fn build_telemetry_reply(
 /// The response plaintext is `[tag(4 LE)] [CayenneLPP GPS entry]? [CayenneLPP
 /// battery entries]?`: the `tag` is reflected verbatim from the REQ so the
 /// companion matches reply to request, a GPS entry is appended when a fix is
-/// cached, and a battery percentage + charging-state entry pair is appended
-/// from `battery` (the same [`battery::BatteryStatus`] the host `status`
-/// command and the admin-menu screen read — see that module's docs).
+/// cached, and a battery percentage + charging-state entry pair — followed by
+/// a raw-millivolt entry — is appended from `battery` (the same
+/// [`battery::BatteryStatus`] the host `status` command and the admin-menu
+/// screen read — see that module's docs).
+///
+/// `battery.raw_mv` is forwarded as-is and is NOT subject to the charging
+/// latch that `battery.percent` is (see `battery.rs` module docs' "ADC
+/// calibration ... raw_mv" section): while `battery.charging` is `true`,
+/// `raw_mv` keeps tracking the live, rail-contaminated pin voltage and can
+/// read well above what `percent` alone implies (observed as high as ~4888 mV
+/// on a nominal single-cell pack). A contact reading the RESPONSE should
+/// expect `raw_mv` and `percent`/`charging` to diverge exactly while charging
+/// — that is the diagnostic signal, not a decode error.
+///
 /// Encrypted with the ECDH shared secret; dest = the contact, src = us.
 /// Returns `(frame, len)` or `None` if the path-length field cannot be encoded.
 fn build_telemetry_response(
@@ -3772,6 +3783,7 @@ fn build_telemetry_response(
         tag,
         gps,
         Some((battery.percent, battery.charging)),
+        Some(battery.raw_mv),
         &mut pt_buf,
     );
 
@@ -4306,7 +4318,7 @@ fn handle_req(
             }
 
             // Build and enqueue the RESPONSE (reflect tag + GPS fix if any +
-            // battery percent/charging, always).
+            // battery percent/charging/raw_mv, always).
             let gps = gps_snapshot.map(|(lat_e7, lon_e7, _age)| (lat_e7, lon_e7));
             match build_telemetry_response(our_id, contact_pubkey, req.tag, gps, battery_snapshot) {
                 Some((resp_frame, resp_len)) => {
@@ -4317,12 +4329,13 @@ fn handle_req(
                         |ev| ui_events.push(ev),
                     );
                     log::info!(
-                        "TX telemetry RESPONSE to 0x{:02x} (tag={:#010x}): {}, battery={}%{}",
+                        "TX telemetry RESPONSE to 0x{:02x} (tag={:#010x}): {}, battery={}%{} raw_mv={}",
                         raw_src,
                         req.tag,
                         if gps.is_some() { "location" } else { "no-fix (presence marker)" },
                         battery_snapshot.percent,
                         if battery_snapshot.charging { " (charging)" } else { "" },
+                        battery_snapshot.raw_mv,
                     );
                 }
                 None => log::warn!("telemetry RESPONSE: frame encoding failed"),
