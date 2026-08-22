@@ -33,6 +33,7 @@
 //!     extra_type 0xFF:            [4 random bytes] (no bundled extra)
 
 use crate::crypto::{encrypt_then_mac_var, mac_then_decrypt_var, sha256, MacError};
+use crate::header::PathLen;
 use sha2::{Digest, Sha256};
 
 // ── Error type ───────────────────────────────────────────────────────────────
@@ -46,6 +47,11 @@ pub enum CodecError {
     TruncatedPayload,
     /// Ciphertext length is not a multiple of the AES block size (16).
     MisalignedCiphertext,
+    /// `path_len` byte is malformed: reserved `hash_size == 4`, or
+    /// `hop_count * hash_size` exceeds [`crate::constants::MAX_PATH_SIZE`]
+    /// (mirrors [`crate::PathLen::is_valid`] / upstream's
+    /// `Packet::isValidPathLen`, `src/Packet.cpp` @ `companion-v1.17.1`).
+    InvalidPathLen,
 }
 
 impl From<MacError> for CodecError {
@@ -399,6 +405,16 @@ pub fn decode_path_return_plaintext(
         return Err(CodecError::TruncatedPayload);
     }
     let path_len_byte = plaintext[0];
+    // Reject a malformed inner path_len (reserved hash_size, or hop_count *
+    // hash_size exceeding MAX_PATH_SIZE / the fixed `path` buffer below)
+    // before any arithmetic on it — mirrors MeshCore v1.17's new check on
+    // this same inner field (`src/Mesh.cpp`'s PAYLOAD_TYPE_PATH branch drops
+    // the frame rather than acting on an invalid encoding). Without this,
+    // e.g. path_len_byte=0x7F (hash_size=2, hop_count=63 -> 126 bytes) blows
+    // past the 64-byte `path` buffer below and panics.
+    if !PathLen(path_len_byte).is_valid() {
+        return Err(CodecError::InvalidPathLen);
+    }
     let hash_size = ((path_len_byte >> 6) + 1) as usize;
     let hop_count = (path_len_byte & 63) as usize;
     let path_byte_count = hop_count * hash_size;
@@ -858,6 +874,42 @@ mod tests {
         assert_eq!(rp.path_byte_count, 4);
         assert_eq!(&rp.path[..4], &[0xAA, 0xBB, 0xCC, 0xDD]);
         assert_eq!(rp.extra, PathExtra::Ack([1, 2, 3, 4]));
+    }
+
+    /// REGRESSION: an oversize/reserved inner `path_len` byte must be
+    /// rejected with `CodecError::InvalidPathLen`, not panic. Before the fix,
+    /// `path_len_byte=0x7F` (hash_size=2, hop_count=63 -> 126 bytes) blew
+    /// past the fixed 64-byte `path` buffer:
+    /// "range end index 126 out of range for slice of length 64" — a panic
+    /// that aborts and reboots the esp-idf std device. Reachable only after
+    /// the allowlist gate and a valid ECDH/MAC (trusted-peer defense-in-
+    /// depth, not an unauthenticated remote DoS). Mirrors MeshCore v1.17's
+    /// own new check on this same inner field (`src/Mesh.cpp`'s
+    /// PAYLOAD_TYPE_PATH branch drops the frame instead of acting on it).
+    #[test]
+    fn path_return_decode_oversize_inner_path_len_rejected() {
+        let mut pt = [0u8; 2];
+        pt[0] = 0x7F; // hash_size=2, hop_count=63 -> 126 bytes > MAX_PATH_SIZE
+        pt[1] = 0xFF; // extra_type (never reached)
+
+        assert_eq!(
+            decode_path_return_plaintext(&pt, 2).unwrap_err(),
+            CodecError::InvalidPathLen
+        );
+    }
+
+    /// REGRESSION companion: the reserved `hash_size == 4` encoding
+    /// (bits[7:6] == 0b11) must also be rejected, independent of hop_count.
+    #[test]
+    fn path_return_decode_reserved_hash_size_rejected() {
+        let mut pt = [0u8; 2];
+        pt[0] = 0xC0; // hash_size=4 (reserved), hop_count=0
+        pt[1] = 0xFF;
+
+        assert_eq!(
+            decode_path_return_plaintext(&pt, 2).unwrap_err(),
+            CodecError::InvalidPathLen
+        );
     }
 
     #[test]
