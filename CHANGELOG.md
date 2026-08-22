@@ -8,6 +8,22 @@ Versioning is managed by [release-please](https://github.com/googleapis/release-
 The entry below documents everything landed before release-please's first
 `chore(release): vX.Y.Z` PR.
 
+## [0.7.1](https://github.com/jagoda/meshcadet/compare/v0.7.0...v0.7.1) (2026-08-22)
+
+
+### Fixed
+
+* **protocol:** dedup a transport-coded frame's payload correctly ([924c471](https://github.com/jagoda/meshcadet/commit/924c4715cc7410ff0e973e18e0126bf3ebaee452))
+* **protocol:** reject malformed inner PATH-return path_len instead of panicking ([5863e02](https://github.com/jagoda/meshcadet/commit/5863e026935aa3c91213830231b65758f94d9d5e))
+* transport-coded dedup mis-slicing and inner PATH-return path_len panic ([54dfdf0](https://github.com/jagoda/meshcadet/commit/54dfdf0cbae95e784465ff591e1ccd65293bc810))
+* v1.17 currency bump, group-sender-name disclosure, transport-code RX fix ([465036d](https://github.com/jagoda/meshcadet/commit/465036df5165da1c717e3c425b492d5a7726133a))
+* v1.17 currency bump, group-sender-name disclosure, transport-code RX fix ([420f084](https://github.com/jagoda/meshcadet/commit/420f084c20b6d5e3e5ee7bf5bbe235020eb23a5d))
+
+
+### Documentation
+
+* **firmware:** correct the RESPONSE-arm's stale justification comment ([b85fd82](https://github.com/jagoda/meshcadet/commit/b85fd82313ad979d7502be5a07e19154596a6b06))
+
 ## [0.7.0](https://github.com/jagoda/meshcadet/compare/v0.6.0...v0.7.0) (2026-08-22)
 
 
