@@ -15,18 +15,16 @@
 //! single-source-of-truth technique `ui_sim::signal_meter` (its own sibling
 //! widget rig) already uses.
 //!
-//! Renders all six `battery-level` states (`0` = Unknown outline, `1` =
-//! Charging, `2..=5` = Critical/Low/Medium/High) side by side in one frame,
-//! proving:
+//! Renders all five `battery-level` states (`0` = Unknown outline, `1` =
+//! Charging, `2..=4` = Low/Partial/Full) side by side in one frame, proving:
 //! - Unknown paints an outline-only shell (a visible non-background stroke,
 //!   no fill);
 //! - Charging paints a FULL body in `brand-signal` cyan, distinct from every
-//!   percent-bucket color;
-//! - Critical/Low/Medium/High each paint their own distinct fill color
-//!   (`alert` red / `warn` yellow / `ok` green / `ok` green) with a
-//!   strictly-ascending filled-pixel-area sequence, proving the fill
-//!   fraction actually scales with bucket rather than every level painting
-//!   the same fixed shape.
+//!   bucket color;
+//! - Low/Partial/Full each paint their own distinct fill color (`alert` red
+//!   / `warn` yellow / `ok` green) with a strictly-ascending
+//!   filled-pixel-area sequence, proving the fill fraction actually scales
+//!   with bucket rather than every level painting the same fixed shape.
 //!
 //! Slint enforces a process-wide `Platform` singleton, so this module's
 //! render entry point must never run in the same process as `lib.rs`'s,
@@ -47,7 +45,7 @@ pub const HEIGHT: u32 = 240;
 
 /// Width of each indicator's own column in the row (see
 /// `BatteryIndicatorRowUi`) — deliberately wider than any single indicator
-/// instance so six render with visible gaps between them, easing
+/// instance so all five render with visible gaps between them, easing
 /// visual/pixel-scan inspection. Same value `ui_sim::signal_meter` uses for
 /// its own six-state row.
 pub const COL_WIDTH: u32 = 48;
@@ -66,11 +64,11 @@ slint::slint! {
             padding-left: 8px;
             padding-top: 20px;
 
-            // One column per `battery-level` state, 0 (Unknown) through 5
-            // (High) — the exact `0..=5` range
+            // One column per `battery-level` state, 0 (Unknown) through 4
+            // (Full) — the exact `0..=4` range
             // `firmware_core::ui::battery_indicator::level_to_indicator_level`
             // ever emits.
-            for level in 6 : Rectangle {
+            for level in 5 : Rectangle {
                 width: 48px;
                 height: 24px;
                 BatteryIndicator {

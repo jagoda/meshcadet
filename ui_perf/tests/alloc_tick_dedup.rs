@@ -17,11 +17,14 @@
 //! THE FIX (landed in `firmware/src/ui/mod.rs`): both setters now early-return
 //! before formatting/pushing when the fields the screen actually renders
 //! haven't changed — full `GpsStatus` equality for the GPS row (the whole
-//! struct is exactly what the four rows render); for battery, `percent`/
-//! `charging` on exact equality plus `raw_mv` on a delta-gate (see
-//! `firmware_core::ui::admin_menu::battery_display_fields_changed`'s doc) —
-//! `held_raw_mv` stays a live diagnostic-only field the row never shows,
-//! excluded outright.
+//! struct is exactly what the four rows render); for battery, `charging`/
+//! `held_raw_mv`/`level` on exact equality plus `raw_mv` on a delta-gate
+//! (see `firmware_core::ui::admin_menu::battery_display_fields_changed`'s
+//! doc) — `boot_mv`/`confirmed`/`percent` are deliberately excluded (see
+//! that function's doc for why; `percent` was dropped from the row entirely
+//! as of `meshcadet-battery-three-state-pipeline`, 2026-08-22, to fit the
+//! admin screen's width budget once the row grew to the full HIL-capture
+//! vector).
 //!
 //! `meshcadet-battery-glanceable-indicator`: the AdminMenu row now also
 //! renders `raw_mv` (see `format_battery_display`'s doc), so `raw_mv` can no
@@ -32,6 +35,10 @@
 //! is the resolution; this measurement's tick sequence below is shaped to
 //! exercise both the "sub-threshold jitter absorbed" and "genuine movement
 //! gates a push" cases explicitly, not just "raw_mv never gates".
+//! `meshcadet-battery-three-state-pipeline` (2026-08-22) then extended the
+//! row (and the gate) to the full HIL-capture state vector — see
+//! `battery_ticks`'s own doc for how the fixture below stays realistic
+//! under that wider gate.
 //!
 //! This test cannot import `firmware`'s types directly (`firmware` is a
 //! DETACHED xtensa-only workspace — see its `Cargo.toml`'s doc comment), so
@@ -216,10 +223,15 @@ fn battery_status(percent: u8, charging: bool, raw_mv: u32, held_raw_mv: u32) ->
         charging,
         raw_mv,
         held_raw_mv,
-        // `level` doesn't participate in `battery_display_fields_changed` or
-        // `format_battery_display` (see both functions' docs) — a fixed
-        // placeholder is fine for this measurement.
-        level: BatteryLevel::Medium,
+        // `boot_mv` is fixed for the life of a boot and `battery_ticks`
+        // below never varies `level` — neither participates in this
+        // measurement's gating, so fixed placeholders are fine (see
+        // `battery_display_fields_changed`'s doc for why `boot_mv` is
+        // excluded; `level` IS gated, but stays constant across every tick
+        // this fixture generates).
+        boot_mv: 0,
+        confirmed: true,
+        level: BatteryLevel::Partial,
     }
 }
 
@@ -336,10 +348,20 @@ fn gps_status_push_allocates_only_on_genuine_change() {
 /// (+60mV at `i=30`) — this is what exercises
 /// `battery_display_fields_changed`'s `raw_mv` delta-gate honestly: small
 /// per-tick jitter must never gate the row, but the single large step must,
-/// independent of whatever `percent`/`charging` are doing at that same tick.
-/// `percent` drops twice (`i=20`, `i=40`) and `charging` flips once
-/// (`i=45`), each at a DIFFERENT tick than the raw_mv step, so every push
-/// this test expects is attributable to exactly one cause.
+/// independent of whatever `held_raw_mv`/`charging` are doing at that same
+/// tick. `held_raw_mv` (basis_mv) steps twice (`i=20`, `i=40`) and
+/// `charging` flips once (`i=45`), each at a DIFFERENT tick than the raw_mv
+/// step, so every push this test expects is attributable to exactly one
+/// cause.
+///
+/// `held_raw_mv` moves ONLY at those two ticks, on the SAME cadence as the
+/// fixture's `percent` field — realistic, since in the real pipeline both
+/// are derived from the same underlying `settled_mv` (`percent` is dropped
+/// from the RENDERED row as of `meshcadet-battery-three-state-pipeline`,
+/// see `format_battery_display`'s doc, but its value here still tracks
+/// `held_raw_mv`'s cadence for fixture realism) — a continuously drifting
+/// `held_raw_mv` independent of that cadence would not be a realistic
+/// fixture and would swamp this measurement with a push every tick.
 fn battery_ticks(n: usize) -> Vec<BatteryStatus> {
     const JITTER_PATTERN_MV: [i32; 4] = [0, 3, -2, 1];
     (0..n as u32)
@@ -347,11 +369,12 @@ fn battery_ticks(n: usize) -> Vec<BatteryStatus> {
             let baseline_mv: i32 = if i < 30 { 3700 } else { 3760 };
             let jitter_mv = JITTER_PATTERN_MV[(i as usize) % JITTER_PATTERN_MV.len()];
             let raw_mv = (baseline_mv + jitter_mv) as u32;
+            let held_raw_mv = 3_800 - 20 * (i / 20); // steps at i=20, i=40
             battery_status(
-                80 - (i / 20) as u8, // percent: changes at i=20, i=40
+                80 - (i / 20) as u8, // percent (not rendered, kept in cadence for realism): changes at i=20, i=40
                 i >= 45,             // charging: changes at i=45
                 raw_mv,
-                3690 + i, // held_raw_mv — diagnostic-only, never gates the row
+                held_raw_mv,
             )
         })
         .collect()
@@ -393,14 +416,14 @@ fn battery_display_push_allocates_only_on_genuine_change() {
     println!(
         "[alloc-tick] battery row, {} ticks: UNCONDITIONAL {} allocs vs GUARDED {} allocs ({} pushes) \
          — sub-threshold raw_mv jitter does NOT gate the row; the one genuine \
-         raw_mv step, and the percent/charging changes, each gate exactly once",
+         raw_mv step, and the held_raw_mv/charging changes, each gate exactly once",
         ticks.len(), unconditional_allocs, guarded_allocs, pushes,
     );
 
     assert_eq!(
         pushes, 5,
-        "expected 1 initial change + percent drop at 20 + raw_mv step at 30 \
-         + percent drop at 40 + charging flip at 45"
+        "expected 1 initial change + held_raw_mv step at 20 + raw_mv step at 30 \
+         + held_raw_mv step at 40 + charging flip at 45"
     );
     assert!(
         unconditional_allocs >= ticks.len(),

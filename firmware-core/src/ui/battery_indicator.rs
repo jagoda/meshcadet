@@ -10,19 +10,21 @@
 
 use crate::battery::BatteryLevel;
 
-/// Convert a [`BatteryLevel`] to the `0..=5` int the Slint `BatteryIndicator`
+/// Convert a [`BatteryLevel`] to the `0..=4` int the Slint `BatteryIndicator`
 /// widget's `battery-level` property expects. Matches `BatteryLevel`'s own
 /// declaration order 1:1 — `Unknown` -> `0` (outline-only, no reading yet),
-/// `Charging` -> `1` (full body, distinct accent color), `Critical`/`Low`/
-/// `Medium`/`High` -> `2..=5` (ascending fill).
+/// `Charging` -> `1` (full body, distinct accent color), `Low`/`Partial`/
+/// `Full` -> `2..=4` (ascending fill). As of 2026-08-22
+/// (`meshcadet-battery-three-state-pipeline`) this is a 5-state range, not
+/// the prior 6-state (`0..=5`) one — `BatteryLevel` dropped from 4
+/// percent-domain buckets to 3 voltage-domain ones.
 pub fn level_to_indicator_level(level: BatteryLevel) -> i32 {
     match level {
         BatteryLevel::Unknown => 0,
         BatteryLevel::Charging => 1,
-        BatteryLevel::Critical => 2,
-        BatteryLevel::Low => 3,
-        BatteryLevel::Medium => 4,
-        BatteryLevel::High => 5,
+        BatteryLevel::Low => 2,
+        BatteryLevel::Partial => 3,
+        BatteryLevel::Full => 4,
     }
 }
 
@@ -35,16 +37,15 @@ mod tests {
         let levels = [
             BatteryLevel::Unknown,
             BatteryLevel::Charging,
-            BatteryLevel::Critical,
             BatteryLevel::Low,
-            BatteryLevel::Medium,
-            BatteryLevel::High,
+            BatteryLevel::Partial,
+            BatteryLevel::Full,
         ];
         let ints: Vec<i32> = levels
             .iter()
             .map(|&l| level_to_indicator_level(l))
             .collect();
-        assert_eq!(ints, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(ints, vec![0, 1, 2, 3, 4]);
     }
 
     #[test]
@@ -53,7 +54,7 @@ mod tests {
     }
 
     #[test]
-    fn high_maps_to_five() {
-        assert_eq!(level_to_indicator_level(BatteryLevel::High), 5);
+    fn full_maps_to_four() {
+        assert_eq!(level_to_indicator_level(BatteryLevel::Full), 4);
     }
 }
