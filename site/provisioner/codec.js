@@ -53,6 +53,13 @@ export const FRAME_QUERY_ADVERT = 0x04;
  * mirroring `FRAME_QUERY_CONTACTS`/`FRAME_QUERY_CHANNELS`.
  */
 export const FRAME_QUERY_ROOMS = 0x05;
+/**
+ * Query the device's current screen-lock configuration and PIN-set state.
+ * Payload: empty. The device replies `FRAME_RSP_LOCK`. Deliberately a
+ * dedicated query/response pair rather than folding lock state into
+ * `FRAME_QUERY_STATUS`/`decodeRspStatus` — that payload stays frozen.
+ */
+export const FRAME_QUERY_LOCK = 0x06;
 
 export const FRAME_ADD_CONTACT = 0x10;
 export const FRAME_DEL_CONTACT = 0x11;
@@ -78,6 +85,22 @@ export const FRAME_SET_NOTIF_DEFAULTS = 0x40;
 
 export const FRAME_SET_PIN = 0x50;
 export const FRAME_SET_DEVICE_NAME = 0x51;
+/**
+ * Set the screen-lock PIN. Payload: a fixed `LOCK_PIN_LEN`-byte ASCII-digit
+ * PIN, distinct from the admin PIN (`FRAME_SET_PIN`). Rejected at the
+ * device's decode path if the payload is not exactly `LOCK_PIN_LEN` bytes or
+ * contains any non-ASCII-digit byte — 4-digit enforcement is a decode-path
+ * invariant, not a UI-layer check (mirrored client-side in
+ * `validation.js`, never a substitute for it).
+ */
+export const FRAME_SET_LOCK_PIN = 0x52;
+/**
+ * Set the screen-lock enable flag(s) and idle timeout. Payload:
+ * `lock_flags(1) | lock_timeout_s(2 LE)`. `RSP_OK` for this frame means
+ * "accepted and forwarded", not "persisted" — persistence completes
+ * asynchronously on the device's UI thread.
+ */
+export const FRAME_SET_LOCK_CONFIG = 0x53;
 
 export const FRAME_COMMIT_PROVISIONING = 0x70;
 export const FRAME_EXPORT_HISTORY = 0x71;
@@ -110,6 +133,39 @@ export const FRAME_RSP_ADVERT = 0x8a;
 export const FRAME_RSP_ROOM = 0x8b;
 /** Response: terminal frame of a room enumeration stream (no payload). */
 export const FRAME_RSP_ROOMS_DONE = 0x8c;
+/**
+ * Response: answer to `FRAME_QUERY_LOCK`. Payload: `lock_flags(1) |
+ * lock_timeout_s(2 LE) | pin_set(1)`. The PIN itself is deliberately NOT
+ * echoed back — same precedent as `FRAME_RSP_ROOM` not echoing the guest
+ * password — only whether one is currently set.
+ */
+export const FRAME_RSP_LOCK = 0x8d;
+
+// ── Screen-lock constants (mirrors provisioning.rs's "Screen-lock
+//    constants") ────────────────────────────────────────────────────────────
+
+/**
+ * Fixed length of the lock PIN, in ASCII-digit bytes. Unlike `MAX_PIN_LEN`
+ * (the admin PIN's variable-length ceiling), the lock PIN is always exactly
+ * this many digits.
+ */
+export const LOCK_PIN_LEN = 4;
+
+/** `lock_flags` bit 0 — the lock enable/disable toggle. */
+export const LOCK_SCREEN_ENABLE = 0x01;
+/**
+ * `lock_flags` bit 1 — provisioner-forbids-on-device-disable. Defined and
+ * documented as reserved; behaviour is NOT shipped by this campaign — see
+ * `protocol::provisioning::LOCK_NO_DEVICE_DISABLE`'s doc comment.
+ */
+export const LOCK_NO_DEVICE_DISABLE = 0x02;
+
+/** Minimum accepted `lock_timeout_s` (seconds of idle time before the lock trips). */
+export const LOCK_TIMEOUT_MIN_S = 15;
+/** Maximum accepted `lock_timeout_s`. */
+export const LOCK_TIMEOUT_MAX_S = 3600;
+/** Default `lock_timeout_s` (5 minutes). */
+export const LOCK_TIMEOUT_DEFAULT_S = 300;
 
 // `protocol::history::HistoryMsgType`.
 export const HISTORY_MSG_TYPE_DM = 0;
@@ -120,7 +176,8 @@ export const HISTORY_MSG_TYPE_GRP_TXT = 1;
 /**
  * Mirrors `protocol::provisioning::ProvError`'s variants (as `.kind`):
  * `TruncatedFrame`, `BadMagic`, `CrcMismatch`, `TruncatedPayload`,
- * `NameTooLong`, `PinTooLong`.
+ * `NameTooLong`, `PinTooLong`, `PasswordTooLong`, `PathTooLong`,
+ * `LockPinInvalid`.
  */
 export class ProvError extends Error {
   constructor(kind) {
@@ -280,6 +337,13 @@ export function findMagicStart(buf) {
 // Rust's `.min(MAX_..._LEN)`) rather than throwing — truncation is a
 // decode-time-detectable data-loss condition, not an encode-time error, in
 // the Rust codec, so this mirrors that exactly.
+//
+// Exception: `encodeSetLockPin`. Its Rust counterpart (`encode_set_lock_pin`)
+// takes a fixed-size `[u8; LOCK_PIN_LEN]`, not a `.min()`-truncated slice —
+// there is no "over-length" case to silently truncate, by construction. The
+// JS mirror throws instead, on purpose (see that function's own doc
+// comment): `encode_set_pin` accepting 16 arbitrary bytes is precisely the
+// shape the lock PIN's wire contract does not repeat, in either language.
 
 /** Wire layout: `pubkey(32) | telemetry_enable(1) | name_len(1) | name(name_len)` */
 export function encodeAddContact(pubkey, telemetryEnable, name) {
@@ -368,6 +432,37 @@ export function encodeSetDeviceName(name) {
   return out;
 }
 
+/**
+ * Encode a `SetLockPin` payload. Wire layout: `pin(LOCK_PIN_LEN)` — always
+ * exactly `LOCK_PIN_LEN` bytes, no length prefix (mirrors
+ * `encode_set_lock_pin`'s fixed-size `[u8; LOCK_PIN_LEN]` signature).
+ *
+ * Unlike `encodeSetPin` (which silently truncates an over-length PIN to
+ * `MAX_PIN_LEN`), this does not silently accept an arbitrary-length input:
+ * `pin` must already be exactly `LOCK_PIN_LEN` ASCII digits (validated
+ * client-side by `validation.js` before this is ever called, mirroring the
+ * decode-path rejection that is the actual enforcement point). Throws a
+ * plain `Error` — not `ProvError`, since this is an encode-time caller
+ * contract, not a wire-decode outcome — if that invariant is violated.
+ */
+export function encodeSetLockPin(pin) {
+  const pinBytes = encodeUtf8(pin);
+  if (pinBytes.length !== LOCK_PIN_LEN || !/^[0-9]+$/.test(pin)) {
+    throw new Error(
+      `encodeSetLockPin: pin must be exactly ${LOCK_PIN_LEN} ASCII digits, got ${JSON.stringify(pin)}`
+    );
+  }
+  return pinBytes;
+}
+
+/** Wire layout: `lock_flags(1) | lock_timeout_s(2 LE)` */
+export function encodeSetLockConfig(lockFlags, lockTimeoutS) {
+  const out = new Uint8Array(3);
+  out[0] = lockFlags & 0xff;
+  new DataView(out.buffer).setUint16(1, lockTimeoutS & 0xffff, true);
+  return out;
+}
+
 // ── Payload decode functions (device -> host responses) ─────────────────────
 //
 // Mirrors provisioning.rs's "Payload decode functions" byte-for-byte,
@@ -377,6 +472,21 @@ function requireLen(payload, min) {
   if (payload.length < min) {
     throw new ProvError("TruncatedPayload");
   }
+}
+
+/**
+ * Decode an `RspLock` payload. Wire layout: `lock_flags(1) |
+ * lock_timeout_s(2 LE) | pin_set(1)`. The PIN is never part of this
+ * payload — see `FRAME_RSP_LOCK`'s doc comment.
+ */
+export function decodeRspLock(payload) {
+  requireLen(payload, 4);
+  const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+  return {
+    lock_flags: payload[0],
+    lock_timeout_s: view.getUint16(1, true),
+    pin_set: payload[3] !== 0,
+  };
 }
 
 /** Decode an `RspError` payload. Wire layout: `error_code(1) | msg_len(1) | msg(msg_len)` */

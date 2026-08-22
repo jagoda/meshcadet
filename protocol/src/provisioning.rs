@@ -63,6 +63,46 @@ pub const MAX_ROOM_PASSWORD_LEN: usize = MAX_LOGIN_PASSWORD_LEN;
 /// again to keep a single source of truth.
 pub const MAX_ROOM_PATH_LEN: usize = MAX_PATH_SIZE;
 
+// ── Screen-lock constants (docs/adr/0013-screen-lock-policy-layer.md, D1/D2/D6) ─
+//
+// These are the wire-level pieces of the screen-lock policy layer: frame
+// opcodes and payload shapes below, plus the flag bits and timeout bounds
+// here. The lock *state machine* (idle→lock decision, brute-force backoff,
+// persistence) is firmware/firmware-core scope, not this crate's — see the
+// `meshcadet-screen-lock` campaign plan.
+
+/// Fixed length of the lock PIN, in ASCII-digit bytes. Unlike
+/// [`MAX_PIN_LEN`] (the admin PIN's variable-length ceiling), the lock PIN
+/// is always exactly this many digits — see [`decode_set_lock_pin`], which
+/// enforces both the length and the ASCII-digit-only content as a
+/// decode-path rejection (not a UI-layer check).
+pub const LOCK_PIN_LEN: usize = 4;
+
+/// `lock_flags` bit 0 — the lock enable/disable toggle. Device-editable from
+/// all three configuration surfaces (on-device admin menu, web provisioner,
+/// host CLI) via [`FRAME_SET_LOCK_CONFIG`].
+pub const LOCK_SCREEN_ENABLE: u8 = 0x01;
+
+/// `lock_flags` bit 1 — provisioner-forbids-on-device-disable. **Defined and
+/// documented as reserved; behaviour is NOT shipped.** See the screen-lock
+/// plan's D6: the marginal control is judged near-zero (the admin menu is
+/// already gated behind a *different* PIN than the lock), so this bit is
+/// wired into the wire contract now, at zero cost, without implementing any
+/// enforcement this campaign. A future child may ship the behaviour.
+pub const LOCK_NO_DEVICE_DISABLE: u8 = 0x02;
+
+/// Minimum accepted `lock_timeout_s` (seconds of idle time before the lock
+/// trips). The single source of truth all three configuration surfaces
+/// clamp against — see the screen-lock plan's D1.
+pub const LOCK_TIMEOUT_MIN_S: u16 = 15;
+
+/// Maximum accepted `lock_timeout_s`.
+pub const LOCK_TIMEOUT_MAX_S: u16 = 3600;
+
+/// Default `lock_timeout_s` (5 minutes) applied when the lock is enabled
+/// without an explicit timeout.
+pub const LOCK_TIMEOUT_DEFAULT_S: u16 = 300;
+
 // ── Frame type constants ─────────────────────────────────────────────────────
 //
 // 0x01–0x7F  host → device (commands)
@@ -103,6 +143,13 @@ pub const FRAME_QUERY_ADVERT: u8 = 0x04;
 /// the full contact enumeration client-side.
 pub const FRAME_QUERY_ROOMS: u8 = 0x05;
 
+/// Query the device's current screen-lock configuration and PIN-set state.
+/// Payload: empty. The device replies [`FRAME_RSP_LOCK`]. Deliberately a
+/// dedicated query/response pair rather than folding lock state into
+/// [`FRAME_QUERY_STATUS`]/[`RspStatusPayload`] — see that struct's doc
+/// comment for why it stays frozen.
+pub const FRAME_QUERY_LOCK: u8 = 0x06;
+
 /// Add a contact entry.
 pub const FRAME_ADD_CONTACT: u8 = 0x10;
 /// Delete a contact entry by pubkey.
@@ -142,6 +189,23 @@ pub const FRAME_SET_PIN: u8 = 0x50;
 /// the provisioning config blob — a device name is a property of the node's
 /// identity, and applies immediately regardless of provisioned state).
 pub const FRAME_SET_DEVICE_NAME: u8 = 0x51;
+
+/// Set the screen-lock PIN. Payload: [`SetLockPinPayload`] — a fixed
+/// [`LOCK_PIN_LEN`]-byte ASCII-digit PIN, distinct from the admin PIN
+/// ([`FRAME_SET_PIN`]). Rejected at the decode path (see
+/// [`decode_set_lock_pin`]) if the payload is not exactly [`LOCK_PIN_LEN`]
+/// bytes or contains any non-ASCII-digit byte — 4-digit enforcement is a
+/// decode-path invariant, not a UI-layer check.
+pub const FRAME_SET_LOCK_PIN: u8 = 0x52;
+
+/// Set the screen-lock enable flag(s) and idle timeout. Payload:
+/// [`SetLockConfigPayload`]. Writable from all three configuration surfaces
+/// (on-device admin menu, web provisioner, host CLI); host/provisioner
+/// writes are forwarded from the frame handler to the UI thread rather than
+/// persisted directly (the `mc_rts` single-writer invariant — see the
+/// screen-lock plan's D2). `RSP_OK` for this frame means "accepted and
+/// forwarded", not "persisted" — persistence completes asynchronously.
+pub const FRAME_SET_LOCK_CONFIG: u8 = 0x53;
 
 /// Commit: mark provisioning complete and persist config to flash.
 /// Payload: empty.  Device reboots after responding RspOk.
@@ -204,6 +268,11 @@ pub const FRAME_RSP_ADVERT: u8 = 0x8A;
 pub const FRAME_RSP_ROOM: u8 = 0x8B;
 /// Response: terminal frame of a room enumeration stream (no payload).
 pub const FRAME_RSP_ROOMS_DONE: u8 = 0x8C;
+/// Response: answer to [`FRAME_QUERY_LOCK`]. Payload: [`RspLockPayload`].
+/// The PIN itself is deliberately NOT echoed back — same precedent as
+/// [`FRAME_RSP_ROOM`] not echoing the guest password — only whether one is
+/// currently set.
+pub const FRAME_RSP_LOCK: u8 = 0x8D;
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -226,6 +295,9 @@ pub enum ProvError {
     PasswordTooLong,
     /// A room `out_path` field exceeds `MAX_ROOM_PATH_LEN`.
     PathTooLong,
+    /// A `SET_LOCK_PIN` payload is not exactly `LOCK_PIN_LEN` bytes, or
+    /// contains a byte that is not an ASCII digit (`b'0'..=b'9'`).
+    LockPinInvalid,
 }
 
 // ── Payload structs ───────────────────────────────────────────────────────────
@@ -330,6 +402,39 @@ pub struct SetDeviceNamePayload {
     pub name: [u8; MAX_NAME_LEN],
     /// Actual byte length of `name` (0 ⇒ clear the stored name).
     pub name_len: u8,
+}
+
+/// Payload for `FRAME_SET_LOCK_PIN`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetLockPinPayload {
+    /// The lock PIN — always exactly `LOCK_PIN_LEN` ASCII-digit bytes after
+    /// a successful [`decode_set_lock_pin`].
+    pub pin: [u8; LOCK_PIN_LEN],
+}
+
+/// Payload for `FRAME_SET_LOCK_CONFIG`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetLockConfigPayload {
+    /// Bitfield: see [`LOCK_SCREEN_ENABLE`] / [`LOCK_NO_DEVICE_DISABLE`].
+    pub lock_flags: u8,
+    /// Idle-timeout seconds before the lock trips. Not clamped by this
+    /// decode function — clamping to `LOCK_TIMEOUT_MIN_S..=LOCK_TIMEOUT_MAX_S`
+    /// is a firmware-core concern (the single source of truth all three
+    /// configuration surfaces share — see the screen-lock plan's D1), not a
+    /// wire-decode concern.
+    pub lock_timeout_s: u16,
+}
+
+/// Payload for `FRAME_RSP_LOCK` (response to `FRAME_QUERY_LOCK`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RspLockPayload {
+    /// Bitfield: see [`LOCK_SCREEN_ENABLE`] / [`LOCK_NO_DEVICE_DISABLE`].
+    pub lock_flags: u8,
+    /// Current idle-timeout seconds.
+    pub lock_timeout_s: u16,
+    /// `true` if a lock PIN is currently stored on the device. The PIN
+    /// itself is never echoed back (see `FRAME_RSP_LOCK`'s doc comment).
+    pub pin_set: bool,
 }
 
 /// Payload for `FRAME_RSP_STATUS` (response to `FRAME_QUERY_STATUS`).
@@ -662,6 +767,38 @@ pub fn encode_set_device_name(name: &[u8], out: &mut [u8]) -> usize {
     1 + name_len
 }
 
+/// Encode a `SetLockPin` payload.  Returns bytes written (always `LOCK_PIN_LEN`).
+///
+/// Wire layout: `pin(LOCK_PIN_LEN)`.
+///
+/// Unlike [`encode_set_pin`] (which accepts up to `MAX_PIN_LEN` arbitrary
+/// bytes and silently truncates), this takes a fixed-size `[u8; LOCK_PIN_LEN]`
+/// — there is no length to truncate. Content validation (ASCII-digit-only)
+/// is a decode-path concern; see [`decode_set_lock_pin`].
+pub fn encode_set_lock_pin(pin: &[u8; LOCK_PIN_LEN], out: &mut [u8]) -> usize {
+    out[0..LOCK_PIN_LEN].copy_from_slice(pin);
+    LOCK_PIN_LEN
+}
+
+/// Encode a `SetLockConfig` payload.  Returns bytes written (always 3).
+///
+/// Wire layout: `lock_flags(1) | lock_timeout_s(2 LE)`
+pub fn encode_set_lock_config(lock_flags: u8, lock_timeout_s: u16, out: &mut [u8]) -> usize {
+    out[0] = lock_flags;
+    out[1..3].copy_from_slice(&lock_timeout_s.to_le_bytes());
+    3
+}
+
+/// Encode an `RspLock` payload.  Returns bytes written (always 4).
+///
+/// Wire layout: `lock_flags(1) | lock_timeout_s(2 LE) | pin_set(1)`
+pub fn encode_rsp_lock(payload: &RspLockPayload, out: &mut [u8]) -> usize {
+    out[0] = payload.lock_flags;
+    out[1..3].copy_from_slice(&payload.lock_timeout_s.to_le_bytes());
+    out[3] = payload.pin_set as u8;
+    4
+}
+
 /// Encode an `RspStatus` payload.  Returns bytes written (always 59).
 ///
 /// Wire layout: `provisioned(1) | pubkey(32) | contact_count(1) | channel_count(1) |
@@ -958,6 +1095,51 @@ pub fn decode_set_device_name(payload: &[u8]) -> Result<SetDeviceNamePayload, Pr
     Ok(SetDeviceNamePayload {
         name,
         name_len: name_len as u8,
+    })
+}
+
+/// Decode a `SetLockPin` payload.
+///
+/// **4-digit enforcement is a decode-path rejection, not a UI check**: any
+/// payload that is not exactly `LOCK_PIN_LEN` bytes, or that contains a byte
+/// that is not an ASCII digit (`b'0'..=b'9'`), is rejected with
+/// `ProvError::LockPinInvalid` — a single error distinguishable from every
+/// other `ProvError` variant, covering both the length and content checks.
+pub fn decode_set_lock_pin(payload: &[u8]) -> Result<SetLockPinPayload, ProvError> {
+    if payload.len() != LOCK_PIN_LEN {
+        return Err(ProvError::LockPinInvalid);
+    }
+    if !payload.iter().all(u8::is_ascii_digit) {
+        return Err(ProvError::LockPinInvalid);
+    }
+    let mut pin = [0u8; LOCK_PIN_LEN];
+    pin.copy_from_slice(payload);
+    Ok(SetLockPinPayload { pin })
+}
+
+/// Decode a `SetLockConfig` payload.
+///
+/// Does not clamp `lock_timeout_s` to `LOCK_TIMEOUT_MIN_S..=LOCK_TIMEOUT_MAX_S`
+/// — see [`SetLockConfigPayload::lock_timeout_s`]'s doc comment.
+pub fn decode_set_lock_config(payload: &[u8]) -> Result<SetLockConfigPayload, ProvError> {
+    if payload.len() < 3 {
+        return Err(ProvError::TruncatedPayload);
+    }
+    Ok(SetLockConfigPayload {
+        lock_flags: payload[0],
+        lock_timeout_s: u16::from_le_bytes(payload[1..3].try_into().unwrap()),
+    })
+}
+
+/// Decode an `RspLock` payload.
+pub fn decode_rsp_lock(payload: &[u8]) -> Result<RspLockPayload, ProvError> {
+    if payload.len() < 4 {
+        return Err(ProvError::TruncatedPayload);
+    }
+    Ok(RspLockPayload {
+        lock_flags: payload[0],
+        lock_timeout_s: u16::from_le_bytes(payload[1..3].try_into().unwrap()),
+        pin_set: payload[3] != 0,
     })
 }
 
@@ -1906,5 +2088,195 @@ mod tests {
         let mut payload = [0u8; 20];
         payload[0] = (MAX_PIN_LEN + 1) as u8; // pin_len > MAX_PIN_LEN
         assert_eq!(decode_set_pin(&payload), Err(ProvError::PinTooLong));
+    }
+
+    // ── Screen-lock frames (retired-opcode audit + roundtrips) ───────────────
+
+    #[test]
+    fn lock_frame_types_are_the_documented_free_opcodes() {
+        // Guards the mission's abort condition: none of the four proposed
+        // opcodes may already be claimed, and 0x30/0x60 (retired) must stay
+        // untouched by this change.
+        assert_eq!(FRAME_QUERY_LOCK, 0x06);
+        assert_eq!(FRAME_SET_LOCK_PIN, 0x52);
+        assert_eq!(FRAME_SET_LOCK_CONFIG, 0x53);
+        assert_eq!(FRAME_RSP_LOCK, 0x8D);
+        for claimed in [
+            FRAME_QUERY_STATUS,
+            FRAME_QUERY_CONTACTS,
+            FRAME_QUERY_CHANNELS,
+            FRAME_QUERY_ADVERT,
+            FRAME_QUERY_ROOMS,
+            FRAME_ADD_CONTACT,
+            FRAME_DEL_CONTACT,
+            FRAME_ADD_CHANNEL,
+            FRAME_DEL_CHANNEL,
+            FRAME_ADD_ROOM,
+            FRAME_DEL_ROOM,
+            FRAME_SET_NOTIF_DEFAULTS,
+            FRAME_SET_PIN,
+            FRAME_SET_DEVICE_NAME,
+            FRAME_COMMIT_PROVISIONING,
+            FRAME_EXPORT_HISTORY,
+            FRAME_CLEAR_HISTORY,
+            FRAME_RSP_OK,
+            FRAME_RSP_ERROR,
+            FRAME_RSP_STATUS,
+            FRAME_RSP_IDENTITY,
+            FRAME_RSP_HISTORY_ENTRY,
+            FRAME_RSP_HISTORY_DONE,
+            FRAME_RSP_CONTACT,
+            FRAME_RSP_CONTACTS_DONE,
+            FRAME_RSP_CHANNEL,
+            FRAME_RSP_CHANNELS_DONE,
+            FRAME_RSP_ADVERT,
+            FRAME_RSP_ROOM,
+            FRAME_RSP_ROOMS_DONE,
+        ] {
+            assert_ne!(claimed, FRAME_QUERY_LOCK);
+            assert_ne!(claimed, FRAME_SET_LOCK_PIN);
+            assert_ne!(claimed, FRAME_SET_LOCK_CONFIG);
+            assert_ne!(claimed, FRAME_RSP_LOCK);
+        }
+        // The retired opcodes must remain unclaimed by any frame type,
+        // the new ones included.
+        assert_ne!(FRAME_QUERY_LOCK, 0x30);
+        assert_ne!(FRAME_QUERY_LOCK, 0x60);
+        assert_ne!(FRAME_SET_LOCK_PIN, 0x30);
+        assert_ne!(FRAME_SET_LOCK_PIN, 0x60);
+        assert_ne!(FRAME_SET_LOCK_CONFIG, 0x30);
+        assert_ne!(FRAME_SET_LOCK_CONFIG, 0x60);
+        assert_ne!(FRAME_RSP_LOCK, 0x30);
+        assert_ne!(FRAME_RSP_LOCK, 0x60);
+    }
+
+    #[test]
+    fn lock_flag_and_timeout_constants_match_the_screen_lock_plan() {
+        assert_eq!(LOCK_SCREEN_ENABLE, 0x01);
+        assert_eq!(LOCK_NO_DEVICE_DISABLE, 0x02);
+        assert_eq!(LOCK_TIMEOUT_MIN_S, 15);
+        assert_eq!(LOCK_TIMEOUT_MAX_S, 3600);
+        assert_eq!(LOCK_TIMEOUT_DEFAULT_S, 300);
+        assert!((LOCK_TIMEOUT_MIN_S..=LOCK_TIMEOUT_MAX_S).contains(&LOCK_TIMEOUT_DEFAULT_S));
+    }
+
+    #[test]
+    fn set_lock_pin_roundtrip() {
+        let pin = *b"1234";
+        let mut payload_buf = [0u8; 8];
+        let plen = encode_set_lock_pin(&pin, &mut payload_buf);
+        assert_eq!(plen, LOCK_PIN_LEN);
+
+        let mut frame_buf = [0u8; 16];
+        let n = encode_frame(FRAME_SET_LOCK_PIN, &payload_buf[..plen], &mut frame_buf);
+        let (ft, payload) = decode_frame(&frame_buf[..n]).unwrap();
+        assert_eq!(ft, FRAME_SET_LOCK_PIN);
+
+        let decoded = decode_set_lock_pin(payload).unwrap();
+        assert_eq!(decoded.pin, pin);
+    }
+
+    #[test]
+    fn decode_set_lock_pin_rejects_wrong_length() {
+        // Too short.
+        assert_eq!(decode_set_lock_pin(b"123"), Err(ProvError::LockPinInvalid));
+        // Too long.
+        assert_eq!(
+            decode_set_lock_pin(b"12345"),
+            Err(ProvError::LockPinInvalid)
+        );
+    }
+
+    #[test]
+    fn decode_set_lock_pin_rejects_non_ascii_digit_bytes() {
+        assert_eq!(decode_set_lock_pin(b"12a4"), Err(ProvError::LockPinInvalid));
+        assert_eq!(
+            decode_set_lock_pin(&[0xFFu8, b'1', b'2', b'3']),
+            Err(ProvError::LockPinInvalid)
+        );
+    }
+
+    #[test]
+    fn set_lock_config_roundtrip() {
+        let mut payload_buf = [0u8; 8];
+        let plen = encode_set_lock_config(LOCK_SCREEN_ENABLE, 300, &mut payload_buf);
+        assert_eq!(plen, 3);
+
+        let mut frame_buf = [0u8; 16];
+        let n = encode_frame(FRAME_SET_LOCK_CONFIG, &payload_buf[..plen], &mut frame_buf);
+        let (ft, payload) = decode_frame(&frame_buf[..n]).unwrap();
+        assert_eq!(ft, FRAME_SET_LOCK_CONFIG);
+
+        let decoded = decode_set_lock_config(payload).unwrap();
+        assert_eq!(decoded.lock_flags, LOCK_SCREEN_ENABLE);
+        assert_eq!(decoded.lock_timeout_s, 300);
+    }
+
+    #[test]
+    fn decode_set_lock_config_truncated() {
+        assert_eq!(
+            decode_set_lock_config(&[0u8; 2]),
+            Err(ProvError::TruncatedPayload)
+        );
+    }
+
+    #[test]
+    fn decode_set_lock_config_does_not_clamp_out_of_range_timeout() {
+        // Clamping to LOCK_TIMEOUT_MIN_S..=LOCK_TIMEOUT_MAX_S is firmware-core's
+        // job (the single source of truth all three surfaces share), not the
+        // wire decoder's — the decoder must pass the raw value through
+        // unmodified, even when it is out of the eventual accepted range.
+        let out_of_range: u16 = LOCK_TIMEOUT_MAX_S + 1000;
+        let mut payload_buf = [0u8; 8];
+        let plen = encode_set_lock_config(0, out_of_range, &mut payload_buf);
+        let decoded = decode_set_lock_config(&payload_buf[..plen]).unwrap();
+        assert_eq!(decoded.lock_timeout_s, out_of_range);
+    }
+
+    #[test]
+    fn rsp_lock_roundtrip() {
+        let status = RspLockPayload {
+            lock_flags: LOCK_SCREEN_ENABLE,
+            lock_timeout_s: 300,
+            pin_set: true,
+        };
+        let mut payload_buf = [0u8; 8];
+        let plen = encode_rsp_lock(&status, &mut payload_buf);
+        assert_eq!(plen, 4);
+
+        let mut frame_buf = [0u8; 16];
+        let n = encode_frame(FRAME_RSP_LOCK, &payload_buf[..plen], &mut frame_buf);
+        let (ft, payload) = decode_frame(&frame_buf[..n]).unwrap();
+        assert_eq!(ft, FRAME_RSP_LOCK);
+
+        let decoded = decode_rsp_lock(payload).unwrap();
+        assert_eq!(decoded, status);
+    }
+
+    #[test]
+    fn rsp_lock_roundtrip_disabled_no_pin() {
+        let status = RspLockPayload {
+            lock_flags: 0,
+            lock_timeout_s: LOCK_TIMEOUT_DEFAULT_S,
+            pin_set: false,
+        };
+        let mut payload_buf = [0u8; 8];
+        let plen = encode_rsp_lock(&status, &mut payload_buf);
+        let decoded = decode_rsp_lock(&payload_buf[..plen]).unwrap();
+        assert_eq!(decoded, status);
+    }
+
+    #[test]
+    fn decode_rsp_lock_truncated() {
+        assert_eq!(decode_rsp_lock(&[0u8; 3]), Err(ProvError::TruncatedPayload));
+    }
+
+    #[test]
+    fn query_lock_frame_roundtrip() {
+        let mut buf = [0u8; 16];
+        let n = encode_frame(FRAME_QUERY_LOCK, &[], &mut buf);
+        let (ft, payload) = decode_frame(&buf[..n]).unwrap();
+        assert_eq!(ft, FRAME_QUERY_LOCK);
+        assert!(payload.is_empty());
     }
 }

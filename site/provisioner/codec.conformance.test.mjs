@@ -183,6 +183,25 @@ check("decodeRspError rejects a msg_len claiming more bytes than are present", (
   );
 });
 
+check("decodeRspLock rejects a payload shorter than the 4-byte floor", () => {
+  assert.throws(
+    () => codec.decodeRspLock(new Uint8Array(3)),
+    (err) => err instanceof codec.ProvError && err.kind === "TruncatedPayload",
+  );
+});
+
+check("encodeSetLockPin rejects a pin that isn't exactly LOCK_PIN_LEN ASCII digits", () => {
+  assert.throws(() => codec.encodeSetLockPin("123"), /exactly 4 ASCII digits/);
+  assert.throws(() => codec.encodeSetLockPin("12345"), /exactly 4 ASCII digits/);
+  assert.throws(() => codec.encodeSetLockPin("12a4"), /exactly 4 ASCII digits/);
+  assert.throws(() => codec.encodeSetLockPin(""), /exactly 4 ASCII digits/);
+});
+
+check("encodeSetLockPin accepts a well-formed 4-digit pin", () => {
+  const payload = codec.encodeSetLockPin("0192");
+  assert.equal(codec.bytesToHex(payload), "30313932");
+});
+
 check("decodeRspHistoryEntry returns null (not throw) on a truncated payload", () => {
   // Mirrors protocol::history::decode_rsp_history_entry's Option contract —
   // there is no ProvError variant for this codec (it lives outside
@@ -228,6 +247,9 @@ const ENCODE_OPS = {
   query_channels: () => new Uint8Array(0),
   query_rooms: () => new Uint8Array(0),
   query_advert: (p) => codec.encodeQueryAdvert(p.host_unix_time),
+  query_lock: () => new Uint8Array(0),
+  set_lock_pin: (p) => codec.encodeSetLockPin(p.pin),
+  set_lock_config: (p) => codec.encodeSetLockConfig(p.lock_flags, p.lock_timeout_s),
   commit_provisioning: () => new Uint8Array(0),
   export_history: () => new Uint8Array(0),
   clear_history: () => new Uint8Array(0),
@@ -251,6 +273,7 @@ const DECODE_OPS = {
   rsp_room: codec.decodeRspRoom,
   rsp_history_entry: codec.decodeRspHistoryEntry,
   rsp_advert: codec.decodeRspAdvert,
+  rsp_lock: codec.decodeRspLock,
 };
 
 // Fields that are raw byte arrays (`Uint8Array`) in codec.js's decoded
