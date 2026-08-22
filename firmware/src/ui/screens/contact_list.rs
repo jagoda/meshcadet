@@ -262,7 +262,7 @@ slint::slint! {
         in property <int> signal_level: 0;
         // Coarse battery-level bucket (`meshcadet-battery-soc-filtering` /
         // `meshcadet-battery-glanceable-indicator`): 0 = Unknown, 1 =
-        // Charging, 2..=5 = Critical/Low/Medium/High. Pushed by
+        // Charging, 2..=4 = Low/Partial/Full. Pushed by
         // `ContactListScreen::set_battery_level`; see `BatteryIndicator`'s
         // embedding below.
         in property <int> battery_level: 0;

@@ -124,19 +124,24 @@
 //! a VIRGIN device (no persisted `settled_mv` yet, so this exact residual
 //! gap applies) that boots already plugged in over a truly depleted pack
 //! did eventually see `percent` catch up once the pack was confirmed off
-//! power — but only by crawling down through [`slew_limit_percent`]'s
-//! discharge-monotonic cap ([`PERCENT_MAX_SLEW_PER_UPDATE_PCT`] per
-//! ~[`PEAK_WINDOW_MS`] window), the same limiter that smooths *legitimate*
+//! power — but only by crawling down through `slew_limit_percent`'s
+//! (removed 2026-08-22 — see module docs' "Three-state voltage-domain
+//! bucket" section) discharge-monotonic cap (2 percentage points per
+//! ~[`PEAK_WINDOW_MS`] window), the same limiter that smoothed *legitimate*
 //! discharge noise once a basis is trustworthy. Applied to the FIRST
 //! correction of an unconfirmed, contaminated boot-time guess, that same cap
 //! meant up to ~25 minutes reading a near-full `percent`/`level` on a device
 //! that was, the whole time, sitting at its true depleted charge — for
 //! this board's plain-ADC design, effectively invisible to the user as
 //! "the indicator reads full when depleted, and doesn't change whether the
-//! cable is attached or not." [`battery_window_close_step`] is the fix:
-//! the slew limiter is skipped for the poll that first proves the basis
-//! confirmed, so the display snaps straight to the true reading instead of
-//! crawling toward it. See that function's own doc for the exact mechanism.
+//! cable is attached or not." The original (2026-08-17) fix special-cased
+//! the slew limiter to skip the poll that first proves the basis confirmed.
+//! `meshcadet-battery-three-state-pipeline` (2026-08-22) superseded that
+//! special case by deleting the slew limiter outright —
+//! [`battery_window_close_step`] now always snaps `settled_mv`/`level`
+//! straight to the truth on every window close, confirmed or not — see
+//! module docs' "Three-state voltage-domain bucket" section for the full
+//! rationale.
 //!
 //! ## ADC calibration (2026-07-05 redirect) and the diagnostic `raw_mv` field
 //!
@@ -339,50 +344,112 @@
 //! still reflects the freshest 2 s-cadence ADC-averaged read, unfiltered,
 //! same as before this change.
 //!
-//! ### (C) Slew-limited, discharge-monotonic `percent`
+//! ### (C) [REMOVED 2026-08-22] Slew-limited, discharge-monotonic `percent`
 //!
-//! [`slew_limit_percent`] derives the DISPLAYED `percent` from the raw
-//! `settled_mv`-derived target percentage, combining two effects in one
-//! function: (1) a max-step-per-update cap ([`PERCENT_MAX_SLEW_PER_UPDATE_PCT`])
-//! in either direction, so a single window's worth of movement can't jump
-//! the displayed value abruptly; (2) while NOT charging, the displayed value
-//! is additionally floored at its own previous value — it can fall, never
-//! rise, until charging is detected. `held_raw_mv` (the underlying
-//! `settled_mv` basis) is unaffected by either the cap or the latch — it
-//! still reflects the raw resting reading immediately, same as `percent`
-//! used to before this change.
+//! This section used to describe `slew_limit_percent`: a max-step-per-update
+//! cap plus a discharge-monotonic latch (floor `percent` at its own previous
+//! value until charging is detected) applied to the DISPLAYED `percent`.
+//! `meshcadet-battery-three-state-pipeline` (2026-08-22) deleted it, along
+//! with `PERCENT_MAX_SLEW_PER_UPDATE_PCT` and the driver's
+//! `displayed_percent` field, because it was directly responsible for a
+//! hardware-reported bug: a device charged to 100% and unplugged stayed
+//! pinned near its PRE-charge percent forever, because the latch only
+//! releases while `charging == true`, and `settled_mv` (the target the
+//! display is allowed to rise toward) is itself frozen during the charge
+//! session — so the display could rise only while charging, and while
+//! charging there was nothing above it to rise to. The only escape was an
+//! off-power reboot. See the "Three-state voltage-domain bucket" section
+//! below for the fix and the second, independent mechanism (an unprotected
+//! boot-time seed) that converged on the same symptom. This is also a
+//! second, distinct instance of the general "a rate-limiter must gate on a
+//! confirmed prior, not apply uniformly to an unconfirmed one" defect class
+//! — not the same instance PR #163 already fixed (that one made the FIRST
+//! correction of an unconfirmed seed instant; this one is about every
+//! SUBSEQUENT correction while `settled_mv` itself is frozen by charging).
 //!
-//! **The latch's closer, named and bounded:** the
-//! "self-resolves once charging is detected" claim's closer is
-//! [`battery_poll_step`]'s stateless, per-poll [`EXTERNAL_POWER_MV_THRESHOLD`]
-//! check (this same module, see the "Fix" section above) — re-evaluated
-//! every peak-sampling window with no history/precondition of its own (it
-//! needs no prior charging state, no prior sample at all: a single
-//! over-ceiling reading is sufficient, proven by
-//! `engages_on_the_very_first_poll_with_no_prior_history` above). Worst
-//! case, not typical case: the latch releases at most one [`PEAK_WINDOW_MS`]
-//! (~30 s) after external power is actually applied — the time for the
-//! contaminated reading to become that window's peak and for the window to
-//! close — never later, and never gated on any OTHER event's precondition.
+//! ### (D) [REVISED 2026-08-22] Coarse bucket level
 //!
-//! ### (D) Coarse bucket level
+//! `BatteryLevel` used to have four percent buckets (`Critical`/`Low`/
+//! `Medium`/`High`) computed from the slew-limited `percent`. It is now
+//! THREE buckets (`Low`/`Partial`/`Full`) computed directly from
+//! `settled_mv` in millivolts — see the "Three-state voltage-domain bucket"
+//! section below for the full rationale and mechanism.
 //!
-//! [`BatteryLevel`] (`Unknown` / `Charging` / `Critical` / `Low` / `Medium` /
-//! `High`) is computed by [`battery_level_bucket`] from the displayed
-//! `percent` and `charging`, with hysteresis at each of the three internal
-//! boundaries ([`BUCKET_HYSTERESIS_PCT`]) so a `percent` value oscillating
-//! right at a boundary doesn't visibly flap the bucket every poll. Exposed
-//! as [`BatteryStatus::level`] — landed here (2026-08-04) as a DATA field
-//! only, with no consumer, deliberately left to a dependent UI mission (see
-//! this module's original acceptance line). **`meshcadet-battery-
-//! glanceable-indicator` (the dependent mission) wired it**: `level` now
-//! drives the header `BatteryIndicator` widget on the four operational
-//! screens (`ContactList`/`MessageView`/`Compose`/`GpsStatus` — see
-//! `ui::battery_indicator`'s doc) via a simple bucket-equality gate
-//! (`UiRuntime::set_battery_level`) — no additional hysteresis/delta-gating
-//! needed there beyond what `battery_level_bucket` already applies above.
-//! The on-device admin-menu row and the over-the-air telemetry RESPONSE
-//! still don't read it.
+//! ## Three-state voltage-domain bucket (2026-08-22)
+//!
+//! `meshcadet-battery-three-state-pipeline`: the user only needs the
+//! on-device indicator to distinguish three charge states (`Low`/`Partial`/
+//! `Full`), plus the already-working `Charging`/`Unknown`. Recon for that
+//! relaxed requirement found the display could get permanently stuck LOW on
+//! a freshly-charged device — the *opposite* symptom from the one PR #163
+//! fixed — via **two independent mechanisms that converge on the same wrong
+//! output**:
+//!
+//! 1. **The display could never rise while off external power.** The
+//!    (now-deleted) discharge-monotonic latch's documented "closer" was the
+//!    `charging` flag, but `settled_mv` (the value the display rises
+//!    *toward*) is itself frozen at the pre-charge reading for the whole
+//!    charge session (see the "Fix" section above). So the display could
+//!    only rise while charging, and while charging there was nothing above
+//!    it to rise to — charge 20%→100%, unplug, and the display stayed
+//!    pinned at ~20% forever. The only escape was an off-power reboot.
+//! 2. **The boot basis was a single un-peak-held sample taken during
+//!    inrush.** [`PeakWindowSampler`] exists precisely because
+//!    LoRa-TX/backlight rail sag drags readings down mid-window — but
+//!    [`BatteryDriver::new`]'s `initial_mv` seed is constructed *from* that
+//!    sampler without being protected *by* it: a boot-time sag could seed a
+//!    falsely-low basis, and mechanism (1) then made that low reading
+//!    permanent for the rest of the power cycle.
+//!
+//! Both mechanisms lived in the percent-DISPLAY filter layer (the slew
+//! limiter, the discharge-monotonic latch, and the percent-domain bucket
+//! hysteresis stacked on top of them) — a layer that existed to smooth a
+//! precise percent NUMBER. A 3-state display doesn't need a smoothed
+//! number; it needs a stable BUCKET, and a bucket ±[`LEVEL_HYSTERESIS_MV`]
+//! wide is already immune to the ADC/curve-breakpoint jitter the slew
+//! limiter was built to hide. **Deleting the filter layer is both the
+//! simplification and the fix**: [`battery_level_bucket`] now buckets
+//! directly on `settled_mv` (millivolts), with hysteresis expressed in
+//! millivolts, at [`LEVEL_LOW_PARTIAL_MV`] and [`LEVEL_PARTIAL_FULL_MV`].
+//! `BatteryStatus::percent` becomes a pure, stateless
+//! `percent_from_millivolts(settled_mv)` — the same value the wire, host
+//! CLI, and admin row already consumed, minus the filter — and no
+//! percent-domain state (no `displayed_percent`) survives in
+//! [`BatteryDriver`] at all. With no stateful filter carrying a prior
+//! output, there is no untrustworthy prior to protect, and the whole bug
+//! class (#163's symptom, this symptom, and the next one in the family)
+//! becomes structurally unreachable rather than individually patched.
+//!
+//! **Boot seed hardening:** [`BatteryDriver::new`]'s `initial_mv` is
+//! treated as provisional — it may seed the display so the first screen
+//! isn't blank, but the first closed [`PeakWindowSampler`] window
+//! unconditionally overwrites `settled_mv` via the normal
+//! [`battery_window_close_step`] chain, whether the corrected value is
+//! higher or lower, with no rate limit to fight through. The raw boot
+//! sample is now also recorded separately as `boot_mv` (see
+//! [`BatteryStatus::boot_mv`]) so a HIL capture can see the gap between
+//! "what boot read" and "what the first settled window corrected it to" —
+//! the discriminator between "inrush sag" and "the pack really is low."
+//! The NVS-restore precedence (a persisted confirmed basis beats a live
+//! boot sample while on external power — the #163 fix) is unchanged.
+//!
+//! **What stays:** the peak-hold sampler ((B) above), the
+//! impossible-voltage external-power threshold ([`battery_poll_step`]), the
+//! `confirmed` latch and NVS `settled_mv` persistence ((A) above) — all of
+//! that defends against *physical* contamination (charge-rail voltage, TX
+//! sag, a poisoned boot seed), not against ordinary display jitter, and the
+//! relaxed 3-state requirement doesn't touch any of it.
+//!
+//! Every millivolt constant this section introduces
+//! ([`LEVEL_LOW_PARTIAL_MV`], [`LEVEL_PARTIAL_FULL_MV`],
+//! [`LEVEL_HYSTERESIS_MV`]) ships PROVISIONAL, derived from
+//! [`RESTING_SOC_CURVE`] (itself uncalibrated) rather than a fresh
+//! measurement — a measured constant sourced from a code comment (or, here,
+//! from another uncalibrated derived table) decays the moment the tree
+//! underneath it moves, so none of these are final until a real capture
+//! reports each one's absolute value. A user-run HIL capture (this build
+//! ships the probes, not the capture itself — that needs real device time)
+//! is what locks them.
 
 // This module is pure Rust with no ADC/hardware dependency — see
 // `firmware::battery` for `BatteryDriver` (the real ADC1 read path), which
@@ -458,24 +525,29 @@ pub const EXTERNAL_POWER_MV_THRESHOLD: u32 = 4300;
 /// acceptance line.
 pub const PEAK_WINDOW_MS: u64 = 30_000;
 
-/// Maximum change (percentage points) [`slew_limit_percent`] lets the
-/// displayed `percent` move per peak-window update, in either direction. At
-/// [`PEAK_WINDOW_MS`] cadence this bounds a full 0↔100 swing to at most
-/// `100 / PERCENT_MAX_SLEW_PER_UPDATE_PCT` windows (~17 minutes at this
-/// tuned value) while still fully damping single-window ADC/curve-breakpoint
-/// jitter of a point or two — see module docs' "(C)" section.
-pub const PERCENT_MAX_SLEW_PER_UPDATE_PCT: u8 = 2;
+/// `Low|Partial` [`BatteryLevel`] boundary, in millivolts, before
+/// [`LEVEL_HYSTERESIS_MV`] is applied — see module docs' "Three-state
+/// voltage-domain bucket" section. **PROVISIONAL**: derived from
+/// [`RESTING_SOC_CURVE`] (itself uncalibrated) as "~20% SoC, charge soon,"
+/// not from a fresh measurement. Closed by a real HIL capture (Q3/Q5/Q7 in
+/// the capture checklist), not by this change.
+pub const LEVEL_LOW_PARTIAL_MV: u32 = 3_700;
 
-/// Percent boundaries between adjacent [`BatteryLevel`] buckets: `Critical|Low`,
-/// `Low|Medium`, `Medium|High`, before hysteresis is applied.
-const BUCKET_BOUNDARIES_PCT: [u8; 3] = [25, 50, 75];
+/// `Partial|Full` [`BatteryLevel`] boundary, in millivolts, before
+/// [`LEVEL_HYSTERESIS_MV`] is applied — see module docs' "Three-state
+/// voltage-domain bucket" section. **PROVISIONAL**, same basis/caveat as
+/// [`LEVEL_LOW_PARTIAL_MV`]: derived from [`RESTING_SOC_CURVE`] as "~85%
+/// SoC, mostly full."
+pub const LEVEL_PARTIAL_FULL_MV: u32 = 4_000;
 
-/// Hysteresis margin (percentage points) applied at each [`BUCKET_BOUNDARIES_PCT`]
-/// boundary: once in a bucket, `percent` must cross a boundary by MORE than
-/// this margin (not just touch it) before [`battery_level_bucket`] reports a
-/// different bucket — stops single-point jitter right at a boundary from
-/// flapping the reported bucket every poll.
-const BUCKET_HYSTERESIS_PCT: u8 = 3;
+/// Hysteresis margin (millivolts) applied at each of
+/// [`LEVEL_LOW_PARTIAL_MV`]/[`LEVEL_PARTIAL_FULL_MV`]: once in a bucket,
+/// `settled_mv` must cross a boundary by MORE than this margin (not just
+/// touch it) before [`battery_level_bucket`] reports a different bucket —
+/// stops ADC/curve-breakpoint jitter right at a boundary from flapping the
+/// reported bucket every window. **PROVISIONAL**: this is the number the
+/// capture checklist's Q5 (at-rest jitter band) is specified to measure.
+pub const LEVEL_HYSTERESIS_MV: u32 = 30;
 
 /// Minimum `settled_mv` movement (since what's currently on flash) before
 /// [`should_persist_settled_mv`] considers a write worth the flash wear —
@@ -500,20 +572,28 @@ pub const PERSIST_MIN_INTERVAL_MS: u64 = 5 * 60_000;
 /// investigation (originally diagnosis-only — see this module's "ADC
 /// calibration ... raw_mv" doc section for how that scoping later widened);
 /// `level` was added 2026-08-04 as data-only, then wired to the header
-/// `BatteryIndicator` widget by `meshcadet-battery-glanceable-indicator`.
+/// `BatteryIndicator` widget by `meshcadet-battery-glanceable-indicator`;
+/// `boot_mv`/`confirmed` were added 2026-08-22
+/// (`meshcadet-battery-three-state-pipeline`) as HIL capture probes — see
+/// module docs' "Three-state voltage-domain bucket" section.
 ///
 /// This is the single representation wired into every consumer: the radio
 /// telemetry RESPONSE (`main.rs::build_telemetry_response`, `percent`/
-/// `charging`/`raw_mv` — see `raw_mv`'s own field doc for how that widened),
-/// the host `status` command (`protocol::provisioning::
-/// RspStatusPayload`, every field), the on-device admin-menu row
-/// (`percent`/`charging`/`raw_mv` — see `raw_mv`'s own field doc for how
-/// that widened), and the on-device header `BatteryIndicator` widget on the
-/// four operational screens (`level` only) — so every consumer reports the
-/// same numbers by construction rather than independent reads/formats.
+/// `charging`/`raw_mv`/`held_raw_mv`/`level` — see `raw_mv`'s own field doc
+/// for how that widened), the host `status` command (`protocol::
+/// provisioning::RspStatusPayload`, every field), the on-device admin-menu
+/// row (every field except `held_raw_mv`'s wire-only sibling — see
+/// `ui::admin_menu::format_battery_display`'s doc for the exact row
+/// layout), and the on-device header `BatteryIndicator` widget on the four
+/// operational screens (`level` only) — so every consumer reports the same
+/// numbers by construction rather than independent reads/formats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BatteryStatus {
-    /// Charge percentage, `0..=100`.
+    /// Charge percentage, `0..=100`. A pure, stateless
+    /// `percent_from_millivolts(held_raw_mv)` as of 2026-08-22 — no
+    /// percent-domain filter (slew limit, discharge-monotonic latch) sits
+    /// between the basis and this field anymore; see module docs'
+    /// "Three-state voltage-domain bucket" section.
     pub percent: u8,
     /// `true` if the pack is inferred to be charging (see module docs).
     pub charging: bool,
@@ -529,24 +609,43 @@ pub struct BatteryStatus {
     /// `main.rs::build_telemetry_response`'s doc for the charging-divergence
     /// caveat that entails).
     pub raw_mv: u32,
-    /// Last known non-charge-inflated ("resting") millivolt reading — the
-    /// same `settled_mv` basis `percent` is derived from (before the
-    /// slew-limit/latch in [`slew_limit_percent`] is applied — see module
-    /// docs' "(C)" section), but exposed as raw millivolts instead of a
-    /// lossy-rounded percentage. Unlike `raw_mv`, this is frozen while
-    /// charging (contamination-free by construction) — see module docs'
-    /// "`held_raw_mv`" section. Diagnostic only: surfaced via the host CLI
-    /// `status` command only — the on-device admin-menu row does NOT render
-    /// this field (only `raw_mv`, above).
+    /// Last known non-charge-inflated ("resting") millivolt reading —
+    /// `settled_mv`, the SAME basis `percent` and `level` are derived from,
+    /// exposed as raw millivolts instead of a lossy-rounded percentage (as
+    /// of 2026-08-22, `percent`/`level` derive from this value directly —
+    /// no filter sits between them anymore, see module docs' "Three-state
+    /// voltage-domain bucket" section). Unlike `raw_mv`, this is frozen
+    /// while charging (contamination-free by construction) — see module
+    /// docs' "`held_raw_mv`" section. Rendered on-device as of 2026-08-22
+    /// (the admin-menu row's `b:` field — see
+    /// `ui::admin_menu::format_battery_display`'s doc); previously host-CLI
+    /// only.
     pub held_raw_mv: u32,
+    /// This boot's raw, un-peak-held ADC seed sample (`BatteryDriver::new`'s
+    /// `initial_mv`) — fixed for the life of the boot, added 2026-08-22
+    /// (`meshcadet-battery-three-state-pipeline`) as the discriminator
+    /// between "inrush sag" and "the pack really is low" (see module docs'
+    /// "Three-state voltage-domain bucket" section). Rendered on-device (the
+    /// admin-menu row's `B:` field) and read only diagnostically — no
+    /// production logic branches on it; the first closed peak window already
+    /// unconditionally overwrites `held_raw_mv`/`percent`/`level` regardless
+    /// of what this field reads.
+    pub boot_mv: u32,
+    /// Whether `held_raw_mv` is a trustworthy (CONFIRMED) basis — see
+    /// [`advance_settled_confirmed`] and module docs' "(A)" section. Added
+    /// 2026-08-22 as a HIL capture probe (the admin-menu row's `f:` field —
+    /// see `ui::admin_menu::format_battery_display`'s doc); the underlying
+    /// `confirmed` latch itself predates this field (2026-08-04) and already
+    /// gated NVS persistence — this just makes it visible on-device.
+    pub confirmed: bool,
     /// Coarse bucketed level — see [`BatteryLevel`] and module docs' "(D)"
     /// section. Drives the header `BatteryIndicator` widget on the four
     /// operational screens (`ContactList`/`MessageView`/`Compose`/
     /// `GpsStatus` — ADR-0010 D5), wired by
     /// `meshcadet-battery-glanceable-indicator` via
-    /// `ui::battery_indicator::level_to_indicator_level`; not read by the
-    /// admin-menu row (which renders `percent`/`raw_mv` instead) or the
-    /// over-the-air telemetry RESPONSE.
+    /// `ui::battery_indicator::level_to_indicator_level`; also rendered by
+    /// the admin-menu row (`L:` field, as of 2026-08-22) and the
+    /// over-the-air telemetry RESPONSE (as of 2026-08-22).
     pub level: BatteryLevel,
 }
 
@@ -558,94 +657,103 @@ impl BatteryStatus {
             charging: false,
             raw_mv: 0,
             held_raw_mv: 0,
+            boot_mv: 0,
+            confirmed: false,
             level: BatteryLevel::Unknown,
         }
     }
 }
 
-// ── BatteryLevel — coarse bucket (D) ─────────────────────────────────────────
+// ── BatteryLevel — coarse voltage-domain bucket (D) ──────────────────────────
 
-/// Coarse battery-level bucket: 4 charge-percent buckets plus `Unknown` and
-/// `Charging` — see module docs' "(D)" section. DATA only — no UI wiring in
-/// this mission.
+/// Coarse battery-level bucket: 3 voltage-domain buckets (`Low`/`Partial`/
+/// `Full`) plus `Unknown` and `Charging` — see module docs' "Three-state
+/// voltage-domain bucket" section. As of 2026-08-22
+/// (`meshcadet-battery-three-state-pipeline`) this is computed directly from
+/// `settled_mv` (millivolts), not from the (now-deleted) slew-limited
+/// `percent`; the prior 4-bucket percent-domain version
+/// (`Critical`/`Low`/`Medium`/`High`) is gone, not renamed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BatteryLevel {
     /// No sample taken yet (mirrors [`BatteryStatus::unknown`]).
     Unknown,
     /// External power present (see [`battery_poll_step`]) — takes priority
-    /// over every percent-based bucket below, regardless of what the frozen
-    /// `percent` basis underneath it currently reads.
+    /// over every voltage-based bucket below, regardless of what the frozen
+    /// `settled_mv` basis underneath it currently reads.
     Charging,
-    /// Roughly `0..25%` (before hysteresis).
-    Critical,
-    /// Roughly `25..50%` (before hysteresis).
+    /// Below [`LEVEL_LOW_PARTIAL_MV`] (before hysteresis) — charge soon.
     Low,
-    /// Roughly `50..75%` (before hysteresis).
-    Medium,
-    /// Roughly `75..100%` (before hysteresis).
-    High,
+    /// Between [`LEVEL_LOW_PARTIAL_MV`] and [`LEVEL_PARTIAL_FULL_MV`] (before
+    /// hysteresis) — fine to operate.
+    Partial,
+    /// At or above [`LEVEL_PARTIAL_FULL_MV`] (before hysteresis) —
+    /// mostly/fully charged.
+    Full,
 }
 
-/// Map `percent` (post [`slew_limit_percent`]) to a [`BatteryLevel`] bucket,
-/// with hysteresis at each of the three [`BUCKET_BOUNDARIES_PCT`] boundaries
-/// so `percent` oscillating right at a boundary doesn't flap the reported
-/// bucket every poll — see module docs' "(D)" section.
+/// Map `settled_mv` (millivolts) to a [`BatteryLevel`] bucket, with
+/// hysteresis at each of [`LEVEL_LOW_PARTIAL_MV`]/[`LEVEL_PARTIAL_FULL_MV`]
+/// ([`LEVEL_HYSTERESIS_MV`] wide) so `settled_mv` oscillating right at a
+/// boundary doesn't flap the reported bucket every window — see module
+/// docs' "Three-state voltage-domain bucket" section.
 ///
 /// `prev` is the previously reported bucket (for hysteresis's "which
 /// direction of travel" context). `charging` always wins outright
-/// (`BatteryLevel::Charging`), matching `percent`'s own frozen-while-
-/// charging basis. Leaving `Charging`/`Unknown` (no established
-/// percent-bucket to apply hysteresis against) lands on the plain,
-/// no-hysteresis bucket for the current `percent` — same as a fresh boot.
-pub fn battery_level_bucket(prev: BatteryLevel, percent: u8, charging: bool) -> BatteryLevel {
+/// (`BatteryLevel::Charging`), matching `settled_mv`'s own frozen-while-
+/// charging basis. Leaving `Charging`/`Unknown` (no established bucket to
+/// apply hysteresis against) lands on the plain, no-hysteresis bucket for
+/// the current `settled_mv` — same as a fresh boot.
+pub fn battery_level_bucket(prev: BatteryLevel, settled_mv: u32, charging: bool) -> BatteryLevel {
     if charging {
         return BatteryLevel::Charging;
     }
 
     let prev_bucket_index = match prev {
-        BatteryLevel::Critical => Some(0u8),
-        BatteryLevel::Low => Some(1u8),
-        BatteryLevel::Medium => Some(2u8),
-        BatteryLevel::High => Some(3u8),
+        BatteryLevel::Low => Some(0u8),
+        BatteryLevel::Partial => Some(1u8),
+        BatteryLevel::Full => Some(2u8),
         BatteryLevel::Unknown | BatteryLevel::Charging => None,
     };
 
     let index = match prev_bucket_index {
-        None => plain_bucket_index(percent),
-        Some(prev_idx) => hysteresis_bucket_index(prev_idx, percent),
+        None => plain_bucket_index_mv(settled_mv),
+        Some(prev_idx) => hysteresis_bucket_index_mv(prev_idx, settled_mv),
     };
 
     match index {
-        0 => BatteryLevel::Critical,
-        1 => BatteryLevel::Low,
-        2 => BatteryLevel::Medium,
-        _ => BatteryLevel::High,
+        0 => BatteryLevel::Low,
+        1 => BatteryLevel::Partial,
+        _ => BatteryLevel::Full,
     }
 }
 
-/// Plain (no-hysteresis) bucket index for `percent`: the count of
-/// [`BUCKET_BOUNDARIES_PCT`] entries `percent` has reached or passed.
-fn plain_bucket_index(percent: u8) -> u8 {
-    BUCKET_BOUNDARIES_PCT
+/// The two [`BatteryLevel`] boundaries, in ascending mV order — `settled_mv`
+/// past index `i` means at/above `LEVEL_BOUNDARIES_MV[i]`.
+const LEVEL_BOUNDARIES_MV: [u32; 2] = [LEVEL_LOW_PARTIAL_MV, LEVEL_PARTIAL_FULL_MV];
+
+/// Plain (no-hysteresis) bucket index for `settled_mv`: the count of
+/// [`LEVEL_BOUNDARIES_MV`] entries `settled_mv` has reached or passed.
+fn plain_bucket_index_mv(settled_mv: u32) -> u8 {
+    LEVEL_BOUNDARIES_MV
         .iter()
-        .filter(|&&b| percent >= b)
+        .filter(|&&b| settled_mv >= b)
         .count() as u8
 }
 
 /// Hysteresis-adjusted bucket index, starting from `prev_idx`: rising past a
-/// boundary requires clearing it by more than [`BUCKET_HYSTERESIS_PCT`];
+/// boundary requires clearing it by more than [`LEVEL_HYSTERESIS_MV`];
 /// falling past a boundary requires dropping below it by more than the same
-/// margin. A `percent` within the margin of a boundary leaves `prev_idx`
+/// margin. A `settled_mv` within the margin of a boundary leaves `prev_idx`
 /// unchanged in that direction.
-fn hysteresis_bucket_index(prev_idx: u8, percent: u8) -> u8 {
+fn hysteresis_bucket_index_mv(prev_idx: u8, settled_mv: u32) -> u8 {
     let mut idx = prev_idx;
-    while (idx as usize) < BUCKET_BOUNDARIES_PCT.len()
-        && percent >= BUCKET_BOUNDARIES_PCT[idx as usize].saturating_add(BUCKET_HYSTERESIS_PCT)
+    while (idx as usize) < LEVEL_BOUNDARIES_MV.len()
+        && settled_mv >= LEVEL_BOUNDARIES_MV[idx as usize].saturating_add(LEVEL_HYSTERESIS_MV)
     {
         idx += 1;
     }
     while idx > 0
-        && percent < BUCKET_BOUNDARIES_PCT[(idx - 1) as usize].saturating_sub(BUCKET_HYSTERESIS_PCT)
+        && settled_mv < LEVEL_BOUNDARIES_MV[(idx - 1) as usize].saturating_sub(LEVEL_HYSTERESIS_MV)
     {
         idx -= 1;
     }
@@ -783,28 +891,6 @@ impl PeakWindowSampler {
     }
 }
 
-// ── slew_limit_percent — slew-limit + discharge-monotonic latch (C) ────────
-
-/// Derive the DISPLAYED percent from `target` (this update's fresh
-/// `percent_from_millivolts(settled_mv)`), `prev` (the previously displayed
-/// percent), and `charging` — see module docs' "(C)" section.
-///
-/// - While NOT charging, the displayed value is floored at `prev` (never
-///   rises) — the discharge-monotonic latch. Its closer is `charging`
-///   itself, sourced fresh from [`battery_poll_step`]'s stateless per-poll
-///   threshold check every call — see module docs' "(C)" section for the
-///   bounded-worst-case citation.
-/// - In both directions, movement per call is capped at
-///   [`PERCENT_MAX_SLEW_PER_UPDATE_PCT`] — the slew limit.
-pub fn slew_limit_percent(prev: u8, target: u8, charging: bool) -> u8 {
-    let bounded_target = if charging { target } else { target.min(prev) };
-    if bounded_target >= prev {
-        prev.saturating_add((bounded_target - prev).min(PERCENT_MAX_SLEW_PER_UPDATE_PCT))
-    } else {
-        prev.saturating_sub((prev - bounded_target).min(PERCENT_MAX_SLEW_PER_UPDATE_PCT))
-    }
-}
-
 // ── settled_mv persistence — confirmed latch, boot seed, write-wear policy (A) ──
 
 /// Advance the `confirmed` latch — see module docs' "(A)" section.
@@ -868,69 +954,46 @@ pub fn should_persist_settled_mv(
     }
 }
 
-// ── battery_window_close_step — the full per-window pipeline (fix: depleted-reads-full) ──
+// ── battery_window_close_step — the full per-window pipeline ────────────────
 
 /// One full state transition for a just-closed [`PeakWindowSampler`] window —
 /// host-testable, no ADC dependency — the exact chain [`BatteryDriver::poll`]
 /// drives: [`battery_poll_step`] (settled_mv/charging) →
 /// [`advance_settled_confirmed`] (the confirmed latch) →
-/// [`percent_from_millivolts`] (this window's target percent) → the displayed
-/// percent (see the confirmed-basis note below) → [`battery_level_bucket`]
-/// (the coarse bucket). Returns the updated
-/// `(settled_mv, charging, confirmed, displayed_percent, level)`.
+/// [`battery_level_bucket`] (the coarse bucket, computed directly on the new
+/// `settled_mv`). Returns the updated `(settled_mv, charging, confirmed,
+/// level)`. `BatteryStatus::percent` is not tracked here at all as of
+/// 2026-08-22 — it is a pure, stateless `percent_from_millivolts(settled_mv)`
+/// computed wherever a `BatteryStatus` snapshot is built (see
+/// [`BatteryDriver::status`]), not a value this pipeline carries forward.
 ///
-/// **Fixes `meshcadet-battery-level-reads-full-when-depleted`:** a VIRGIN
-/// device (no NVS-persisted `settled_mv` yet — see module docs' "(A)"
-/// section) that boots already on external power seeds `displayed_percent`
-/// at the contaminated, near-100% reading — the module's own documented
-/// "residual gap" (see the "Fix" section above). That write-up understated
-/// the gap's real severity: the FIRST time the pack is genuinely confirmed
-/// off external power (a real unplug), the raw chain used to run the fresh,
-/// correct-but-far-lower target straight through [`slew_limit_percent`] —
-/// whose whole premise is "protect a TRUSTWORTHY prior reading from an
-/// implausible jump." An unconfirmed basis is, by definition, not yet a
-/// trustworthy prior to protect, so limiting that first correction dragged
-/// the display from ~100% down to the pack's true depleted charge at
-/// [`PERCENT_MAX_SLEW_PER_UPDATE_PCT`] per ~[`PEAK_WINDOW_MS`] window — up to
-/// ~25 minutes (`100 / PERCENT_MAX_SLEW_PER_UPDATE_PCT` windows) of reading a
-/// near-full `percent`/`level` (`High`, or `Charging` while still plugged —
-/// both render as a visually "full" glanceable indicator) on a device that
-/// was, the entire time, sitting at its true, deeply-depleted charge. Fix:
-/// the slew limiter is skipped — `displayed_percent` snaps straight to
-/// `target_percent` — on any poll where `confirmed` was **not yet true
-/// BEFORE this poll**, which is exactly the poll that first proves the
-/// basis trustworthy (or any poll before that, where the display was never
-/// trustworthy to begin with and there is nothing to protect by smoothing
-/// it). Every already-working case is unaffected: a device that boots
-/// off-power, or boots on-power with a persisted (already-confirmed) basis,
-/// is `confirmed` from its very first sample (see [`seed_boot_state`]) and
-/// slew-limits every update exactly as before.
+/// **Fixes `meshcadet-battery-level-reads-full-when-depleted` (2026-08-17)
+/// and `meshcadet-battery-three-state-pipeline` (2026-08-22) — both from the
+/// SAME root simplification.** The former shipped a special case (skip the
+/// slew limiter on the poll that first proves `confirmed`) to escape a
+/// percent-domain filter that shouldn't have applied to an unconfirmed seed
+/// in the first place. The latter found a SECOND way that same filter layer
+/// produced a stuck-wrong display (a charged-then-unplugged pack pinned near
+/// its pre-charge reading — see module docs' "Three-state voltage-domain
+/// bucket" section) and, rather than adding a second special case, deleted
+/// the filter layer outright: no slew limit, no discharge-monotonic latch,
+/// no `was_confirmed` snap-on-first-confirm branch. `settled_mv`'s own
+/// [`battery_poll_step`]/[`advance_settled_confirmed`] chain and
+/// [`battery_level_bucket`]'s millivolt hysteresis are now the ONLY filtering
+/// between the ADC and the display — with no stateful percent-domain filter
+/// carrying a prior output, there is no untrustworthy prior left to protect,
+/// and both bug instances (and the next one in the family) are structurally
+/// unreachable rather than individually patched.
 pub fn battery_window_close_step(
     settled_mv: u32,
-    displayed_percent: u8,
     level: BatteryLevel,
     confirmed: bool,
     window_peak_mv: u32,
-) -> (u32, bool, bool, u8, BatteryLevel) {
+) -> (u32, bool, bool, BatteryLevel) {
     let (new_settled_mv, charging) = battery_poll_step(settled_mv, window_peak_mv);
-    let was_confirmed = confirmed;
     let new_confirmed = advance_settled_confirmed(confirmed, charging);
-    let target_percent = percent_from_millivolts(new_settled_mv);
-    let new_displayed_percent = if was_confirmed {
-        slew_limit_percent(displayed_percent, target_percent, charging)
-    } else {
-        // No trustworthy prior displayed value exists yet — nothing to
-        // protect via gradual movement, so show the truth immediately.
-        target_percent
-    };
-    let new_level = battery_level_bucket(level, new_displayed_percent, charging);
-    (
-        new_settled_mv,
-        charging,
-        new_confirmed,
-        new_displayed_percent,
-        new_level,
-    )
+    let new_level = battery_level_bucket(level, new_settled_mv, charging);
+    (new_settled_mv, charging, new_confirmed, new_level)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1024,6 +1087,8 @@ mod tests {
         assert!(!s.charging);
         assert_eq!(s.raw_mv, 0);
         assert_eq!(s.held_raw_mv, 0);
+        assert_eq!(s.boot_mv, 0);
+        assert!(!s.confirmed);
         assert_eq!(s.level, BatteryLevel::Unknown);
     }
 
@@ -1280,162 +1345,100 @@ mod tests {
         );
     }
 
-    // ── slew_limit_percent — slew-limit + discharge-monotonic latch (C) ─────
-
-    #[test]
-    fn slew_limit_caps_a_large_drop_to_the_max_step() {
-        let out = slew_limit_percent(80, 10, false);
-        assert_eq!(out, 80 - PERCENT_MAX_SLEW_PER_UPDATE_PCT);
-    }
-
-    #[test]
-    fn slew_limit_caps_a_large_rise_while_charging() {
-        let out = slew_limit_percent(20, 90, true);
-        assert_eq!(out, 20 + PERCENT_MAX_SLEW_PER_UPDATE_PCT);
-    }
-
-    #[test]
-    fn slew_limit_passes_a_small_rise_through_unclamped_while_charging() {
-        let out = slew_limit_percent(50, 51, true);
-        assert_eq!(out, 51);
-    }
-
-    #[test]
-    fn slew_limit_passes_a_small_drop_through_unclamped_while_discharging() {
-        let out = slew_limit_percent(50, 49, false);
-        assert_eq!(out, 49);
-    }
-
-    #[test]
-    fn discharge_latch_never_rises_while_not_charging() {
-        // Even if the settled_mv-derived target momentarily reads HIGHER
-        // (e.g. a resting voltage recovery under no load), the displayed
-        // percent must not visibly climb while off external power.
-        let out = slew_limit_percent(40, 55, false);
-        assert_eq!(
-            out, 40,
-            "must hold, not rise, while discharging — the latch only releases on charging"
-        );
-    }
-
-    #[test]
-    fn discharge_latch_releases_the_instant_charging_is_true() {
-        // The latch's closer (charging) is stateless and needs no history —
-        // the very same call that flips charging=true also lets the value
-        // rise (subject to the slew cap).
-        let out = slew_limit_percent(40, 55, true);
-        assert_eq!(out, 40 + PERCENT_MAX_SLEW_PER_UPDATE_PCT);
-    }
-
-    #[test]
-    fn discharge_latch_still_allows_falling_further() {
-        let out = slew_limit_percent(40, 10, false);
-        assert_eq!(out, 40 - PERCENT_MAX_SLEW_PER_UPDATE_PCT);
-    }
-
-    #[test]
-    fn slew_limit_settles_exactly_at_target_after_enough_updates() {
-        let mut displayed = 90u8;
-        let target = 36u8;
-        for _ in 0..100 {
-            displayed = slew_limit_percent(displayed, target, false);
-        }
-        assert_eq!(
-            displayed, target,
-            "must converge to the true target given enough updates, not overshoot or stall short"
-        );
-    }
-
-    // ── BatteryLevel bucket + hysteresis (D) ─────────────────────────────────
+    // ── BatteryLevel bucket + hysteresis (D) — voltage-domain, 3-state ──────
 
     #[test]
     fn bucket_charging_always_wins() {
         assert_eq!(
-            battery_level_bucket(BatteryLevel::Critical, 90, true),
-            BatteryLevel::Charging
+            battery_level_bucket(BatteryLevel::Low, 4_150, true),
+            BatteryLevel::Charging,
+            "charging must win regardless of the frozen settled_mv basis underneath"
         );
     }
 
     #[test]
     fn bucket_plain_assignment_from_unknown_or_charging() {
         assert_eq!(
-            battery_level_bucket(BatteryLevel::Unknown, 10, false),
-            BatteryLevel::Critical
-        );
-        assert_eq!(
-            battery_level_bucket(BatteryLevel::Unknown, 30, false),
+            battery_level_bucket(BatteryLevel::Unknown, 3_500, false),
             BatteryLevel::Low
         );
         assert_eq!(
-            battery_level_bucket(BatteryLevel::Unknown, 60, false),
-            BatteryLevel::Medium
+            battery_level_bucket(BatteryLevel::Unknown, 3_850, false),
+            BatteryLevel::Partial
         );
         assert_eq!(
-            battery_level_bucket(BatteryLevel::Unknown, 90, false),
-            BatteryLevel::High
+            battery_level_bucket(BatteryLevel::Unknown, 4_150, false),
+            BatteryLevel::Full
         );
         assert_eq!(
-            battery_level_bucket(BatteryLevel::Charging, 60, false),
-            BatteryLevel::Medium,
-            "leaving Charging with no prior percent-bucket lands on the plain bucket"
+            battery_level_bucket(BatteryLevel::Charging, 3_850, false),
+            BatteryLevel::Partial,
+            "leaving Charging with no prior bucket lands on the plain bucket"
         );
     }
 
     #[test]
     fn bucket_hysteresis_holds_near_a_boundary_from_below() {
-        // Sitting in Low (25..50), a percent that only just touches the 50
-        // boundary (without clearing it by more than the hysteresis margin)
-        // must NOT flip to Medium yet.
-        let held = battery_level_bucket(BatteryLevel::Low, 51, false);
+        // Sitting in Low, a settled_mv that only just touches the
+        // LEVEL_LOW_PARTIAL_MV boundary (without clearing it by more than
+        // LEVEL_HYSTERESIS_MV) must NOT flip to Partial yet.
+        let held = battery_level_bucket(BatteryLevel::Low, LEVEL_LOW_PARTIAL_MV + 1, false);
         assert_eq!(
             held,
             BatteryLevel::Low,
-            "51% is within the hysteresis band of the 50 boundary"
+            "1mV past the boundary is within the hysteresis band"
         );
     }
 
     #[test]
     fn bucket_hysteresis_flips_once_clearly_past_the_boundary() {
-        let flipped = battery_level_bucket(BatteryLevel::Low, 54, false);
-        assert_eq!(flipped, BatteryLevel::Medium);
+        let flipped = battery_level_bucket(
+            BatteryLevel::Low,
+            LEVEL_LOW_PARTIAL_MV + LEVEL_HYSTERESIS_MV + 1,
+            false,
+        );
+        assert_eq!(flipped, BatteryLevel::Partial);
     }
 
     #[test]
     fn bucket_hysteresis_holds_near_a_boundary_from_above() {
-        // Sitting in Medium (50..75), a percent that only just dips under 50
-        // must NOT flip back to Low yet.
-        let held = battery_level_bucket(BatteryLevel::Medium, 49, false);
-        assert_eq!(held, BatteryLevel::Medium);
+        // Sitting in Partial, a settled_mv that only just dips under
+        // LEVEL_LOW_PARTIAL_MV must NOT flip back to Low yet.
+        let held = battery_level_bucket(BatteryLevel::Partial, LEVEL_LOW_PARTIAL_MV - 1, false);
+        assert_eq!(held, BatteryLevel::Partial);
     }
 
     #[test]
     fn bucket_hysteresis_falls_once_clearly_past_the_boundary() {
-        let fell = battery_level_bucket(BatteryLevel::Medium, 46, false);
+        let fell = battery_level_bucket(
+            BatteryLevel::Partial,
+            LEVEL_LOW_PARTIAL_MV.saturating_sub(LEVEL_HYSTERESIS_MV + 1),
+            false,
+        );
         assert_eq!(fell, BatteryLevel::Low);
     }
 
     #[test]
     fn bucket_hysteresis_does_not_flap_across_repeated_jitter_at_a_boundary() {
         let mut bucket = BatteryLevel::Low;
-        // Jitter back and forth right around the 50 boundary, never clearing
-        // the hysteresis margin in either direction.
-        for &p in &[50u8, 49, 51, 48, 52, 49, 51] {
-            bucket = battery_level_bucket(bucket, p, false);
-            assert_eq!(bucket, BatteryLevel::Low, "must not flap at {p}%");
+        // Jitter back and forth right around the LEVEL_LOW_PARTIAL_MV
+        // boundary, never clearing the hysteresis margin in either direction.
+        let b = LEVEL_LOW_PARTIAL_MV;
+        for &mv in &[b, b - 5, b + 5, b - 10, b + 10, b - 5, b + 5] {
+            bucket = battery_level_bucket(bucket, mv, false);
+            assert_eq!(bucket, BatteryLevel::Low, "must not flap at {mv}mV");
         }
     }
 
     #[test]
     fn bucket_can_traverse_every_boundary_when_genuinely_discharging() {
         let mut bucket = BatteryLevel::Unknown;
-        bucket = battery_level_bucket(bucket, 95, false);
-        assert_eq!(bucket, BatteryLevel::High);
-        bucket = battery_level_bucket(bucket, 70, false);
-        assert_eq!(bucket, BatteryLevel::Medium);
-        bucket = battery_level_bucket(bucket, 45, false);
+        bucket = battery_level_bucket(bucket, 4_150, false);
+        assert_eq!(bucket, BatteryLevel::Full);
+        bucket = battery_level_bucket(bucket, 3_850, false);
+        assert_eq!(bucket, BatteryLevel::Partial);
+        bucket = battery_level_bucket(bucket, 3_400, false);
         assert_eq!(bucket, BatteryLevel::Low);
-        bucket = battery_level_bucket(bucket, 5, false);
-        assert_eq!(bucket, BatteryLevel::Critical);
     }
 
     // ── settled_mv persistence (A): confirmed latch / boot seed / write-wear ─
@@ -1564,7 +1567,7 @@ mod tests {
         assert_eq!(WRITES_PER_HOUR, 12);
     }
 
-    // ── battery_window_close_step / full pipeline (fix: depleted-reads-full) ──
+    // ── battery_window_close_step / full pipeline ────────────────────────────
     //
     // A tiny host-side stand-in for `BatteryDriver` — the exact
     // boot-then-poll sequence `firmware::battery::BatteryDriver` drives,
@@ -1579,7 +1582,6 @@ mod tests {
         settled_mv: u32,
         charging: bool,
         confirmed: bool,
-        displayed_percent: u8,
         level: BatteryLevel,
         peak_sampler: PeakWindowSampler,
     }
@@ -1587,13 +1589,11 @@ mod tests {
     impl SimDriver {
         fn boot(persisted: Option<u32>, initial_mv: u32, now_ms: u64) -> Self {
             let (settled_mv, charging, confirmed) = seed_boot_state(persisted, initial_mv);
-            let displayed_percent = percent_from_millivolts(settled_mv);
-            let level = battery_level_bucket(BatteryLevel::Unknown, displayed_percent, charging);
+            let level = battery_level_bucket(BatteryLevel::Unknown, settled_mv, charging);
             SimDriver {
                 settled_mv,
                 charging,
                 confirmed,
-                displayed_percent,
                 level,
                 peak_sampler: PeakWindowSampler::new(now_ms, initial_mv),
             }
@@ -1603,18 +1603,15 @@ mod tests {
         /// Only actually updates state once a peak window closes.
         fn poll(&mut self, now_ms: u64, mv: u32) {
             if let Some(window_peak_mv) = self.peak_sampler.sample(now_ms, mv) {
-                let (settled_mv, charging, confirmed, displayed_percent, level) =
-                    battery_window_close_step(
-                        self.settled_mv,
-                        self.displayed_percent,
-                        self.level,
-                        self.confirmed,
-                        window_peak_mv,
-                    );
+                let (settled_mv, charging, confirmed, level) = battery_window_close_step(
+                    self.settled_mv,
+                    self.level,
+                    self.confirmed,
+                    window_peak_mv,
+                );
                 self.settled_mv = settled_mv;
                 self.charging = charging;
                 self.confirmed = confirmed;
-                self.displayed_percent = displayed_percent;
                 self.level = level;
             }
         }
@@ -1626,25 +1623,32 @@ mod tests {
                 self.poll(*now_ms, mv);
             }
         }
+
+        /// `percent` as of 2026-08-22 is a pure function of `settled_mv` —
+        /// no state to track separately (see module docs' "Three-state
+        /// voltage-domain bucket" section).
+        fn percent(&self) -> u8 {
+            percent_from_millivolts(self.settled_mv)
+        }
     }
 
     #[test]
-    fn pipeline_synthetic_full_voltage_discharging_reads_high_not_charging() {
+    fn pipeline_synthetic_full_voltage_discharging_reads_full_not_charging() {
         let mut d = SimDriver::boot(None, RESTING_FULL_MV, 0);
         let mut now = 0u64;
         d.run(&mut now, 20, RESTING_FULL_MV);
         assert!(!d.charging);
-        assert_eq!(d.level, BatteryLevel::High);
-        assert!(d.displayed_percent >= 90);
+        assert_eq!(d.level, BatteryLevel::Full);
+        assert!(d.percent() >= 90);
     }
 
     #[test]
-    fn pipeline_synthetic_depleted_voltage_discharging_reads_critical_not_charging() {
+    fn pipeline_synthetic_depleted_voltage_discharging_reads_low_not_charging() {
         let mut d = SimDriver::boot(None, BATTERY_EMPTY_MV + 50, 0);
         let mut now = 0u64;
         d.run(&mut now, 20, BATTERY_EMPTY_MV + 50);
         assert!(!d.charging);
-        assert_eq!(d.level, BatteryLevel::Critical);
+        assert_eq!(d.level, BatteryLevel::Low);
     }
 
     #[test]
@@ -1659,38 +1663,149 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_boot_already_plugged_virgin_device_over_depleted_pack_reaches_critical_within_one_window_of_confirming_not_a_25_minute_crawl(
-    ) {
-        // The exact regression this mission fixes: a VIRGIN device (no NVS
-        // basis yet) boots already on external power, over a truly
-        // depleted pack. `charging` is detected immediately; `percent`
-        // initially shows the documented residual-gap contaminated reading.
-        // The FIX under test: the instant the pack is genuinely confirmed
-        // off external power (a real unplug), the display must snap to the
-        // truth in that same window close, not crawl down at
-        // PERCENT_MAX_SLEW_PER_UPDATE_PCT/window (which would take ~25
-        // minutes from ~100%).
-        let depleted_mv = BATTERY_EMPTY_MV + 50; // deep in Critical range
+    fn pipeline_boot_already_plugged_with_persisted_basis_shows_correct_percent_immediately() {
+        // The already-working case (NVS persistence closes this gap): a
+        // persisted, previously-confirmed low basis means `confirmed` is
+        // true from the very first sample, so this was never affected by
+        // either bug mechanism this mission fixes.
+        let d = SimDriver::boot(Some(3_775), EXTERNAL_POWER_MV_THRESHOLD + 500, 0);
+        assert!(d.charging);
+        assert!(d.confirmed);
+        assert_eq!(d.percent(), 36);
+        assert_eq!(d.level, BatteryLevel::Charging);
+    }
+
+    // ── Named acceptance regressions (meshcadet-battery-three-state-pipeline) ──
+    //
+    // These three prove the mission's two independent root-cause mechanisms
+    // — the charge-session ratchet and the unprotected boot seed — are
+    // fixed, and that the #163 depleted-reads-full direction still holds.
+    // Confirmed via static trace against the pre-fix pipeline (this
+    // module's "Three-state voltage-domain bucket" doc section) to FAIL
+    // there: mechanism (1) means the pre-fix `slew_limit_percent`'s
+    // discharge-monotonic latch could only crawl a displayed percent upward
+    // at `PERCENT_MAX_SLEW_PER_UPDATE_PCT` (2 points) per closed window —
+    // recovering from ~10% to ~100% took on the order of 45 windows, not
+    // two. Mechanism (2) means a boot-time sag was immediately `confirmed`
+    // (an off-power boot sample confirms instantly — see
+    // `seed_boot_state_virgin_device_off_power_is_confirmed`), so its first
+    // correction was ALSO slew-limited rather than snapping to truth — only
+    // the boot-while-PLUGGED/unconfirmed case had a special-cased escape.
+
+    #[test]
+    fn charge_session_then_unplug_recovers_to_full_within_two_windows() {
+        // Boots off-power at a low-but-plausible basis (confirmed immediately).
+        let mut d = SimDriver::boot(None, 3_600, 0);
+        assert_eq!(d.level, BatteryLevel::Low);
+
+        let mut now = 0u64;
+        // Charge session: two whole windows above the external-power ceiling.
+        // `settled_mv` freezes at the pre-charge basis for the entire
+        // session — the correct, still-kept freeze/latch behaviour (see
+        // `battery_poll_step`), NOT the bug.
+        d.run(&mut now, 15, EXTERNAL_POWER_MV_THRESHOLD + 500);
+        d.run(&mut now, 15, EXTERNAL_POWER_MV_THRESHOLD + 500);
+        assert!(d.charging);
+        assert_eq!(
+            d.settled_mv, 3_600,
+            "basis stays frozen at the pre-charge reading for the whole session"
+        );
+
+        // Unplug: the pack is now genuinely at RESTING_FULL_MV. The first
+        // post-unplug window's peak still carries the just-closed charging
+        // window's reseed sample (`PeakWindowSampler`'s documented
+        // one-window settling lag — see that struct's own doc), so it takes
+        // the SECOND window to see a genuinely-low peak.
+        d.run(&mut now, 15, RESTING_FULL_MV);
+        d.run(&mut now, 15, RESTING_FULL_MV);
+
+        assert!(!d.charging, "must detect the unplug");
+        assert_eq!(
+            d.level,
+            BatteryLevel::Full,
+            "must recover to Full within two closed windows post-unplug, not stay pinned \
+             near the pre-charge Low bucket forever"
+        );
+        assert!(
+            d.percent() >= 90,
+            "percent must also recover, not just the bucket: got {}%",
+            d.percent()
+        );
+    }
+
+    #[test]
+    fn boot_sag_seeded_basis_is_corrected_by_the_first_closed_window() {
+        // A boot-time sag (LoRa-TX/backlight rail sag during inrush, per
+        // `BatteryDriver::new`'s doc) seeds `initial_mv` 400 mV BELOW the
+        // true resting voltage. The device boots off external power, so
+        // `seed_boot_state` marks it `confirmed` immediately — exactly the
+        // case the pre-fix slew limiter did NOT protect.
+        let true_resting_mv = 3_900; // ~67% on RESTING_SOC_CURVE
+        let sagged_boot_mv = true_resting_mv - 400; // 3_500, ~5%
+        let mut d = SimDriver::boot(None, sagged_boot_mv, 0);
+        assert!(d.confirmed, "an off-power boot sample confirms immediately");
+        assert_eq!(d.settled_mv, sagged_boot_mv);
+
+        let mut now = 0u64;
+        // First closed window: the rail has recovered post-inrush, so every
+        // sample in this window reads the true resting voltage.
+        d.run(&mut now, 15, true_resting_mv);
+
+        assert_eq!(
+            d.settled_mv, true_resting_mv,
+            "must fully correct to the true reading in the FIRST closed window, not crawl"
+        );
+        assert_eq!(d.level, BatteryLevel::Partial);
+
+        // Same proof "in either direction" the plan's acceptance line
+        // names — but a boot-HIGH-then-correct-DOWN variant of the FIRST
+        // window specifically would conflate this fix with
+        // `PeakWindowSampler`'s own, separate, documented one-window
+        // settling lag (it seeds a window's peak with the sample that
+        // opened it, so a high boot seed legitimately survives its own
+        // first window's peak-hold — that is correct peak-hold behavior,
+        // not the slew-limiter bug this test targets; the third named
+        // regression below covers exactly that lag for the boot-while-
+        // plugged case). This asserts the actual fix instead: once
+        // `confirmed`, a later, ordinary single-window movement — away from
+        // any boot seed's peak-hold shadow — snaps fully to the new target
+        // in ONE window, in EITHER direction, with no slew delay stacked on
+        // top of the window relationship.
+        let mut d2 = SimDriver::boot(None, true_resting_mv, 0); // off-power boot: confirmed immediately
+        let mut now2 = 0u64;
+        d2.run(&mut now2, 15, true_resting_mv); // window 1: flat, settles the boot seed's own shadow
+        d2.run(&mut now2, 15, true_resting_mv - 400); // window 2: closing sample reseeds window 3 below
+        assert_eq!(
+            d2.settled_mv, true_resting_mv,
+            "the window-2 peak still carries window 1's closing (flat) sample forward — \
+             PeakWindowSampler's own documented one-window reseed lag, not this fix's concern"
+        );
+        d2.run(&mut now2, 15, true_resting_mv - 400); // window 3: now genuinely, fully low
+        assert_eq!(
+            d2.settled_mv,
+            true_resting_mv - 400,
+            "once the peak is genuinely at the new target, the basis must snap there in ONE \
+             window — no slew delay stacked on top of the window relationship"
+        );
+    }
+
+    #[test]
+    fn boot_while_plugged_over_depleted_pack_reaches_low_within_two_windows_no_crawl() {
+        // The #163 direction, re-proven under the new voltage-domain bucket:
+        // a VIRGIN device boots already on external power over a truly
+        // depleted pack. `charging` is detected immediately; the basis
+        // initially shows the contaminated boot-time reading (the documented
+        // residual gap — module docs' "Fix" section). The instant the pack
+        // is genuinely confirmed off external power, the bucket/percent must
+        // snap to the truth, not crawl down over ~25 minutes.
+        let depleted_mv = BATTERY_EMPTY_MV + 50; // deep in Low range
         let mut d = SimDriver::boot(None, EXTERNAL_POWER_MV_THRESHOLD + 500, 0);
         assert!(
             d.charging,
             "boot-while-plugged must be flagged charging immediately"
         );
-        assert_eq!(
-            d.displayed_percent, 100,
-            "documented residual gap: first contaminated reading leaks through until confirmed"
-        );
 
         let mut now = 0u64;
-        // Genuinely unplugged from the very next sample onward. The FIRST
-        // window to close still carries the contaminated boot sample as its
-        // peak (`PeakWindowSampler` seeds a window's peak from the sample
-        // that opened it — see that struct's own settling-time doc note),
-        // so it takes a second window of all-low samples to see a peak
-        // that's actually low. That one-window peak-hold lag is
-        // pre-existing, documented, and NOT what this test is guarding —
-        // what matters is what happens the instant the peak genuinely goes
-        // low: a snap to truth, not a ~25-minute crawl.
         d.run(&mut now, 15, depleted_mv); // closes the contaminated window
         d.run(&mut now, 15, depleted_mv); // closes a genuinely-low window
 
@@ -1701,48 +1816,13 @@ mod tests {
         assert!(d.confirmed, "an off-power sample must confirm the basis");
         assert_eq!(
             d.level,
-            BatteryLevel::Critical,
-            "must reflect the true depleted charge in the SAME window that first confirms it, \
-             not crawl down over many more windows"
+            BatteryLevel::Low,
+            "must reflect the true depleted charge within two windows, not crawl down further"
         );
         assert!(
-            d.displayed_percent < 10,
-            "percent must snap to the true low reading immediately once confirmed, got {}%",
-            d.displayed_percent
-        );
-    }
-
-    #[test]
-    fn pipeline_boot_already_plugged_with_persisted_basis_shows_correct_percent_immediately() {
-        // The already-working case (NVS persistence closes this gap): a
-        // persisted, previously-confirmed low basis means `confirmed` is
-        // true from the very first sample, so this was never affected by
-        // the slew-limiter bug above — must keep working exactly as before.
-        let d = SimDriver::boot(Some(3_775), EXTERNAL_POWER_MV_THRESHOLD + 500, 0);
-        assert!(d.charging);
-        assert!(d.confirmed);
-        assert_eq!(d.displayed_percent, 36);
-        assert_eq!(d.level, BatteryLevel::Charging);
-    }
-
-    #[test]
-    fn pipeline_confirmed_normal_discharge_still_slew_limits_real_adc_jitter() {
-        // Regression guard for the fix above: once `confirmed`, ordinary
-        // discharge tracking must still be slew-limited (not snap
-        // instantly) — the fix only bypasses the limiter for the
-        // not-yet-confirmed case, never for a device that's already
-        // established a trustworthy basis.
-        let mut d = SimDriver::boot(None, 3_900, 0); // boots off-power: confirmed immediately
-        assert!(d.confirmed);
-        let mut now = 0u64;
-        // A big legitimate single-window drop (e.g. curve-breakpoint jitter
-        // plus a real step) must still be capped at PERCENT_MAX_SLEW_PER_UPDATE_PCT.
-        let before = d.displayed_percent;
-        d.run(&mut now, 15, 3_500); // much lower target
-        let after = d.displayed_percent;
-        assert!(
-            before - after <= PERCENT_MAX_SLEW_PER_UPDATE_PCT,
-            "already-confirmed basis must still slew-limit: {before}% -> {after}%"
+            d.percent() < 10,
+            "percent must also snap to the true low reading, got {}%",
+            d.percent()
         );
     }
 }

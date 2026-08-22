@@ -2,22 +2,25 @@
 // battery_indicator.slint — phone-style glanceable battery-level widget.
 //
 // Consumes `meshcadet-battery-soc-filtering`'s coarse
-// `firmware_core::battery::BatteryLevel` bucket via a plain `0..=5` int
+// `firmware_core::battery::BatteryLevel` bucket via a plain `0..=4` int
 // (`firmware_core::ui::battery_indicator::level_to_indicator_level` converts
 // the enum on the Rust side before it ever reaches this markup — Slint
 // properties can't carry a Rust enum directly, same convention
-// `signal_meter.slint`'s own doc establishes):
+// `signal_meter.slint`'s own doc establishes). As of 2026-08-22
+// (`meshcadet-battery-three-state-pipeline`) this is a 5-state range
+// (`0..=4`), not the prior 6-state (`0..=5`) one — `BatteryLevel` dropped
+// from 4 percent-domain buckets to 3 voltage-domain ones:
 //   - `0` = `Unknown`  — no sample taken yet (fresh boot): renders an
 //              outline-only shell, no fill.
 //   - `1` = `Charging` — external power present (`battery.rs`'s freeze/latch
 //              logic): renders a full body in a distinct accent color, NOT
-//              one of the percent-bucket colors below — charging is a MODE,
-//              not a percent reading (the frozen `percent` basis underneath
-//              it may read anywhere from 0-100%; showing it as a percent-
-//              bucket color would misrepresent that basis as live).
-//   - `2..=5` = `Critical`/`Low`/`Medium`/`High` — ascending fill fraction
-//              AND ascending color (red -> yellow -> green -> green),
-//              mirroring a real phone's battery-icon convention.
+//              one of the bucket colors below — charging is a MODE, not a
+//              voltage reading (the frozen `settled_mv` basis underneath it
+//              may read anywhere in-range; showing it as a bucket color
+//              would misrepresent that basis as live).
+//   - `2..=4` = `Low`/`Partial`/`Full` — ascending fill fraction AND
+//              ascending color (red -> yellow -> green), mirroring a real
+//              phone's battery-icon convention.
 //
 // # No text glyphs
 //
@@ -48,10 +51,10 @@ export component BatteryIndicator {
 
     // Defensive clamp — same rationale as `SignalMeter`'s `filled-bars`: the
     // property is Rust-driven (`level_to_indicator_level` only ever emits
-    // `0..=5`), but clamping means a future out-of-range value degrades to
+    // `0..=4`), but clamping means a future out-of-range value degrades to
     // the nearest valid state instead of this widget indexing past its own
     // branch set.
-    property <int> level: max(0, min(5, battery-level));
+    property <int> level: max(0, min(4, battery-level));
 
     // Shared shell geometry — the body occupies the left ~82% of the
     // widget's width, leaving room for the terminal nub on the right (a
@@ -87,21 +90,19 @@ export component BatteryIndicator {
     // ── Fill ────────────────────────────────────────────────────────────
     // Fraction of the body's INNER area (inset by the shell's own
     // `border-width` so the fill never paints over the outline stroke).
-    // `Charging` (1) and `High` (5) both read full; `Critical`/`Low`/
-    // `Medium` step up through three ascending fractions — this is a coarse
-    // BUCKET indicator, not a second percent gauge, so the fractions are
-    // deliberately round numbers, not pixel-exact against the firmware
-    // `percent` value, but ordered so "more bucket" always reads as "more
-    // fill" and "more color-urgency" (`alert` red -> `warn` yellow -> `ok`
-    // green).
+    // `Charging` (1) and `Full` (4) both read full; `Low`/`Partial` step up
+    // through two ascending fractions — this is a coarse BUCKET indicator,
+    // not a second percent gauge, so the fractions are deliberately round
+    // numbers, not pixel-exact against the firmware `percent` value, but
+    // ordered so "more bucket" always reads as "more fill" and "more
+    // color-urgency" (`alert` red -> `warn` yellow -> `ok` green).
     property <float> fill-fraction: level == 0 ? 0.0 : (
         level == 1 ? 1.0 : (
-        level == 2 ? 0.28 : (
-        level == 3 ? 0.52 : (
-        level == 4 ? 0.76 : 1.0))));
+        level == 2 ? 0.35 : (
+        level == 3 ? 0.7 : 1.0)));
     property <color> fill-color: level == 1 ? Theme.brand-signal : (
         level == 2 ? Theme.alert : (
-        level == 3 ? Theme.warn : Theme.ok)); // levels 4 (Medium)/5 (High)
+        level == 3 ? Theme.warn : Theme.ok)); // level 4 (Full)
 
     if fill-fraction > 0 : Rectangle {
         x: shell-border;

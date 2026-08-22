@@ -40,23 +40,26 @@
 //! - ADC voltage divider on GPIO4 (`BOARD_BAT_ADC`) — no PMU/fuel-gauge IC on
 //!   this board; see `battery` module docs for the full hardware-feasibility
 //!   gate and the charging-state inference mechanism.
-//! - Two fields surfaced to the on-air telemetry RESPONSE and the on-device
-//!   admin-menu screen: charge percentage + charging state (never raw
-//!   voltage there — a deliberate design decision, 2026-07-03). The host CLI `status`
-//!   command additionally surfaces two diagnostic-only raw millivolt
-//!   readings: `RspStatusPayload.battery_raw_mv` (added 2026-07-05 for the
-//!   ADC-calibration investigation) — the LIVE, rail-contaminated-while-
-//!   charging voltage — and `battery_held_raw_mv` (added 2026-07-05,
-//!   follow-on) — the last non-charge-inflated ("resting") voltage,
-//!   contamination-free even though USB carries both the CLI UART and charge
-//!   power on this board (see `battery` module docs). Neither is read by
-//!   either of the other two consumers. Percent is also re-anchored
+//! - Originally two fields surfaced to the on-air telemetry RESPONSE and the
+//!   on-device admin-menu screen (charge percentage + charging state, never
+//!   raw voltage there — 2026-07-03); `raw_mv` widened into both later
+//!   (2026-07-05/2026-08-04), and `held_raw_mv`/`level` widened into both
+//!   again as of `meshcadet-battery-three-state-pipeline` (2026-08-22) — see
+//!   `ui::admin_menu::format_battery_display`'s doc for the current
+//!   admin-menu row layout and `build_telemetry_response`'s doc for the
+//!   current RESPONSE layout. The host CLI `status` command surfaces every
+//!   field: `RspStatusPayload.battery_raw_mv` (added 2026-07-05 for the
+//!   ADC-calibration investigation) is the LIVE, rail-contaminated-while-
+//!   charging voltage; `battery_held_raw_mv` (added 2026-07-05, follow-on)
+//!   is the last non-charge-inflated ("resting") voltage, contamination-free
+//!   even though USB carries both the CLI UART and charge power on this
+//!   board (see `battery` module docs). Percent is also re-anchored
 //!   (2026-07-05 follow-on) to a resting-voltage curve rather than the
 //!   charging terminal voltage, so a rested-full pack now reads ~100% — see
 //!   `battery` module docs' "Full-scale anchor" section.
 //! - Single shared source (`battery::BatteryStatus`) wired into all three
-//!   consumers so percent/charging always agree: the native telemetry
-//!   RESPONSE, the host `status` command
+//!   consumers so every field always agrees: the native telemetry RESPONSE,
+//!   the host `status` command
 //!   (`RspStatusPayload.battery_percent/battery_charging/battery_raw_mv/battery_held_raw_mv`),
 //!   and the admin-menu screen.
 //!
@@ -229,6 +232,7 @@ static ROOM_CLOCK_SOURCE: std::sync::Mutex<room_session::ClockSource> =
     std::sync::Mutex::new(room_session::ClockSource::None);
 
 use battery::BatteryDriver;
+use firmware_core::ui::battery_indicator::level_to_indicator_level;
 use dispatcher::{
     AirtimeBudget, DuplicateFilter, OutstandingKind, OutstandingSend,
     OutstandingSends, TxQueue, lora_airtime_ms, tx_guard_allows,
@@ -3754,9 +3758,12 @@ fn build_telemetry_reply(
 /// battery entries]?`: the `tag` is reflected verbatim from the REQ so the
 /// companion matches reply to request, a GPS entry is appended when a fix is
 /// cached, and a battery percentage + charging-state entry pair — followed by
-/// a raw-millivolt entry — is appended from `battery` (the same
-/// [`battery::BatteryStatus`] the host `status` command and the admin-menu
-/// screen read — see that module's docs).
+/// a raw-millivolt entry, a held-raw-millivolt entry, and a level entry (as
+/// of `meshcadet-battery-three-state-pipeline`, 2026-08-22 — always appended
+/// strictly after the earlier entries, per that codec function's own doc) —
+/// is appended from `battery` (the same [`battery::BatteryStatus`] the host
+/// `status` command and the admin-menu screen read — see that module's
+/// docs).
 ///
 /// `battery.raw_mv` is forwarded as-is and is NOT subject to the charging
 /// latch that `battery.percent` is (see `battery.rs` module docs' "ADC
@@ -3765,7 +3772,9 @@ fn build_telemetry_reply(
 /// read well above what `percent` alone implies (observed as high as ~4888 mV
 /// on a nominal single-cell pack). A contact reading the RESPONSE should
 /// expect `raw_mv` and `percent`/`charging` to diverge exactly while charging
-/// — that is the diagnostic signal, not a decode error.
+/// — that is the diagnostic signal, not a decode error. `battery.held_raw_mv`
+/// (the level entry's own basis) IS frozen by that same latch, unlike
+/// `raw_mv`.
 ///
 /// Encrypted with the ECDH shared secret; dest = the contact, src = us.
 /// Returns `(frame, len)` or `None` if the path-length field cannot be encoded.
@@ -3784,6 +3793,8 @@ fn build_telemetry_response(
         gps,
         Some((battery.percent, battery.charging)),
         Some(battery.raw_mv),
+        Some(battery.held_raw_mv),
+        Some(level_to_indicator_level(battery.level) as u8),
         &mut pt_buf,
     );
 

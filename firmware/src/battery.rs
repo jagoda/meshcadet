@@ -137,13 +137,11 @@ pub struct BatteryDriver<'d> {
     /// [`advance_settled_confirmed`] and `firmware_core::battery`'s "(A)"
     /// doc section.
     confirmed: bool,
-    /// Displayed percent — `settled_mv`'s target percent, slew-limited and
-    /// discharge-monotonic-latched. See [`slew_limit_percent`] and
-    /// `firmware_core::battery`'s "(C)" doc section.
-    displayed_percent: u8,
-    /// Coarse bucket, computed from `displayed_percent`/`cached_charging`
-    /// with hysteresis. See [`battery_level_bucket`] and
-    /// `firmware_core::battery`'s "(D)" doc section.
+    /// Coarse bucket, computed directly from `settled_mv`/`cached_charging`
+    /// with millivolt hysteresis — no percent-domain state survives here as
+    /// of 2026-08-22 (`meshcadet-battery-three-state-pipeline`; see
+    /// [`battery_level_bucket`] and `firmware_core::battery`'s "Three-state
+    /// voltage-domain bucket" doc section).
     level: BatteryLevel,
     /// Peak-over-window sampler feeding `settled_mv`'s update cadence — see
     /// [`PeakWindowSampler`] and `firmware_core::battery`'s "(B)" doc
@@ -154,6 +152,11 @@ pub struct BatteryDriver<'d> {
     /// charging latch and never filtered by the peak-window sampler above.
     /// See module docs' "ADC calibration ... raw_mv" section.
     live_mv: u32,
+    /// This boot's raw, un-peak-held ADC seed sample (`new`'s own
+    /// `initial_mv`) — fixed for the life of the boot. Added 2026-08-22 as a
+    /// HIL capture probe (`BatteryStatus::boot_mv`'s own field doc) — the
+    /// discriminator between "inrush sag" and "the pack really is low."
+    boot_mv: u32,
     /// Uptime ms of the last ADC sample (poll throttling).
     last_poll_ms: u64,
 
@@ -222,15 +225,14 @@ impl<'d> BatteryDriver<'d> {
 
         let persisted_mv = load_persisted_settled_mv(&nvs_partition);
         let (settled_mv, cached_charging, confirmed) = seed_boot_state(persisted_mv, initial_mv);
-        let displayed_percent = percent_from_millivolts(settled_mv);
-        let level = battery_level_bucket(BatteryLevel::Unknown, displayed_percent, cached_charging);
+        let level = battery_level_bucket(BatteryLevel::Unknown, settled_mv, cached_charging);
 
         log::info!(
             "battery ADC initialised (curve-fitting calibration) — GPIO4 (ADC1_CH3), initial read {} mV, restored settled_mv {:?} from NVS, basis now {} mV ({}%, {})",
             initial_mv,
             persisted_mv,
             settled_mv,
-            displayed_percent,
+            percent_from_millivolts(settled_mv),
             if cached_charging { "charging" } else { "not charging" },
         );
 
@@ -240,10 +242,13 @@ impl<'d> BatteryDriver<'d> {
             settled_mv,
             cached_charging,
             confirmed,
-            displayed_percent,
             level,
             peak_sampler: PeakWindowSampler::new(now_ms, initial_mv),
             live_mv: initial_mv,
+            // Provisional boot seed — see `BatteryStatus::boot_mv`'s doc.
+            // The first closed peak window below unconditionally overwrites
+            // `settled_mv`/`level`, regardless of what this reads.
+            boot_mv: initial_mv,
             last_poll_ms: now_ms,
             nvs_partition,
             // A restored value is, by construction, already durably on
@@ -259,9 +264,9 @@ impl<'d> BatteryDriver<'d> {
     /// Called on every dispatcher-loop iteration; only actually samples the
     /// ADC every [`BATTERY_POLL_INTERVAL_MS`]. Each sample is fed through
     /// [`PeakWindowSampler`]; [`battery_poll_step`] (and everything derived
-    /// from it — `settled_mv`, `charging`, `confirmed`, `displayed_percent`,
-    /// `level`, NVS persistence) only actually updates once a ~30 s peak
-    /// window closes — see `firmware_core::battery`'s "(B)" doc section.
+    /// from it — `settled_mv`, `charging`, `confirmed`, `level`, NVS
+    /// persistence) only actually updates once a ~30 s peak window closes —
+    /// see `firmware_core::battery`'s "(B)" doc section.
     pub fn poll(&mut self, now_ms: u64) {
         if now_ms.saturating_sub(self.last_poll_ms) < BATTERY_POLL_INTERVAL_MS {
             return;
@@ -287,25 +292,16 @@ impl<'d> BatteryDriver<'d> {
                 };
 
                 let was_charging = self.cached_charging;
-                let (settled_mv, charging, confirmed, displayed_percent, level) =
-                    battery_window_close_step(
-                        self.settled_mv,
-                        self.displayed_percent,
-                        self.level,
-                        self.confirmed,
-                        window_peak_mv,
-                    );
+                let (settled_mv, charging, confirmed, level) = battery_window_close_step(
+                    self.settled_mv,
+                    self.level,
+                    self.confirmed,
+                    window_peak_mv,
+                );
                 self.settled_mv = settled_mv;
                 self.cached_charging = charging;
                 self.confirmed = confirmed;
-                self.displayed_percent = displayed_percent;
                 self.level = level;
-
-                // Diagnostic-only: this window's raw target percent, purely
-                // for the transition log line below (not otherwise used —
-                // `battery_window_close_step` already folded it into
-                // `displayed_percent`).
-                let target_percent = percent_from_millivolts(settled_mv);
 
                 // Log the transition (not every window) — the one field
                 // signal that lets a HIL run be diagnosed after the fact
@@ -314,12 +310,11 @@ impl<'d> BatteryDriver<'d> {
                 // froze/resynced.
                 if charging != was_charging {
                     log::info!(
-                        "battery charging state -> {} (window peak {} mV, percent basis now {} mV / {}%, displayed {}%)",
+                        "battery charging state -> {} (window peak {} mV, percent basis now {} mV / {}%)",
                         charging,
                         window_peak_mv,
                         settled_mv,
-                        target_percent,
-                        self.displayed_percent,
+                        percent_from_millivolts(settled_mv),
                     );
                 }
 
@@ -345,23 +340,29 @@ impl<'d> BatteryDriver<'d> {
     }
 
     /// Return the current battery status snapshot (percent + charging +
-    /// diagnostic raw mV + held raw mV + coarse level bucket).
+    /// diagnostic raw mV + held raw mV + boot mV + confirmed + coarse level
+    /// bucket).
     ///
-    /// `percent` is the slew-limited, discharge-monotonic-latched displayed
-    /// value derived from `settled_mv` — never the raw live voltage, so a
-    /// charge-inflated read never surfaces here (see module docs). `raw_mv`
-    /// IS the raw live voltage, unfrozen and unfiltered by the peak-window
-    /// sampler, for diagnosis (see module docs' "raw_mv" section).
-    /// `held_raw_mv` is the underlying `settled_mv` basis in millivolts
-    /// (unsmoothed by the slew limit — see `firmware_core::battery`'s "(C)"
-    /// section). `level` is the coarse bucket (data only — see that
-    /// module's "(D)" section).
+    /// `percent` is a pure, stateless `percent_from_millivolts(settled_mv)`
+    /// as of 2026-08-22 — no percent-domain filter sits between the basis
+    /// and this field anymore (see `firmware_core::battery`'s "Three-state
+    /// voltage-domain bucket" doc section), so a charge-inflated read still
+    /// never surfaces here (that protection is `battery_poll_step`'s
+    /// freeze/latch, unchanged). `raw_mv` IS the raw live voltage, unfrozen
+    /// and unfiltered by the peak-window sampler, for diagnosis (see module
+    /// docs' "raw_mv" section). `held_raw_mv` is the underlying `settled_mv`
+    /// basis in millivolts — the SAME basis `percent`/`level` derive from.
+    /// `boot_mv` is this boot's raw seed sample, fixed for the boot's
+    /// lifetime. `confirmed` is the trust latch. `level` is the coarse
+    /// voltage-domain bucket.
     pub fn status(&self) -> BatteryStatus {
         BatteryStatus {
-            percent: self.displayed_percent,
+            percent: percent_from_millivolts(self.settled_mv),
             charging: self.cached_charging,
             raw_mv: self.live_mv,
             held_raw_mv: self.settled_mv,
+            boot_mv: self.boot_mv,
+            confirmed: self.confirmed,
             level: self.level,
         }
     }

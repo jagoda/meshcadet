@@ -162,8 +162,9 @@ slint::slint! {
     }
 
     // Read-only info row — a label + right-aligned value, no touch/toggle at
-    // all. Used for "🔋 Battery", which is pure display (no control surface,
-    // same "status/display only" contract as the GPS status screen).
+    // all. Used ONLY for "🔋 Battery" (a single instantiation below), which
+    // is pure display (no control surface, same "status/display only"
+    // contract as the GPS status screen).
     component InfoRow {
         in property <string> label;
         in property <string> value;
@@ -192,12 +193,27 @@ slint::slint! {
                     horizontal-stretch: 1.0;
                 }
 
+                // `meshcadet-battery-three-state-pipeline` (2026-08-22) grew
+                // this row's `value` from a short "~63% (3900mV)" summary to
+                // the full HIL-capture state vector
+                // (`firmware_core::ui::admin_menu::format_battery_display`'s
+                // doc) — up to ~35 characters. The screen is 320px wide with
+                // a fixed 40px row height and no vertical layout slack to
+                // grow it (`AdminMenuScreenUi`'s row budget is already
+                // 236/240px committed), so this instance is sized DOWN to
+                // `Theme.size-meta` (not the row's default `size-body-lg`)
+                // for width headroom, with `overflow: elide` as a defensive
+                // fallback so a still-too-long capture (e.g. an unexpectedly
+                // large millivolt reading) truncates visibly with an
+                // ellipsis rather than silently clipping mid-character or
+                // painting outside the row.
                 Text {
                     text: value;
-                    font-size: Theme.size-body-lg;
+                    font-size: Theme.size-meta;
                     color: Theme.text-secondary;
                     vertical-alignment: center;
                     horizontal-alignment: right;
+                    overflow: elide;
                 }
             }
         }
@@ -324,11 +340,12 @@ slint::slint! {
         in property <bool>   notif_audible: true;
         in property <int>    screen_sleep_timeout_s: 30;
         in property <string> screen_sleep_display: "30s";
-        // Precomputed Rust-side (`"~<n>% (<mv>mV)"` / `"~<n>% (<mv>mV,
-        // charging)"` — `meshcadet-battery-glanceable-indicator` added the
-        // raw mV reading alongside the percent) — same "format on the Rust
-        // side, pass a plain string" convention as `screen_sleep_display`
-        // above.
+        // Precomputed Rust-side — see `firmware_core::ui::admin_menu::
+        // format_battery_display`'s doc for the current row layout (the
+        // full HIL-capture state vector as of
+        // `meshcadet-battery-three-state-pipeline`, 2026-08-22) — same
+        // "format on the Rust side, pass a plain string" convention as
+        // `screen_sleep_display` above.
         in property <string> battery_display: "—";
         // Trackball-driven row highlight: 0=visual toggle, 1=audible toggle,
         // 2=screen-sleep stepper, 3=GPS status row. `-1` = no highlight yet
@@ -512,12 +529,12 @@ impl AdminMenuScreen {
         self.component.set_screen_sleep_display(format_screen_sleep(seconds).into());
     }
 
-    /// Set the displayed battery row (`"~<n>% (<mv>mV)"` / `"~<n>%
-    /// (<mv>mV, charging)"`), precomputed Rust-side by
-    /// [`format_battery_display`] from the shared `battery::BatteryStatus`
-    /// snapshot — the same source the host `status` command and the radio
-    /// telemetry RESPONSE read (single shared source; see the firmware
-    /// `battery` module docs).
+    /// Set the displayed battery row — the full HIL-capture state vector,
+    /// precomputed Rust-side by [`format_battery_display`] (see that
+    /// function's own doc for the exact layout) from the shared
+    /// `battery::BatteryStatus` snapshot — the same source the host
+    /// `status` command and the radio telemetry RESPONSE read (single
+    /// shared source; see the firmware `battery` module docs).
     pub fn set_battery_display(&self, text: &str) {
         self.component.set_battery_display(text.into());
     }

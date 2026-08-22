@@ -235,6 +235,14 @@ impl<'a> Writer<'a> {
         self.push_byte(val as u8);
     }
 
+    /// Write both bytes of `val` big-endian (the held-raw-millivolt
+    /// `LPP_LUMINOSITY`-repurposed entry — a plain exact integer, not
+    /// Cayenne's scaled fixed-point; see [`LPP_LUMINOSITY`]'s doc).
+    fn push_u16_be(&mut self, val: u16) {
+        self.push_byte((val >> 8) as u8);
+        self.push_byte(val as u8);
+    }
+
     fn push_u64(&mut self, val: u64) {
         if val == 0 {
             self.push_byte(b'0');
@@ -385,13 +393,40 @@ const LPP_DIGITAL_INPUT: u8 = 0;
 /// the request-side REQ.
 const LPP_GENERIC_SENSOR: u8 = 100;
 
+/// Cayenne LPP data-type byte for a 2-byte unsigned sensor reading
+/// (`LPP_LUMINOSITY`, real meaning "1 lux/LSB unsigned"). Repurposed here —
+/// like [`LPP_GENERIC_SENSOR`] above — to carry
+/// [`battery::BatteryStatus::held_raw_mv`](super) (the percent basis, in
+/// millivolts — `meshcadet-battery-three-state-pipeline`, 2026-08-22) as a
+/// plain 2-byte big-endian *exact* integer. 2 bytes (not 4, unlike
+/// `raw_mv`'s [`LPP_GENERIC_SENSOR`] entry) is enough: a resting
+/// single-cell pack's mV reading is always well under `u16::MAX`, the same
+/// bound [`super::battery::clamp_raw_mv_for_wire`] already assumes for the
+/// wire `battery_raw_mv: u16` field.
+const LPP_LUMINOSITY: u8 = 101;
+
+/// Cayenne LPP data-type byte for a 1-byte digital-output reading
+/// (`LPP_DIGITAL_OUTPUT`). Repurposed here to carry
+/// [`battery::BatteryLevel`](super)'s wire ordinal (`0..=4`, the same
+/// mapping as `firmware_core::ui::battery_indicator::
+/// level_to_indicator_level` — `meshcadet-battery-three-state-pipeline`,
+/// 2026-08-22) — distinct from [`LPP_DIGITAL_INPUT`] (already the battery
+/// charging bool) and [`LPP_PRESENCE`] (already the "no GPS fix" marker),
+/// so every small-int/boolean entry in one RESPONSE stays unambiguous by
+/// TYPE byte, not just by position.
+const LPP_DIGITAL_OUTPUT: u8 = 1;
+
 /// Bytes of one LPP GPS entry on the wire: channel(1) + type(1) + lat(3) +
 /// lon(3) + alt(3) = 11.
 const LPP_GPS_ENTRY_LEN: usize = 11;
 
 /// Bytes of one 1-byte-payload LPP entry (percentage, digital-input,
-/// presence): channel(1) + type(1) + data(1) = 3.
+/// digital-output, presence): channel(1) + type(1) + data(1) = 3.
 const LPP_BYTE_ENTRY_LEN: usize = 3;
+
+/// Bytes of one 2-byte-payload LPP entry (the held-raw-millivolt
+/// luminosity-repurposed entry): channel(1) + type(1) + data(2) = 4.
+const LPP_U16_ENTRY_LEN: usize = 4;
 
 /// Bytes of one 4-byte-payload LPP entry (the raw-millivolt generic-sensor
 /// entry): channel(1) + type(1) + data(4) = 6.
@@ -399,9 +434,10 @@ const LPP_U32_ENTRY_LEN: usize = 6;
 
 /// Maximum RESPONSE plaintext length: tag(4) + one LPP GPS entry(11) + one
 /// battery-percentage entry(3) + one charging-state entry(3) + one
-/// raw-millivolt entry(6) = 27. A round 32 gives headroom for a future extra
-/// LPP entry without a reallocation surprise at the call site.
-pub const MAX_TELEMETRY_RESPONSE_LEN: usize = 32;
+/// raw-millivolt entry(6) + one held-raw-millivolt entry(4) + one level
+/// entry(3) = 34. A round 40 gives headroom for a future extra LPP entry
+/// without a reallocation surprise at the call site.
+pub const MAX_TELEMETRY_RESPONSE_LEN: usize = 40;
 
 /// A parsed inbound telemetry REQ.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -471,12 +507,32 @@ pub fn is_telemetry_req(req: &TelemetryReq) -> bool {
 /// stores coordinates as e7 (1e-7 deg), so we scale down by 1000; altitude is
 /// not tracked and is reported as 0. `out` must be ≥ [`MAX_TELEMETRY_RESPONSE_LEN`].
 ///
+/// When `held_raw_mv` is `Some(millivolts)`, a held-raw-millivolt
+/// (`LPP_LUMINOSITY`-repurposed) entry is appended **after** the raw-mV
+/// entry (never before — same "never reorder before an existing entry"
+/// rule as `raw_mv` above). This is `BatteryStatus::held_raw_mv` — the SAME
+/// basis `percent`/`level` derive from, frozen while charging (unlike
+/// `raw_mv`) — added 2026-08-22 (`meshcadet-battery-three-state-pipeline`)
+/// as a HIL capture probe (see `battery.rs` module docs' "Three-state
+/// voltage-domain bucket" section).
+///
+/// When `level` is `Some(ordinal)`, a battery-level (`LPP_DIGITAL_OUTPUT`-
+/// repurposed) entry is appended **after** the held-raw-mV entry —
+/// `ordinal` is the same `0..=4` wire encoding
+/// `firmware_core::ui::battery_indicator::level_to_indicator_level`
+/// produces (this crate does not depend on `firmware_core`, so the caller
+/// converts the enum before calling). Added alongside `held_raw_mv`, same
+/// mission.
+///
 /// Returns the number of bytes written.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_telemetry_response_lpp(
     tag: u32,
     gps: Option<(i32, i32)>,
     battery: Option<(u8, bool)>,
     raw_mv: Option<u32>,
+    held_raw_mv: Option<u32>,
+    level: Option<u8>,
     out: &mut [u8],
 ) -> usize {
     let mut w = Writer { buf: out, pos: 0 };
@@ -523,6 +579,18 @@ pub fn encode_telemetry_response_lpp(
         w.push_u32_be(mv);
     }
 
+    if let Some(mv) = held_raw_mv {
+        w.push_byte(TELEM_CHANNEL_SELF);
+        w.push_byte(LPP_LUMINOSITY);
+        w.push_u16_be(mv.min(u16::MAX as u32) as u16);
+    }
+
+    if let Some(ordinal) = level {
+        w.push_byte(TELEM_CHANNEL_SELF);
+        w.push_byte(LPP_DIGITAL_OUTPUT);
+        w.push_byte(ordinal);
+    }
+
     w.pos
 }
 
@@ -545,14 +613,26 @@ pub struct TelemetryResponseLpp {
     /// still recover `battery` in that case, since this entry is always
     /// appended strictly after the percentage/charging pair.
     pub battery_raw_mv: Option<u32>,
+    /// Held (percent-basis) battery millivolt reading
+    /// (`BatteryStatus::held_raw_mv`), if the `LPP_LUMINOSITY`-repurposed
+    /// entry was present (`meshcadet-battery-three-state-pipeline`,
+    /// 2026-08-22). Independent of `battery`/`battery_raw_mv` above — same
+    /// forward-compat reasoning: always appended strictly after them.
+    pub battery_held_raw_mv: Option<u32>,
+    /// Battery level bucket wire ordinal (`0..=4`, same encoding as
+    /// `firmware_core::ui::battery_indicator::level_to_indicator_level`), if
+    /// the `LPP_DIGITAL_OUTPUT`-repurposed entry was present. Added
+    /// alongside `battery_held_raw_mv`, same mission.
+    pub battery_level: Option<u8>,
 }
 
 /// Parse a `PAYLOAD_TYPE_RESPONSE` plaintext produced by
-/// [`encode_telemetry_response_lpp`]. Returns `None` if it is too short to hold
-/// a tag. Scans every LPP entry in the body (GPS, presence, percentage,
-/// digital-input, generic-sensor raw-mv); unrecognised entry types stop the
-/// scan (defensive against a foreign/corrupt RESPONSE rather than misreading
-/// past it).
+/// [`encode_telemetry_response_lpp`]. Returns `None` if it is too short to
+/// hold a tag. Scans every LPP entry in the body (GPS, presence, percentage,
+/// digital-input, generic-sensor raw-mv, luminosity-repurposed held-raw-mv,
+/// digital-output-repurposed level); unrecognised entry types stop the scan
+/// (defensive against a foreign/corrupt RESPONSE rather than misreading past
+/// it).
 pub fn decode_telemetry_response_lpp(plaintext: &[u8]) -> Option<TelemetryResponseLpp> {
     if plaintext.len() < 4 {
         return None;
@@ -562,6 +642,8 @@ pub fn decode_telemetry_response_lpp(plaintext: &[u8]) -> Option<TelemetryRespon
     let mut percent: Option<u8> = None;
     let mut charging: Option<bool> = None;
     let mut raw_mv: Option<u32> = None;
+    let mut held_raw_mv: Option<u32> = None;
+    let mut level: Option<u8> = None;
     let mut body = &plaintext[4..];
 
     while body.len() >= 2 {
@@ -589,6 +671,14 @@ pub fn decode_telemetry_response_lpp(plaintext: &[u8]) -> Option<TelemetryRespon
                 raw_mv = Some(read_u32_be(&body[2..6]));
                 body = &body[LPP_U32_ENTRY_LEN..];
             }
+            LPP_LUMINOSITY if body.len() >= LPP_U16_ENTRY_LEN => {
+                held_raw_mv = Some(read_u16_be(&body[2..4]) as u32);
+                body = &body[LPP_U16_ENTRY_LEN..];
+            }
+            LPP_DIGITAL_OUTPUT if body.len() >= LPP_BYTE_ENTRY_LEN => {
+                level = Some(body[2]);
+                body = &body[LPP_BYTE_ENTRY_LEN..];
+            }
             _ => break, // unknown/truncated entry — stop scanning defensively.
         }
     }
@@ -602,6 +692,8 @@ pub fn decode_telemetry_response_lpp(plaintext: &[u8]) -> Option<TelemetryRespon
         gps_e4,
         battery,
         battery_raw_mv: raw_mv,
+        battery_held_raw_mv: held_raw_mv,
+        battery_level: level,
     })
 }
 
@@ -620,6 +712,12 @@ fn read_i24_be(b: &[u8]) -> i32 {
 /// raw-millivolt `LPP_GENERIC_SENSOR` entry — plain, unscaled).
 fn read_u32_be(b: &[u8]) -> u32 {
     ((b[0] as u32) << 24) | ((b[1] as u32) << 16) | ((b[2] as u32) << 8) | (b[3] as u32)
+}
+
+/// Read a 16-bit big-endian unsigned integer from a 2-byte slice (the
+/// held-raw-millivolt `LPP_LUMINOSITY`-repurposed entry — plain, unscaled).
+fn read_u16_be(b: &[u8]) -> u16 {
+    ((b[0] as u16) << 8) | (b[1] as u16)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -847,7 +945,15 @@ mod tests {
         let lat_e7 = 481_173_000i32;
         let lon_e7 = 115_169_000i32;
         let mut buf = [0u8; MAX_TELEMETRY_RESPONSE_LEN];
-        let n = encode_telemetry_response_lpp(tag, Some((lat_e7, lon_e7)), None, None, &mut buf);
+        let n = encode_telemetry_response_lpp(
+            tag,
+            Some((lat_e7, lon_e7)),
+            None,
+            None,
+            None,
+            None,
+            &mut buf,
+        );
         assert!(n <= MAX_TELEMETRY_RESPONSE_LEN);
         let resp = decode_telemetry_response_lpp(&buf[..n]).expect("must parse");
         assert_eq!(
@@ -857,6 +963,8 @@ mod tests {
         assert_eq!(resp.gps_e4, Some((lat_e7 / 1000, lon_e7 / 1000)));
         assert_eq!(resp.battery, None, "no battery reading was supplied");
         assert_eq!(resp.battery_raw_mv, None, "no raw_mv reading was supplied");
+        assert_eq!(resp.battery_held_raw_mv, None);
+        assert_eq!(resp.battery_level, None);
     }
 
     #[test]
@@ -866,7 +974,15 @@ mod tests {
         let lat_e7 = -338_688_000i32; // -33.8688°
         let lon_e7 = -151_209_300i32; // -15.12093°
         let mut buf = [0u8; MAX_TELEMETRY_RESPONSE_LEN];
-        let n = encode_telemetry_response_lpp(tag, Some((lat_e7, lon_e7)), None, None, &mut buf);
+        let n = encode_telemetry_response_lpp(
+            tag,
+            Some((lat_e7, lon_e7)),
+            None,
+            None,
+            None,
+            None,
+            &mut buf,
+        );
         let resp = decode_telemetry_response_lpp(&buf[..n]).unwrap();
         assert_eq!(resp.gps_e4, Some((lat_e7 / 1000, lon_e7 / 1000)));
     }
@@ -880,7 +996,7 @@ mod tests {
     fn response_lpp_no_fix_still_exceeds_tag_so_companion_matches() {
         let tag = 0xCAFEu32;
         let mut buf = [0u8; MAX_TELEMETRY_RESPONSE_LEN];
-        let n = encode_telemetry_response_lpp(tag, None, None, None, &mut buf);
+        let n = encode_telemetry_response_lpp(tag, None, None, None, None, None, &mut buf);
         assert!(
             n > 4,
             "no-fix response must exceed the 4-byte tag (got {n}) or the companion ignores it"
@@ -904,6 +1020,8 @@ mod tests {
             Some((481_173_000, 115_169_000)),
             None,
             None,
+            None,
+            None,
             &mut buf,
         );
         assert!(n > 4, "fix response must exceed the 4-byte tag (got {n})");
@@ -922,6 +1040,8 @@ mod tests {
             Some((lat_e7, lon_e7)),
             Some((82, true)),
             None,
+            None,
+            None,
             &mut buf,
         );
         assert!(
@@ -939,7 +1059,8 @@ mod tests {
         // mis-parsing the presence entry as the start of a battery entry.
         let tag = 0x1u32;
         let mut buf = [0u8; MAX_TELEMETRY_RESPONSE_LEN];
-        let n = encode_telemetry_response_lpp(tag, None, Some((14, false)), None, &mut buf);
+        let n =
+            encode_telemetry_response_lpp(tag, None, Some((14, false)), None, None, None, &mut buf);
         let resp = decode_telemetry_response_lpp(&buf[..n]).unwrap();
         assert_eq!(resp.gps_e4, None);
         assert_eq!(
@@ -952,7 +1073,8 @@ mod tests {
     #[test]
     fn response_lpp_battery_not_charging_roundtrips() {
         let mut buf = [0u8; MAX_TELEMETRY_RESPONSE_LEN];
-        let n = encode_telemetry_response_lpp(1, None, Some((50, false)), None, &mut buf);
+        let n =
+            encode_telemetry_response_lpp(1, None, Some((50, false)), None, None, None, &mut buf);
         let resp = decode_telemetry_response_lpp(&buf[..n]).unwrap();
         assert_eq!(resp.battery, Some((50, false)));
     }
@@ -962,7 +1084,8 @@ mod tests {
         // Defensive: a caller passing an out-of-range percent must not corrupt
         // the wire format with a value a real receiver would reject/misread.
         let mut buf = [0u8; MAX_TELEMETRY_RESPONSE_LEN];
-        let n = encode_telemetry_response_lpp(1, None, Some((250, true)), None, &mut buf);
+        let n =
+            encode_telemetry_response_lpp(1, None, Some((250, true)), None, None, None, &mut buf);
         let resp = decode_telemetry_response_lpp(&buf[..n]).unwrap();
         assert_eq!(resp.battery, Some((100, true)), "percent must clamp to 100");
     }
@@ -972,7 +1095,7 @@ mod tests {
         // `None` means "no reading available" (e.g. a bench rig with no
         // battery ADC wired) — must not fabricate a battery reading on the wire.
         let mut buf = [0u8; MAX_TELEMETRY_RESPONSE_LEN];
-        let n = encode_telemetry_response_lpp(1, Some((0, 0)), None, None, &mut buf);
+        let n = encode_telemetry_response_lpp(1, Some((0, 0)), None, None, None, None, &mut buf);
         let resp = decode_telemetry_response_lpp(&buf[..n]).unwrap();
         assert_eq!(resp.battery, None);
     }
@@ -985,11 +1108,14 @@ mod tests {
             Some((i32::MIN, i32::MAX)),
             Some((100, true)),
             Some(u32::MAX),
+            Some(u32::MAX),
+            Some(4),
             &mut buf,
         );
         assert!(
             n <= MAX_TELEMETRY_RESPONSE_LEN,
-            "worst case (max tag + GPS + battery + raw_mv) must fit: {n} > {MAX_TELEMETRY_RESPONSE_LEN}"
+            "worst case (max tag + GPS + battery + raw_mv + held_raw_mv + level) must fit: \
+             {n} > {MAX_TELEMETRY_RESPONSE_LEN}"
         );
     }
 
@@ -1006,6 +1132,8 @@ mod tests {
             Some((lat_e7, lon_e7)),
             Some((82, true)),
             Some(4_142),
+            None,
+            None,
             &mut buf,
         );
         assert!(n <= MAX_TELEMETRY_RESPONSE_LEN, "must fit ceiling: {n}");
@@ -1024,7 +1152,7 @@ mod tests {
         // The whole point of choosing LPP_GENERIC_SENSOR over LPP_VOLTAGE: a
         // value that is NOT a multiple of 10 mV must still round-trip exactly.
         let mut buf = [0u8; MAX_TELEMETRY_RESPONSE_LEN];
-        let n = encode_telemetry_response_lpp(1, None, None, Some(4_037), &mut buf);
+        let n = encode_telemetry_response_lpp(1, None, None, Some(4_037), None, None, &mut buf);
         let resp = decode_telemetry_response_lpp(&buf[..n]).unwrap();
         assert_eq!(resp.battery_raw_mv, Some(4_037));
     }
@@ -1032,7 +1160,8 @@ mod tests {
     #[test]
     fn response_lpp_raw_mv_absent_when_not_supplied() {
         let mut buf = [0u8; MAX_TELEMETRY_RESPONSE_LEN];
-        let n = encode_telemetry_response_lpp(1, None, Some((50, false)), None, &mut buf);
+        let n =
+            encode_telemetry_response_lpp(1, None, Some((50, false)), None, None, None, &mut buf);
         let resp = decode_telemetry_response_lpp(&buf[..n]).unwrap();
         assert_eq!(
             resp.battery_raw_mv, None,
@@ -1048,7 +1177,15 @@ mod tests {
     #[test]
     fn response_lpp_raw_mv_entry_appended_after_battery_pair() {
         let mut buf = [0u8; MAX_TELEMETRY_RESPONSE_LEN];
-        let n = encode_telemetry_response_lpp(1, None, Some((82, true)), Some(4_142), &mut buf);
+        let n = encode_telemetry_response_lpp(
+            1,
+            None,
+            Some((82, true)),
+            Some(4_142),
+            None,
+            None,
+            &mut buf,
+        );
         // skip the 4-byte tag + the 3-byte no-fix presence marker (gps=None).
         let body = &buf[4 + LPP_BYTE_ENTRY_LEN..n];
 
@@ -1075,6 +1212,76 @@ mod tests {
         assert_eq!(body[1], LPP_PERCENTAGE);
         assert_eq!(body[4], LPP_DIGITAL_INPUT);
         assert_eq!(body[7], LPP_GENERIC_SENSOR);
+    }
+
+    // ── held_raw_mv / level LPP entries (meshcadet-battery-three-state-pipeline) ──
+
+    #[test]
+    fn response_lpp_held_raw_mv_and_level_roundtrip_alongside_everything_else() {
+        let tag = 0xBEEFu32;
+        let lat_e7 = 481_173_000i32;
+        let lon_e7 = 115_169_000i32;
+        let mut buf = [0u8; MAX_TELEMETRY_RESPONSE_LEN];
+        let n = encode_telemetry_response_lpp(
+            tag,
+            Some((lat_e7, lon_e7)),
+            Some((82, true)),
+            Some(4_888),
+            Some(3_775),
+            Some(1), // Charging ordinal
+            &mut buf,
+        );
+        assert!(n <= MAX_TELEMETRY_RESPONSE_LEN, "must fit ceiling: {n}");
+        let resp = decode_telemetry_response_lpp(&buf[..n]).expect("must parse");
+        assert_eq!(resp.battery, Some((82, true)));
+        assert_eq!(resp.battery_raw_mv, Some(4_888));
+        assert_eq!(
+            resp.battery_held_raw_mv,
+            Some(3_775),
+            "held_raw_mv must round-trip exactly"
+        );
+        assert_eq!(resp.battery_level, Some(1));
+    }
+
+    #[test]
+    fn response_lpp_held_raw_mv_and_level_absent_when_not_supplied() {
+        let mut buf = [0u8; MAX_TELEMETRY_RESPONSE_LEN];
+        let n =
+            encode_telemetry_response_lpp(1, None, Some((50, false)), None, None, None, &mut buf);
+        let resp = decode_telemetry_response_lpp(&buf[..n]).unwrap();
+        assert_eq!(resp.battery_held_raw_mv, None);
+        assert_eq!(resp.battery_level, None);
+    }
+
+    /// Wire-golden byte-layout test: held_raw_mv/level MUST be appended
+    /// strictly after raw_mv (never inserted before it), so an older peer's
+    /// break-on-unknown-type decoder still recovers percent/charging/raw_mv.
+    #[test]
+    fn response_lpp_held_raw_mv_and_level_appended_after_raw_mv() {
+        let mut buf = [0u8; MAX_TELEMETRY_RESPONSE_LEN];
+        let n = encode_telemetry_response_lpp(
+            1,
+            None,
+            Some((82, true)),
+            Some(4_142),
+            Some(3_624),
+            Some(2), // Low ordinal
+            &mut buf,
+        );
+        // skip tag(4) + no-fix presence(3) + percentage(3) + digital-input(3) + raw_mv(6).
+        let body = &buf[4
+            + LPP_BYTE_ENTRY_LEN
+            + LPP_BYTE_ENTRY_LEN
+            + LPP_BYTE_ENTRY_LEN
+            + LPP_U32_ENTRY_LEN..n];
+
+        // [channel, LPP_LUMINOSITY, mv(2 BE)] [channel, LPP_DIGITAL_OUTPUT, ordinal]
+        assert_eq!(
+            &body[0..4],
+            &[TELEM_CHANNEL_SELF, LPP_LUMINOSITY, 0x0e, 0x28] // 3624 = 0x0e28, big-endian
+        );
+        assert_eq!(&body[4..7], &[TELEM_CHANNEL_SELF, LPP_DIGITAL_OUTPUT, 2]);
+        assert_eq!(body.len(), 7, "no trailing bytes beyond the two entries");
     }
 
     /// REGRESSION: the full native
@@ -1132,6 +1339,8 @@ mod tests {
             Some((lat_e7, lon_e7)),
             Some((77, false)),
             Some(3_931),
+            Some(3_900),
+            Some(3), // Partial ordinal
             &mut resp_pt,
         );
 
@@ -1166,6 +1375,8 @@ mod tests {
             Some(3_931),
             "raw_mv must round-trip end-to-end too"
         );
+        assert_eq!(resp.battery_held_raw_mv, Some(3_900));
+        assert_eq!(resp.battery_level, Some(3));
     }
 
     // ── policy gate (documented, tested indirectly) ───────────────────────────

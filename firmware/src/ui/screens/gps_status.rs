@@ -247,7 +247,7 @@ slint::slint! {
         in property <int> signal_level: 0;
         // Coarse battery-level bucket (`meshcadet-battery-soc-filtering` /
         // `meshcadet-battery-glanceable-indicator`): 0 = Unknown, 1 =
-        // Charging, 2..=5 = Critical/Low/Medium/High. Pushed by
+        // Charging, 2..=4 = Low/Partial/Full. Pushed by
         // `GpsStatusScreen::set_battery_level` (`UiRuntime::set_battery_level`
         // in `ui/mod.rs`); see `BatteryIndicator`'s embedding below.
         in property <int> battery_level: 0;
@@ -521,7 +521,7 @@ impl GpsStatusScreen {
     /// Push a fresh coarse battery-level bucket into the header's
     /// `BatteryIndicator` (`meshcadet-battery-soc-filtering` /
     /// `meshcadet-battery-glanceable-indicator`). `level` is `0` (Unknown),
-    /// `1` (Charging), or `2..=5` (Critical/Low/Medium/High —
+    /// `1` (Charging), or `2..=4` (Low/Partial/Full —
     /// `firmware_core::ui::battery_indicator::level_to_indicator_level`'s
     /// output) — the caller (`UiRuntime::set_battery_level`) owns the
     /// `BatteryLevel` -> `int` conversion so every screen's wrapper takes the
