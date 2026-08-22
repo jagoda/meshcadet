@@ -94,6 +94,24 @@ impl PathLen {
     pub fn path_byte_len(self) -> u8 {
         self.hop_count() * self.hash_size()
     }
+
+    /// Mirrors `Packet::isValidPathLen` (`src/Packet.cpp` @ `companion-v1.17.1`,
+    /// unchanged since `dee3e26a`): a `path_len` byte is rejected if its
+    /// encoded hash size is the reserved value `4` (`hash_size == 4` — bits
+    /// [7:6] == `0b11`, "Reserved for future"), or if `hop_count * hash_size`
+    /// would exceed [`crate::constants::MAX_PATH_SIZE`] (64 bytes). This is a
+    /// stricter check than [`Self::new`], which currently accepts
+    /// `hash_size == 4` (a value MeshCadet never constructs, but upstream
+    /// stock nodes reject on receipt — see `Packet::readFrom`) — [`Self::new`]
+    /// is left as-is (widening its range would be a separate, unrelated
+    /// change) and callers that need upstream's exact receive-side validation
+    /// should call `is_valid` on the raw byte instead.
+    pub fn is_valid(self) -> bool {
+        if self.hash_size() == 4 {
+            return false; // Reserved for future
+        }
+        self.hop_count() as usize * self.hash_size() as usize <= crate::constants::MAX_PATH_SIZE
+    }
 }
 
 #[cfg(test)]
@@ -195,5 +213,41 @@ mod tests {
         assert!(PathLen::new(5, 0).is_none()); // hash_size=5 invalid
         assert!(PathLen::new(1, 64).is_none()); // hop_count=64 invalid
         assert!(PathLen::new(2, 32).is_some()); // max valid for 2-byte mode
+    }
+
+    // ── PathLen::is_valid (mirrors Packet::isValidPathLen) ────────────────────
+
+    #[test]
+    fn path_len_is_valid_rejects_reserved_hash_size_4() {
+        // bits[7:6] = 0b11 -> hash_size = 4, reserved regardless of hop_count.
+        assert!(!PathLen(0xC0).is_valid()); // hash_size=4, hop_count=0
+        assert!(!PathLen(0xC1).is_valid()); // hash_size=4, hop_count=1
+                                            // `new` currently mints hash_size=4 (out of scope of this change —
+                                            // MeshCadet never constructs it), but `is_valid` must still reject
+                                            // whatever it produces, matching stock nodes' receive-side check.
+        let minted = PathLen::new(4, 0).unwrap();
+        assert!(!minted.is_valid());
+    }
+
+    #[test]
+    fn path_len_is_valid_rejects_oversize_path() {
+        // hash_size=2, hop_count=63 -> 126 bytes > MAX_PATH_SIZE (64).
+        assert!(!PathLen::new(2, 63).unwrap().is_valid());
+        // hash_size=3, hop_count=22 -> 66 bytes > 64.
+        assert!(!PathLen::new(3, 22).unwrap().is_valid());
+    }
+
+    #[test]
+    fn path_len_is_valid_accepts_boundary_and_typical_values() {
+        // hash_size=2, hop_count=32 -> exactly 64 bytes, at the cap.
+        assert!(PathLen::new(2, 32).unwrap().is_valid());
+        // hash_size=1, hop_count=63 -> 63 bytes, within the cap.
+        assert!(PathLen::new(1, 63).unwrap().is_valid());
+        // hash_size=3, hop_count=21 -> exactly 63 bytes, within the cap.
+        assert!(PathLen::new(3, 21).unwrap().is_valid());
+        // Zero hops is always valid regardless of hash size.
+        assert!(PathLen::new(2, 0).unwrap().is_valid());
+        // MeshCadet's own preset (2-byte path hashes, spec §2.2).
+        assert!(PathLen(0x42).is_valid());
     }
 }

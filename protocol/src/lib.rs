@@ -5,9 +5,11 @@
 //! format: packet framing, header/route/payload-type fields, 2-byte path-hash
 //! encoding, the crypto/identity primitives (Ed25519 → X25519 ECDH, AES-128-ECB,
 //! 2-byte HMAC-SHA256 MAC), the DM + ACK codec, and symmetric channel encryption.
-//! It is also prefix-compatible with v1.16, the current protocol target (the
-//! ACK codec accepts and prefix-matches v1.16's widened 6-byte ACK; see
-//! [`codec::compute_ack_hash`]).
+//! It is also prefix-compatible with v1.16/v1.17, the current protocol target
+//! (the ACK codec accepts and prefix-matches v1.16's widened 6-byte ACK; see
+//! [`codec::compute_ack_hash`]). v1.17.1 was verified wire-unchanged from
+//! v1.16.0 (`FIRMWARE_VER_CODE` still 13; every `src/MeshCore.h` constant
+//! identical) — no codec change was needed for the v1.17 bump.
 //!
 //! The authoritative spec is the upstream MeshCore v1.15.0 firmware source
 //! (`dee3e26a`) this crate is ported from.

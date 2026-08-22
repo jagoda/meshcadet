@@ -9,7 +9,13 @@
   posture is "unchanged" for room contacts is corrected — the no-*discovery*
   half does not hold once a room contact is provisioned (identity pubkey
   leaks in the clear via room login); see the "Qualified 2026-08-01" note
-  under §2 below.
+  under §2 below. **Qualified 2026-08-22 (v1.17 compat recon):** §1's
+  protocol target is current for MeshCore **v1.16/v1.17** — v1.17.1 was
+  verified wire-unchanged from v1.16.0 (`FIRMWARE_VER_CODE` still 13,
+  `MAX_PACKET_PAYLOAD` 184, `MAX_PATH_SIZE` 64, `MAX_ADVERT_DATA_SIZE` 32,
+  `CIPHER_*` all identical) by `meshcadet-meshcore-117-compat-recon-20260822-145129066`;
+  no codec/wire change was needed. See "Amendment (2026-07-25)" §a for the
+  v1.17 note.
 - **Deciders:** Project maintainer design conversation
 - **Supersedes:** —
 - **Canonical source:** This ADR is the authoritative in-repo record of the
@@ -19,7 +25,8 @@
 - **Protocol reference:** Reverse-engineered from the MeshCore firmware
   source, byte-exact against MeshCore `dee3e26a` / v1.15.0; target bumped
   2026-07-25 to v1.16 with v1.15 back-compat (see §1 and "Amendment
-  (2026-07-25)").
+  (2026-07-25)"); v1.17.1 verified wire-unchanged 2026-08-22 (no target bump
+  needed — see "Amendment (2026-07-25)" §a).
 
 ## Context
 
@@ -37,10 +44,14 @@ in the design conversation and must survive across future work sessions.
 
 ### 1. Interop (hard requirement — must match the deployed mesh byte-exact)
 
-- **Protocol target:** MeshCore **v1.16, with backward compatibility to v1.15
-  where possible** (amended 2026-07-25; supersedes the original
-  v1.15.0-dee3e26-only lock — see "Amendment (2026-07-25)" below for why the
-  bump is not a breaking wire change).
+- **Protocol target:** MeshCore **v1.16/v1.17** (v1.17.1 verified
+  wire-unchanged: `FIRMWARE_VER_CODE` 13, `MAX_PACKET_PAYLOAD` 184,
+  `MAX_PATH_SIZE` 64, `MAX_ADVERT_DATA_SIZE` 32, `CIPHER_*` all identical),
+  with backward compatibility to v1.15 where possible (amended 2026-07-25;
+  supersedes the original v1.15.0-dee3e26-only lock — see "Amendment
+  (2026-07-25)" below for why the bump is not a breaking wire change;
+  v1.17.1 currency confirmed 2026-08-22, no further amendment needed since
+  it changes zero wire bytes).
 - **Radio preset:** freq **910.525 MHz**, bandwidth **62.5 kHz**, spreading
   factor **7**, coding rate **5 (4/5)**, **2-byte path hashes** (confirmed
   against a live device; `path_len` bits[7:6] = `0b01`).
@@ -233,6 +244,20 @@ no amount of source inspection answers. `PREAMBLE_LEN` stays at 8 pending an
 on-air bench measurement against stock v1.15 *and* v1.16 nodes — this
 amendment upgrades the protocol *target*, not the bench-verification status
 of the radio PHY.
+
+**Qualified 2026-08-22 (v1.17 compat recon,
+`meshcadet-meshcore-117-compat-recon-20260822-145129066`):** protocol target
+extended to v1.16/v1.17 — v1.17.1 is byte-exact wire-compatible with v1.16.0
+(every `src/MeshCore.h` constant identical, `FIRMWARE_VER_CODE` still 13; the
+851 host tests in `protocol`/`firmware-core` are green and already pin the
+on-air DM/ACK/GRP_TXT/advert frames), so this is a currency note, not a new
+amendment to §1's decision. The preamble question above is unaffected and
+does **not** narrow: v1.17 does not touch `preambleLengthForSF(sf)` either —
+still `sf <= 8 ? 32 : 16` — so the open 8-vs-32 on-air bench question carries
+forward unchanged against v1.17 nodes too. This note does **not** claim any
+bench confirmation; the predicate remains maintainer-run (Houston mission
+`meshcadet-hil-preamble-measurement` cancelled by maintainer ruling
+2026-07-15).
 
 ### b. Room-server-as-provisioned-contact
 

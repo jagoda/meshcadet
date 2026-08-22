@@ -81,8 +81,9 @@ posture is detailed in [`SECURITY.md`](SECURITY.md).
 ## What it does
 
 - Talks real MeshCore over LoRa (SX1262): DMs, channel messages, ACKs, and
-  pull-only location telemetry. Byte-exact against v1.15.0, targeting v1.16
-  with v1.15 back-compat (see [ADR-0001 §1](docs/adr/0001-charter.md)).
+  pull-only location telemetry. Byte-exact against v1.15.0, targeting
+  v1.16/v1.17 with v1.15 back-compat (v1.17.1 verified wire-unchanged from
+  v1.16.0; see [ADR-0001 §1](docs/adr/0001-charter.md)).
 - Touch-screen UI (Slint) with two tabs: **Contacts** (direct-message peers)
   and **Groups** — a unified list of provisioned channels and room-server
   connections, visually distinguished — plus a conversation view and a
@@ -157,7 +158,7 @@ DM / ACK / channel-message / pull-telemetry paths. Before relying on it:
 
 | Crate | Role | Builds with |
 |-------|------|-------------|
-| `protocol/` | MeshCore wire port (framing, crypto, codec); byte-exact v1.15, prefix-compatible v1.16; shared | stable, host-native |
+| `protocol/` | MeshCore wire port (framing, crypto, codec); byte-exact v1.15, prefix-compatible v1.16/v1.17 (v1.17.1 wire-unchanged); shared | stable, host-native |
 | `firmware-core/` | Decoupled, host-testable half of firmware logic (dispatcher, PIN-menu, notifications, GPS/battery/runtime-settings parsing+codecs) — no `esp-idf-*`/Slint dep; also a `path` dep of `firmware/` (see ADR-0005) | stable, host-native |
 | `firmware/` | T-Deck device app (radio, GPS, touch UI, storage, admin menu) | `esp` toolchain, `xtensa-esp32s3-espidf` |
 | `host/` | Admin CLI (`meshcadet`): USB provisioning, history export, PIN reset | stable, host-native |

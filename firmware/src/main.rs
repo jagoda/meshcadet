@@ -3838,21 +3838,40 @@ fn on_receive(
     gps_verified: bool,
     adopted_server_clock: &mut Option<room_session::AdoptedServerClock>,
 ) {
-    if frame.len() < 2 {
-        rx_diag!("RX: frame too short ({} bytes)", frame.len());
-        return;
-    }
-
-    let header_byte  = frame[0];
-    let path_len_byte = frame[1];
-    let hash_size  = ((path_len_byte >> 6) + 1) as usize;
-    let hop_count  = (path_len_byte & 0x3F) as usize;
-    let path_bytes = hop_count * hash_size;
-    let payload_off = 2 + path_bytes;
-    if frame.len() < payload_off {
-        log::warn!("RX: frame shorter than encoded path ({} bytes)", frame.len());
-        return;
-    }
+    // Frame header parsing (route-type branch for transport-coded frames,
+    // `PathLen::is_valid()` early-reject) lives in `firmware_core::rx_frame`
+    // so it is exercised by `cargo test -p firmware-core` — see that
+    // module's doc for why a bare `payload_off = 2 + path_bytes` here
+    // misparses a ROUTE_TYPE_TRANSPORT_FLOOD/TRANSPORT_DIRECT frame (its 4
+    // transport-code bytes sit between the header byte and `path_len`).
+    let rx_header = match firmware_core::rx_frame::parse_rx_frame_header(frame) {
+        Ok(rx_header) => rx_header,
+        Err(firmware_core::rx_frame::RxFrameError::Empty) => {
+            rx_diag!("RX: empty frame");
+            return;
+        }
+        Err(firmware_core::rx_frame::RxFrameError::TooShortForPathLen { frame_len, needed }) => {
+            rx_diag!("RX: frame too short for path_len ({} bytes, needed {})", frame_len, needed);
+            return;
+        }
+        Err(firmware_core::rx_frame::RxFrameError::InvalidPathLen { path_len_byte }) => {
+            rx_diag!(
+                "RX: invalid path_len byte 0x{:02x} (reserved hash_size or oversize path)",
+                path_len_byte,
+            );
+            return;
+        }
+        Err(firmware_core::rx_frame::RxFrameError::TooShortForPath { frame_len, payload_off }) => {
+            log::warn!(
+                "RX: frame shorter than encoded path ({} bytes, needed {})",
+                frame_len, payload_off,
+            );
+            return;
+        }
+    };
+    let header_byte = rx_header.header_byte;
+    let hop_count = rx_header.hop_count as usize;
+    let payload_off = rx_header.payload_off;
     let payload = &frame[payload_off..];
 
     let payload_type = (header_byte >> 2) & 0x0F;

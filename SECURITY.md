@@ -62,8 +62,9 @@ what this reporting channel is and is not:
   HMAC-SHA256) plus MeshCadet's allowlist policy for protection. See
   [ADR-0001 §1](docs/adr/0001-charter.md) for the exact primitives, which are
   fixed by the need for byte-exact interop with MeshCore (v1.15, with the
-  v1.16 target adopted 2026-07-25 — see ADR-0001 §1) — this project cannot
-  unilaterally change them without breaking interop.
+  v1.16/v1.17 target adopted 2026-07-25 and confirmed current 2026-08-22 —
+  v1.17.1 is wire-unchanged from v1.16.0 — see ADR-0001 §1) — this project
+  cannot unilaterally change them without breaking interop.
 - **Non-allowlisted traffic is silently dropped**, by design: DMs and
   telemetry requests from unknown senders get no ACK and no reply, so a
   scanning adversary cannot distinguish "device offline" from "you're not on
@@ -99,8 +100,9 @@ auditing this codebase:
   incorrect attempts. Brute-forcing a short PIN via the on-screen keypad is
   slow but not formally prevented.
 - **Inherited protocol-level limitation: AES-128-ECB.** MeshCore (v1.15,
-  byte-exact-ported; v1.16, the current target, is unchanged here — see
-  ADR-0001 §1) encrypts DM/channel payloads with
+  byte-exact-ported; v1.16/v1.17, the current target, is unchanged here —
+  v1.17.1 verified wire-unchanged 2026-08-22 — see ADR-0001 §1) encrypts
+  DM/channel payloads with
   AES-128 in **ECB mode**, not a mode with a per-message nonce/IV (see
   [ADR-0001 §1](docs/adr/0001-charter.md), "Discrepancy on record"). ECB
   leaks whether two ciphertext blocks encode identical plaintext. This is a
@@ -143,6 +145,21 @@ auditing this codebase:
   (not yet implemented): surfacing this trade-off in the host CLI's
   `add-room` provisioning output, so an admin adding a room contact sees
   the discoverability cost at the moment they accept it.*
+- **Group/channel message sender names are unverified.** MeshCore's
+  `GRP_TXT` payload carries no sender signature — the plaintext is just
+  `"<name>: <msg>"`, and `<name>` is whatever the sending device chose to
+  put there. Any holder of a channel's shared secret can encrypt a frame
+  claiming to be any other member by name; there is no cryptographic
+  binding between the claimed name and the sender's identity key.
+  MeshCadet renders the full string as received (`handle_grp_txt` →
+  `UiEvent::IncomingGroupMsg`, `firmware/src/main.rs`), exactly as the
+  MeshCore companion does, with no name-vs-identity verification. This is
+  a pre-existing property of the MeshCore group-channel wire protocol —
+  documented plainly upstream (MeshCore `docs/payloads.md`, "Group text
+  message" section) as of v1.17 — not a MeshCadet-specific weakness or a
+  v1.17 regression, and not fixable without breaking channel interop.
+  Newly disclosed here 2026-08-22 as part of v1.17 currency review; assume
+  a channel-key holder can impersonate any name on that channel.
 - **Physical USB possession is the sole provisioning authentication
   factor.** By design (see "Trust boundaries" above) — there is no
   secondary factor (password, hardware key, etc.) gating the host CLI's

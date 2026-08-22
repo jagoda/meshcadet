@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "MeshCore v1.15 wire protocol (framing, path encoding, crypto, codec) shared by MeshCadet firmware and the host CLI."
+description = "MeshCore v1.15 wire protocol (framing, path encoding, crypto, codec), prefix-compatible with v1.16/v1.17, shared by MeshCadet firmware and the host CLI."
 
 [lints.rust]
 unsafe_code = "forbid"

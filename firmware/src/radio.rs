@@ -6,14 +6,19 @@
 //! than an async LoRa-phy stack, matching the single-task polling model of
 //! the MeshCore dispatcher loop.
 //!
-//! # Locked preset (MeshCore v1.15 + v1.16 interop)
+//! # Locked preset (MeshCore v1.15 + v1.16/v1.17 interop)
 //!
 //! No version detection or negotiation is required: the v1.15→v1.16 wire
 //! packet format is unchanged, and MeshCadet's ACK codec is prefix-compatible
 //! with both versions (see `compute_ack_hash` in `protocol/src/codec.rs`).
-//! One exception is under active verification, not yet resolved by
-//! inspection: v1.16 changed its OWN default LoRa preamble length (see the
-//! `Preamble` row and [`PREAMBLE_LEN`]'s doc comment); MeshCadet has not
+//! v1.17.1 was verified wire-unchanged from v1.16.0 (`FIRMWARE_VER_CODE`
+//! still 13; every `src/MeshCore.h` constant identical) — nothing here
+//! needed to change for the v1.17 bump. One exception is under active
+//! verification, not yet resolved by inspection: v1.16 changed its OWN
+//! default LoRa preamble length (see the `Preamble` row and
+//! [`PREAMBLE_LEN`]'s doc comment); v1.17 does **not** further change
+//! `preambleLengthForSF(sf)` (still `sf<=8 ? 32 : 16`), so this remains the
+//! same open question against v1.16 and v1.17 nodes alike. MeshCadet has not
 //! adopted that change pending an on-air bench measurement.
 //! | Parameter | Value |
 //! |-----------|-------|
@@ -137,10 +142,15 @@ pub const LDRO_CODE: u8 = 0x00;
 /// inherit RadioLib's SX1262 default of 8. v1.16's `RadioLibWrappers::begin()`
 /// changed ITS OWN default to `preambleLengthForSF(sf) = sf<=8 ? 32 : 16`
 /// (32 at MeshCadet's locked SF7) — undocumented outside that radio wrapper,
-/// present in no spec doc. Whether 8 and 32 are mutually receivable is a
-/// physical-layer question this constant cannot answer by inspection; it is
-/// pinned at 8 pending an on-air bench measurement against stock v1.15 *and*
-/// v1.16 nodes. Do not change this value without recording that measurement.
+/// present in no spec doc. v1.17.1 does **not** touch `preambleLengthForSF`
+/// (verified 2026-08-22 against the `companion-v1.17.1` tag: byte-identical
+/// to v1.16.0) — the same 8-vs-32 question carries forward unchanged, not
+/// widened, against v1.17 nodes. Whether 8 and 32 are mutually receivable is
+/// a physical-layer question this constant cannot answer by inspection; it
+/// is pinned at 8 pending an on-air bench measurement against stock v1.15,
+/// v1.16, *and* v1.17 nodes (maintainer-owned bench work; see
+/// `docs/adr/0001-charter.md` Amendment (2026-07-25) §a). Do not change this
+/// value without recording that measurement.
 pub const PREAMBLE_LEN: u16 = 8;
 /// LoRa private-network sync word, hi/lo register bytes.
 ///
