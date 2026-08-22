@@ -4,7 +4,10 @@
 // defaults, device-name set, commit), the M2 **sensitive-data** surface:
 // admin-PIN set/reset, history export (local download), and history clear,
 // and (meshcadet-room-web-provisioner) room-server provisioning: room
-// list/add/remove plus its `type=3` QR/URI (see the "Rooms" section below).
+// list/add/remove plus its `type=3` QR/URI (see the "Rooms" section below),
+// and (meshcadet-lock-web-provisioner) the screen-lock surface: a 4-digit
+// lock PIN distinct from the admin PIN, plus enable/timeout controls (see
+// the "Screen lock" section below and docs/adr/0013-screen-lock-policy-layer.md).
 //
 // No build step (site/README.md convention): plain ES module, loaded
 // directly by the browser. The QR library is VENDORED locally at
@@ -20,18 +23,20 @@
 // Client-side security model (docs/adr/0007-provisioner-codec.md): no
 // analytics/telemetry, nothing sent to a server (GitHub Pages is fully
 // static). Every secret this page touches — a generated channel secret, the
-// admin PIN, a room's guest password (ADR-0002 §4/ADR-0001 §4), and exported
+// admin PIN, the screen-lock PIN (docs/adr/0013-screen-lock-policy-layer.md),
+// a room's guest password (ADR-0002 §4/ADR-0001 §4), and exported
 // private-message history — is created/handled only in this page and either
 // sent to the device over the already-open serial connection or offered to
 // the user as an explicit local download; it is never logged, never placed
 // in the URL, and never written to `localStorage`/`sessionStorage`.
 // Specifically: the PIN and guest-password fields are cleared the instant
-// they're sent (and `session.setPin`/`session.addRoom` each scrub their own
-// buffer), and history text is written to disk only on an explicit "Download
-// transcript" click, never auto-downloaded and never console-logged.
+// they're sent (and `session.setPin`/`session.setLockPin`/`session.addRoom`
+// each scrub their own buffer), and history text is written to disk only on
+// an explicit "Download transcript" click, never auto-downloaded and never
+// console-logged.
 
 import { ProvisionerSession, DeviceError } from "./provisioner/session.js";
-import { bytesToHex } from "./provisioner/codec.js";
+import { bytesToHex, LOCK_SCREEN_ENABLE } from "./provisioner/codec.js";
 import { buildContactUri, buildRoomUri, cardToUri } from "./provisioner/contact-uri.js";
 import {
   validatePubkeyHex,
@@ -39,6 +44,8 @@ import {
   validateDeviceName,
   validatePin,
   validateRoomPassword,
+  validateLockPin,
+  validateLockTimeout,
 } from "./provisioner/validation.js";
 import { formatHistoryTranscript } from "./provisioner/history-format.js";
 import QRCode from "./vendor/qrcode.js";
@@ -146,6 +153,16 @@ const setPinForm = document.getElementById("set-pin-form");
 const setPinInput = document.getElementById("set-pin-input");
 const setPinStatus = document.getElementById("set-pin-status");
 
+const lockPanel = document.getElementById("lock-panel");
+const lockPinForm = document.getElementById("lock-pin-form");
+const lockPinInput = document.getElementById("lock-pin-input");
+const lockPinStatus = document.getElementById("lock-pin-status");
+const lockConfigForm = document.getElementById("lock-config-form");
+const lockEnableInput = document.getElementById("lock-enable-input");
+const lockTimeoutInput = document.getElementById("lock-timeout-input");
+const lockConfigSaveButton = document.getElementById("lock-config-save-button");
+const lockConfigStatus = document.getElementById("lock-config-status");
+
 const historyPanel = document.getElementById("history-panel");
 const historyReadButton = document.getElementById("history-read-button");
 const historyDownloadButton = document.getElementById("history-download-button");
@@ -166,6 +183,7 @@ const writePanels = [
   notifPanel,
   commitPanel,
   pinPanel,
+  lockPanel,
   historyPanel,
   clearHistoryPanel,
 ];
@@ -238,6 +256,16 @@ if (!ProvisionerSession.isSupported() || !ProvisionerSession.isSecureContext()) 
     event.preventDefault();
     handleSetPin();
   });
+
+  lockPinForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    handleSetLockPin();
+  });
+  lockConfigForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    handleSetLockConfig();
+  });
+
   historyReadButton.addEventListener("click", handleReadHistory);
   historyDownloadButton.addEventListener("click", handleDownloadTranscript);
   clearHistoryButton.addEventListener("click", handleClearHistoryArm);
@@ -338,6 +366,8 @@ function clearFormStatuses() {
   notifStatus.textContent = "";
   commitStatus.textContent = "";
   setPinStatus.textContent = "";
+  lockPinStatus.textContent = "";
+  lockConfigStatus.textContent = "";
   historyStatus.textContent = "";
   clearHistoryStatus.textContent = "";
   cardUriStatus.textContent = "";
@@ -349,6 +379,7 @@ function clearFormStatuses() {
   // page's memory the instant we disconnect" treatment as the admin PIN —
   // see this mission's scope note on guest-password/channel-secret hygiene.
   setPinInput.value = "";
+  lockPinInput.value = "";
   addRoomPassword.value = "";
   addChannelSecret.value = "";
   delChannelSecret.value = "";
@@ -1002,6 +1033,68 @@ async function handleSetPin() {
     // error (a device RSP_ERROR message or transport failure), not the PIN.
     reportWriteError(setPinStatus, "set PIN", err);
   }
+}
+
+// ── Screen lock (set-lock-pin / set-lock-config) ──────────────────────────
+//
+// The screen-lock PIN is a FOURTH secret this page carries, and a secret
+// distinct from the admin PIN above — unlocking the screen must never open
+// the admin menu, and vice versa (docs/adr/0013-screen-lock-policy-layer.md,
+// D6). `handleSetLockPin` gets the exact same hygiene discipline as
+// `handleSetPin`: validated client-side (`validateLockPin`, which never
+// echoes the PIN back — it's a secret), passed straight to
+// `session.setLockPin` (which sends it over serial and scrubs its own
+// buffer), and the input field cleared on EVERY exit path — success, catch,
+// and `clearFormStatuses` (disconnect) — never logged, never placed in the
+// URL, never written to storage.
+//
+// `handleSetLockConfig` (enable + idle timeout) carries no secret — same
+// posture as `handleSetNotifDefaults` — but the timeout still gets a
+// reject-not-clamp client-side check (`validateLockTimeout`) naming the
+// `15..=3600` bound, mirroring the decode-path/CLI enforcement of the same
+// bound.
+
+async function handleSetLockPin() {
+  const pin = lockPinInput.value;
+  const validated = validateLockPin(pin);
+  if (!validated.ok) {
+    lockPinStatus.textContent = validated.error;
+    return;
+  }
+  lockPinStatus.textContent = "Setting lock PIN…";
+  try {
+    await session.setLockPin(pin);
+    // Clear the field immediately on success so the secret doesn't linger in
+    // the DOM (it's already been scrubbed from the session buffer).
+    lockPinInput.value = "";
+    lockPinStatus.textContent = "Lock PIN set. Takes effect at the device's next boot.";
+  } catch (err) {
+    // Clear here too: a failed submit is not a reason to leave a secret
+    // sitting in the DOM any longer than the successful path would (same
+    // discipline as handleSetPin's catch branch).
+    lockPinInput.value = "";
+    // Note: never surface the PIN itself — reportWriteError logs only the
+    // error (a device RSP_ERROR message or transport failure), not the PIN.
+    reportWriteError(lockPinStatus, "set lock PIN", err);
+  }
+}
+
+async function handleSetLockConfig() {
+  const validated = validateLockTimeout(lockTimeoutInput.value);
+  if (!validated.ok) {
+    lockConfigStatus.textContent = validated.error;
+    return;
+  }
+  const lockFlags = lockEnableInput.checked ? LOCK_SCREEN_ENABLE : 0;
+  await withButtonDisabled(lockConfigSaveButton, async () => {
+    lockConfigStatus.textContent = "Saving…";
+    try {
+      await session.setLockConfig(lockFlags, validated.timeoutS);
+      lockConfigStatus.textContent = `Lock config set: enabled=${lockEnableInput.checked}, timeout=${validated.timeoutS}s. Accepted and forwarded — persistence completes on the device.`;
+    } catch (err) {
+      reportWriteError(lockConfigStatus, "set lock config", err);
+    }
+  });
 }
 
 // ── Export history (export-history) ───────────────────────────────────────

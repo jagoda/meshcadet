@@ -24,6 +24,9 @@ import {
   encodeAddContact,
   encodeAddRoom,
   encodeSetPin,
+  encodeSetLockPin,
+  encodeSetLockConfig,
+  LOCK_SCREEN_ENABLE,
   FRAME_QUERY_STATUS,
   FRAME_QUERY_CONTACTS,
   FRAME_QUERY_CHANNELS,
@@ -33,6 +36,8 @@ import {
   FRAME_ADD_ROOM,
   FRAME_DEL_ROOM,
   FRAME_SET_PIN,
+  FRAME_SET_LOCK_PIN,
+  FRAME_SET_LOCK_CONFIG,
   FRAME_EXPORT_HISTORY,
   FRAME_CLEAR_HISTORY,
   FRAME_RSP_STATUS,
@@ -631,6 +636,54 @@ async function setPinSendsCorrectFrame() {
   await session.disconnect();
 }
 
+// ── Scenario 12b: setLockPin sends FRAME_SET_LOCK_PIN with the encoded lock-PIN payload ──
+
+async function setLockPinSendsCorrectFrame() {
+  const written = [];
+  const { port, push } = makeFakePort((chunk) => {
+    written.push(chunk);
+    setTimeout(() => push(encodeFrame(FRAME_RSP_OK)), 5);
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  await session.setLockPin("4321");
+
+  assert.equal(written.length, 1);
+  const sent = decodeFrame(written[0]);
+  assert.equal(sent.frameType, FRAME_SET_LOCK_PIN);
+  // Payload is exactly LOCK_PIN_LEN bytes, no length prefix — matches
+  // encodeSetLockPin exactly (unlike encodeSetPin, no truncation possible).
+  assert.deepEqual(Array.from(sent.payload), Array.from(encodeSetLockPin("4321")));
+
+  await session.disconnect();
+}
+
+// ── Scenario 12c: setLockConfig sends FRAME_SET_LOCK_CONFIG with lock_flags + lock_timeout_s ──
+
+async function setLockConfigSendsCorrectFrame() {
+  const written = [];
+  const { port, push } = makeFakePort((chunk) => {
+    written.push(chunk);
+    setTimeout(() => push(encodeFrame(FRAME_RSP_OK)), 5);
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  await session.setLockConfig(LOCK_SCREEN_ENABLE, 300);
+
+  assert.equal(written.length, 1);
+  const sent = decodeFrame(written[0]);
+  assert.equal(sent.frameType, FRAME_SET_LOCK_CONFIG);
+  assert.deepEqual(Array.from(sent.payload), Array.from(encodeSetLockConfig(LOCK_SCREEN_ENABLE, 300)));
+
+  await session.disconnect();
+}
+
 // ── Scenario 13: exportHistory streams RSP_HISTORY_ENTRY*N -> RSP_HISTORY_DONE ─
 
 /** Wire layout: index(1) | sender_hash(1) | msg_type(1) | timestamp(4 LE) | text_len(1) | is_ours(1) | text(text_len). */
@@ -1136,6 +1189,8 @@ const scenarios = [
   ["commit() resolves on RSP_OK ahead of a simulated first-boot port close", commitResolvesBeforeSimulatedReboot],
   ["concurrent command calls are serialized, not interleaved", concurrentCommandsAreSerialized],
   ["setPin sends FRAME_SET_PIN with the encoded PIN payload", setPinSendsCorrectFrame],
+  ["setLockPin sends FRAME_SET_LOCK_PIN with the encoded lock-PIN payload", setLockPinSendsCorrectFrame],
+  ["setLockConfig sends FRAME_SET_LOCK_CONFIG with lock_flags + lock_timeout_s", setLockConfigSendsCorrectFrame],
   ["exportHistory streams RSP_HISTORY_ENTRY*N -> RSP_HISTORY_DONE (oldest-first)", exportHistoryStreamsToDone],
   ["exportHistory tolerates a bounded stray reply before the stream", exportHistoryToleratesStrayFrame],
   ["exportHistory surfaces a device RSP_ERROR as DeviceError", exportHistoryDeviceError],
