@@ -377,6 +377,28 @@ fn rsp_room_vector(
     decode_vector(name, "rsp_room", FRAME_RSP_ROOM, &buf[..plen], expect)
 }
 
+fn rsp_lock_vector(
+    name: &'static str,
+    lock_flags: u8,
+    lock_timeout_s: u16,
+    pin_set: bool,
+) -> Vector {
+    let payload_in = RspLockPayload {
+        lock_flags,
+        lock_timeout_s,
+        pin_set,
+    };
+    let mut buf = [0u8; 8];
+    let plen = encode_rsp_lock(&payload_in, &mut buf);
+    let d = decode_rsp_lock(&buf[..plen]).expect("golden generator: rsp_lock self-decode");
+    let expect = Json::Obj(vec![
+        ("lock_flags", n(d.lock_flags as i64)),
+        ("lock_timeout_s", n(d.lock_timeout_s as i64)),
+        ("pin_set", b(d.pin_set)),
+    ]);
+    decode_vector(name, "rsp_lock", FRAME_RSP_LOCK, &buf[..plen], expect)
+}
+
 fn rsp_error_vector(name: &'static str, error_code: u8, msg: &[u8]) -> Vector {
     let mut buf = [0u8; 128];
     let plen = encode_rsp_error(error_code, msg, &mut buf);
@@ -724,6 +746,53 @@ fn build_vectors() -> Vec<Vector> {
         ));
     }
     v.push(encode_vector(
+        "query_lock",
+        "query_lock",
+        FRAME_QUERY_LOCK,
+        &[],
+        Json::Obj(vec![]),
+    ));
+    {
+        let pin = *b"1234";
+        let mut buf = [0u8; 8];
+        let plen = encode_set_lock_pin(&pin, &mut buf);
+        v.push(encode_vector(
+            "set_lock_pin",
+            "set_lock_pin",
+            FRAME_SET_LOCK_PIN,
+            &buf[..plen],
+            Json::Obj(vec![("pin", s(std::str::from_utf8(&pin).unwrap()))]),
+        ));
+    }
+    {
+        let mut buf = [0u8; 8];
+        let plen = encode_set_lock_config(LOCK_SCREEN_ENABLE, 300, &mut buf);
+        v.push(encode_vector(
+            "set_lock_config_enabled",
+            "set_lock_config",
+            FRAME_SET_LOCK_CONFIG,
+            &buf[..plen],
+            Json::Obj(vec![
+                ("lock_flags", n(LOCK_SCREEN_ENABLE as i64)),
+                ("lock_timeout_s", n(300)),
+            ]),
+        ));
+    }
+    {
+        let mut buf = [0u8; 8];
+        let plen = encode_set_lock_config(0, LOCK_TIMEOUT_MIN_S, &mut buf);
+        v.push(encode_vector(
+            "set_lock_config_disabled_min_timeout",
+            "set_lock_config",
+            FRAME_SET_LOCK_CONFIG,
+            &buf[..plen],
+            Json::Obj(vec![
+                ("lock_flags", n(0)),
+                ("lock_timeout_s", n(LOCK_TIMEOUT_MIN_S as i64)),
+            ]),
+        ));
+    }
+    v.push(encode_vector(
         "commit_provisioning",
         "commit_provisioning",
         FRAME_COMMIT_PROVISIONING,
@@ -892,6 +961,19 @@ fn build_vectors() -> Vec<Vector> {
         [0x2au8; 32],
         1_700_000_000,
         "Cadet Card",
+    ));
+
+    v.push(rsp_lock_vector(
+        "rsp_lock_enabled_pin_set",
+        LOCK_SCREEN_ENABLE,
+        LOCK_TIMEOUT_DEFAULT_S,
+        true,
+    ));
+    v.push(rsp_lock_vector(
+        "rsp_lock_disabled_no_pin",
+        0,
+        LOCK_TIMEOUT_DEFAULT_S,
+        false,
     ));
 
     v.push(rsp_history_entry_vector(
