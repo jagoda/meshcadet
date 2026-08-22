@@ -8,6 +8,41 @@ Versioning is managed by [release-please](https://github.com/googleapis/release-
 The entry below documents everything landed before release-please's first
 `chore(release): vX.Y.Z` PR.
 
+## [0.7.0](https://github.com/jagoda/meshcadet/compare/v0.6.0...v0.7.0) (2026-08-22)
+
+
+### Added
+
+* **firmware:** auto-retry unacked DM/room-post sends with backoff cap ([d6eb9d0](https://github.com/jagoda/meshcadet/commit/d6eb9d02a7463dfc6a91e937668f7353b6869746))
+* **firmware:** auto-retry unacked DM/room-post sends with backoff cap ([5da1534](https://github.com/jagoda/meshcadet/commit/5da153439cfd6b793e771b2f82ebf3da414f9ccc))
+* **firmware:** stabilize battery SoC — NVS persistence, peak sampling, slew-limit + buckets ([2508553](https://github.com/jagoda/meshcadet/commit/250855365451d1279c19c942b6de46bfb9502ca1))
+* **firmware:** tri-state delivery-state model for DM/room-post ACKs ([0315458](https://github.com/jagoda/meshcadet/commit/0315458adae9e07adc2a743f66821c97b39ee7ce))
+* **firmware:** tri-state delivery-state model for DM/room-post ACKs ([8cfa860](https://github.com/jagoda/meshcadet/commit/8cfa860188b832b4ed786323fc5d29b98b79b4fb))
+* **protocol:** send raw battery millivolts in the telemetry RESPONSE ([208f45f](https://github.com/jagoda/meshcadet/commit/208f45f6dccee3b398c1942b2bc2450433fb1fcc))
+* **protocol:** send raw battery millivolts in the telemetry RESPONSE ([1a8c1c6](https://github.com/jagoda/meshcadet/commit/1a8c1c64292779e49dbd64271d372a9a36b9346b))
+* **ui:** add a glanceable battery indicator beside the header signal meter ([e6a0019](https://github.com/jagoda/meshcadet/commit/e6a0019c4a9b04c41d46ff1266133c3dd597f187))
+* **ui:** add a glanceable battery indicator beside the header SignalMeter ([8d630a7](https://github.com/jagoda/meshcadet/commit/8d630a7a4c077892c2dd315dd4ad0530e1b0b238))
+
+
+### Fixed
+
+* **ci:** close the vocabulary-leak recurrence path at commit-subject time ([ba7a834](https://github.com/jagoda/meshcadet/commit/ba7a834220ce413cc0ef3d852e6e9a4751196a80))
+* **ci:** scrub internal doc-path leak from alloc_tick_dedup.rs ([706bb2b](https://github.com/jagoda/meshcadet/commit/706bb2bf5cdce2ad3af14a833e3884d8a051959f))
+* **ci:** scrub internal doc-path leaks from battery.rs comments ([aa86dee](https://github.com/jagoda/meshcadet/commit/aa86dee5b84cfadbf032106d1330f05c3d08dc62))
+* **ci:** scrub internal-ops vocabulary leak from ACK-matcher doc comments ([a56bd88](https://github.com/jagoda/meshcadet/commit/a56bd88fb99fefbd2bce18dbf067e0e1949212ff))
+* **ci:** scrub internal-ops vocabulary leak from battery.rs doc comment ([712389b](https://github.com/jagoda/meshcadet/commit/712389b2d00060547d61c12a5dcc9d0730afa432))
+* **firmware:** accept pre-fix GPS RMC sync from the GNSS module's backup RTC ([f07eded](https://github.com/jagoda/meshcadet/commit/f07eded51db10edb5d3ff49137b98429ea5ae7cd))
+* **firmware:** battery indicator no longer crawls at ~2%/30s off a contaminated boot-time guess ([aa6dbc0](https://github.com/jagoda/meshcadet/commit/aa6dbc034d9860098dd097f2973bc0ab461c842c))
+* **firmware:** honest clock-source provenance and a real sync-age on the GPS status screen ([a3bb136](https://github.com/jagoda/meshcadet/commit/a3bb136c4e5830dbb6dd29ecda11137733e5663c))
+* **firmware:** honest clock-source provenance and a real sync-age on the GPS status screen ([7962350](https://github.com/jagoda/meshcadet/commit/7962350a22e259908b35dab7bf8e9c17fbf5b0a7))
+* **firmware:** skip the discharge slew limit on the first confirmed percent basis ([edff082](https://github.com/jagoda/meshcadet/commit/edff082aa6a6794f8bdd7db2cd4c10ef68b84d07))
+* **ui:** align header icon clusters to the header's outer edges ([d6585ae](https://github.com/jagoda/meshcadet/commit/d6585ae04d125cdde99c054f82beb914991d1c00))
+* **ui:** align header icon clusters to the header's outer edges ([87719fd](https://github.com/jagoda/meshcadet/commit/87719fdb37b525ee7b4b616778b666c85a8e7b2b))
+* **ui:** center the messaging view's header status icons vertically ([60abad2](https://github.com/jagoda/meshcadet/commit/60abad28132a8d1dc810df28fec67aef9172cd96))
+* **ui:** center the messaging view's header status icons vertically ([985f07d](https://github.com/jagoda/meshcadet/commit/985f07dd10dd0f5e1ff4dd50be8a0e4ea24c2b00))
+* **ui:** drop the static comet accent from the message-view header ([3ce2ea2](https://github.com/jagoda/meshcadet/commit/3ce2ea24e8fe6c9efd62f6e0a91de2e4ac378f8d))
+* **ui:** drop the static comet accent from the message-view header ([8e5136f](https://github.com/jagoda/meshcadet/commit/8e5136fd4fe1a0ad02c642769078c346f4147807))
+
 ## [0.6.0](https://github.com/jagoda/meshcadet/compare/v0.5.0...v0.6.0) (2026-08-04)
 
 
