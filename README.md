@@ -129,6 +129,53 @@ contact:
 - MeshCadet is **never itself a room server** — it does not host, relay, or
   serve a room to anyone else.
 
+## Screen lock
+
+MeshCadet can lock its touch screen after a configurable idle timeout,
+requiring a 4-digit PIN to unlock. Enable/disable and the timeout
+(15–3600 s) are settable from all three configuration surfaces: the
+on-device admin menu, the [web provisioner](site/README.md), and the host
+CLI (`lock-config`, below). The lock PIN itself is settable only from the
+web provisioner and the host CLI (`set-lock-pin` / `reset-lock-pin`) — there
+is no on-device path to set or change it.
+
+- **Two distinct PINs.** The lock PIN is **not** the admin-menu PIN.
+  Unlocking the screen never opens the admin menu, and the admin PIN never
+  unlocks the screen. This is deliberate: a shared PIN would let anyone who
+  can unlock the screen also open the admin menu and disable the lock,
+  defeating the point of having one.
+- **Casual-access control, not a security boundary.** `admin_server`, the
+  thread that handles runtime USB-serial admin frames (including
+  `set-lock-pin`/`lock-config`), applies **no PIN gate of any kind** —
+  physical USB possession is already the sole authentication factor for the
+  admin channel (see [ADR-0001 §4](docs/adr/0001-charter.md)), and
+  `reset-lock-pin` exists precisely as the deliberate recovery path for a
+  forgotten lock PIN. The practical consequence: **anyone with physical
+  access to the device and a USB cable clears the screen lock**, no PIN
+  needed. Both the lock PIN and the admin PIN are also stored **in plaintext**
+  in device flash, each checked with its own constant-time comparison
+  (`pin_menu::verify_pin` for the admin PIN, `lock_store::verify` for the
+  lock PIN) — that prevents a timing side-channel, but it is not hashing.
+  Treat the screen lock as a deterrent against a casual pickup, not as
+  protection against anyone willing to plug in a cable.
+- **No emergency / SOS affordance.** Nothing — no emergency contact, no SOS
+  send, no panic gesture — is reachable while the screen is locked. This is a
+  deliberate ruling, not an oversight: an affordance reachable from a locked
+  screen is a bypass by construction, and MeshCadet does not claim to be a
+  safety-of-life device (see the [Disclaimer](#-disclaimer--no-warranty-no-guarantee-of-safety-use-at-your-own-risk)
+  above).
+- **Notifications still fire while locked.** A message received while locked
+  still chirps and bumps the lock screen's badge, but discloses a **count
+  only** — no sender name, no message preview. An in-flight Compose draft
+  survives a lock/unlock cycle, and the device boots locked whenever the lock
+  is enabled. Five consecutive wrong PINs trigger an escalating backoff
+  (30/60/120/300 s, capped); nothing about a wrong PIN is written to flash.
+
+See [`docs/adr/0013-screen-lock-policy-layer.md`](docs/adr/0013-screen-lock-policy-layer.md)
+for the full design rationale, and
+[`docs/screen-lock-bench-procedure.md`](docs/screen-lock-bench-procedure.md)
+for the on-hardware verification procedure.
+
 ## Status and known limitations
 
 Functional and interop-tested against real MeshCore hardware for the core
