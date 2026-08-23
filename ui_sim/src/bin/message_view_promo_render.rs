@@ -25,35 +25,35 @@ fn main() {
                 from_name: "",
                 time_str: "2:14p",
                 is_ours: false,
-                acked: false,
+                delivery_state: 0,
             },
             PromoMessage {
                 text: "Nice catch! Any photos?",
                 from_name: "",
                 time_str: "2:15p",
                 is_ours: true,
-                acked: true,
+                delivery_state: 1, // Acked
             },
             PromoMessage {
                 text: "Snapped a few - sending later tonight",
                 from_name: "",
                 time_str: "2:16p",
                 is_ours: false,
-                acked: false,
+                delivery_state: 0,
             },
             PromoMessage {
                 text: "Can't wait!",
                 from_name: "",
                 time_str: "2:17p",
                 is_ours: true,
-                acked: false,
+                delivery_state: 0, // Pending
             },
             PromoMessage {
                 text: "Also - clear skies forecast for the meteor shower this weekend!",
                 from_name: "",
                 time_str: "2:19p",
                 is_ours: false,
-                acked: false,
+                delivery_state: 0,
             },
         ],
     );

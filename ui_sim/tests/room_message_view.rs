@@ -56,14 +56,14 @@ fn room_posts_render_as_received_message_bubbles() {
                 from_name: "",
                 time_str: "3:01p",
                 is_ours: false,
-                acked: false,
+                delivery_state: 0,
             },
             PromoMessage {
                 text: "post two",
                 from_name: "",
                 time_str: "3:02p",
                 is_ours: false,
-                acked: false,
+                delivery_state: 0,
             },
         ],
     );

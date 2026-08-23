@@ -61,7 +61,7 @@ fn status_icon_pair_is_vertically_centered_in_the_header_not_top_anchored() {
             from_name: "",
             time_str: "2:14p",
             is_ours: false,
-            acked: false,
+            delivery_state: 0,
         }],
     );
     // All 5 bars filled — the strongest, most visually unmistakable signal
