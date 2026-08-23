@@ -34,6 +34,9 @@
 //! | `FRAME_EXPORT_HISTORY`  | host→device | stream all history entries, then send DONE |
 //! | `FRAME_CLEAR_HISTORY`   | host→device | erase ALL persisted conversation history (every DM + channel, both directions), reply `RSP_OK` / `RSP_ERROR` — flash effect immediate, UI in-memory state needs a reboot to reflect it (see handler doc comment) |
 //! | `FRAME_QUERY_ADVERT`    | host→device | build + sign this device's self-advert card, reply `RSP_ADVERT` with the raw card bytes — written straight to this serial reply, **never** enqueued onto `txq`/the radio dispatcher (see handler doc comment) |
+//! | `FRAME_QUERY_LOCK`      | host→device | reply `RSP_LOCK` with the CURRENT `lock_flags`/`lock_timeout_s` (read fresh from `mc_rts` every call — the on-device admin menu can change them without going through this thread) and whether a screen-lock PIN is stored (`mc_lock`) |
+//! | `FRAME_SET_LOCK_PIN`    | host→device | set/reset the screen-lock PIN (distinct from the admin PIN above), persist to the dedicated `mc_lock` NVS store, reply `RSP_OK` / `RSP_ERROR` |
+//! | `FRAME_SET_LOCK_CONFIG` | host→device | forward the new enable-flags/timeout to the UI thread as `UiEvent::LockConfigChanged` over the cloned `evt_tx` — **not** persisted by this thread (the `mc_rts` single-writer invariant, see this file's own module doc below); `RSP_OK` means "accepted and forwarded," not "persisted" |
 //!
 //! `QUERY_STATUS` is the host CLI's connect-and-verify command (`meshcadet
 //! status` / `identity`).  The unprovisioned [`provisioning_server`] answers it
@@ -65,8 +68,30 @@
 //! channel/contact set captured at boot; persisted edits take full effect on
 //! the next boot — consistent with the existing provisioning model, in which
 //! the provisioned channel set is not yet wired to the radio.
+//!
+//! # The `mc_rts` single-writer invariant (screen-lock plan D2)
+//!
+//! **This thread must never write the `mc_rts` (`runtime_settings_store`)
+//! namespace.** That store's sole writer is the UI thread — see
+//! `runtime_settings_store.rs`'s module doc for the read-modify-write race a
+//! second writer would open. `FRAME_SET_LOCK_CONFIG` therefore does not call
+//! `runtime_settings_store::save` (or touch `pin_menu::RuntimeSettings` at
+//! all) the way `FRAME_SET_NOTIF_DEFAULTS`/`FRAME_SET_PIN` mutate and persist
+//! `ProvisionedConfig` above; it forwards the new value to the UI thread as a
+//! `UiEvent::LockConfigChanged` instead, over the `evt_tx` clone this
+//! thread's `run()` is spawned with (`main.rs`'s admin_server spawn site —
+//! `SyncSender` is `Clone`, constructed well before that spawn). This is
+//! what makes "lock enable/timeout configurable from all three surfaces
+//! (on-device admin menu, web provisioner, host CLI)" possible without
+//! reopening `mc_rts`'s config-ownership split
+//! (`checklists/meshcadet-firmware-dispatcher-stateful-feature.md`'s last
+//! item).
+//!
+//! Reads of `mc_rts` (`FRAME_QUERY_LOCK`, below) are unrestricted — the
+//! invariant is about writes, not reads.
 
 use std::io::Write;
+use std::sync::mpsc::SyncSender;
 
 use anyhow::anyhow;
 use esp_idf_svc::nvs::{EspNvsPartition, NvsDefault};
@@ -76,19 +101,22 @@ use protocol::provisioning::{
     FRAME_ADD_CHANNEL, FRAME_ADD_CONTACT, FRAME_ADD_ROOM, FRAME_CLEAR_HISTORY,
     FRAME_COMMIT_PROVISIONING, FRAME_DEL_CHANNEL, FRAME_DEL_CONTACT, FRAME_DEL_ROOM,
     FRAME_EXPORT_HISTORY, FRAME_QUERY_ADVERT, FRAME_QUERY_CHANNELS, FRAME_QUERY_CONTACTS,
-    FRAME_QUERY_ROOMS, FRAME_QUERY_STATUS, FRAME_RSP_ADVERT, FRAME_RSP_CHANNEL,
+    FRAME_QUERY_LOCK, FRAME_QUERY_ROOMS, FRAME_QUERY_STATUS, FRAME_RSP_ADVERT, FRAME_RSP_CHANNEL,
     FRAME_RSP_CHANNELS_DONE, FRAME_RSP_CONTACT, FRAME_RSP_CONTACTS_DONE, FRAME_RSP_ERROR,
-    FRAME_RSP_HISTORY_DONE, FRAME_RSP_HISTORY_ENTRY, FRAME_RSP_IDENTITY, FRAME_RSP_OK,
-    FRAME_RSP_STATUS, FRAME_SET_DEVICE_NAME, FRAME_SET_NOTIF_DEFAULTS,
-    FRAME_SET_PIN, FRAME_OVERHEAD, MAX_NAME_LEN, PROV_MAGIC, ProvError, RspStatusPayload,
+    FRAME_RSP_HISTORY_DONE, FRAME_RSP_HISTORY_ENTRY, FRAME_RSP_IDENTITY, FRAME_RSP_LOCK,
+    FRAME_RSP_OK, FRAME_RSP_STATUS, FRAME_SET_DEVICE_NAME, FRAME_SET_LOCK_CONFIG,
+    FRAME_SET_LOCK_PIN, FRAME_SET_NOTIF_DEFAULTS, FRAME_SET_PIN, FRAME_OVERHEAD, LOCK_PIN_LEN,
+    MAX_NAME_LEN, PROV_MAGIC, ProvError, RspLockPayload, RspStatusPayload,
     decode_add_channel, decode_add_contact, decode_del_channel, decode_del_contact, decode_frame,
-    decode_set_device_name, decode_set_notif_defaults, decode_set_pin,
+    decode_set_device_name, decode_set_lock_config, decode_set_lock_pin, decode_set_notif_defaults,
+    decode_set_pin,
     encode_frame, encode_rsp_channel, encode_rsp_contact, encode_rsp_error, encode_rsp_identity,
-    encode_rsp_status,
+    encode_rsp_lock, encode_rsp_status,
 };
 use protocol::{encode_rsp_history_entry, Identity, MAX_ADVERT_CARD_LEN, MAX_RSP_HISTORY_ENTRY_PAYLOAD};
 
 use firmware_core::room_admin::{self, AddRoomOutcome, DelRoomOutcome};
+use firmware_core::ui::ui_task_boundary::send_or_count;
 
 use crate::advert_ts_store;
 use crate::config_store::{
@@ -97,6 +125,7 @@ use crate::config_store::{
 };
 use crate::history_store::HistoryStore;
 use crate::room_session;
+use crate::ui::UiEvent;
 
 /// Frame receive buffer.  Sized to match `provisioning_server` (512 B) so the
 /// largest host command frame always fits: an `ADD_CONTACT` / `ADD_CHANNEL`
@@ -117,6 +146,13 @@ mod err {
     pub const CHANNEL_NOT_FOUND: u8 = 0x04;
     pub const DECODE_ERROR: u8      = 0x05;
     pub const STORAGE_ERROR: u8     = 0x06;
+    /// `FRAME_SET_LOCK_CONFIG` decoded fine but could not be forwarded to the
+    /// UI thread (the `UiEvent` queue was full or the UI thread is gone) —
+    /// distinct from `STORAGE_ERROR` because nothing was written to NVS
+    /// either way; see that handler's doc for the ack-asymmetry this exists
+    /// to preserve (`RSP_OK` must mean "accepted and forwarded," never a
+    /// silently swallowed forward failure).
+    pub const FORWARD_ERROR: u8     = 0x07;
 }
 
 /// Entry point for the admin server thread.
@@ -160,6 +196,12 @@ mod err {
 /// `QUERY_STATUS` reports the same battery reading the radio telemetry
 /// RESPONSE and the admin-menu screen show (single shared source; see
 /// `battery` module docs).
+///
+/// `evt_tx` is a clone of the dispatcher/UI event channel (ADR-0012 D3),
+/// constructed by `main.rs` well before this thread is spawned —
+/// `FRAME_SET_LOCK_CONFIG` forwards a `UiEvent::LockConfigChanged` over it
+/// rather than writing `mc_rts` directly (see this module's doc for the
+/// single-writer invariant this exists to preserve).
 pub fn run(
     history: &'static std::sync::Mutex<Option<HistoryStore>>,
     gps_status: &'static std::sync::Mutex<crate::gps::GpsStatus>,
@@ -167,6 +209,7 @@ pub fn run(
     identity: Identity,
     mut config: Box<ProvisionedConfig>,
     nvs_partition: EspNvsPartition<NvsDefault>,
+    evt_tx: SyncSender<UiEvent>,
 ) {
     // Device display name lives in the identity store (`mc_id`/`name`), not
     // the provisioned config blob — see identity_store.rs doc comment. Load
@@ -182,6 +225,15 @@ pub fn run(
     let mut rx_buf = [0u8; RX_BUF_LEN];
     let mut rx_len = 0usize;
     let mut stdout_ = std::io::stdout();
+    // Count of `UiEvent::LockConfigChanged` forwards dropped because the UI
+    // event queue was full/disconnected (`send_or_count`, ADR-0012 C2) — this
+    // thread's own local counter, distinct from `main.rs`'s dispatcher-loop
+    // `evt_dropped` (a different thread, a different channel-degradation
+    // budget). Logged inline on every drop (`FRAME_SET_LOCK_CONFIG`'s arm),
+    // not just periodically — a host-initiated config write is rare enough
+    // that a drop is worth surfacing immediately, unlike the high-frequency
+    // per-tick pushes `main.rs` batches into a periodic log line.
+    let mut evt_dropped: u32 = 0;
 
     // Stack HWM immediately after setup, before the frame loop — the exact
     // point an on-hardware boot crashed as a `pthread`-task stack overflow
@@ -249,6 +301,8 @@ pub fn run(
                     &nvs_partition,
                     &mut device_name,
                     &mut device_name_len,
+                    &evt_tx,
+                    &mut evt_dropped,
                     &mut stdout_,
                 ) {
                     log::warn!("admin_server: handle_frame error: {}", e);
@@ -288,6 +342,8 @@ fn handle_frame(
     nvs_partition: &EspNvsPartition<NvsDefault>,
     device_name: &mut [u8; MAX_NAME_LEN],
     device_name_len: &mut u8,
+    evt_tx: &SyncSender<UiEvent>,
+    evt_dropped: &mut u32,
     out: &mut impl Write,
 ) -> anyhow::Result<()> {
     match frame_type {
@@ -604,6 +660,44 @@ fn handle_frame(
                 send_frame(out, frame_type, &room_payload)?;
             }
         }
+        // ── QUERY_LOCK ───────────────────────────────────────────────────────
+        // The host CLI's `lock-status` command / the web provisioner's lock
+        // panel. Unlike every `QUERY_*` arm above, this reads a store this
+        // thread does NOT own (`mc_rts`, via `runtime_settings_store::load`)
+        // fresh on every call rather than a boot-time snapshot: the on-device
+        // admin menu can change `lock_flags`/`lock_timeout_s` directly
+        // (phase 8 of the screen-lock campaign), bypassing this thread
+        // entirely, so a cached copy here would go stale. This is a READ —
+        // the single-writer invariant this file's module doc states is about
+        // WRITES (this thread never calls `runtime_settings_store::save`).
+        // `pin_set` comes from the separate `mc_lock` store this thread DOES
+        // own (see `FRAME_SET_LOCK_PIN` below); the PIN bytes themselves are
+        // never read back onto the wire — only whether one is configured.
+        FRAME_QUERY_LOCK => {
+            let notif_defaults = (config.notif_defaults.visual, config.notif_defaults.audible);
+            let settings = crate::runtime_settings_store::load(nvs_partition.clone(), notif_defaults)
+                .unwrap_or_else(|e| {
+                    log::warn!(
+                        "admin_server: QUERY_LOCK — runtime_settings_store::load failed: {:?}; \
+                         reporting defaults",
+                        e,
+                    );
+                    crate::pin_menu::RuntimeSettings::default_enabled()
+                });
+            let (_lock_pin, lock_pin_len) = crate::lock_store::load(nvs_partition.clone());
+            log::info!(
+                "admin_server: QUERY_LOCK — lock_flags=0x{:02x} lock_timeout_s={} pin_set={}",
+                settings.lock_flags, settings.lock_timeout_s, lock_pin_len > 0,
+            );
+            let rsp = RspLockPayload {
+                lock_flags: settings.lock_flags,
+                lock_timeout_s: settings.lock_timeout_s,
+                pin_set: lock_pin_len > 0,
+            };
+            let mut pbuf = [0u8; 8];
+            let plen = encode_rsp_lock(&rsp, &mut pbuf);
+            send_frame(out, FRAME_RSP_LOCK, &pbuf[..plen])?;
+        }
         // ── ADD_ROOM ─────────────────────────────────────────────────────────
         // Upsert a room-server contact keyed on its pubkey: `room_admin::handle_add_room`
         // (firmware-core, host-tested — see the M1 gap-fix doc there) decodes
@@ -764,6 +858,92 @@ fn handle_frame(
                 Err(e) => {
                     log::warn!("admin_server: SET_PIN decode: {:?}", e);
                     return send_error(out, err::DECODE_ERROR, b"set_pin decode error");
+                }
+            }
+        }
+        // ── SET_LOCK_PIN ─────────────────────────────────────────────────────
+        // The host CLI's `set-lock-pin`/`reset-lock-pin` commands and the web
+        // provisioner's lock-PIN field — distinct PIN from SET_PIN's admin PIN
+        // above, stored in its own dedicated `mc_lock` NVS namespace rather
+        // than `ProvisionedConfig` (D2; see `lock_store.rs`'s module doc for
+        // the full reasoning). `decode_set_lock_pin` has already enforced the
+        // exactly-`LOCK_PIN_LEN`-ASCII-digit shape (`ProvError::LockPinInvalid`
+        // otherwise) — this arm trusts that and owns only the NVS write + ack.
+        // The PIN itself is never logged, mirroring the guest-password
+        // discipline the ADD_ROOM arm above documents.
+        FRAME_SET_LOCK_PIN => {
+            match decode_set_lock_pin(payload) {
+                Ok(p) => {
+                    match crate::lock_store::save(nvs_partition.clone(), &p.pin, LOCK_PIN_LEN as u8) {
+                        Ok(()) => {
+                            log::info!("admin_server: SET_LOCK_PIN — stored");
+                            send_ok(out)?;
+                        }
+                        Err(e) => {
+                            log::error!("admin_server: SET_LOCK_PIN — NVS save failed: {:?}", e);
+                            return send_error(out, err::STORAGE_ERROR, b"NVS save failed");
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("admin_server: SET_LOCK_PIN decode: {:?}", e);
+                    return send_error(out, err::DECODE_ERROR, b"set_lock_pin decode error");
+                }
+            }
+        }
+        // ── SET_LOCK_CONFIG ──────────────────────────────────────────────────
+        // The host CLI's `lock-config --enable/--disable --timeout` and the
+        // web provisioner's lock enable/timeout controls.
+        //
+        // HARD CONSTRAINT (screen-lock plan D2 — see this file's module doc):
+        // this thread must NOT write `mc_rts`. Forward the new flags/timeout
+        // to the UI thread instead, over the `evt_tx` clone this thread was
+        // spawned with; `UiRuntime::handle_event`'s `UiEvent::LockConfigChanged`
+        // arm applies it via `pin_menu::apply_menu_action` and persists
+        // through the existing `UiCommand::PersistRuntimeSettings` path,
+        // asynchronously, on the UI thread's own schedule.
+        //
+        // ACK ASYMMETRY (documented per this mission's scope): `RSP_OK` here
+        // means "accepted and forwarded," NOT "persisted" — unlike every
+        // other `SET_*` arm in this file, where `RSP_OK` follows a completed
+        // NVS write. A `try_send` failure (the UI event queue is full, or the
+        // UI thread is gone) is surfaced as `RSP_ERROR(FORWARD_ERROR)` rather
+        // than swallowed — a dropped forward must never look like an
+        // accepted change to the host.
+        FRAME_SET_LOCK_CONFIG => {
+            match decode_set_lock_config(payload) {
+                Ok(cfg) => {
+                    let sent = send_or_count(
+                        evt_tx,
+                        UiEvent::LockConfigChanged {
+                            lock_flags: cfg.lock_flags,
+                            lock_timeout_s: cfg.lock_timeout_s,
+                        },
+                        evt_dropped,
+                    );
+                    if sent {
+                        log::info!(
+                            "admin_server: SET_LOCK_CONFIG — forwarded to UI thread \
+                             (lock_flags=0x{:02x} lock_timeout_s={})",
+                            cfg.lock_flags, cfg.lock_timeout_s,
+                        );
+                        send_ok(out)?;
+                    } else {
+                        log::warn!(
+                            "admin_server: SET_LOCK_CONFIG — UiEvent queue full/disconnected \
+                             ({} dropped so far); NOT forwarded",
+                            *evt_dropped,
+                        );
+                        return send_error(
+                            out,
+                            err::FORWARD_ERROR,
+                            b"lock config not forwarded to UI thread",
+                        );
+                    }
+                }
+                Err(e) => {
+                    log::warn!("admin_server: SET_LOCK_CONFIG decode: {:?}", e);
+                    return send_error(out, err::DECODE_ERROR, b"set_lock_config decode error");
                 }
             }
         }

@@ -53,7 +53,7 @@
 //! | [`inbound_replay`] | `firmware/src/main.rs`'s `handle_dm` gate + `inbound_replay_store.rs` (a small dedicated per-contact NVS store) |
 //! | [`battery`]       | `battery::BatteryDriver` (ADC1 sampling)                        |
 //! | [`runtime_settings_store`] | `runtime_settings_store::{load, save}` (`EspNvs`)     |
-//! | [`lock_store`]    | `lock_store::{load, save}` (`EspNvs`, `mc_lock` namespace — a later campaign phase) |
+//! | [`lock_store`]    | `lock_store::{load, save}` (`EspNvs`, `mc_lock` namespace)      |
 //! | [`ui::lock`]      | *(none yet — the Slint lock screen + `UiRuntime` wiring is a later campaign phase)* |
 //! | [`signal_tracker`] | rx-tap in `firmware/src/main.rs` + the Slint `SignalMeter` widget (`ui/signal_meter.slint`, glue in [`ui::signal_meter`]) |
 //!
