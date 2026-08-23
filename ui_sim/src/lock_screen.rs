@@ -328,7 +328,10 @@ impl LockScreenFrame {
         let rendered = self.window.draw_if_needed(|renderer| {
             renderer.render(&mut framebuffer, WIDTH as usize);
         });
-        assert!(rendered, "lock-screen frame was not dirty — nothing painted");
+        assert!(
+            rendered,
+            "lock-screen frame was not dirty — nothing painted"
+        );
         framebuffer
     }
 }

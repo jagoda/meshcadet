@@ -140,8 +140,18 @@ pub fn check_source(ui_mod_src: &str) -> Vec<String> {
     let keyboard_block = &ui_mod_src[keyboard_off..trackball_off];
     let trackball_block = &ui_mod_src[trackball_off..trackball_end_off];
 
-    check_block(keyboard_block, KEYBOARD_RISKY_CALL, "keyboard", &mut violations);
-    check_block(trackball_block, TRACKBALL_RISKY_CALL, "trackball", &mut violations);
+    check_block(
+        keyboard_block,
+        KEYBOARD_RISKY_CALL,
+        "keyboard",
+        &mut violations,
+    );
+    check_block(
+        trackball_block,
+        TRACKBALL_RISKY_CALL,
+        "trackball",
+        &mut violations,
+    );
 
     violations
 }
@@ -236,11 +246,15 @@ mod tests {
     fn ungated_keyboard_block_is_caught() {
         let violations = check_source(&synthetic_step(false, true));
         assert!(
-            violations.iter().any(|v| v.contains("keyboard block calls")),
+            violations
+                .iter()
+                .any(|v| v.contains("keyboard block calls")),
             "expected a keyboard violation, got {violations:?}"
         );
         assert!(
-            !violations.iter().any(|v| v.contains("trackball block calls")),
+            !violations
+                .iter()
+                .any(|v| v.contains("trackball block calls")),
             "trackball is still gated and must not be flagged, got {violations:?}"
         );
     }
@@ -250,7 +264,9 @@ mod tests {
     fn ungated_trackball_block_is_caught() {
         let violations = check_source(&synthetic_step(true, false));
         assert!(
-            violations.iter().any(|v| v.contains("trackball block calls")),
+            violations
+                .iter()
+                .any(|v| v.contains("trackball block calls")),
             "expected a trackball violation, got {violations:?}"
         );
     }
@@ -284,7 +300,9 @@ mod tests {
         );
         let violations = check_source(&src);
         assert!(
-            violations.iter().any(|v| v.contains("keyboard block calls")),
+            violations
+                .iter()
+                .any(|v| v.contains("keyboard block calls")),
             "a comment-only mention must not satisfy the gate; got {violations:?}"
         );
     }

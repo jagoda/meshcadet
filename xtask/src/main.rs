@@ -320,7 +320,10 @@ fn main() -> ExitCode {
         );
     } else {
         ok = false;
-        eprintln!("xtask verify-lock-gate: FAILED — {} violation(s):", lock_gate.len());
+        eprintln!(
+            "xtask verify-lock-gate: FAILED — {} violation(s):",
+            lock_gate.len()
+        );
         for v in &lock_gate {
             eprintln!("  - {v}");
         }
