@@ -444,6 +444,26 @@ pub enum UiEvent {
         lock_flags: u8,
         lock_timeout_s: u16,
     },
+    /// Host/provisioner wrote a new screen-lock PIN via `FRAME_SET_LOCK_PIN`
+    /// — forwarded here (mirrors `LockConfigChanged`'s live-forward pattern)
+    /// so the change takes effect immediately in this thread's
+    /// `stored_lock_pin`/`stored_lock_pin_len`, instead of only at the next
+    /// boot via `BootSeed::lock_pin`/`lock_pin_len`. Before this variant
+    /// existed, a `set-lock-pin` write landed durably in the dedicated
+    /// `mc_lock` NVS store (`admin_server` owns that write outright — no
+    /// single-writer conflict with `mc_rts` the way `LockConfigChanged`
+    /// has) but the live UI thread never learned of it, so a same-session
+    /// `set-lock-pin` followed by `lock-config --enable` locked the device
+    /// with a PIN the running UI thread still compared against the STALE
+    /// boot-time value (or none at all) — locking the operator out until a
+    /// power cycle, and making `reset-lock-pin` against an already-locked
+    /// device a no-op from the operator's point of view. `handle_event`
+    /// applies this via the existing [`UiRuntime::set_lock_pin`] — the same
+    /// call `BootSeed` makes.
+    LockPinChanged {
+        lock_pin: [u8; LOCK_PIN_LEN],
+        lock_pin_len: u8,
+    },
 }
 
 /// Every boot-time (`main.rs::run()`'s bring-up path) `UiRuntime` seed call,
@@ -2627,7 +2647,18 @@ impl<'d> UiRuntime<'d> {
         // renders between here and this file's own render call below, so any
         // component swap earlier in this exact tick is corrected before a
         // single frame of it is ever flushed to the display.
+        //
+        // F2 (deep-review pass 1): also the retry site for a `trip_lock`
+        // whose `LockScreen::new()` failed — `locked` is `true` but
+        // `lock_screen` is still `None` in that case (see `trip_lock`'s
+        // doc). `construct_lock_screen` is idempotent (no-ops once
+        // `lock_screen` is `Some`), so calling it unconditionally here every
+        // tick while locked is cheap in the common case and self-heals a
+        // transient construction failure without a dedicated retry timer.
         if self.locked {
+            if self.lock_screen.is_none() {
+                self.construct_lock_screen();
+            }
             if let Some(ref screen) = self.lock_screen {
                 screen.show();
             }
@@ -2773,6 +2804,21 @@ impl<'d> UiRuntime<'d> {
                     s.lock_flags, s.lock_timeout_s,
                 );
                 persist_runtime_settings(&self.cmd_tx, &s);
+            }
+            // Host/provisioner wrote a new screen-lock PIN, forwarded by
+            // `admin_server` after its own durable `mc_lock` NVS write
+            // already landed — see `UiEvent::LockPinChanged`'s own doc for
+            // the lockout/no-op-reset mechanism this closes. No persist
+            // call here: `admin_server` already owns and wrote the
+            // `mc_lock` store directly (unlike `LockConfigChanged`'s
+            // `mc_rts`, this store has no single-writer conflict), so this
+            // arm only needs to make the live in-memory copy match it.
+            UiEvent::LockPinChanged { lock_pin, lock_pin_len } => {
+                self.set_lock_pin(lock_pin, lock_pin_len);
+                log::info!(
+                    "ui: screen-lock PIN changed via host/provisioner (lock_pin_len={})",
+                    lock_pin_len,
+                );
             }
             UiEvent::IncomingDm { from_hash, from_name, text } => {
                 self.contact_names
@@ -3904,22 +3950,56 @@ impl<'d> UiRuntime<'d> {
     /// Does NOT reset `last_activity_ms` — an idle-triggered trip should not
     /// silently extend the very timeout it just fired (there is nothing to
     /// extend: the lock has already tripped either way).
+    ///
+    /// FAILS CLOSED (deep-review pass 1, F2): `self.locked` is set `true`
+    /// unconditionally, BEFORE [`Self::construct_lock_screen`]'s fallible
+    /// `LockScreen::new()` is even attempted — not after a successful
+    /// construction, as this used to read. Every keyboard/trackball input
+    /// gate in `step()` checks `self.locked`, not "is a lock overlay
+    /// present," so the old ordering meant a `LockScreen::new()` failure
+    /// left `locked == false` with the underlying screen already hidden by
+    /// `hide_active_screen()` above: a blank window that still accepted
+    /// input meant for the (invisible) underlying screen — locked-looking
+    /// but functionally unlocked. Setting `locked` first closes that gap
+    /// even on a construction failure; `construct_lock_screen` is retried,
+    /// idempotently, from the per-tick reassertion block below until it
+    /// succeeds, so a transient failure (e.g. a momentary allocation
+    /// failure) self-heals into an actually-visible lock overlay without
+    /// ever widening the input gate in the meantime.
     fn trip_lock(&mut self) {
         if self.locked {
             return;
         }
         self.hide_active_screen();
+        self.locked = true;
+        self.construct_lock_screen();
+        self.window.request_redraw();
+    }
+
+    /// Build and wire the lock overlay component if it is not already
+    /// present. No-op if `lock_screen` is already `Some` — safe to call
+    /// every tick from the per-tick reassertion block below without
+    /// rebuilding (and re-wiring, which would clear `lock_digits`/callbacks
+    /// mid-entry) an already-live overlay. See [`Self::trip_lock`]'s doc for
+    /// why a construction failure here does not itself leave the lock
+    /// gate open.
+    fn construct_lock_screen(&mut self) {
+        if self.lock_screen.is_some() {
+            return;
+        }
         match screens::LockScreen::new() {
             Ok(screen) => {
                 self.wire_lock_screen(&screen);
                 screen.set_unread_count(self.total_unread());
                 self.lock_screen = Some(screen);
-                self.locked = true;
-                self.window.request_redraw();
                 log::info!("ui: screen locked");
             }
             Err(e) => {
-                log::error!("ui: failed to construct lock screen: {:?}", e);
+                log::error!(
+                    "ui: failed to construct lock screen (locked=true, input gate stays \
+                     closed; will retry next tick): {:?}",
+                    e
+                );
             }
         }
     }

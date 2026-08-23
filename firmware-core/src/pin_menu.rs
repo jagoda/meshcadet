@@ -21,8 +21,17 @@
 //! always returns `false` regardless of the entered PIN.
 
 use protocol::provisioning::{
-    LOCK_SCREEN_ENABLE, LOCK_TIMEOUT_DEFAULT_S, LOCK_TIMEOUT_MAX_S, LOCK_TIMEOUT_MIN_S,
+    LOCK_NO_DEVICE_DISABLE, LOCK_SCREEN_ENABLE, LOCK_TIMEOUT_DEFAULT_S, LOCK_TIMEOUT_MAX_S,
+    LOCK_TIMEOUT_MIN_S,
 };
+
+/// Every currently-defined `lock_flags` bit — [`LOCK_SCREEN_ENABLE`] ∪
+/// [`LOCK_NO_DEVICE_DISABLE`] (deep-review pass 1, F3). [`MenuAction::
+/// SetLockFlags`] masks its raw wire byte against this before storing it, so
+/// an undefined/reserved bit set by a future or malformed wire payload can
+/// never persist into `lock_flags` and later be silently reinterpreted once
+/// a bit beyond these two is ever defined.
+const LOCK_FLAGS_DEFINED_MASK: u8 = LOCK_SCREEN_ENABLE | LOCK_NO_DEVICE_DISABLE;
 
 /// Maximum PIN length in bytes (matches `provisioning::MAX_PIN_LEN`).
 pub const MAX_PIN_LEN: usize = 16;
@@ -116,6 +125,14 @@ pub enum MenuAction {
     },
     /// Overwrite all feature-lock flags at once.
     ///
+    /// `apply_menu_action` masks the raw byte against
+    /// [`LOCK_FLAGS_DEFINED_MASK`] before storing it — the wire byte this
+    /// rides in (`FRAME_SET_LOCK_CONFIG`'s `lock_flags`) is a full `u8` with
+    /// only bits 0/1 currently defined; storing it unmasked would let any
+    /// undefined/reserved bit a future or malformed host write sets persist
+    /// into NVS and be silently reinterpreted the moment a bit beyond these
+    /// two is ever defined (deep-review pass 1, F3).
+    ///
     /// Same status as `SetContactTelemetry` above: handled, tested, not yet
     /// reachable from any on-device menu row.
     #[allow(dead_code)]
@@ -190,7 +207,7 @@ pub fn apply_menu_action(action: &MenuAction, settings: &mut RuntimeSettings) {
             }
         }
         MenuAction::SetLockFlags(flags) => {
-            settings.lock_flags = *flags;
+            settings.lock_flags = *flags & LOCK_FLAGS_DEFINED_MASK;
         }
         MenuAction::SetScreenSleepTimeout(secs) => {
             settings.screen_sleep_timeout_s = (*secs).min(SCREEN_SLEEP_MAX_S);
@@ -368,6 +385,34 @@ mod tests {
         };
         apply_menu_action(&MenuAction::SetLockFlags(0x00), &mut s);
         assert_eq!(s.lock_flags, 0x00);
+    }
+
+    /// Regression guard (deep-review pass 1, F3): a raw wire byte with bits
+    /// beyond the two currently-defined `LOCK_*` flags set must be masked
+    /// down before it lands in `lock_flags` — an unmasked write would let an
+    /// undefined/reserved bit persist to NVS and be silently reinterpreted
+    /// the moment a bit beyond `LOCK_SCREEN_ENABLE`/`LOCK_NO_DEVICE_DISABLE`
+    /// is ever defined.
+    #[test]
+    fn set_lock_flags_masks_undefined_bits() {
+        let mut s = RuntimeSettings::default();
+        apply_menu_action(&MenuAction::SetLockFlags(0xFF), &mut s);
+        assert_eq!(
+            s.lock_flags, 0x03,
+            "only LOCK_SCREEN_ENABLE|LOCK_NO_DEVICE_DISABLE may persist, not the raw wire byte"
+        );
+    }
+
+    /// The two currently-defined bits themselves must still pass through
+    /// untouched — the mask must not also clip legitimate flag combinations.
+    #[test]
+    fn set_lock_flags_preserves_defined_bits() {
+        let mut s = RuntimeSettings::default();
+        apply_menu_action(&MenuAction::SetLockFlags(LOCK_SCREEN_ENABLE), &mut s);
+        assert_eq!(s.lock_flags, LOCK_SCREEN_ENABLE);
+
+        apply_menu_action(&MenuAction::SetLockFlags(LOCK_NO_DEVICE_DISABLE), &mut s);
+        assert_eq!(s.lock_flags, LOCK_NO_DEVICE_DISABLE);
     }
 
     // ── screen-sleep timeout ──────────────────────────────────────────────

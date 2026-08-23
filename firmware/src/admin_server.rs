@@ -35,7 +35,7 @@
 //! | `FRAME_CLEAR_HISTORY`   | host→device | erase ALL persisted conversation history (every DM + channel, both directions), reply `RSP_OK` / `RSP_ERROR` — flash effect immediate, UI in-memory state needs a reboot to reflect it (see handler doc comment) |
 //! | `FRAME_QUERY_ADVERT`    | host→device | build + sign this device's self-advert card, reply `RSP_ADVERT` with the raw card bytes — written straight to this serial reply, **never** enqueued onto `txq`/the radio dispatcher (see handler doc comment) |
 //! | `FRAME_QUERY_LOCK`      | host→device | reply `RSP_LOCK` with the CURRENT `lock_flags`/`lock_timeout_s` (read fresh from `mc_rts` every call — the on-device admin menu can change them without going through this thread) and whether a screen-lock PIN is stored (`mc_lock`) |
-//! | `FRAME_SET_LOCK_PIN`    | host→device | set/reset the screen-lock PIN (distinct from the admin PIN above), persist to the dedicated `mc_lock` NVS store, reply `RSP_OK` / `RSP_ERROR` |
+//! | `FRAME_SET_LOCK_PIN`    | host→device | set/reset the screen-lock PIN (distinct from the admin PIN above), persist to the dedicated `mc_lock` NVS store, forward `UiEvent::LockPinChanged` to the UI thread so it takes effect live rather than only at next boot, reply `RSP_OK` / `RSP_ERROR` |
 //! | `FRAME_SET_LOCK_CONFIG` | host→device | forward the new enable-flags/timeout to the UI thread as `UiEvent::LockConfigChanged` over the cloned `evt_tx` — **not** persisted by this thread (the `mc_rts` single-writer invariant, see this file's own module doc below); `RSP_OK` means "accepted and forwarded," not "persisted" |
 //!
 //! `QUERY_STATUS` is the host CLI's connect-and-verify command (`meshcadet
@@ -201,7 +201,10 @@ mod err {
 /// constructed by `main.rs` well before this thread is spawned —
 /// `FRAME_SET_LOCK_CONFIG` forwards a `UiEvent::LockConfigChanged` over it
 /// rather than writing `mc_rts` directly (see this module's doc for the
-/// single-writer invariant this exists to preserve).
+/// single-writer invariant this exists to preserve), and `FRAME_SET_LOCK_PIN`
+/// forwards a `UiEvent::LockPinChanged` over it so a live lock-PIN write
+/// takes effect immediately rather than only at the next boot (see that
+/// handler's doc comment).
 pub fn run(
     history: &'static std::sync::Mutex<Option<HistoryStore>>,
     gps_status: &'static std::sync::Mutex<crate::gps::GpsStatus>,
@@ -225,13 +228,14 @@ pub fn run(
     let mut rx_buf = [0u8; RX_BUF_LEN];
     let mut rx_len = 0usize;
     let mut stdout_ = std::io::stdout();
-    // Count of `UiEvent::LockConfigChanged` forwards dropped because the UI
-    // event queue was full/disconnected (`send_or_count`, ADR-0012 C2) — this
-    // thread's own local counter, distinct from `main.rs`'s dispatcher-loop
-    // `evt_dropped` (a different thread, a different channel-degradation
-    // budget). Logged inline on every drop (`FRAME_SET_LOCK_CONFIG`'s arm),
-    // not just periodically — a host-initiated config write is rare enough
-    // that a drop is worth surfacing immediately, unlike the high-frequency
+    // Count of `UiEvent::LockConfigChanged`/`UiEvent::LockPinChanged`
+    // forwards dropped because the UI event queue was full/disconnected
+    // (`send_or_count`, ADR-0012 C2) — this thread's own local counter,
+    // distinct from `main.rs`'s dispatcher-loop `evt_dropped` (a different
+    // thread, a different channel-degradation budget). Logged inline on
+    // every drop (`FRAME_SET_LOCK_CONFIG`/`FRAME_SET_LOCK_PIN`'s arms), not
+    // just periodically — a host-initiated config write is rare enough that
+    // a drop is worth surfacing immediately, unlike the high-frequency
     // per-tick pushes `main.rs` batches into a periodic log line.
     let mut evt_dropped: u32 = 0;
 
@@ -868,15 +872,51 @@ fn handle_frame(
         // than `ProvisionedConfig` (D2; see `lock_store.rs`'s module doc for
         // the full reasoning). `decode_set_lock_pin` has already enforced the
         // exactly-`LOCK_PIN_LEN`-ASCII-digit shape (`ProvError::LockPinInvalid`
-        // otherwise) — this arm trusts that and owns only the NVS write + ack.
+        // otherwise) — this arm trusts that and owns the NVS write + ack.
         // The PIN itself is never logged, mirroring the guest-password
         // discipline the ADD_ROOM arm above documents.
+        //
+        // LIVE FORWARD (deep-review pass 1, F1): after the NVS write lands,
+        // also forward `UiEvent::LockPinChanged` to the UI thread — mirrors
+        // `FRAME_SET_LOCK_CONFIG` below, except this store has no
+        // single-writer conflict (`admin_server` already owns `mc_lock`
+        // outright), so the forward is purely "make the live copy match what
+        // was just persisted," not a delegation of the write itself. Before
+        // this forward existed, the UI thread's `stored_lock_pin` only ever
+        // updated at boot (`BootSeed::lock_pin`), so a `set-lock-pin` in the
+        // same USB session as a subsequent `lock-config --enable` locked the
+        // device against a PIN the running UI thread had never seen — locked
+        // out until power-cycle — and `reset-lock-pin` against an
+        // already-locked device silently failed to unlock it (the live
+        // comparison in `trip_lock`/unlock-attempt code still ran against the
+        // stale boot-time PIN). A forward failure (UI queue full/disconnected)
+        // does NOT fail this request — the NVS write already durably
+        // succeeded and will still take effect at the next boot via
+        // `BootSeed`, same as before this fix; only the live-forward
+        // convenience is lost, logged as a warning rather than surfaced as
+        // `RSP_ERROR` to the host (unlike `FORWARD_ERROR` below, where
+        // nothing was persisted at all).
         FRAME_SET_LOCK_PIN => {
             match decode_set_lock_pin(payload) {
                 Ok(p) => {
                     match crate::lock_store::save(nvs_partition.clone(), &p.pin, LOCK_PIN_LEN as u8) {
                         Ok(()) => {
                             log::info!("admin_server: SET_LOCK_PIN — stored");
+                            if !send_or_count(
+                                evt_tx,
+                                UiEvent::LockPinChanged {
+                                    lock_pin: p.pin,
+                                    lock_pin_len: LOCK_PIN_LEN as u8,
+                                },
+                                evt_dropped,
+                            ) {
+                                log::warn!(
+                                    "admin_server: SET_LOCK_PIN — UiEvent queue full/disconnected \
+                                     ({} dropped so far); NVS write stands, live UI update skipped \
+                                     (takes effect at next boot)",
+                                    *evt_dropped,
+                                );
+                            }
                             send_ok(out)?;
                         }
                         Err(e) => {
