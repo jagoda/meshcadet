@@ -99,6 +99,7 @@ use protocol::emoji::EMOJI_TABLE;
 
 /// Provisioning-codec golden-vector generator — see `golden`'s module doc.
 pub mod golden;
+pub mod lock_gate;
 pub mod partition_budget;
 pub mod room_aggregate_notification;
 pub mod room_drain_window_periodic_reeval;

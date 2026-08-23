@@ -77,9 +77,19 @@ slint::slint! {
     component StepperRow {
         in property <string> label;
         // Raw seconds value, used only to enable/disable the +/- buttons at
-        // the 0/120 bounds. The visible text is `display_text`.
+        // the min_value/max_value bounds. The visible text is `display_text`.
         in property <int>    value;
         in property <string> display_text;
+        // Bounds for the +/- enable/disable + muted-color gating below.
+        // Default 0..=120 matches this component's original sole caller
+        // (the screen-sleep row) exactly, so that instantiation's behavior
+        // is byte-for-byte unchanged; the screen-lock timeout row (plan D1:
+        // `LOCK_TIMEOUT_MIN_S..=LOCK_TIMEOUT_MAX_S`, 15..=3600) sets both
+        // explicitly. `apply_menu_action` re-clamps to the real bound
+        // regardless — these two properties only drive this ROW's own
+        // affordance styling, never the persisted value.
+        in property <int>    min_value: 0;
+        in property <int>    max_value: 120;
         // Trackball highlight — see `AdminMenuScreenUi.selected_index`.
         in property <bool>   selected;
         callback decremented;
@@ -120,12 +130,12 @@ slint::slint! {
                         text: "−";
                         font-size: Theme.icon-sm; // 18px
                         font-weight: 600;
-                        color: value <= 0 ? Theme.text-muted : Theme.brand-signal;
+                        color: value <= min_value ? Theme.text-muted : Theme.brand-signal;
                         horizontal-alignment: center;
                         vertical-alignment: center;
                     }
                     dec_touch := TouchArea {
-                        enabled: value > 0;
+                        enabled: value > min_value;
                         clicked => { root.decremented(); }
                     }
                 }
@@ -148,12 +158,12 @@ slint::slint! {
                         text: "+";
                         font-size: Theme.icon-sm; // 18px
                         font-weight: 600;
-                        color: value >= 120 ? Theme.text-muted : Theme.brand-signal;
+                        color: value >= max_value ? Theme.text-muted : Theme.brand-signal;
                         horizontal-alignment: center;
                         vertical-alignment: center;
                     }
                     inc_touch := TouchArea {
-                        enabled: value < 120;
+                        enabled: value < max_value;
                         clicked => { root.incremented(); }
                     }
                 }
@@ -347,9 +357,17 @@ slint::slint! {
         // "format on the Rust side, pass a plain string" convention as
         // `screen_sleep_display` above.
         in property <string> battery_display: "—";
+        // Screen-lock enable toggle + idle-timeout stepper (screen-lock
+        // plan D1/D6) — same apply/persist pattern as the toggles/stepper
+        // above, wired through `MenuAction::SetLockEnabled`/
+        // `SetLockTimeout` (see `ui::mod::UiRuntime::navigate_to_admin_menu`).
+        in property <bool>   lock_enabled: false;
+        in property <int>    lock_timeout_s: 300;
+        in property <string> lock_timeout_display: "300s";
         // Trackball-driven row highlight: 0=visual toggle, 1=audible toggle,
-        // 2=screen-sleep stepper, 3=GPS status row. `-1` = no highlight yet
-        // (touch taps a row directly and never sets this).
+        // 2=screen-sleep stepper, 3=lock-enable toggle, 4=lock-timeout
+        // stepper, 5=GPS status row. `-1` = no highlight yet (touch taps a
+        // row directly and never sets this).
         in property <int>    selected_index: -1;
         // Shared full-window starfield texture, set once by Rust right after
         // construction (`ui::backdrop_asset::shared_backdrop_image()`) — see
@@ -361,7 +379,31 @@ slint::slint! {
         callback toggle_notif_audible;
         callback decrement_screen_sleep_timeout;
         callback increment_screen_sleep_timeout;
+        callback toggle_lock_enabled;
+        callback decrement_lock_timeout;
+        callback increment_lock_timeout;
         callback open_gps_status;
+
+        // Scroll `main_flick` so `selected_index`'s row is in view — same
+        // "Rust drives a public function after a property update" pattern
+        // `contact_list.rs`'s `scroll_selected_into_view` uses, here at this
+        // screen's own uniform 40px row height (every `StepperRow`/
+        // `ToggleRow`/`NavRow`/`InfoRow` instance is `height: 40px`) instead
+        // of `ContactRow`'s 54px. `selected_index` is 0-based against the
+        // SELECTABLE rows only (battery's `InfoRow` has no `selected`
+        // property and is never highlighted), so row `i`'s y-offset within
+        // the Flickable is `(i + 1) * 40px` — `+1` skips over the
+        // non-selectable battery row that always sits above every
+        // selectable one.
+        public function scroll_selected_into_view() {
+            if selected_index < 0 {
+                return;
+            }
+            main_flick.viewport-y = max(
+                min(0px, main_flick.height - main_flick.viewport-height),
+                -((selected_index + 1) * 40px),
+            );
+        }
 
         // ── One-shot screen-entry reveal — see module doc ───────────────────
         in-out property <float> reveal_opacity: 0;
@@ -440,40 +482,70 @@ slint::slint! {
                 }
             }
 
-            // ── Battery (read-only info row) ─────────────────────────────────
-            InfoRow {
-                label: "🔋  Battery";
-                value: battery_display;
-            }
+            // ── Rows (scrollable — see `scroll_selected_into_view`'s doc) ────
+            // Seven rows at 40px each (280px) plus this screen's own 36px
+            // header exceed the 320x240 panel (316px total content), so —
+            // unlike the pre-screen-lock 5-row layout, which fit at
+            // 236/240px with no scrolling needed — this list is wrapped in a
+            // `Flickable`, the same mechanism `contact_list.rs`'s row list
+            // already uses for the same reason (an unbounded/growing row
+            // count on a fixed-height panel). `vertical-stretch: 1.0` lets
+            // the Flickable's own viewport claim the remaining height below
+            // the fixed 36px header.
+            main_flick := Flickable {
+                vertical-stretch: 1.0;
+                VerticalLayout {
+                    // ── Battery (read-only info row) ─────────────────────────
+                    InfoRow {
+                        label: "🔋  Battery";
+                        value: battery_display;
+                    }
 
-            // ── Toggle rows ─────────────────────────────────────────────────
-            ToggleRow {
-                label: "🔔  Visual notifications";
-                value: notif_visual;
-                selected: selected_index == 0;
-                toggled => { root.toggle_notif_visual(); }
+                    // ── Toggle rows ───────────────────────────────────────────
+                    ToggleRow {
+                        label: "🔔  Visual notifications";
+                        value: notif_visual;
+                        selected: selected_index == 0;
+                        toggled => { root.toggle_notif_visual(); }
+                    }
+                    ToggleRow {
+                        label: "🔊  Audible notifications";
+                        value: notif_audible;
+                        selected: selected_index == 1;
+                        toggled => { root.toggle_notif_audible(); }
+                    }
+                    StepperRow {
+                        label: "💤  Screen sleep";
+                        value: screen_sleep_timeout_s;
+                        display_text: screen_sleep_display;
+                        selected: selected_index == 2;
+                        decremented => { root.decrement_screen_sleep_timeout(); }
+                        incremented => { root.increment_screen_sleep_timeout(); }
+                    }
+                    // ── Screen lock (plan D1/D6) ─────────────────────────────
+                    ToggleRow {
+                        label: "🔒  Screen lock";
+                        value: lock_enabled;
+                        selected: selected_index == 3;
+                        toggled => { root.toggle_lock_enabled(); }
+                    }
+                    StepperRow {
+                        label: "⏱  Lock timeout";
+                        value: lock_timeout_s;
+                        display_text: lock_timeout_display;
+                        min_value: 15; // LOCK_TIMEOUT_MIN_S
+                        max_value: 3600; // LOCK_TIMEOUT_MAX_S
+                        selected: selected_index == 4;
+                        decremented => { root.decrement_lock_timeout(); }
+                        incremented => { root.increment_lock_timeout(); }
+                    }
+                    NavRow {
+                        label: "📍  GPS status";
+                        selected: selected_index == 5;
+                        tapped => { root.open_gps_status(); }
+                    }
+                }
             }
-            ToggleRow {
-                label: "🔊  Audible notifications";
-                value: notif_audible;
-                selected: selected_index == 1;
-                toggled => { root.toggle_notif_audible(); }
-            }
-            StepperRow {
-                label: "💤  Screen sleep";
-                value: screen_sleep_timeout_s;
-                display_text: screen_sleep_display;
-                selected: selected_index == 2;
-                decremented => { root.decrement_screen_sleep_timeout(); }
-                incremented => { root.increment_screen_sleep_timeout(); }
-            }
-            NavRow {
-                label: "📍  GPS status";
-                selected: selected_index == 3;
-                tapped => { root.open_gps_status(); }
-            }
-
-            Rectangle { vertical-stretch: 1.0; }
         }
     }
 }
@@ -484,16 +556,26 @@ slint::slint! {
 /// regardless of what step size the widget uses.
 const SCREEN_SLEEP_STEP_S: i32 = 5;
 
-// `format_screen_sleep`/`format_battery_display` are pure Rust with no
-// Slint dependency — they now live in `firmware_core::ui::admin_menu` so
-// their tests execute under `cargo test --workspace` (this crate is a
-// detached, cross-compiled workspace — see `Cargo.toml`'s doc comment — so
-// a `#[cfg(test)]` block written here would type-check but never run).
-// Only this Slint-backed view wrapper stays. `pub(crate) use` preserves
-// `format_battery_display`'s original crate-visible re-export (also called
-// from `ui::mod::UiRuntime::set_battery_status`). See
+/// Step size (seconds) applied per +/- tap on the lock-timeout stepper.
+/// `LOCK_TIMEOUT_MIN_S..=LOCK_TIMEOUT_MAX_S` is 15..=3600 — 15s matches the
+/// floor exactly (so tapping "-" from the default 300s lands on clean
+/// multiples all the way down to the minimum) without being so fine-grained
+/// that reaching 3600s takes an unreasonable number of taps.
+/// `pin_menu::apply_menu_action` re-clamps the result regardless of this
+/// widget-only step size, same discipline as `SCREEN_SLEEP_STEP_S`.
+const LOCK_TIMEOUT_STEP_S: i32 = 15;
+
+// `format_screen_sleep`/`format_lock_timeout`/`format_battery_display` are
+// pure Rust with no Slint dependency — they now live in
+// `firmware_core::ui::admin_menu` so their tests execute under `cargo test
+// --workspace` (this crate is a detached, cross-compiled workspace — see
+// `Cargo.toml`'s doc comment — so a `#[cfg(test)]` block written here would
+// type-check but never run). Only this Slint-backed view wrapper stays.
+// `pub(crate) use` preserves `format_battery_display`'s original
+// crate-visible re-export (also called from
+// `ui::mod::UiRuntime::set_battery_status`). See
 // `docs/adr/0005-firmware-core-extraction.md`.
-use firmware_core::ui::admin_menu::format_screen_sleep;
+use firmware_core::ui::admin_menu::{format_lock_timeout, format_screen_sleep};
 pub(crate) use firmware_core::ui::admin_menu::format_battery_display;
 
 /// Rust-side wrapper.
@@ -529,6 +611,21 @@ impl AdminMenuScreen {
         self.component.set_screen_sleep_display(format_screen_sleep(seconds).into());
     }
 
+    /// Set the initial displayed state of the screen-lock enable toggle
+    /// (plan D6 `LOCK_SCREEN_ENABLE`, `lock_flags` bit 0).
+    pub fn set_lock_enabled(&self, v: bool) {
+        self.component.set_lock_enabled(v);
+    }
+
+    /// Set the initial displayed lock idle-timeout
+    /// (`LOCK_TIMEOUT_MIN_S..=LOCK_TIMEOUT_MAX_S`, 15..=3600s; plan D1).
+    /// Same "raw value + precomputed display string" pair as
+    /// [`Self::set_screen_sleep_timeout`].
+    pub fn set_lock_timeout(&self, seconds: i32) {
+        self.component.set_lock_timeout_s(seconds);
+        self.component.set_lock_timeout_display(format_lock_timeout(seconds).into());
+    }
+
     /// Set the displayed battery row — the full HIL-capture state vector,
     /// precomputed Rust-side by [`format_battery_display`] (see that
     /// function's own doc for the exact layout) from the shared
@@ -543,12 +640,16 @@ impl AdminMenuScreen {
         self.component.on_back_pressed(cb);
     }
 
-    /// Move the trackball highlight to row `idx` (0..=3; see
+    /// Move the trackball highlight to row `idx` (0..=5; see
     /// `AdminMenuScreenUi.selected_index`'s doc for the row mapping; `-1`
-    /// clears it). The caller (`UiRuntime::handle_trackball_admin_menu`) owns
-    /// clamping `idx` to the row count.
+    /// clears it) and scroll it into view — same
+    /// set-property-then-invoke-the-scroll-function pattern
+    /// `ContactListScreen::set_selected_index` uses. The caller
+    /// (`UiRuntime::handle_trackball_admin_menu`) owns clamping `idx` to the
+    /// row count.
     pub fn set_selected_index(&self, idx: i32) {
         self.component.set_selected_index(idx);
+        self.component.invoke_scroll_selected_into_view();
     }
 
     /// Fire `back_pressed` exactly as the header's back button would — used
@@ -579,8 +680,23 @@ impl AdminMenuScreen {
         self.component.invoke_increment_screen_sleep_timeout();
     }
 
+    /// Fire `toggle_lock_enabled` exactly as tapping that row would — used
+    /// by the trackball's Click handler when row 3 (lock-enable toggle) is
+    /// highlighted.
+    pub fn invoke_toggle_lock_enabled(&self) {
+        self.component.invoke_toggle_lock_enabled();
+    }
+
+    /// Fire `increment_lock_timeout` exactly as tapping the lock-timeout
+    /// stepper's "+" would — used by the trackball's Click handler when row
+    /// 4 is highlighted. Same "Click maps to increment" convention as
+    /// [`Self::invoke_increment_screen_sleep_timeout`].
+    pub fn invoke_increment_lock_timeout(&self) {
+        self.component.invoke_increment_lock_timeout();
+    }
+
     /// Fire `open_gps_status` exactly as tapping that row would — used by the
-    /// trackball's Click handler when row 3 is highlighted.
+    /// trackball's Click handler when row 5 is highlighted.
     pub fn invoke_open_gps_status(&self) {
         self.component.invoke_open_gps_status();
     }
@@ -636,6 +752,49 @@ impl AdminMenuScreen {
         });
     }
 
+    /// Fires `cb(new_value)` when the user taps the screen-lock enable row.
+    /// See [`Self::on_toggle_notif_visual`] for the displayed-state contract.
+    pub fn on_toggle_lock_enabled(&self, cb: impl Fn(bool) + 'static) {
+        let comp = self.component.clone_strong();
+        self.component.on_toggle_lock_enabled(move || {
+            let new_val = !comp.get_lock_enabled();
+            comp.set_lock_enabled(new_val);
+            cb(new_val);
+        });
+    }
+
+    /// Fires `cb(new_seconds)` when the user taps "−" on the lock-timeout
+    /// row. Clamped to a floor of `LOCK_TIMEOUT_MIN_S` here for the widget's
+    /// own displayed-state consistency; the caller
+    /// (`ui::mod::navigate_to_admin_menu`) applies `new_seconds` via
+    /// `pin_menu::apply_menu_action`, which re-clamps to
+    /// `LOCK_TIMEOUT_MIN_S..=LOCK_TIMEOUT_MAX_S` as the single source of
+    /// truth for the persisted invariant — same division of labor as
+    /// [`Self::on_decrement_screen_sleep_timeout`].
+    pub fn on_decrement_lock_timeout(&self, cb: impl Fn(i32) + 'static) {
+        let comp = self.component.clone_strong();
+        self.component.on_decrement_lock_timeout(move || {
+            let new_val =
+                (comp.get_lock_timeout_s() - LOCK_TIMEOUT_STEP_S).max(protocol::provisioning::LOCK_TIMEOUT_MIN_S as i32);
+            comp.set_lock_timeout_s(new_val);
+            comp.set_lock_timeout_display(format_lock_timeout(new_val).into());
+            cb(new_val);
+        });
+    }
+
+    /// Fires `cb(new_seconds)` when the user taps "+" on the lock-timeout
+    /// row. See [`Self::on_decrement_lock_timeout`] for the clamp contract.
+    pub fn on_increment_lock_timeout(&self, cb: impl Fn(i32) + 'static) {
+        let comp = self.component.clone_strong();
+        self.component.on_increment_lock_timeout(move || {
+            let new_val =
+                (comp.get_lock_timeout_s() + LOCK_TIMEOUT_STEP_S).min(protocol::provisioning::LOCK_TIMEOUT_MAX_S as i32);
+            comp.set_lock_timeout_s(new_val);
+            comp.set_lock_timeout_display(format_lock_timeout(new_val).into());
+            cb(new_val);
+        });
+    }
+
     /// Fires `cb()` when the user taps the "📍 GPS status" row. The caller
     /// navigates to the read-only [`super::gps_status::GpsStatusScreen`]
     /// sub-screen — no state to flip here (this row is pure navigation).
@@ -643,6 +802,10 @@ impl AdminMenuScreen {
         self.component.on_open_gps_status(cb);
     }
 
+    /// Re-attach this (already-constructed) component as the window's
+    /// current one — see `message_view.rs`'s identical `show()` doc for the
+    /// screen-lock D3 retained-overlay rationale.
+    pub fn show(&self) { self.component.show().ok(); }
     pub fn hide(&self) { self.component.hide().ok(); }
 }
 

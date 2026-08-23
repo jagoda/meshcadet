@@ -19,6 +19,20 @@ pub fn format_screen_sleep(seconds: i32) -> String {
     }
 }
 
+/// Format the screen-lock idle-timeout seconds value for display.
+///
+/// Unlike `format_screen_sleep`, there is no zero sentinel here (plan D1:
+/// on/off rides `lock_flags` bit 0, never an overloaded timeout value) — the
+/// admin-menu stepper only ever shows a value in
+/// `protocol::provisioning::LOCK_TIMEOUT_MIN_S..=LOCK_TIMEOUT_MAX_S`
+/// (15..=3600). Deliberately always plain seconds (`"<n>s"`), same shape as
+/// `format_screen_sleep` — a minutes-rounded display (`"90s"` -> `"1m"`)
+/// would silently hide exactly which value a live +/- stepper is currently
+/// sitting on while the user is actively adjusting it.
+pub fn format_lock_timeout(seconds: i32) -> String {
+    format!("{}s", seconds.max(0))
+}
+
 /// Minimum `raw_mv` movement (since the value the AdminMenu row LAST
 /// ACTUALLY DISPLAYED — see [`battery_display_fields_changed`]'s doc for why
 /// that's a different basis than "last polled") before that movement alone
@@ -167,6 +181,28 @@ mod tests {
     fn format_positive_appends_s() {
         assert_eq!(format_screen_sleep(30), "30s");
         assert_eq!(format_screen_sleep(120), "120s");
+    }
+
+    // ── format_lock_timeout ──────────────────────────────────────────────
+
+    #[test]
+    fn format_lock_timeout_at_bounds() {
+        assert_eq!(format_lock_timeout(15), "15s"); // LOCK_TIMEOUT_MIN_S
+        assert_eq!(format_lock_timeout(3600), "3600s"); // LOCK_TIMEOUT_MAX_S
+    }
+
+    #[test]
+    fn format_lock_timeout_default() {
+        assert_eq!(format_lock_timeout(300), "300s");
+    }
+
+    #[test]
+    fn format_lock_timeout_never_shows_never_no_zero_sentinel() {
+        // Unlike format_screen_sleep, 0 is not a valid on-device value (D1),
+        // but the formatter itself must not panic or go negative if ever
+        // called directly with an out-of-range value.
+        assert_eq!(format_lock_timeout(0), "0s");
+        assert_eq!(format_lock_timeout(-5), "0s");
     }
 
     /// Test-only convenience constructor — every field explicit so a reader

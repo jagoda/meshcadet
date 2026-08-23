@@ -57,7 +57,7 @@
 # pinned to the author's own branch tip is not a staleness claim about
 # main; this guard's whole point is that only a fresh build settles it.
 #
-# CURRENT baseline — measured 2026-08-02 by
+# PREVIOUS baseline — measured 2026-08-02 by
 # meshcadet-emoji-render-set-curation-20260802-141020550, which grew
 # `RENDER_EXTRA_CPS` from 50 to the campaign's confirmed 600-entry target
 # (+550 codepoints):
@@ -70,6 +70,31 @@
 # render-set-contract mission's measured 1,814-1,947 B/emoji marginal cost —
 # comfortably inside this mission's own +998-1,071 KB budget and under the
 # 4,718,592 B (4.5 MiB) hard ceiling, with ~370 KB of margin still under it.
+#
+# CURRENT baseline — measured 2026-08-23, sourced from the failing CI
+# `firmware` job's own `verify-partition-budget` step run at this branch's
+# head commit cf450fb0fe08e6eadc45b8d20b2426071726dc44
+# (https://github.com/jagoda/meshcadet/actions/runs/32655143768/job/97232591655),
+# by ci-fix-meshcadet-lock-firmware-ui-20260823-174742559. NOT a local
+# `measure-app-image-size.sh` run: this CI-fix mission's worktree has the
+# `esp` rustup toolchain but bootstrapping the ESP-IDF sysroot failed
+# ("Error: Could not install all requested Tools") in this sandboxed
+# environment, so the CI job's own figure for this exact commit — produced
+# by the identical script, on the identical tree — is used as the freshest
+# available authoritative measurement instead of a guess or a stale report:
+#
+#   4,641,888 B (4.43 MiB) of the 6 MiB (6,291,456 B) `factory` partition,
+#   1,649,568 B (1.57 MiB) headroom — 73.8% used.
+#
+# Moved +6.75% from the 4,348,560 B previous entry (past the 5% threshold,
+# which is exactly why CI failed and this baseline needed bumping). This PR
+# (jagoda/meshcadet#179) lands the screen-lock overlay + lock screen
+# (4-dot pad + numpad reusing pin_entry.rs's theme, D4 backoff countdown,
+# D5 unread badge), an admin-menu lock-enable toggle + timeout stepper, and
+# registers 3 new glyphs (⏱ lock-timeout, ✉ D5 badge, ⏳ backoff countdown)
+# rasterized at every PIXEL_SIZES entry (10/14/28px) rather than just the
+# EMOJI_SIZES subset — real, intentional UI + glyph-coverage growth, not
+# drift to chase down.
 #
 # Expect a few bytes of run-to-run noise even on an unchanged tree: two
 # consecutive builds at cd08085 measured 3,360,432 B and 3,360,448 B (16 B
@@ -86,4 +111,4 @@
 # running firmware/scripts/measure-app-image-size.sh (or reading
 # `verify-partition-budget`'s own "measured" line), never by hand-editing
 # this number from a guess or a stale report.
-4348560
+4641888

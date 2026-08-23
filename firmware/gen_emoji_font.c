@@ -898,8 +898,16 @@ static const unsigned long BMP_SYMBOLS[] = {
      * rather than left for a third occurrence of this exact bug class. */
     0x2014, /* —  em dash — GPS status "no fix yet" coordinates placeholder (gps_status.rs) */
     0x2026, /* …  horizontal ellipsis — GPS status "Acquiring…" fix-state text (gps_status.rs) */
+    /* screen-lock (meshcadet-lock-firmware-ui): all three used at sizes
+     * outside EMOJI_SIZES (10/14/28px — none of {11,13,14,16,18,20} covers
+     * all three), so they must be BMP_SYMBOLS (rasterised at every
+     * PIXEL_SIZES entry) rather than UI_EXTRA_CPS, mirroring 0x2699/0x2212
+     * above for the identical reason. */
+    0x23F1, /* ⏱  stopwatch — admin-menu "Lock timeout" row label (admin_menu.rs) */
+    0x2709, /* ✉  envelope — lock screen's D5 count-only waiting-message badge (lock.rs) */
+    0x23F3, /* ⏳  hourglass — lock screen's backoff-countdown state (lock.rs) */
 };
-#define N_BMP_SYMBOLS 10
+#define N_BMP_SYMBOLS 13
 
 /* Pixel sizes to rasterise.
  *

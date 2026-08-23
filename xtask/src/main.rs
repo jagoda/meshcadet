@@ -44,6 +44,11 @@
 //!   only resets the reflood backoff epoch when a route is actually known,
 //!   never on "a login reply arrived" alone (see
 //!   `xtask::room_reflood_reset_requires_route`'s doc).
+//! - **verify-lock-gate** — `UiRuntime::step()`'s keyboard/trackball input
+//!   blocks check `self.locked` before any branch that reads
+//!   `self.active_screen` directly, so the screen-lock overlay's retained
+//!   underlying screen never leaks input while locked (see
+//!   `xtask::lock_gate`'s doc).
 //!
 //! Both also run as `cargo test`s, which is what CI / every downstream change
 //! actually gates on; this binary exists for a quick manual re-check with a
@@ -302,6 +307,24 @@ fn main() -> ExitCode {
             reflood_reset_route_gated.len()
         );
         for v in &reflood_reset_route_gated {
+            eprintln!("  - {v}");
+        }
+    }
+
+    let lock_gate = xtask::lock_gate::check(&repo_root);
+    if lock_gate.is_empty() {
+        println!(
+            "xtask verify-lock-gate: OK — {}'s keyboard/trackball input blocks gate on \
+             `self.locked` before any active-screen-dependent branch.",
+            xtask::lock_gate::UI_MOD_REL_PATH
+        );
+    } else {
+        ok = false;
+        eprintln!(
+            "xtask verify-lock-gate: FAILED — {} violation(s):",
+            lock_gate.len()
+        );
+        for v in &lock_gate {
             eprintln!("  - {v}");
         }
     }

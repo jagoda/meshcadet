@@ -9,7 +9,12 @@
 //!
 //! Boundary:
 //! - `PinEntryScreen` fires `on_pin_correct(pin: String)` when the entered PIN
-//!   matches the stored hash.  The caller navigates to the admin menu.
+//!   matches the stored PIN (`pin_menu::verify_pin` — a plaintext
+//!   constant-time comparison, NOT a hash; see that function's own doc for
+//!   why: this device has no factory-reset/USB-admin PIN gate to protect a
+//!   hash against, so hashing would buy nothing here — D-honest in the
+//!   screen-lock plan states this posture explicitly).  The caller navigates
+//!   to the admin menu.
 //! - `PinEntryScreen` fires `on_pin_wrong()` on mismatch (for the notification
 //!   and attempt-counter logic, owned by the caller).
 //! - PIN storage / hashing is NOT in this module — the caller supplies the
@@ -358,5 +363,9 @@ impl PinEntryScreen {
     // created per PIN prompt — see `UiRuntime::navigate_to_pin_entry` — so
     // there is no reset-and-reuse path either).
 
+    /// Re-attach this (already-constructed) component as the window's
+    /// current one — see `message_view.rs`'s identical `show()` doc for the
+    /// screen-lock D3 retained-overlay rationale.
+    pub fn show(&self) { self.component.show().ok(); }
     pub fn hide(&self) { self.component.hide().ok(); }
 }

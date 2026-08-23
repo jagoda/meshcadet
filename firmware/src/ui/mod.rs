@@ -119,8 +119,9 @@ use crate::pin_menu;
 // The screen-lock PIN's fixed wire/storage length — sizes `BootSeed::lock_pin`
 // / `UiRuntime::stored_lock_pin` below. `protocol` (unlike `firmware_core`) is
 // a plain host-buildable crate with no ESP-IDF dependency, so this import is
-// unconditional too.
-use protocol::provisioning::LOCK_PIN_LEN;
+// unconditional too. `LOCK_SCREEN_ENABLE` is `lock_flags` bit 0 (plan D6),
+// read here to decide whether the idle-lock/boot-locked checks apply at all.
+use protocol::provisioning::{LOCK_PIN_LEN, LOCK_SCREEN_ENABLE};
 // `gps::GpsStatus` is a plain Copy struct (no hardware dependency) — used
 // here purely as a display-state type for the GPS status screen.
 use crate::gps;
@@ -159,6 +160,15 @@ use firmware_core::ui::keyboard::{keyboard_drain_should_stop, message_view_compo
 use firmware_core::ui::message_view::incoming_message_is_unread;
 use firmware_core::ui::splash::splash_should_dismiss;
 use firmware_core::ui::touch::touch_wake_transition;
+// Screen-lock (plan D3/D4/D-test): the pure idle->lock decision + escalating
+// backoff state machine (`firmware_core::ui::lock`) and the lock-PIN
+// comparison (`firmware_core::lock_store::verify`, distinct from
+// `pin_menu::verify_pin` — see that function's own doc). This module owns
+// only the Slint/hardware plumbing around them (the overlay itself, the real
+// clock, and NVS-backed storage) — see `firmware_core::ui::lock`'s module
+// doc for the full division of labor.
+use firmware_core::ui::lock::{attempt_unlock, boots_locked, idle_lock_due, unlock_attempt_allowed, LockAttemptState};
+use firmware_core::lock_store::verify as verify_lock_pin;
 use screens::contact_list::{build_channel_items, build_contact_items};
 use screens::message_view::{build_message_items, wrap_outgoing_mentions};
 
@@ -779,14 +789,12 @@ pub struct UiRuntime<'d> {
     /// The screen-lock PIN bytes and length (zeroed = no lock PIN
     /// configured) — a separate secret from `stored_pin`/`stored_pin_len`
     /// above. Boot-seeded via [`Self::set_lock_pin`] from
-    /// [`UiEvent::BootSeed`]; not yet read anywhere else in this file — the
-    /// lock overlay's unlock-attempt comparison
-    /// (`pin_menu::verify_pin`-against-`stored_lock_pin`, mirroring
-    /// `stored_pin`'s use at the `PinEntry` screen) is a later phase of the
-    /// screen-lock campaign (`meshcadet-lock-firmware-ui`).
-    #[allow(dead_code)]
+    /// [`UiEvent::BootSeed`]. Compared against an unlock attempt via
+    /// `firmware_core::lock_store::verify` (NOT `pin_menu::verify_pin`,
+    /// which compares against the admin PIN — see this mission's hard
+    /// constraint: unlocking the screen must not open the admin menu, and
+    /// the admin PIN must not unlock the screen).
     stored_lock_pin: [u8; LOCK_PIN_LEN],
-    #[allow(dead_code)]
     stored_lock_pin_len: u8,
     /// On-device admin-menu RuntimeSettings (separate from the provisioning
     /// config — see `pin_menu` module docs). Shared via `Rc<RefCell<_>>` so the
@@ -916,6 +924,55 @@ pub struct UiRuntime<'d> {
     /// immediately, instead of showing an empty/default reading until the
     /// next dispatcher-loop push.
     signal_level: SignalLevel,
+
+    // ── Screen lock (plan D3/D4) ─────────────────────────────────────────
+    //
+    // `ActiveScreen` is UNCHANGED by this feature (D3) — the lock is an
+    // overlay ABOVE whatever `active_screen` currently is, not a ninth
+    // variant. `locked` + `lock_screen` are the overlay's own state,
+    // orthogonal to `active_screen`/`screen_asleep` entirely.
+    /// `true` while the lock overlay is showing. The single source of truth
+    /// for "is the device locked" — `active_screen` is deliberately NOT
+    /// consulted for this (see module doc).
+    locked: bool,
+    /// The live lock-overlay component, `Some` only while `locked`. A fresh
+    /// one is built on every lock trip (mirrors `PinEntryScreen`'s own
+    /// per-visit convention — see `screens::lock`'s module doc) rather than
+    /// retained/reused across trips; the component this field's ABSENCE
+    /// implies is retained is `active_screen`, not this one.
+    lock_screen: Option<screens::LockScreen>,
+    /// Shared digit buffer for the lock overlay's numpad — mirrors
+    /// `pin_digits` above but kept separate (never shared with the admin
+    /// `PinEntry` screen's buffer): the two PINs must never be comparable
+    /// through a shared code path (hard constraint).
+    lock_digits: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+    /// Set by the lock overlay's ✓ callback (a `'static` Slint closure that
+    /// cannot capture `&mut self`) with the just-entered digit sequence;
+    /// drained by `step()` on the next tick. Mirrors `pending_compose_text`'s
+    /// identical `Rc<RefCell<Option<_>>>` handoff shape.
+    pending_lock_confirm: std::rc::Rc<std::cell::RefCell<Option<Vec<u8>>>>,
+    /// In-RAM-only wrong-PIN attempt counter + escalating-backoff state
+    /// (plan D4) — see `firmware_core::ui::lock::LockAttemptState`'s doc for
+    /// why this is never persisted to NVS.
+    lock_attempt_state: LockAttemptState,
+    /// `uptime_ms` timestamp the CURRENT lockout window (if any) started —
+    /// paired with `lock_lockout_s` for
+    /// `firmware_core::ui::lock::unlock_attempt_allowed`'s saturating-elapsed
+    /// check. Meaningless while `lock_lockout_s == 0` (no active lockout).
+    lock_lockout_started_ms: u64,
+    /// Seconds the current lockout window lasts, `0` = no active lockout —
+    /// the value `firmware_core::ui::lock::attempt_unlock` returned for the
+    /// most recent wrong PIN.
+    lock_lockout_s: u32,
+    /// The whole-second countdown value LAST pushed to the lock screen's
+    /// `lockout_text`, `None` while no lockout is active. Dedup gate for
+    /// the per-tick countdown recompute below — without it, every `step()`
+    /// tick re-`format!`s and re-pushes the SAME displayed second (ticks run
+    /// far faster than 1 Hz), the identical alloc-and-tick-churn class this
+    /// codebase already guards elsewhere (see
+    /// `firmware_core::ui::admin_menu::battery_display_fields_changed`'s
+    /// doc for the precedent this mirrors).
+    lock_countdown_last_shown_s: Option<u32>,
 
     // ── Screen-sleep (backlight-off) state ────────────────────────────────
     //
@@ -1396,6 +1453,14 @@ impl<'d> UiRuntime<'d> {
             // Matches `SignalTracker::new`'s own boot default (see that
             // constructor's doc) — device-just-booted, no repeater heard yet.
             signal_level: SignalLevel::DirectOnly,
+            locked: false,
+            lock_screen: None,
+            lock_digits: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            pending_lock_confirm: std::rc::Rc::new(std::cell::RefCell::new(None)),
+            lock_attempt_state: LockAttemptState::default(),
+            lock_lockout_started_ms: 0,
+            lock_lockout_s: 0,
+            lock_countdown_last_shown_s: None,
             screen_asleep: false,
             // Overwritten by the first `step()` call — see the field doc.
             last_activity_ms: 0,
@@ -2071,6 +2136,75 @@ impl<'d> UiRuntime<'d> {
             }
         }
 
+        // ── Process a pending lock-unlock attempt ────────────────────────────
+        // Slint callbacks are 'static and cannot call &mut self methods
+        // directly — the lock overlay's ✓ callback (`wire_lock_screen`)
+        // stashes the entered digits here; drained once per step() while we
+        // hold exclusive access, same handoff shape as `pending_nav` above.
+        let pending_lock_digits = self.pending_lock_confirm.borrow_mut().take();
+        if let Some(digits) = pending_lock_digits {
+            // Defensive: `firmware_core::ui::lock::attempt_unlock` does NOT
+            // itself enforce the lockout window (see that function's doc —
+            // it delegates this to the caller) — the lock screen's own
+            // numpad is already hidden entirely while backing off (no path
+            // for a fresh confirm to fire), but a stale/racing confirm
+            // queued just before a lockout started must still be refused
+            // rather than scored as a fresh attempt.
+            if unlock_attempt_allowed(now_ms, self.lock_lockout_started_ms, self.lock_lockout_s) {
+                let correct = verify_lock_pin(&digits, &self.stored_lock_pin, self.stored_lock_pin_len);
+                let outcome = attempt_unlock(correct, &mut self.lock_attempt_state);
+                if outcome.unlocked {
+                    self.notif.fire(NotifEvent::PinSuccess, now_ms, self.screen_asleep);
+                    self.unlock(now_ms);
+                } else {
+                    self.notif.fire(NotifEvent::PinError, now_ms, self.screen_asleep);
+                    self.lock_lockout_s = outcome.lockout_s;
+                    self.lock_lockout_started_ms = now_ms;
+                    // A fresh lockout starting must always seed its first
+                    // displayed second, even if it happens to numerically
+                    // match whatever a PRIOR lockout's countdown last
+                    // pushed — reset the dedup gate rather than leaving a
+                    // stale value that could silently skip this seed.
+                    self.lock_countdown_last_shown_s = None;
+                    if let Some(ref screen) = self.lock_screen {
+                        screen.trigger_reject();
+                        if outcome.lockout_s > 0 {
+                            self.lock_countdown_last_shown_s = Some(outcome.lockout_s);
+                            screen.set_backing_off(&format!("Try again in {}s", outcome.lockout_s));
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Lock backoff countdown (D4) ──────────────────────────────────────
+        // Recomputed every tick while a lockout is active so the lock
+        // screen's displayed countdown visibly ticks down, independent of
+        // whether a confirm attempt was made this tick. Gated on
+        // `lock_countdown_last_shown_s` actually changing — see that
+        // field's doc for why (`step()` ticks far faster than 1 Hz; without
+        // the gate every tick would re-`format!` + re-push the identical
+        // displayed second).
+        if self.locked && self.lock_lockout_s > 0 {
+            let elapsed_ms = now_ms.saturating_sub(self.lock_lockout_started_ms);
+            let total_ms = (self.lock_lockout_s as u64).saturating_mul(1000);
+            if elapsed_ms >= total_ms {
+                self.lock_lockout_s = 0;
+                self.lock_countdown_last_shown_s = None;
+                if let Some(ref screen) = self.lock_screen {
+                    screen.clear_backing_off();
+                }
+            } else {
+                let remaining_s = ((total_ms - elapsed_ms).div_ceil(1000)) as u32;
+                if self.lock_countdown_last_shown_s != Some(remaining_s) {
+                    self.lock_countdown_last_shown_s = Some(remaining_s);
+                    if let Some(ref screen) = self.lock_screen {
+                        screen.set_backing_off(&format!("Try again in {}s", remaining_s));
+                    }
+                }
+            }
+        }
+
         // ── Sync notification prefs from the admin-menu toggles ─────────────
         // Must run before `handle_event` below so a toggle flipped this same
         // tick already gates the events processed a few lines down. See
@@ -2081,6 +2215,22 @@ impl<'d> UiRuntime<'d> {
         let events = std::mem::take(&mut self.events);
         for event in events {
             self.handle_event(event, now_ms);
+        }
+
+        // ── Lock-screen badge refresh (D5) ───────────────────────────────────
+        // Runs AFTER the event loop above (which is where `self.unread`
+        // actually changes, e.g. `IncomingDm`/`IncomingGroupMsg`) so a
+        // message arriving THIS tick is reflected in the same tick's render
+        // — D5's count-only badge must stay live while locked, not freeze
+        // at whatever it read when the lock tripped. Unread state itself is
+        // untouched by this (plan D5: "unaffected by the lock" — a message
+        // stays unread until its conversation is actually opened after
+        // unlock); this only refreshes what the overlay DISPLAYS.
+        if self.locked {
+            let count = self.total_unread();
+            if let Some(ref screen) = self.lock_screen {
+                screen.set_unread_count(count);
+            }
         }
 
         // ── Audible notification (buzzer) ───────────────────────────────────────
@@ -2151,8 +2301,23 @@ impl<'d> UiRuntime<'d> {
                         log::info!("ui: touch woke screen (swallowed, kind={:?})", ev.kind);
                     }
                     if outcome.dispatch {
-                        // dispatch_touch returns (logical_x, logical_y) after the Deg90-CW
-                        // transform; capture for diagnostics overlay (ignored in production).
+                        // ── Lock gate (touch modality, D3) ───────────────────
+                        // Placed after the wake/swallow interceptor above
+                        // (unchanged) and covers this call, the ONLY place
+                        // touch reaches a screen: `self.window` is the ONE
+                        // Slint window every screen shares (see
+                        // `platform.rs`'s module doc — "the window's
+                        // currently-set component" is singular), and while
+                        // `locked` that current component is the lock
+                        // overlay (`trip_lock`'s `screen.show()`), never
+                        // `active_screen` — so `dispatch_touch` here already
+                        // reaches ONLY the lock screen's own numpad while
+                        // locked, by construction, with no `self.locked`
+                        // branch needed at this call itself. (Contrast the
+                        // keyboard/trackball blocks below, which — unlike
+                        // this one — branch on `self.active_screen` directly
+                        // in Rust and DO need an explicit `self.locked` gate
+                        // for exactly that reason.)
                         let _lxy = self.window.dispatch_touch(ev);
                         // Mark this as the earliest un-painted input, if none
                         // is already pending — see `pending_input_ms`'s doc.
@@ -2168,8 +2333,10 @@ impl<'d> UiRuntime<'d> {
                                 "touch: raw({},{}) \u{2192} logical({},{})",
                                 ev.point.x, ev.point.y, lx, ly,
                             );
-                            if let ActiveScreen::ContactList(ref scr) = self.active_screen {
-                                scr.set_touch_debug((ev.point.x, ev.point.y), (lx, ly));
+                            if !self.locked {
+                                if let ActiveScreen::ContactList(ref scr) = self.active_screen {
+                                    scr.set_touch_debug((ev.point.x, ev.point.y), (lx, ly));
+                                }
                             }
                         }
                     }
@@ -2261,6 +2428,25 @@ impl<'d> UiRuntime<'d> {
                         // sleep (handled in the `if self.screen_asleep` arm) can
                         // never reach here — it neither flips to write mode nor
                         // seeds a character.
+                        //
+                        // ── Lock gate (keyboard modality, D3) ────────────────
+                        // Placed after the wake/swallow interceptor (the
+                        // `if self.screen_asleep` arm above) and BEFORE any
+                        // of the `self.active_screen`-dependent branching
+                        // below — unlike touch's `dispatch_touch` (see that
+                        // call site's own comment), every branch here reads
+                        // `self.active_screen` directly in Rust, bypassing
+                        // Slint's window-component routing entirely; without
+                        // this gate a printable key typed while a
+                        // (retained, hidden) MessageView/Compose sits under
+                        // the lock overlay could seed/send/navigate against
+                        // it invisibly.
+                        if self.locked {
+                            // The lock screen has no keyboard-driven digit
+                            // entry (touch-only numpad, mirroring
+                            // PinEntryScreen) — deliberately a no-op rather
+                            // than falling through to the branches below.
+                        } else {
                         let compose_seed = if matches!(self.active_screen, ActiveScreen::MessageView(_)) {
                             message_view_compose_seed(byte)
                         } else {
@@ -2319,6 +2505,7 @@ impl<'d> UiRuntime<'d> {
                         } else if let Some(text) = keyboard::key_text(byte) {
                             self.window.dispatch_key(text);
                         }
+                        }
                     }
                     // See `keyboard_drain_should_stop`'s doc: stops on a
                     // nav-triggering byte (screen is about to swap) or once
@@ -2362,7 +2549,22 @@ impl<'d> UiRuntime<'d> {
                     if self.pending_input_ms.is_none() {
                         self.pending_input_ms = Some(now_ms);
                     }
-                    self.handle_trackball_event(ev);
+                    // ── Lock gate (trackball modality, D3) ───────────────────
+                    // Placed after the wake/swallow interceptor (the
+                    // `if self.screen_asleep` arm above) and BEFORE
+                    // `handle_trackball_event`, which branches on
+                    // `self.active_screen` directly in Rust — same reason
+                    // the keyboard block above needs this (see that call
+                    // site's comment); touch does not (see the touch block's
+                    // own comment). The lock screen has no trackball
+                    // interaction (touch-only numpad, mirroring
+                    // PinEntryScreen, which also has no trackball handling —
+                    // and D7: nothing reachable while locked, so there is no
+                    // "back" for Left to even go to here), so this is
+                    // deliberately a no-op rather than falling through.
+                    if !self.locked {
+                        self.handle_trackball_event(ev);
+                    }
                 }
             }
         }
@@ -2383,6 +2585,23 @@ impl<'d> UiRuntime<'d> {
             // timeout_s == 0 is the "never sleep" sentinel — no check at all.
         }
 
+        // ── Idle-lock inactivity check (plan D1) ────────────────────────────
+        // Reads the SAME `last_activity_ms` clock the screen-sleep check just
+        // above uses, and trips independently of `screen_asleep` (D1: no
+        // shared field, no grace period — with `lock_timeout_s >= 15` and
+        // `screen_sleep_timeout_s <= 120` the lock CAN trip while the screen
+        // is still lit, and that is correct, not a bug). `idle_lock_due`
+        // itself already no-ops when disabled or already locked.
+        {
+            let (lock_enabled, lock_timeout_s) = {
+                let s = self.runtime_settings.borrow();
+                (s.lock_flags & LOCK_SCREEN_ENABLE != 0, s.lock_timeout_s)
+            };
+            if idle_lock_due(lock_enabled, self.locked, now_ms, self.last_activity_ms, lock_timeout_s) {
+                self.trip_lock();
+            }
+        }
+
         // ── Keyboard-backlight arbiter ────────────────────────────────────────
         // Runs after both the wake path (touch/keyboard poll, above) and the
         // sleep path (inactivity check, just above) have settled
@@ -2390,6 +2609,29 @@ impl<'d> UiRuntime<'d> {
         // `step()`) has had a chance to start the blink loop for a
         // just-arrived message. See `sync_keyboard_backlight`'s doc.
         self.sync_keyboard_backlight(now_ms);
+
+        // ── Lock-overlay reassertion (defense in depth, D3) ─────────────────
+        // Every screen shares ONE Slint window (`platform.rs`'s module doc:
+        // "the window's currently-set component" is singular) — a screen's
+        // own `::new()` unconditionally calls `.show()`, which silently
+        // becomes the window's new current component regardless of
+        // `self.locked`. `trip_lock`/`unlock` above are the two call sites
+        // that manage this deliberately, but `dismiss_splash` (fired from
+        // this same `step()`, independently of `pending_nav`, off its own
+        // timer gate) can race a `trip_lock` that already ran earlier THIS
+        // tick's `handle_event` (boot-locked) — `navigate_to_contact_list`'s
+        // internal `.show()` would otherwise steal the window right out from
+        // under the lock overlay before this tick's render. Reasserting here,
+        // unconditionally, every tick while `locked`, closes that race
+        // regardless of navigation-ordering assumptions elsewhere: nothing
+        // renders between here and this file's own render call below, so any
+        // component swap earlier in this exact tick is corrected before a
+        // single frame of it is ever flushed to the display.
+        if self.locked {
+            if let Some(ref screen) = self.lock_screen {
+                screen.show();
+            }
+        }
 
         // ── Tick Slint ────────────────────────────────────────────────────────
         // Unconditional every iteration, regardless of the render throttle
@@ -2486,6 +2728,17 @@ impl<'d> UiRuntime<'d> {
                 self.set_runtime_settings(seed.runtime_settings);
                 for (hash, is_channel, records) in seed.conversations {
                     self.seed_conversation(hash, is_channel, records);
+                }
+                // Boot-locked (plan D4): "if the lock is enabled, the device
+                // boots locked" — no wipe, no grace window. Checked AFTER
+                // `set_runtime_settings` above (so `lock_flags` reflects the
+                // just-seeded NVS value) and unconditionally, regardless of
+                // which screen `dismiss_splash` will later land on — see
+                // `trip_lock`/`show_active_screen`'s docs for why a
+                // navigation racing this trip (e.g. the splash dismissing
+                // afterward) can never leak a frame of it.
+                if boots_locked(self.runtime_settings.borrow().lock_flags & LOCK_SCREEN_ENABLE != 0) {
+                    self.trip_lock();
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -2926,7 +3179,10 @@ impl<'d> UiRuntime<'d> {
     /// touch), and the GPS-status row navigates. Left goes back to ContactList.
     fn handle_trackball_admin_menu(&mut self, ev: trackball::TrackballEvent) {
         use trackball::TrackballEvent::*;
-        const ROW_COUNT: i32 = 4;
+        // 0=visual toggle, 1=audible toggle, 2=screen-sleep stepper,
+        // 3=lock-enable toggle, 4=lock-timeout stepper, 5=GPS status row —
+        // see `AdminMenuScreenUi.selected_index`'s doc.
+        const ROW_COUNT: i32 = 6;
         let ActiveScreen::AdminMenu(ref screen) = self.active_screen else { return };
         match ev {
             Up | Down => {
@@ -2938,7 +3194,9 @@ impl<'d> UiRuntime<'d> {
                 0 => screen.invoke_toggle_notif_visual(),
                 1 => screen.invoke_toggle_notif_audible(),
                 2 => screen.invoke_increment_screen_sleep_timeout(),
-                3 => screen.invoke_open_gps_status(),
+                3 => screen.invoke_toggle_lock_enabled(),
+                4 => screen.invoke_increment_lock_timeout(),
+                5 => screen.invoke_open_gps_status(),
                 _ => {} // nothing highlighted yet — click has no target
             },
             Left => screen.invoke_back_pressed(),
@@ -3228,6 +3486,8 @@ impl<'d> UiRuntime<'d> {
             screen.set_notif_visual(settings.notif_visual);
             screen.set_notif_audible(settings.notif_audible);
             screen.set_screen_sleep_timeout(settings.screen_sleep_timeout_s as i32);
+            screen.set_lock_enabled(settings.lock_flags & LOCK_SCREEN_ENABLE != 0);
+            screen.set_lock_timeout(settings.lock_timeout_s as i32);
         }
         // Seed the battery row from the cached snapshot (refreshed every
         // dispatcher-loop iteration by `set_battery_status`) so the freshly
@@ -3286,6 +3546,42 @@ impl<'d> UiRuntime<'d> {
                 &mut s,
             );
             log::info!("pin_menu: screen_sleep_timeout_s -> {}", s.screen_sleep_timeout_s);
+            persist_runtime_settings(&cmd_tx, &s);
+        });
+
+        // Screen-lock enable toggle: same apply/persist pattern as the
+        // notif toggles above, via `MenuAction::SetLockEnabled` (single-bit
+        // set/clear of `lock_flags` bit 0 — see that action's own doc for
+        // why this is NOT the same action `UiEvent::LockConfigChanged`'s
+        // host/provisioner path uses).
+        let settings = self.runtime_settings.clone();
+        let cmd_tx = self.cmd_tx.clone();
+        screen.on_toggle_lock_enabled(move |new_val| {
+            let mut s = settings.borrow_mut();
+            pin_menu::apply_menu_action(&pin_menu::MenuAction::SetLockEnabled(new_val), &mut s);
+            log::info!("pin_menu: lock_enabled -> {}", new_val);
+            persist_runtime_settings(&cmd_tx, &s);
+        });
+
+        // Lock-timeout stepper: same apply/persist pattern as the
+        // screen-sleep stepper above. `new_val` is the widget's own
+        // already-clamped-to-15/3600 i32; `apply_menu_action` re-clamps to
+        // `LOCK_TIMEOUT_MIN_S..=LOCK_TIMEOUT_MAX_S` as the single source of
+        // truth (see `MenuAction::SetLockTimeout`).
+        let settings = self.runtime_settings.clone();
+        let cmd_tx = self.cmd_tx.clone();
+        screen.on_decrement_lock_timeout(move |new_val| {
+            let mut s = settings.borrow_mut();
+            pin_menu::apply_menu_action(&pin_menu::MenuAction::SetLockTimeout(new_val.max(0) as u16), &mut s);
+            log::info!("pin_menu: lock_timeout_s -> {}", s.lock_timeout_s);
+            persist_runtime_settings(&cmd_tx, &s);
+        });
+        let settings = self.runtime_settings.clone();
+        let cmd_tx = self.cmd_tx.clone();
+        screen.on_increment_lock_timeout(move |new_val| {
+            let mut s = settings.borrow_mut();
+            pin_menu::apply_menu_action(&pin_menu::MenuAction::SetLockTimeout(new_val.max(0) as u16), &mut s);
+            log::info!("pin_menu: lock_timeout_s -> {}", s.lock_timeout_s);
             persist_runtime_settings(&cmd_tx, &s);
         });
 
@@ -3567,6 +3863,100 @@ impl<'d> UiRuntime<'d> {
             ActiveScreen::Compose(s) => s.hide(),
             ActiveScreen::GpsStatus(s) => s.hide(),
         }
+    }
+
+    /// Re-attach `active_screen`'s ALREADY-CONSTRUCTED component as the
+    /// window's current one, without rebuilding it (screen-lock plan D3:
+    /// unlocking re-shows the RETAINED screen — an in-flight Compose draft
+    /// survives because this never calls any screen's own `::new()`).
+    /// Called by [`Self::unlock`], and defensively every `step()` tick while
+    /// `locked` (see the reassertion comment at that call site) to reclaim
+    /// the window's single shared current-component slot from any
+    /// navigation that raced the lock (e.g. the boot-splash dismissal gate
+    /// firing after `trip_lock` already ran for a boot-locked device).
+    fn show_active_screen(&self) {
+        match &self.active_screen {
+            ActiveScreen::Splash(s) => s.show(),
+            ActiveScreen::Unprovisioned(s) => s.show(),
+            ActiveScreen::ContactList(s) => s.show(),
+            ActiveScreen::PinEntry(s) => s.show(),
+            ActiveScreen::AdminMenu(s) => s.show(),
+            ActiveScreen::MessageView(s) => s.show(),
+            ActiveScreen::Compose(s) => s.show(),
+            ActiveScreen::GpsStatus(s) => s.show(),
+        }
+    }
+
+    /// Total waiting-message count across every conversation — the D5
+    /// count-only badge value. Deliberately just a count: no sender, no
+    /// preview (the badge must not be able to disclose more than this).
+    fn total_unread(&self) -> i32 {
+        self.unread.values().sum::<u32>() as i32
+    }
+
+    /// Trip the screen lock (plan D3/D4): hide whatever is currently shown
+    /// (retaining it, untouched, in `active_screen` for [`Self::unlock`] to
+    /// re-show later) and present a freshly-built lock overlay in its place.
+    /// No-op if already locked (mirrors `idle_lock_due`'s own "already
+    /// locked" no-op arm — defensive, since this is called from more than
+    /// one site: the idle-timeout check and the boot-locked BootSeed arm).
+    ///
+    /// Does NOT reset `last_activity_ms` — an idle-triggered trip should not
+    /// silently extend the very timeout it just fired (there is nothing to
+    /// extend: the lock has already tripped either way).
+    fn trip_lock(&mut self) {
+        if self.locked {
+            return;
+        }
+        self.hide_active_screen();
+        match screens::LockScreen::new() {
+            Ok(screen) => {
+                self.wire_lock_screen(&screen);
+                screen.set_unread_count(self.total_unread());
+                self.lock_screen = Some(screen);
+                self.locked = true;
+                self.window.request_redraw();
+                log::info!("ui: screen locked");
+            }
+            Err(e) => {
+                log::error!("ui: failed to construct lock screen: {:?}", e);
+            }
+        }
+    }
+
+    /// Wire the lock overlay's digit/backspace/confirm callbacks. Confirm
+    /// stashes the entered digits into `pending_lock_confirm` for `step()`
+    /// to drain (Slint callbacks are `'static` and cannot capture `&mut
+    /// self` — same handoff shape `navigate_to_pin_entry` uses for
+    /// `pin_digits`).
+    fn wire_lock_screen(&self, screen: &screens::LockScreen) {
+        self.lock_digits.borrow_mut().clear();
+        let pending = self.pending_lock_confirm.clone();
+        screen.wire_pin_callbacks(self.lock_digits.clone(), move |digits| {
+            *pending.borrow_mut() = Some(digits);
+        });
+    }
+
+    /// Unlock: hide the lock overlay, drop it, and re-show the RETAINED
+    /// `active_screen` — see [`Self::show_active_screen`]'s doc for why this
+    /// never rebuilds it. Resets the idle-activity clock so the freshly
+    /// unlocked screen does not immediately re-trip on the very next
+    /// `step()`. No-op if not locked.
+    fn unlock(&mut self, now_ms: u64) {
+        if !self.locked {
+            return;
+        }
+        if let Some(screen) = self.lock_screen.take() {
+            screen.hide();
+        }
+        self.locked = false;
+        self.lock_lockout_s = 0;
+        self.lock_countdown_last_shown_s = None;
+        self.lock_digits.borrow_mut().clear();
+        self.show_active_screen();
+        self.window.request_redraw();
+        self.last_activity_ms = now_ms;
+        log::info!("ui: screen unlocked");
     }
 
     /// Refresh the live `MessageViewScreen` message model if `(hash, is_channel)`
