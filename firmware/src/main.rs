@@ -107,6 +107,11 @@ use protocol::{
 // importing a name that build never references.
 #[cfg(not(feature = "hil"))]
 use protocol::decode_login_response;
+// Screen-lock PIN's fixed wire/storage length — sizes the `boot_seed_lock_pin`
+// buffer declared unconditionally in `run()` below (so the `hil` build's
+// `BootSeed` construction still type-checks, even though only the
+// `#[cfg(not(feature = "hil"))]` path ever populates it from `lock_store::load`).
+use protocol::provisioning::LOCK_PIN_LEN;
 
 #[cfg(not(feature = "hil"))]
 use esp_idf_hal::i2c::{I2cDriver, config::Config as I2cConfig};
@@ -174,6 +179,11 @@ mod pin_menu;
 // builds only (hil skips NVS entirely, same as config_store).
 #[cfg(not(feature = "hil"))]
 mod runtime_settings_store;
+// Screen-lock PIN store (NVS-backed, `mc_lock` namespace) — production
+// builds only, same HIL exemption as `runtime_settings_store`/`config_store`
+// above (HIL never provisions a lock PIN and never touches NVS for it).
+#[cfg(not(feature = "hil"))]
+mod lock_store;
 // History store and admin USB-serial server — production builds only.
 // HIL rigs have no display, no NVS history, and no admin laptop.
 #[cfg(not(feature = "hil"))]
@@ -983,6 +993,19 @@ fn run() -> anyhow::Result<()> {
     let mut boot_seed_channels: Vec<ui::screens::contact_list::ChannelItem> = Vec::new();
     let mut boot_seed_pin: [u8; pin_menu::MAX_PIN_LEN] = [0u8; pin_menu::MAX_PIN_LEN];
     let mut boot_seed_pin_len: u8 = 0;
+    // The screen-lock PIN — a separate NVS store from `boot_seed_pin` above
+    // (D2: `mc_lock`, not `ProvisionedConfig`), but boot-seeded the exact
+    // same way, over the same BootSeed bundle: the UI thread's copy is
+    // boot-seeded only, so a host-set lock PIN (FRAME_SET_LOCK_PIN) takes
+    // effect at the next boot, the same documented asymmetry the admin PIN
+    // already has (see `admin_server.rs`'s `FRAME_SET_LOCK_PIN` handler doc).
+    // Declared unconditionally (like every other `boot_seed_*` local here) so
+    // the BootSeed construction below type-checks under `--features hil`
+    // too; only ever populated from `lock_store::load` inside the
+    // `#[cfg(not(feature = "hil"))]` block below — a `hil` build leaves it at
+    // its zeroed "no PIN set" default, same as `boot_seed_pin` does today.
+    let mut boot_seed_lock_pin: [u8; LOCK_PIN_LEN] = [0u8; LOCK_PIN_LEN];
+    let mut boot_seed_lock_pin_len: u8 = 0;
     let mut boot_seed_runtime_settings: pin_menu::RuntimeSettings =
         pin_menu::RuntimeSettings::default_enabled();
     let mut boot_seed_conversations: Vec<(u8, bool, Vec<ui::MessageRecord>)> = Vec::new();
@@ -1248,6 +1271,15 @@ fn run() -> anyhow::Result<()> {
                         // ADR-0012 C5: accumulated into the BootSeed bundle.
                         boot_seed_pin = cfg.pin;
                         boot_seed_pin_len = cfg.pin_len;
+                        // Wire the screen-lock PIN in too — a separate NVS
+                        // store (`mc_lock`, not `ProvisionedConfig`; see
+                        // `lock_store`'s module doc for D2's reasoning), but
+                        // boot-seeded over the exact same BootSeed bundle.
+                        {
+                            let (lock_pin, lock_pin_len) = lock_store::load(nvs_partition.clone());
+                            boot_seed_lock_pin = lock_pin;
+                            boot_seed_lock_pin_len = lock_pin_len;
+                        }
                         // Load any previously-saved on-device admin-menu
                         // RuntimeSettings so the AdminMenu screen's toggles
                         // persist across reboot (separate store from the
@@ -1672,8 +1704,20 @@ fn run() -> anyhow::Result<()> {
         // QUERY_CHANNELS and the ADD_*/DEL_* edits), and an NVS handle so runtime
         // edits persist back to flash.  The config + NVS handle are moved into
         // the thread.
+        //
+        // Also a clone of `evt_tx` (screen-lock plan D2/finding 3):
+        // `SyncSender` is `Clone` and is constructed well before this spawn
+        // (~main.rs:809/941), so `admin_server`'s `FRAME_SET_LOCK_CONFIG`
+        // handler can forward a `UiEvent::LockConfigChanged` to the UI thread
+        // instead of writing the `mc_rts` namespace itself — the UI thread
+        // stays the sole writer of that blob (the hard constraint this
+        // change's design notes name; see `admin_server.rs`'s module doc and
+        // its `FRAME_SET_LOCK_CONFIG` handler for the full mechanism). The
+        // original `evt_tx` is NOT moved here — every dispatcher-loop
+        // `send_ui_event(&evt_tx, ...)` call below this spawn still needs it.
         let identity_for_admin = identity.clone();
         let nvs_for_parent = nvs_partition.clone();
+        let evt_tx_for_admin = evt_tx.clone();
         std::thread::Builder::new()
             .name("admin_server".into())
             // 12 KiB. Originally bumped from 8 KiB (see `admin_server.rs`'s
@@ -1701,6 +1745,7 @@ fn run() -> anyhow::Result<()> {
                     identity_for_admin,
                     Box::new(provisioned_config),
                     nvs_for_parent,
+                    evt_tx_for_admin,
                 );
             })
             .expect("admin_server thread spawn failed");
@@ -1945,6 +1990,8 @@ fn run() -> anyhow::Result<()> {
             channels: boot_seed_channels,
             pin: boot_seed_pin,
             pin_len: boot_seed_pin_len,
+            lock_pin: boot_seed_lock_pin,
+            lock_pin_len: boot_seed_lock_pin_len,
             runtime_settings: boot_seed_runtime_settings,
             conversations: boot_seed_conversations,
         })),

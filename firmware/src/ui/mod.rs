@@ -116,6 +116,11 @@ use std::sync::mpsc::SyncSender;
 // `pin_menu` is compiled in all builds (pure Rust, no ESP-IDF deps) so this
 // import is unconditional.
 use crate::pin_menu;
+// The screen-lock PIN's fixed wire/storage length — sizes `BootSeed::lock_pin`
+// / `UiRuntime::stored_lock_pin` below. `protocol` (unlike `firmware_core`) is
+// a plain host-buildable crate with no ESP-IDF dependency, so this import is
+// unconditional too.
+use protocol::provisioning::LOCK_PIN_LEN;
 // `gps::GpsStatus` is a plain Copy struct (no hardware dependency) — used
 // here purely as a display-state type for the GPS status screen.
 use crate::gps;
@@ -412,6 +417,23 @@ pub enum UiEvent {
     /// Change-detected signal-meter push (ADR-0012 C4). See `UiRuntime::
     /// set_signal_level`.
     SignalLevelChanged(SignalLevel),
+    /// Host/provisioner wrote new screen-lock enable-flags/timeout via
+    /// `FRAME_SET_LOCK_CONFIG` — forwarded here rather than `admin_server`
+    /// writing `mc_rts` directly (screen-lock plan D2's single-writer
+    /// invariant: the UI thread stays the sole writer of the `mc_rts` blob —
+    /// see `admin_server.rs`'s module doc). `handle_event` applies this via
+    /// `pin_menu::apply_menu_action` (`SetLockFlags` + `SetLockTimeout` —
+    /// the full-bitfield overwrite, not the single-bit `SetLockEnabled` the
+    /// on-device admin-menu toggle uses, since this carries the WHOLE wire
+    /// `lock_flags` byte) and persists via the existing
+    /// `persist_runtime_settings`/`UiCommand::PersistRuntimeSettings` path.
+    /// `admin_server`'s `RSP_OK` for `SET_LOCK_CONFIG` means "accepted and
+    /// forwarded," not "persisted" — the persist completes asynchronously,
+    /// here, on this event's own handling.
+    LockConfigChanged {
+        lock_flags: u8,
+        lock_timeout_s: u16,
+    },
 }
 
 /// Every boot-time (`main.rs::run()`'s bring-up path) `UiRuntime` seed call,
@@ -446,6 +468,15 @@ pub struct BootSeed {
     /// — see [`UiRuntime::set_pin`].
     pub pin: [u8; pin_menu::MAX_PIN_LEN],
     pub pin_len: u8,
+    /// The screen-lock PIN + its length (`lock_pin_len == 0` means "no
+    /// screen-lock PIN configured") — a SEPARATE secret from `pin`/`pin_len`
+    /// above (the admin-menu PIN); see `firmware::lock_store`'s module doc
+    /// for why it lives in its own `mc_lock` NVS namespace. Boot-seeded the
+    /// same way as `pin`/`pin_len`: a host-set lock PIN
+    /// (`FRAME_SET_LOCK_PIN`) takes effect at the next boot, not live — see
+    /// [`UiRuntime::set_lock_pin`].
+    pub lock_pin: [u8; LOCK_PIN_LEN],
+    pub lock_pin_len: u8,
     /// The on-device admin-menu settings loaded from NVS at boot (or the
     /// provisioning-time defaults on first boot) — see [`UiRuntime::
     /// set_runtime_settings`].
@@ -745,6 +776,18 @@ pub struct UiRuntime<'d> {
     /// Provisioned PIN bytes and length (zeroed = PIN lock disabled).
     stored_pin: [u8; pin_menu::MAX_PIN_LEN],
     stored_pin_len: u8,
+    /// The screen-lock PIN bytes and length (zeroed = no lock PIN
+    /// configured) — a separate secret from `stored_pin`/`stored_pin_len`
+    /// above. Boot-seeded via [`Self::set_lock_pin`] from
+    /// [`UiEvent::BootSeed`]; not yet read anywhere else in this file — the
+    /// lock overlay's unlock-attempt comparison
+    /// (`pin_menu::verify_pin`-against-`stored_lock_pin`, mirroring
+    /// `stored_pin`'s use at the `PinEntry` screen) is a later phase of the
+    /// screen-lock campaign (`meshcadet-lock-firmware-ui`).
+    #[allow(dead_code)]
+    stored_lock_pin: [u8; LOCK_PIN_LEN],
+    #[allow(dead_code)]
+    stored_lock_pin_len: u8,
     /// On-device admin-menu RuntimeSettings (separate from the provisioning
     /// config — see `pin_menu` module docs). Shared via `Rc<RefCell<_>>` so the
     /// `'static` Slint toggle callbacks wired in `navigate_to_admin_menu` can
@@ -1333,6 +1376,8 @@ impl<'d> UiRuntime<'d> {
             admin_menu_selected: -1,
             stored_pin: [0u8; pin_menu::MAX_PIN_LEN],
             stored_pin_len: 0,
+            stored_lock_pin: [0u8; LOCK_PIN_LEN],
+            stored_lock_pin_len: 0,
             runtime_settings: std::rc::Rc::new(std::cell::RefCell::new(
                 pin_menu::RuntimeSettings::default_enabled(),
             )),
@@ -1469,6 +1514,26 @@ impl<'d> UiRuntime<'d> {
         self.stored_pin_len = pin_len;
         log::info!(
             "ui: provisioned PIN stored (pin_len={})",
+            pin_len,
+        );
+    }
+
+    /// Set the screen-lock PIN — a separate secret from [`Self::set_pin`]'s
+    /// admin PIN.
+    ///
+    /// Called from `main.rs` as part of `UiEvent::BootSeed`, alongside
+    /// `set_pin` (see `ui::BootSeed::lock_pin`'s doc for why this rides the
+    /// same boot-seed bundle and the same "takes effect next boot" posture).
+    /// `lock_pin_len == 0` means no screen-lock PIN is configured — no
+    /// consumer reads `stored_lock_pin`/`stored_lock_pin_len` yet (the
+    /// unlock-attempt comparison is `meshcadet-lock-firmware-ui`'s job); this
+    /// method only stores the boot-seeded value so it is ready when that
+    /// phase wires the lock overlay.
+    pub fn set_lock_pin(&mut self, pin: [u8; LOCK_PIN_LEN], pin_len: u8) {
+        self.stored_lock_pin = pin;
+        self.stored_lock_pin_len = pin_len;
+        log::info!(
+            "ui: screen-lock PIN stored (lock_pin_len={})",
             pin_len,
         );
     }
@@ -2417,6 +2482,7 @@ impl<'d> UiRuntime<'d> {
                 }
                 self.set_channels(&seed.channels);
                 self.set_pin(seed.pin, seed.pin_len);
+                self.set_lock_pin(seed.lock_pin, seed.lock_pin_len);
                 self.set_runtime_settings(seed.runtime_settings);
                 for (hash, is_channel, records) in seed.conversations {
                     self.seed_conversation(hash, is_channel, records);
@@ -2430,6 +2496,31 @@ impl<'d> UiRuntime<'d> {
             }
             UiEvent::BatteryStatusChanged(status) => self.set_battery_status(status),
             UiEvent::SignalLevelChanged(level) => self.set_signal_level(level),
+            // Host/provisioner wrote new lock enable-flags/timeout, forwarded
+            // by `admin_server` rather than writing `mc_rts` directly (see
+            // `UiEvent::LockConfigChanged`'s own doc for the single-writer
+            // invariant this preserves). Apply via `pin_menu::apply_menu_action`
+            // — `SetLockFlags` (the full-bitfield overwrite `admin_server`'s
+            // wire payload carries), not `SetLockEnabled` (the on-device
+            // admin-menu toggle's single-bit action) — then persist through
+            // the same `persist_runtime_settings` path the admin-menu
+            // toggles/steppers already use, so `main.rs`'s
+            // `UiCommand::PersistRuntimeSettings` handler stays the ONLY
+            // `mc_rts` writer regardless of which of the three configuration
+            // surfaces originated the change.
+            UiEvent::LockConfigChanged { lock_flags, lock_timeout_s } => {
+                let mut s = self.runtime_settings.borrow_mut();
+                pin_menu::apply_menu_action(&pin_menu::MenuAction::SetLockFlags(lock_flags), &mut s);
+                pin_menu::apply_menu_action(
+                    &pin_menu::MenuAction::SetLockTimeout(lock_timeout_s),
+                    &mut s,
+                );
+                log::info!(
+                    "ui: lock config changed via host/provisioner — lock_flags=0x{:02x} lock_timeout_s={}",
+                    s.lock_flags, s.lock_timeout_s,
+                );
+                persist_runtime_settings(&self.cmd_tx, &s);
+            }
             UiEvent::IncomingDm { from_hash, from_name, text } => {
                 self.contact_names
                     .entry(from_hash)
