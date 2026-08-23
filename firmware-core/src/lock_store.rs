@@ -60,6 +60,37 @@ pub fn serialize(pin: &[u8; LOCK_PIN_LEN], pin_len: u8, out: &mut [u8]) -> usize
     BLOB_LEN
 }
 
+/// Verify an entered PIN attempt against the stored screen-lock PIN.
+///
+/// This is a SEPARATE comparison from `pin_menu::verify_pin` — the lock PIN
+/// is a distinct secret from the admin-menu PIN (screen-lock plan, "the lock
+/// PIN is verified against the boot-seeded lock PIN, not the admin PIN");
+/// keeping this as its own function, sized to [`LOCK_PIN_LEN`] rather than
+/// `pin_menu::MAX_PIN_LEN`, means the two PINs are never compared through a
+/// shared fixed-width buffer where a defect in one could bleed into the
+/// other. Constant-time, mirroring `pin_menu::verify_pin`'s discipline
+/// exactly (no early return on mismatch, and any excess bytes in `entered`
+/// still get OR'd in so a too-long attempt can't shortcut the comparison).
+///
+/// Returns `false` immediately if `stored_pin_len == 0` ("no lock PIN
+/// configured" — mirrors `pin_menu::verify_pin`'s same convention).
+pub fn verify(entered: &[u8], stored_pin: &[u8; LOCK_PIN_LEN], stored_pin_len: u8) -> bool {
+    let slen = stored_pin_len as usize;
+    if slen == 0 {
+        return false;
+    }
+    let mut mismatch: u8 = if entered.len() != slen { 1 } else { 0 };
+    for i in 0..LOCK_PIN_LEN {
+        let a = if i < entered.len() { entered[i] } else { 0x00 };
+        let b = stored_pin[i];
+        mismatch |= a ^ b;
+    }
+    for &b in entered.iter().skip(slen) {
+        mismatch |= b;
+    }
+    mismatch == 0
+}
+
 /// Deserialize a stored lock-PIN blob. Returns `None` on a short/malformed
 /// blob or unrecognised version (first boot with the namespace never
 /// written, or a corrupt blob) — callers treat `None` as "no PIN set",
@@ -159,5 +190,34 @@ mod tests {
             let (_, restored_len) = deserialize(&blob).expect("valid blob");
             assert_eq!(restored_len, len);
         }
+    }
+
+    // ── verify (lock-PIN comparison — distinct from pin_menu::verify_pin) ──
+
+    #[test]
+    fn verify_correct_pin_accepted() {
+        assert!(verify(b"1234", b"1234", LOCK_PIN_LEN as u8));
+    }
+
+    #[test]
+    fn verify_wrong_pin_rejected() {
+        assert!(!verify(b"5678", b"1234", LOCK_PIN_LEN as u8));
+    }
+
+    #[test]
+    fn verify_no_pin_set_always_rejected() {
+        assert!(!verify(b"1234", &[0u8; LOCK_PIN_LEN], 0));
+        assert!(!verify(b"", &[0u8; LOCK_PIN_LEN], 0));
+    }
+
+    #[test]
+    fn verify_shorter_or_longer_entry_rejected() {
+        assert!(!verify(b"123", b"1234", LOCK_PIN_LEN as u8));
+        assert!(!verify(b"12345", b"1234", LOCK_PIN_LEN as u8));
+    }
+
+    #[test]
+    fn verify_single_digit_mismatch_rejected() {
+        assert!(!verify(b"1235", b"1234", LOCK_PIN_LEN as u8));
     }
 }
