@@ -2190,6 +2190,22 @@ impl<'d> UiRuntime<'d> {
             self.handle_event(event, now_ms);
         }
 
+        // ── Lock-screen badge refresh (D5) ───────────────────────────────────
+        // Runs AFTER the event loop above (which is where `self.unread`
+        // actually changes, e.g. `IncomingDm`/`IncomingGroupMsg`) so a
+        // message arriving THIS tick is reflected in the same tick's render
+        // — D5's count-only badge must stay live while locked, not freeze
+        // at whatever it read when the lock tripped. Unread state itself is
+        // untouched by this (plan D5: "unaffected by the lock" — a message
+        // stays unread until its conversation is actually opened after
+        // unlock); this only refreshes what the overlay DISPLAYS.
+        if self.locked {
+            let count = self.total_unread();
+            if let Some(ref screen) = self.lock_screen {
+                screen.set_unread_count(count);
+            }
+        }
+
         // ── Audible notification (buzzer) ───────────────────────────────────────
         // Deliberately runs here, unconditionally — before any touch/keyboard
         // polling and before any future sleep/backlight gating further down in
