@@ -20,6 +20,10 @@
 //! constant-time facilities.  A zero-length stored PIN means "no PIN set" and
 //! always returns `false` regardless of the entered PIN.
 
+use protocol::provisioning::{
+    LOCK_SCREEN_ENABLE, LOCK_TIMEOUT_DEFAULT_S, LOCK_TIMEOUT_MAX_S, LOCK_TIMEOUT_MIN_S,
+};
+
 /// Maximum PIN length in bytes (matches `provisioning::MAX_PIN_LEN`).
 pub const MAX_PIN_LEN: usize = 16;
 
@@ -56,6 +60,14 @@ pub struct RuntimeSettings {
     /// `0..=SCREEN_SLEEP_MAX_S`; `0` means "never sleep". Default
     /// `SCREEN_SLEEP_DEFAULT_S` (30s).
     pub screen_sleep_timeout_s: u8,
+    /// Screen-lock idle timeout, in seconds — independent of
+    /// `screen_sleep_timeout_s` (plan D1: shared `last_activity_ms` clock,
+    /// no shared field, no grace period). Valid range
+    /// `LOCK_TIMEOUT_MIN_S..=LOCK_TIMEOUT_MAX_S`. **No zero sentinel** —
+    /// on/off rides `lock_flags` bit 0 (`LOCK_SCREEN_ENABLE`), never an
+    /// overloaded timeout value (plan D1's explicit rejection of the
+    /// screen-sleep sentinel pattern for this field).
+    pub lock_timeout_s: u16,
 }
 
 impl RuntimeSettings {
@@ -69,6 +81,7 @@ impl RuntimeSettings {
             contact_count: 0,
             lock_flags: 0,
             screen_sleep_timeout_s: SCREEN_SLEEP_DEFAULT_S,
+            lock_timeout_s: LOCK_TIMEOUT_DEFAULT_S,
         }
     }
 }
@@ -110,6 +123,15 @@ pub enum MenuAction {
     /// Set the screen-sleep inactivity timeout, in seconds. Clamped to
     /// `0..=SCREEN_SLEEP_MAX_S` by `apply_menu_action` — `0` means never sleep.
     SetScreenSleepTimeout(u8),
+    /// Enable or disable the screen lock. Sets/clears `lock_flags` bit 0
+    /// (`LOCK_SCREEN_ENABLE`) only — bit 1 (`LOCK_NO_DEVICE_DISABLE`, reserved,
+    /// not shipped this campaign) and any other bits are left untouched.
+    SetLockEnabled(bool),
+    /// Set the screen-lock idle timeout, in seconds. Clamped to
+    /// `LOCK_TIMEOUT_MIN_S..=LOCK_TIMEOUT_MAX_S` by `apply_menu_action` — the
+    /// single source of truth, mirroring `SetScreenSleepTimeout`'s re-clamp
+    /// regardless of what the widget/protocol frame passed.
+    SetLockTimeout(u16),
 }
 
 // ── verify_pin ────────────────────────────────────────────────────────────────
@@ -172,6 +194,16 @@ pub fn apply_menu_action(action: &MenuAction, settings: &mut RuntimeSettings) {
         }
         MenuAction::SetScreenSleepTimeout(secs) => {
             settings.screen_sleep_timeout_s = (*secs).min(SCREEN_SLEEP_MAX_S);
+        }
+        MenuAction::SetLockEnabled(enabled) => {
+            if *enabled {
+                settings.lock_flags |= LOCK_SCREEN_ENABLE;
+            } else {
+                settings.lock_flags &= !LOCK_SCREEN_ENABLE;
+            }
+        }
+        MenuAction::SetLockTimeout(secs) => {
+            settings.lock_timeout_s = (*secs).clamp(LOCK_TIMEOUT_MIN_S, LOCK_TIMEOUT_MAX_S);
         }
     }
 }
@@ -380,6 +412,78 @@ mod tests {
         let mut s = RuntimeSettings::default();
         apply_menu_action(&MenuAction::SetScreenSleepTimeout(255), &mut s);
         assert_eq!(s.screen_sleep_timeout_s, SCREEN_SLEEP_MAX_S);
+    }
+
+    // ── screen-lock enable + timeout ────────────────────────────────────────
+
+    /// Acceptance: default lock timeout is 300s (5 min, plan D1).
+    #[test]
+    fn lock_timeout_defaults_to_300s() {
+        let s = RuntimeSettings::default();
+        assert_eq!(s.lock_timeout_s, 300);
+        assert_eq!(s.lock_timeout_s, LOCK_TIMEOUT_DEFAULT_S);
+    }
+
+    #[test]
+    fn set_lock_enabled_sets_only_bit_zero() {
+        let mut s = RuntimeSettings::default();
+        assert_eq!(s.lock_flags, 0);
+        apply_menu_action(&MenuAction::SetLockEnabled(true), &mut s);
+        assert_eq!(s.lock_flags, LOCK_SCREEN_ENABLE);
+    }
+
+    #[test]
+    fn set_lock_enabled_preserves_other_flag_bits() {
+        // Bit 1 (LOCK_NO_DEVICE_DISABLE, reserved) is set independently and
+        // must survive an on-device enable/disable toggle untouched.
+        let mut s = RuntimeSettings {
+            lock_flags: 0x02,
+            ..Default::default()
+        };
+        apply_menu_action(&MenuAction::SetLockEnabled(true), &mut s);
+        assert_eq!(s.lock_flags, 0x03, "bit 0 set, bit 1 preserved");
+        apply_menu_action(&MenuAction::SetLockEnabled(false), &mut s);
+        assert_eq!(s.lock_flags, 0x02, "bit 0 cleared, bit 1 still preserved");
+    }
+
+    #[test]
+    fn set_lock_timeout_within_range() {
+        let mut s = RuntimeSettings::default();
+        apply_menu_action(&MenuAction::SetLockTimeout(60), &mut s);
+        assert_eq!(s.lock_timeout_s, 60);
+    }
+
+    /// Acceptance: a lock timeout below `LOCK_TIMEOUT_MIN_S` (15) is clamped
+    /// UP, never accepted verbatim — `apply_menu_action` is the single
+    /// source of truth for this bound regardless of what any surface passed.
+    #[test]
+    fn set_lock_timeout_below_min_clamped_up() {
+        let mut s = RuntimeSettings::default();
+        apply_menu_action(&MenuAction::SetLockTimeout(1), &mut s);
+        assert_eq!(s.lock_timeout_s, LOCK_TIMEOUT_MIN_S);
+        apply_menu_action(&MenuAction::SetLockTimeout(0), &mut s);
+        assert_eq!(
+            s.lock_timeout_s, LOCK_TIMEOUT_MIN_S,
+            "no zero sentinel for this field — D1 puts on/off on lock_flags bit 0"
+        );
+    }
+
+    /// Acceptance: a lock timeout above `LOCK_TIMEOUT_MAX_S` (3600) is
+    /// clamped DOWN, never accepted verbatim.
+    #[test]
+    fn set_lock_timeout_above_max_clamped_down() {
+        let mut s = RuntimeSettings::default();
+        apply_menu_action(&MenuAction::SetLockTimeout(u16::MAX), &mut s);
+        assert_eq!(s.lock_timeout_s, LOCK_TIMEOUT_MAX_S);
+    }
+
+    #[test]
+    fn set_lock_timeout_bounds_are_settable_exactly() {
+        let mut s = RuntimeSettings::default();
+        apply_menu_action(&MenuAction::SetLockTimeout(LOCK_TIMEOUT_MIN_S), &mut s);
+        assert_eq!(s.lock_timeout_s, LOCK_TIMEOUT_MIN_S);
+        apply_menu_action(&MenuAction::SetLockTimeout(LOCK_TIMEOUT_MAX_S), &mut s);
+        assert_eq!(s.lock_timeout_s, LOCK_TIMEOUT_MAX_S);
     }
 
     /// Acceptance: wrong PIN is rejected, correct PIN is accepted,
