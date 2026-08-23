@@ -850,6 +850,11 @@ impl MessageViewScreen {
         self.component.invoke_scroll_by(delta_px);
     }
 
+    /// Re-attach this (already-constructed) component as the window's
+    /// current one, without rebuilding it — used to re-show the RETAINED
+    /// active screen after an unlock (screen-lock plan D3). See
+    /// `ui::mod::UiRuntime::show_active_screen`'s doc.
+    pub fn show(&self) { self.component.show().ok(); }
     pub fn hide(&self) { self.component.hide().ok(); }
 }
 

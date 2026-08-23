@@ -26,6 +26,7 @@ pub mod pin_entry;
 pub mod admin_menu;
 pub mod gps_status;
 pub mod splash;
+pub mod lock;
 
 pub use unprovisioned::UnprovisionedScreen;
 pub use contact_list::ContactListScreen;
@@ -35,3 +36,4 @@ pub use pin_entry::PinEntryScreen;
 pub use admin_menu::AdminMenuScreen;
 pub use gps_status::GpsStatusScreen;
 pub use splash::SplashScreen;
+pub use lock::LockScreen;

@@ -637,6 +637,13 @@ impl SplashScreen {
         self.component.set_version_str(version.into());
     }
 
+    /// Re-attach this (already-constructed) component as the window's
+    /// current one — see `message_view.rs`'s identical `show()` doc for the
+    /// screen-lock D3 retained-overlay rationale.
+    pub fn show(&self) {
+        self.component.show().ok();
+    }
+
     pub fn hide(&self) {
         self.component.hide().ok();
     }
