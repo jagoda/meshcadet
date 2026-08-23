@@ -1,8 +1,7 @@
 # ADR-0013 — Screen Lock: Policy/UI Layer, No Wire-Protocol Change
 
 - **Status:** Accepted (2026-08-23)
-- **Deciders:** Maintainer design review (`meshcadet-screen-lock` campaign,
-  `flight-manuals/plans/meshcadet-screen-lock.md`)
+- **Deciders:** Maintainer design review (`meshcadet-screen-lock` campaign)
 - **Supersedes:** —
 - **Implements:** ADR-0001 §4 (physical USB possession = admin authority),
   ADR-0005 (`firmware-core` extraction — the pure lock state machine lives
@@ -26,7 +25,7 @@
 
 MeshCadet had no screen lock: a provisioned T-Deck left unattended exposed
 the full contact list, every conversation thread, and the compose surface to
-anyone who picked it up. The Commander wanted a configurable idle lock
+anyone who picked it up. The maintainer wanted a configurable idle lock
 gated on a 4-digit PIN **distinct from the existing admin-menu PIN**, with
 notifications still firing while locked, the lock PIN writable only from
 the web provisioner and the host CLI, and enable/timeout adjustable from

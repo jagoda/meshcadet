@@ -1,6 +1,6 @@
 # Screen-lock bench procedure (MeshCadet, real T-Deck)
 
-**Commander-run.** This document batches every genuinely device-bound check
+**Maintainer-run.** This document batches every genuinely device-bound check
 for the screen-lock feature into a single sitting on real hardware. It is
 self-contained — no Houston dependency, no queued follow-on mission; the
 checks below are not, and should not become, an automated CI/HIL job.
