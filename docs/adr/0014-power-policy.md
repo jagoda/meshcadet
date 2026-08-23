@@ -176,19 +176,23 @@ clause below rather than inherit an implicit one from here.
    implementation gap a future campaign could close — see D5.
 
 **Expected incremental win over DFS alone: order 5–15 mA `[ESTIMATE —
-datasheet-order, not measured]`.** Real, but smaller than the GPS leg
-(`meshcadet-power-gps-standby`, order ~20 mA) and gated entirely behind
-clause 2's unfalsifiable-without-hardware correctness argument — which is
-why this campaign stages DFS first and does not attempt light sleep at all.
+datasheet-order, not measured]`.** Real, but smaller than the GPS leg's
+*foregone* estimate (`meshcadet-power-gps-standby`, order ~20 mA
+`[ESTIMATE]` — not landed for either variant, see D5 row 9) and gated
+entirely behind clause 2's unfalsifiable-without-hardware correctness
+argument — which is why this campaign stages DFS first and does not attempt
+light sleep at all.
 
 ### D5 — The deliberately-not-attempted register, with magnitudes
 
 Every item this campaign considered and did not implement, ranked by
 estimated magnitude where one exists. Every number below carries its D2 tag.
-This is the complete register as scoped when this ADR was authored;
-`meshcadet-power-gps-standby` adds a u-blox row here if it takes its
-documented abort, and `meshcadet-power-idle-screen` adds rows here if its
-abort reshapes the DFS leg's scope.
+This is the complete register as scoped when this ADR was authored, extended
+by row 9 below (`meshcadet-power-gps-standby` landed a **broader** abort than
+this ADR anticipated — not merely a u-blox row, but the entire GPS
+RF-front-end standby lever, both variants; see row 9's own text), and
+`meshcadet-power-idle-screen` adds rows here if its abort reshapes the DFS
+leg's scope.
 
 | # | Item | Magnitude | Disposition |
 |---|---|---|---|
@@ -200,6 +204,7 @@ abort reshapes the DFS leg's scope.
 | 6 | **Building a power-measurement kit, or a device-measurement procedure** | Not applicable — a procedural exclusion, not a power lever | Ruled out by the maintainer directly (see Context). Nothing in this campaign re-litigates it. This is the premise D2's estimate-labelling rule exists to serve, not an item competing with the others on magnitude. |
 | 7 | **Lowering the shipped `screen_sleep_timeout_s` default (30 s)** | Not estimated — a product decision, not a power lever this campaign is scoped to evaluate | Out of scope. The maintainer did not ask for this behavior change. `meshcadet-power-backlight-brightness` makes brightness *settable*; changing the sleep-timeout default is a separate product decision, deliberately not conflated with it. |
 | 8 | **Host-native execution** | Not applicable | No leg of this campaign targets a host-native relaunch; all device-side validation stays with the maintainer, on real hardware. |
+| 9 | **GPS RF-front-end low-power standby, both variants** (`meshcadet-power-gps-standby`) | ~20 mA `[ESTIMATE]` foregone — this campaign's single largest anticipated lever (the plan's own Phase 2 framing: "the largest single lever in the campaign") | Attempted and aborted for **both** GNSS variants, not only u-blox as this ADR anticipated when authored. **L76K**: its documented command surface (`$PCAS01`–`$PCAS04`/`$PCAS10` NMEA-ASCII, plus the binary CASIC ACK/CFG-PRT/CFG-MSG/CFG-RST/CFG-RATE messages — Quectel `L76K_GNSS_Protocol_Specification` V1.1, 2021-12-16, the full and only documented command set for this exact module) contains **no standby/sleep command of any kind**. Quectel support confirmed this directly on their own forum: *"there is no equivalent of `PMTK_CMD_STANDBY_MODE` in PCAS messages"* — genuine standby requires pulling the module's hardware STANDBY pin low, or a ≥1 s VCC power-cycle while `V_BCKP` stays powered — both physical-pin operations, not UART commands. This board's GPS shield does not wire a STANDBY/EN pin to the ESP32-S3 (`firmware/src/gps.rs`'s own hardware table lists only GPIO43/44, UART TX/RX) — the pin doesn't exist for this firmware to command even if a code path were written. The nearby `$PMTK161,0` "standby" command occasionally cited online belongs to MediaTek MT3333-family modules (e.g. plain L76/L80), a different chipset family than this board's CASIC-based L76K, and does not apply here. **u-blox M10Q**: unchanged from this ADR's original anticipation — power management is `UBX-CFG-PMS`/`UBX-RXM-PMREQ`, binary, not ASCII/NMEA-checksum-verifiable off-hardware. Since **neither** variant has an ASCII/checksum-verifiable, host-testable command, the acceptance template's own host-test requirement (D3.2) cannot be met by any code path for this lever — no firmware or `firmware-core` change accompanies this row, matching D3's leg-may-decide-not-every-leg-earns-a-guard posture (there is no standby path to guard). Follow-on: a hardware-revision campaign wiring the L76K STANDBY pin to a spare GPIO, gated on a bench session (the same hardware-validation-path pattern as D4's light-sleep contract); independently, a u-blox-only leg validating the binary UBX sequence on real u-blox hardware. Deferred predicate: `docs/perf/ui-perf-baseline.md` §9, D13. |
 
 **A sub-decision that is *not* on this register:** the GPS leg's choice of
 whether `$PCAS04,7` (GPS + GLONASS + BeiDou, `firmware-core/src/gps.rs:171`)
@@ -230,9 +235,10 @@ procedure list and does not compete with §9. Concretely:
   clauses 2 and 4) become §9 entries only when a future campaign actually
   stages an attempt at implementing them — this ADR specifies the contract;
   it does not pre-register predicates for work nobody has scheduled yet.
-- If `meshcadet-power-gps-standby` takes its documented u-blox abort, the
-  resulting u-blox-standby deferred predicate is a §9 entry, added by that
-  leg itself as part of its abort's reshape pass — not duplicated here.
+- `meshcadet-power-gps-standby` took a broader abort than anticipated here —
+  covering both GNSS variants, not only u-blox (D5 row 9) — and the
+  resulting deferred predicate is a §9 entry (D13), added by that leg itself
+  as part of its abort's reshape pass, not duplicated here.
 
 ## Consequences
 

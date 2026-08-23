@@ -640,7 +640,8 @@ set, indexed the other way (by kit part).
 **Prerequisites for everything in §9.1:** a T-Deck Plus flashed from a ref that
 carries the diagnostics instrumentation (`collection-kit.md` §2 has the exact
 check), built `--features diagnostics`, plus — for D4/D5/D6 only — a second
-MeshCore-speaking peer node.
+MeshCore-speaking peer node. **D13 is the one exception**: it is not closeable
+by flashing + the standard kit alone — see its own Procedure cell.
 
 ### 9.1 Hardware-only — runnable today, with the kit
 
@@ -661,6 +662,7 @@ MeshCore-speaking peer node.
 | **D12** | Bounded latency of a real concurrent NVS write masking the DIO1 GPIO ISR | `radio-host-validation.md` §4.1's one open ISR-safety item. Bounded and self-recovering by argument; this measures the bound | **Part F** — timed capture around an admin-CLI edit issued while radio traffic is in flight |
 | **P1** | Hands-on functional sweep: every screen, every navigation path, every radio path, on the device | The device-side half of functional parity. Its host-side half — a 58-row static parity matrix with a source citation per row — is met (`task-split-host-validation.md` §5) | **Part H** — walk `task-split-host-validation.md` §5's matrix row by row on hardware |
 | **P2** | The loop model's swept constants (`perf_loop_model/src/params.rs`) — every real ESP32-S3 wall-clock figure it currently carries as a cited *range* | Replaces §5's sensitivity sweep with a calibrated point model. Consumed automatically by `perf_loop_model::calibration` | **Part D** — the calibration table (reuses Part C's log) |
+| **D13** | GPS RF-front-end low-power standby, both variants — does the module actually leave full-power acquisition/tracking during QUIET, and does reacquisition on wake hold P1 (reporting cadence, pre-first-fix always-ACTIVE rule) | `meshcadet-power-gps-standby`'s foregone ~20 mA `[ESTIMATE]` lever (ADR-0014 D5 row 9) — the campaign's single largest anticipated win, not implemented for either GNSS variant because neither has an ASCII/checksum-verifiable, host-testable standby command | **Not closeable by the existing kit as documented — requires new hardware/firmware work first, not just a bench run.** L76K: requires a board rework wiring the module's STANDBY pin to a spare ESP32-S3 GPIO (this GPS shield does not expose one today — see ADR-0014 D5 row 9), then bench-measure the pin-low sleep current and the hot-start reacquisition latency/fix-quality on wake. u-blox M10Q: requires implementing and bench-validating the binary `UBX-CFG-PMS`/`UBX-RXM-PMREQ` sequence on a real u-blox unit — outside the ASCII-lever scope this campaign restricted itself to. Either path is a new leg's scope, gated on a hardware session, not a kit run against today's firmware |
 
 ### 9.2 Blocked on missing code, not on missing hardware
 
