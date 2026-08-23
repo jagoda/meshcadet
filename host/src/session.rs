@@ -18,6 +18,7 @@ use protocol::provisioning::{
     decode_rsp_contact,
     decode_rsp_error,
     decode_rsp_identity,
+    decode_rsp_lock,
     decode_rsp_room,
     decode_rsp_status,
     // encode helpers
@@ -30,11 +31,14 @@ use protocol::provisioning::{
     encode_frame,
     encode_query_advert,
     encode_set_device_name,
+    encode_set_lock_config,
+    encode_set_lock_pin,
     encode_set_notif_defaults,
     encode_set_pin,
     ProvError,
     RspChannelPayload,
     RspContactPayload,
+    RspLockPayload,
     RspRoomPayload,
     RspStatusPayload,
     // frame-type constants
@@ -50,6 +54,7 @@ use protocol::provisioning::{
     FRAME_QUERY_ADVERT,
     FRAME_QUERY_CHANNELS,
     FRAME_QUERY_CONTACTS,
+    FRAME_QUERY_LOCK,
     FRAME_QUERY_ROOMS,
     FRAME_QUERY_STATUS,
     FRAME_RSP_ADVERT,
@@ -61,13 +66,17 @@ use protocol::provisioning::{
     FRAME_RSP_HISTORY_DONE,
     FRAME_RSP_HISTORY_ENTRY,
     FRAME_RSP_IDENTITY,
+    FRAME_RSP_LOCK,
     FRAME_RSP_OK,
     FRAME_RSP_ROOM,
     FRAME_RSP_ROOMS_DONE,
     FRAME_RSP_STATUS,
     FRAME_SET_DEVICE_NAME,
+    FRAME_SET_LOCK_CONFIG,
+    FRAME_SET_LOCK_PIN,
     FRAME_SET_NOTIF_DEFAULTS,
     FRAME_SET_PIN,
+    LOCK_PIN_LEN,
     // frame synchronisation
     PROV_MAGIC,
 };
@@ -648,6 +657,54 @@ impl<T: Transport> Session<T> {
         let mut buf = [0u8; 20];
         let plen = encode_set_pin(pin, &mut buf);
         self.send_and_expect_ok(FRAME_SET_PIN, &buf[..plen])
+    }
+
+    /// Set (or reset) the screen-lock PIN — distinct from the admin PIN set
+    /// by [`Session::set_pin`]. `pin` must be exactly [`LOCK_PIN_LEN`]
+    /// ASCII-digit bytes; the caller (the CLI's `set-lock-pin`/
+    /// `reset-lock-pin` commands) validates this before the call so a
+    /// malformed PIN never reaches the port — this method trusts its input.
+    pub fn set_lock_pin(&mut self, pin: &[u8; LOCK_PIN_LEN]) -> anyhow::Result<()> {
+        let mut buf = [0u8; LOCK_PIN_LEN];
+        let plen = encode_set_lock_pin(pin, &mut buf);
+        self.send_and_expect_ok(FRAME_SET_LOCK_PIN, &buf[..plen])
+    }
+
+    /// Set the screen-lock enable flag(s) and idle timeout.
+    ///
+    /// `lock_timeout_s` is not clamped here — the caller (the CLI's
+    /// `lock-config` command) rejects an out-of-range `--timeout` before
+    /// this call; the wire decode itself does not clamp either (see
+    /// [`protocol::provisioning::SetLockConfigPayload::lock_timeout_s`]'s doc
+    /// comment) — clamping is firmware-core's job.
+    pub fn set_lock_config(&mut self, lock_flags: u8, lock_timeout_s: u16) -> anyhow::Result<()> {
+        let mut buf = [0u8; 3];
+        let plen = encode_set_lock_config(lock_flags, lock_timeout_s, &mut buf);
+        self.send_and_expect_ok(FRAME_SET_LOCK_CONFIG, &buf[..plen])
+    }
+
+    /// Query the device's current screen-lock configuration and PIN-set
+    /// state. Sends `FRAME_QUERY_LOCK` (empty payload), expects
+    /// `FRAME_RSP_LOCK` back — a single-frame round trip, unlike
+    /// `query_status`'s STATUS+IDENTITY pair.
+    pub fn query_lock(&mut self) -> anyhow::Result<RspLockPayload> {
+        let (ft, payload) = self.send_recv_with_retry(FRAME_QUERY_LOCK, &[])?;
+        match ft {
+            FRAME_RSP_LOCK => decode_rsp_lock(&payload)
+                .map_err(|e| anyhow::anyhow!("decode RSP_LOCK payload: {:?}", e)),
+            FRAME_RSP_ERROR => {
+                let e = decode_rsp_error(&payload)
+                    .map_err(|de| anyhow::anyhow!("decode RSP_ERROR payload: {:?}", de))?;
+                let msg =
+                    std::str::from_utf8(&e.msg[..e.msg_len as usize]).unwrap_or("<invalid utf-8>");
+                anyhow::bail!("device error {}: {}", e.error_code, msg)
+            }
+            _ => anyhow::bail!(
+                "unexpected response 0x{:02X} to QUERY_LOCK (expected RSP_LOCK 0x{:02X})",
+                ft,
+                FRAME_RSP_LOCK,
+            ),
+        }
     }
 
     /// Set (or clear, with an empty slice) the device display name.

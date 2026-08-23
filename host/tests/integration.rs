@@ -25,16 +25,17 @@ use protocol::history::{
 use protocol::provisioning::{
     decode_add_channel, decode_add_contact, decode_add_room, decode_del_channel,
     decode_del_contact, decode_del_room, decode_frame, decode_set_device_name,
-    decode_set_notif_defaults, decode_set_pin, encode_frame, encode_rsp_channel,
-    encode_rsp_contact, encode_rsp_error, encode_rsp_identity, encode_rsp_room, encode_rsp_status,
-    RspStatusPayload, FRAME_ADD_CHANNEL, FRAME_ADD_CONTACT, FRAME_ADD_ROOM, FRAME_CLEAR_HISTORY,
+    decode_set_lock_config, decode_set_lock_pin, decode_set_notif_defaults, decode_set_pin,
+    encode_frame, encode_rsp_channel, encode_rsp_contact, encode_rsp_error, encode_rsp_identity,
+    encode_rsp_lock, encode_rsp_room, encode_rsp_status, RspLockPayload, RspStatusPayload,
+    FRAME_ADD_CHANNEL, FRAME_ADD_CONTACT, FRAME_ADD_ROOM, FRAME_CLEAR_HISTORY,
     FRAME_COMMIT_PROVISIONING, FRAME_DEL_CHANNEL, FRAME_DEL_CONTACT, FRAME_DEL_ROOM,
     FRAME_EXPORT_HISTORY, FRAME_QUERY_ADVERT, FRAME_QUERY_CHANNELS, FRAME_QUERY_CONTACTS,
-    FRAME_QUERY_ROOMS, FRAME_QUERY_STATUS, FRAME_RSP_ADVERT, FRAME_RSP_CHANNEL,
+    FRAME_QUERY_LOCK, FRAME_QUERY_ROOMS, FRAME_QUERY_STATUS, FRAME_RSP_ADVERT, FRAME_RSP_CHANNEL,
     FRAME_RSP_CHANNELS_DONE, FRAME_RSP_CONTACT, FRAME_RSP_CONTACTS_DONE, FRAME_RSP_ERROR,
-    FRAME_RSP_HISTORY_DONE, FRAME_RSP_HISTORY_ENTRY, FRAME_RSP_IDENTITY, FRAME_RSP_OK,
-    FRAME_RSP_ROOM, FRAME_RSP_ROOMS_DONE, FRAME_RSP_STATUS, FRAME_SET_DEVICE_NAME,
-    FRAME_SET_NOTIF_DEFAULTS, FRAME_SET_PIN,
+    FRAME_RSP_HISTORY_DONE, FRAME_RSP_HISTORY_ENTRY, FRAME_RSP_IDENTITY, FRAME_RSP_LOCK,
+    FRAME_RSP_OK, FRAME_RSP_ROOM, FRAME_RSP_ROOMS_DONE, FRAME_RSP_STATUS, FRAME_SET_DEVICE_NAME,
+    FRAME_SET_LOCK_CONFIG, FRAME_SET_LOCK_PIN, FRAME_SET_NOTIF_DEFAULTS, FRAME_SET_PIN,
 };
 
 // Pull in the host crate's public types.
@@ -113,6 +114,14 @@ struct MockDevice {
     /// only the advert tests care that this identity's own `.pubkey` is the
     /// one embedded and signed in the card.
     advert_identity: protocol::Identity,
+    /// Current screen-lock flags (mirrors `RuntimeSettings.lock_flags`) — see
+    /// `protocol::provisioning::LOCK_SCREEN_ENABLE`/`LOCK_NO_DEVICE_DISABLE`.
+    lock_flags: u8,
+    /// Current screen-lock idle timeout, seconds.
+    lock_timeout_s: u16,
+    /// The lock PIN currently stored, if any — distinct from `last_pin`
+    /// (the admin PIN). `None` mirrors `RspLockPayload::pin_set == false`.
+    lock_pin: Option<[u8; protocol::provisioning::LOCK_PIN_LEN]>,
 }
 
 impl MockDevice {
@@ -131,6 +140,9 @@ impl MockDevice {
             mock_history: Vec::new(),
             device_name: Vec::new(),
             advert_identity: protocol::Identity::from_seed(pubkey),
+            lock_flags: 0,
+            lock_timeout_s: protocol::provisioning::LOCK_TIMEOUT_DEFAULT_S,
+            lock_pin: None,
         }
     }
 
@@ -352,6 +364,36 @@ impl MockDevice {
                 }
                 Err(e) => error_frame(1, &format!("{:?}", e)),
             },
+
+            FRAME_SET_LOCK_PIN => match decode_set_lock_pin(payload) {
+                Ok(p) => {
+                    self.lock_pin = Some(p.pin);
+                    ok_frame()
+                }
+                Err(e) => error_frame(1, &format!("{:?}", e)),
+            },
+
+            FRAME_SET_LOCK_CONFIG => match decode_set_lock_config(payload) {
+                Ok(c) => {
+                    self.lock_flags = c.lock_flags;
+                    self.lock_timeout_s = c.lock_timeout_s;
+                    ok_frame()
+                }
+                Err(e) => error_frame(1, &format!("{:?}", e)),
+            },
+
+            FRAME_QUERY_LOCK => {
+                let rsp = RspLockPayload {
+                    lock_flags: self.lock_flags,
+                    lock_timeout_s: self.lock_timeout_s,
+                    pin_set: self.lock_pin.is_some(),
+                };
+                let mut pbuf = [0u8; 8];
+                let plen = encode_rsp_lock(&rsp, &mut pbuf);
+                let mut fbuf = [0u8; 32];
+                let n = encode_frame(FRAME_RSP_LOCK, &pbuf[..plen], &mut fbuf);
+                fbuf[..n].to_vec()
+            }
 
             FRAME_SET_DEVICE_NAME => match decode_set_device_name(payload) {
                 Ok(n) => {
@@ -765,6 +807,80 @@ fn test_reset_pin() {
     session
         .set_pin(b"newpin99")
         .expect("set_pin (reset) should succeed");
+}
+
+/// Acceptance: set the screen-lock PIN, distinct from the admin PIN —
+/// verifies the session-level wire round trip the CLI's `set-lock-pin`
+/// dispatches to.
+#[test]
+fn test_set_lock_pin() {
+    let mut session = make_session_v2([0x44_u8; 32]);
+
+    // Before any lock PIN is set, QUERY_LOCK reports pin_set = false.
+    let status = session.query_lock().expect("query_lock before set");
+    assert!(!status.pin_set);
+
+    session
+        .set_lock_pin(b"1234")
+        .expect("set_lock_pin should succeed");
+
+    let status = session.query_lock().expect("query_lock after set");
+    assert!(status.pin_set);
+}
+
+/// Acceptance: reset the screen-lock PIN (recovery path) — same wire frame
+/// as `set_lock_pin`, exercised twice to mirror `test_reset_pin`.
+#[test]
+fn test_reset_lock_pin() {
+    let mut session = make_session_v2([0x45_u8; 32]);
+
+    session
+        .set_lock_pin(b"1111")
+        .expect("set_lock_pin (initial) should succeed");
+    session
+        .set_lock_pin(b"9999")
+        .expect("set_lock_pin (reset) should succeed");
+
+    let status = session.query_lock().expect("query_lock after reset");
+    assert!(status.pin_set);
+}
+
+/// Acceptance: `lock-config --enable --timeout <n>` then `lock-status`
+/// round-trips the flags and timeout the CLI would print.
+#[test]
+fn test_lock_config_enable_and_query() {
+    let mut session = make_session_v2([0x46_u8; 32]);
+
+    session
+        .set_lock_config(protocol::provisioning::LOCK_SCREEN_ENABLE, 120)
+        .expect("set_lock_config (enable) should succeed");
+
+    let status = session.query_lock().expect("query_lock after enable");
+    assert_eq!(
+        status.lock_flags & protocol::provisioning::LOCK_SCREEN_ENABLE,
+        protocol::provisioning::LOCK_SCREEN_ENABLE
+    );
+    assert_eq!(status.lock_timeout_s, 120);
+    assert!(!status.pin_set);
+}
+
+/// Acceptance: `lock-config --disable` clears the enable flag.
+#[test]
+fn test_lock_config_disable() {
+    let mut session = make_session_v2([0x47_u8; 32]);
+
+    session
+        .set_lock_config(protocol::provisioning::LOCK_SCREEN_ENABLE, 60)
+        .expect("enable first");
+    session
+        .set_lock_config(0, protocol::provisioning::LOCK_TIMEOUT_DEFAULT_S)
+        .expect("set_lock_config (disable) should succeed");
+
+    let status = session.query_lock().expect("query_lock after disable");
+    assert_eq!(
+        status.lock_flags & protocol::provisioning::LOCK_SCREEN_ENABLE,
+        0
+    );
 }
 
 /// Acceptance: full provisioning session — contact + channel + identity + PIN

@@ -19,8 +19,18 @@
 //! meshcadet --port /dev/ttyUSB0 set-pin --pin 1234
 //! meshcadet --port /dev/ttyUSB0 commit
 //! meshcadet --port /dev/ttyUSB0 reset-pin --pin 5678
+//! meshcadet --port /dev/ttyUSB0 set-lock-pin --pin 4321
+//! meshcadet --port /dev/ttyUSB0 lock-config --enable --timeout 300
+//! meshcadet --port /dev/ttyUSB0 lock-status
+//! meshcadet --port /dev/ttyUSB0 reset-lock-pin --pin 0000
 //! meshcadet --port /dev/ttyUSB0 clear-history
 //! ```
+//!
+//! The screen-lock PIN (`set-lock-pin`/`reset-lock-pin`) is **distinct from
+//! the admin PIN** (`set-pin`/`reset-pin`) — one unlocks the screen after
+//! the idle timeout trips, the other opens the on-device admin menu.
+//! `reset-lock-pin` is the deliberate recovery path when the lock PIN has
+//! been forgotten and the screen cannot be unlocked from the device itself.
 //!
 //! `gen-channel-secret` is the one exception to "every command needs
 //! `--port`": it never touches the device, so it works standalone (see
@@ -79,7 +89,7 @@ impl SecretBits {
     }
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum Cmd {
     /// Query device provisioning status and identity.
     Status,
@@ -400,6 +410,112 @@ enum Cmd {
         #[arg(long = "pin-stdin", action = ArgAction::SetTrue)]
         pin_stdin: bool,
     },
+
+    /// Set the screen-lock PIN (used to unlock the device's screen after the
+    /// idle timeout trips) — **distinct from the admin PIN** set by
+    /// `set-pin`/`reset-pin`. Entering the admin PIN does not unlock the
+    /// screen, and entering the lock PIN does not open the admin menu.
+    ///
+    /// The PIN crosses the USB link in the clear — correct and intentional,
+    /// the cable is the authentication (see ADR-0001 §4) — but it must not
+    /// leak anywhere else: not in shell history, not in `ps`, not in
+    /// `--help`, not in an echoed confirmation or error message. Supply it
+    /// via `--pin-file`, `--pin-env`, or `--pin-stdin` where practical;
+    /// `--pin` exists for scriptability but is recorded in shell history
+    /// (and briefly visible in process listings on most OSes). Omit all
+    /// four to be prompted.
+    ///
+    /// The PIN must be exactly 4 ASCII digits — rejected locally, before any
+    /// byte reaches the port, if it is not (in addition to, never instead
+    /// of, the device's own decode-path rejection).
+    SetLockPin {
+        /// PIN string — exactly 4 ASCII digits, given directly on the
+        /// command line. Exposed in shell history (and briefly visible in
+        /// process listings on most OSes); prefer one of the other --pin-*
+        /// sources. Mutually exclusive with them.
+        #[arg(long)]
+        pin: Option<String>,
+
+        /// Read the PIN from a file (its trailing newline, if any, is
+        /// stripped). Mutually exclusive with the other --pin-* sources.
+        #[arg(long = "pin-file", value_name = "PATH")]
+        pin_file: Option<PathBuf>,
+
+        /// Read the PIN from the named environment variable. Mutually
+        /// exclusive with the other --pin-* sources.
+        #[arg(long = "pin-env", value_name = "VAR")]
+        pin_env: Option<String>,
+
+        /// Read the PIN as one line from stdin (trailing newline
+        /// stripped). Mutually exclusive with the other --pin-* sources.
+        #[arg(long = "pin-stdin", action = ArgAction::SetTrue)]
+        pin_stdin: bool,
+    },
+
+    /// Reset the screen-lock PIN (physical USB possession is the auth
+    /// factor) — the deliberate recovery path when the lock PIN has been
+    /// forgotten and the screen cannot be unlocked from the device itself.
+    ///
+    /// Equivalent to `set-lock-pin` but clearly named for the recovery
+    /// flow. **Distinct from the admin PIN** reset by `reset-pin` — see
+    /// `set-lock-pin`'s note. The same exposure note and
+    /// --pin-file/--pin-env/--pin-stdin sources (and interactive prompt)
+    /// apply here, as does the 4-ASCII-digit requirement.
+    ResetLockPin {
+        /// New PIN string — exactly 4 ASCII digits, given directly on the
+        /// command line. Exposed in shell history (and briefly visible in
+        /// process listings on most OSes); prefer one of the other
+        /// --pin-* sources. Mutually exclusive with them.
+        #[arg(long)]
+        pin: Option<String>,
+
+        /// Read the PIN from a file (its trailing newline, if any, is
+        /// stripped). Mutually exclusive with the other --pin-* sources.
+        #[arg(long = "pin-file", value_name = "PATH")]
+        pin_file: Option<PathBuf>,
+
+        /// Read the PIN from the named environment variable. Mutually
+        /// exclusive with the other --pin-* sources.
+        #[arg(long = "pin-env", value_name = "VAR")]
+        pin_env: Option<String>,
+
+        /// Read the PIN as one line from stdin (trailing newline
+        /// stripped). Mutually exclusive with the other --pin-* sources.
+        #[arg(long = "pin-stdin", action = ArgAction::SetTrue)]
+        pin_stdin: bool,
+    },
+
+    /// Set the screen-lock's enable/disable state and idle timeout.
+    ///
+    /// Exactly one of `--enable`/`--disable` is required. `--timeout` is
+    /// required with `--enable` (there is no sensible "keep the previous
+    /// timeout" default over this stateless CLI) and refused with
+    /// `--disable` — omit it, since a disabled lock has no idle-timeout to
+    /// speak of.
+    LockConfig {
+        /// Enable the screen lock. Requires `--timeout`. Mutually
+        /// exclusive with `--disable`.
+        #[arg(long, action = ArgAction::SetTrue, conflicts_with = "disable")]
+        enable: bool,
+
+        /// Disable the screen lock. Mutually exclusive with `--enable` and
+        /// `--timeout`.
+        #[arg(long, action = ArgAction::SetTrue, conflicts_with = "enable")]
+        disable: bool,
+
+        /// Idle-timeout seconds before the lock trips (only meaningful, and
+        /// only accepted, with `--enable`). Must be in
+        /// `LOCK_TIMEOUT_MIN_S..=LOCK_TIMEOUT_MAX_S` (15..=3600) — refused
+        /// locally, before any byte reaches the port, with the bound named,
+        /// if out of range. Never silently clamped on the host side.
+        #[arg(long, conflicts_with = "disable")]
+        timeout: Option<u16>,
+    },
+
+    /// Read back the device's current screen-lock configuration: enabled
+    /// state, idle timeout, and whether a lock PIN is currently set. Never
+    /// prints the PIN itself — the device never echoes it back.
+    LockStatus,
 
     /// Export conversation history from the device (oldest-first).
     ///
@@ -859,6 +975,7 @@ fn main() -> anyhow::Result<()> {
                 pin_file.as_deref(),
                 pin_env.as_deref(),
                 pin_stdin,
+                "admin PIN (leave empty for none)",
             )?;
             session.set_pin(pin.as_bytes())?;
             println!("PIN set successfully");
@@ -880,9 +997,77 @@ fn main() -> anyhow::Result<()> {
                 pin_file.as_deref(),
                 pin_env.as_deref(),
                 pin_stdin,
+                "admin PIN (leave empty for none)",
             )?;
             session.set_pin(pin.as_bytes())?;
             println!("PIN reset successfully (physical possession authenticated)");
+        }
+
+        Cmd::SetLockPin {
+            pin,
+            pin_file,
+            pin_env,
+            pin_stdin,
+        } => {
+            let pin = resolve_admin_pin(
+                pin.as_deref(),
+                pin_file.as_deref(),
+                pin_env.as_deref(),
+                pin_stdin,
+                "lock PIN (exactly 4 digits)",
+            )?;
+            let pin = validate_lock_pin(&pin)?;
+            session.set_lock_pin(&pin)?;
+            println!("lock PIN set successfully");
+        }
+
+        Cmd::ResetLockPin {
+            pin,
+            pin_file,
+            pin_env,
+            pin_stdin,
+        } => {
+            let pin = resolve_admin_pin(
+                pin.as_deref(),
+                pin_file.as_deref(),
+                pin_env.as_deref(),
+                pin_stdin,
+                "lock PIN (exactly 4 digits)",
+            )?;
+            let pin = validate_lock_pin(&pin)?;
+            session.set_lock_pin(&pin)?;
+            println!("lock PIN reset successfully (physical possession authenticated)");
+        }
+
+        Cmd::LockConfig {
+            enable,
+            disable,
+            timeout,
+        } => {
+            if !enable && !disable {
+                anyhow::bail!("specify exactly one of --enable, --disable");
+            }
+            let (lock_flags, lock_timeout_s) = if enable {
+                let timeout = timeout.context("--enable requires --timeout <seconds>")?;
+                validate_lock_timeout(timeout)?;
+                (protocol::provisioning::LOCK_SCREEN_ENABLE, timeout)
+            } else {
+                (0u8, protocol::provisioning::LOCK_TIMEOUT_DEFAULT_S)
+            };
+            session.set_lock_config(lock_flags, lock_timeout_s)?;
+            if enable {
+                println!("screen lock enabled, timeout={}s", lock_timeout_s);
+            } else {
+                println!("screen lock disabled");
+            }
+        }
+
+        Cmd::LockStatus => {
+            let s = session.query_lock()?;
+            let enabled = s.lock_flags & protocol::provisioning::LOCK_SCREEN_ENABLE != 0;
+            println!("enabled  : {}", enabled);
+            println!("timeout  : {}s", s.lock_timeout_s);
+            println!("pin set  : {}", s.pin_set);
         }
 
         Cmd::ExportHistory => {
@@ -1154,6 +1339,14 @@ fn resolve_channel_secret(
 /// mutually-exclusive sources, or prompt for it interactively if none were
 /// given. Mirrors [`resolve_guest_password`]/[`resolve_channel_secret`].
 ///
+/// Also reused, unchanged in its four-source resolution logic, by
+/// `set-lock-pin`/`reset-lock-pin` for the **screen-lock** PIN — a distinct
+/// secret from the admin PIN, validated separately by
+/// [`validate_lock_pin`]. `prompt_label` is the only thing that varies
+/// between the two callers: it names which PIN is being asked for on the
+/// interactive-prompt fallback, so a `set-lock-pin` run with no `--pin*`
+/// source given does not confusingly ask for "admin PIN".
+///
 /// Precedence is irrelevant by construction — at most one of `pin`,
 /// `pin_file`, `pin_env`, `pin_stdin` may be set; more than one is a user
 /// error, rejected up front. Never logs, echoes, or embeds the resolved PIN
@@ -1164,6 +1357,7 @@ fn resolve_admin_pin(
     pin_file: Option<&std::path::Path>,
     pin_env: Option<&str>,
     pin_stdin: bool,
+    prompt_label: &str,
 ) -> anyhow::Result<String> {
     let sources_given =
         pin.is_some() as u8 + pin_file.is_some() as u8 + pin_env.is_some() as u8 + pin_stdin as u8;
@@ -1194,13 +1388,56 @@ fn resolve_admin_pin(
 
     // No source given: prompt interactively on stderr — mirrors
     // resolve_guest_password.
-    eprint!("admin PIN (leave empty for none): ");
+    eprint!("{prompt_label}: ");
     std::io::stderr().flush().ok();
     let mut raw = String::new();
     std::io::stdin()
         .read_line(&mut raw)
         .context("reading admin PIN from stdin prompt")?;
     Ok(raw.trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// Validate a screen-lock PIN host-side: exactly
+/// [`protocol::provisioning::LOCK_PIN_LEN`] ASCII digits — refuse anything
+/// else here, before any byte reaches the port. This is **in addition to**,
+/// never a substitute for, `decode_set_lock_pin`'s own device-side/decode-path
+/// rejection (`ProvError::LockPinInvalid`) — a bad host-side check here would
+/// leave the wire-level guarantee as the only protection.
+///
+/// The error message never echoes the PIN — only its byte length.
+fn validate_lock_pin(pin: &str) -> anyhow::Result<[u8; protocol::provisioning::LOCK_PIN_LEN]> {
+    let bytes = pin.as_bytes();
+    if bytes.len() != protocol::provisioning::LOCK_PIN_LEN || !bytes.iter().all(u8::is_ascii_digit)
+    {
+        anyhow::bail!(
+            "lock PIN must be exactly {} ASCII digits (got {} bytes)",
+            protocol::provisioning::LOCK_PIN_LEN,
+            bytes.len(),
+        );
+    }
+    let mut out = [0u8; protocol::provisioning::LOCK_PIN_LEN];
+    out.copy_from_slice(bytes);
+    Ok(out)
+}
+
+/// Validate a `lock-config --enable --timeout <seconds>` value host-side:
+/// must fall in `LOCK_TIMEOUT_MIN_S..=LOCK_TIMEOUT_MAX_S`. Refused here, with
+/// the bound named, rather than silently clamped — the decode path itself
+/// does not clamp either (see `SetLockConfigPayload::lock_timeout_s`'s doc
+/// comment), so a host-side clamp would just move the "what value actually
+/// landed" surprise from the wire to the CLI instead of removing it.
+fn validate_lock_timeout(timeout: u16) -> anyhow::Result<()> {
+    let min = protocol::provisioning::LOCK_TIMEOUT_MIN_S;
+    let max = protocol::provisioning::LOCK_TIMEOUT_MAX_S;
+    if !(min..=max).contains(&timeout) {
+        anyhow::bail!(
+            "--timeout must be in {}..={} seconds (got {})",
+            min,
+            max,
+            timeout
+        );
+    }
+    Ok(())
 }
 
 /// Build the "your guest password will be truncated" warning for `add-room`,
@@ -1471,8 +1708,10 @@ mod tests {
         format_battery_raw_mv, format_gps_clock, format_gps_coords, format_gps_fix,
         generate_channel_secret_hex, parse_channel_secret_hex, parse_contact_uri,
         password_truncation_warning, resolve_admin_pin, resolve_channel_secret,
-        resolve_guest_password, weak_secret_pattern_warning, SecretBits,
+        resolve_guest_password, validate_lock_pin, validate_lock_timeout,
+        weak_secret_pattern_warning, Cli, Cmd, SecretBits,
     };
+    use clap::Parser;
     use protocol::provisioning::RspStatusPayload;
 
     fn status_with_gps(
@@ -1937,7 +2176,7 @@ mod tests {
 
     #[test]
     fn resolve_admin_pin_direct_flag() {
-        let pin = resolve_admin_pin(Some("1234"), None, None, false).unwrap();
+        let pin = resolve_admin_pin(Some("1234"), None, None, false, "admin PIN").unwrap();
         assert_eq!(pin, "1234");
     }
 
@@ -1946,7 +2185,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("meshcadet-test-pin-{}.txt", std::process::id()));
         std::fs::write(&path, "5678\n").unwrap();
-        let pin = resolve_admin_pin(None, Some(path.as_path()), None, false).unwrap();
+        let pin = resolve_admin_pin(None, Some(path.as_path()), None, false, "admin PIN").unwrap();
         std::fs::remove_file(&path).ok();
         assert_eq!(pin, "5678");
     }
@@ -1955,7 +2194,7 @@ mod tests {
     fn resolve_admin_pin_from_env_var() {
         let var = format!("MESHCADET_TEST_PIN_{}", std::process::id());
         std::env::set_var(&var, "9012");
-        let pin = resolve_admin_pin(None, None, Some(var.as_str()), false).unwrap();
+        let pin = resolve_admin_pin(None, None, Some(var.as_str()), false, "admin PIN").unwrap();
         std::env::remove_var(&var);
         assert_eq!(pin, "9012");
     }
@@ -1964,13 +2203,15 @@ mod tests {
     fn resolve_admin_pin_missing_env_var_errors() {
         let var = format!("MESHCADET_TEST_PIN_MISSING_{}", std::process::id());
         std::env::remove_var(&var);
-        let err = resolve_admin_pin(None, None, Some(var.as_str()), false).unwrap_err();
+        let err =
+            resolve_admin_pin(None, None, Some(var.as_str()), false, "admin PIN").unwrap_err();
         assert!(err.to_string().contains(&var));
     }
 
     #[test]
     fn resolve_admin_pin_rejects_multiple_sources() {
-        let err = resolve_admin_pin(Some("13579"), None, Some("SOME_VAR"), false).unwrap_err();
+        let err = resolve_admin_pin(Some("13579"), None, Some("SOME_VAR"), false, "admin PIN")
+            .unwrap_err();
         assert!(err.to_string().contains("at most one"));
         // The error message must name the flags, never a candidate value.
         assert!(!err.to_string().contains("13579"));
@@ -1979,7 +2220,7 @@ mod tests {
     #[test]
     fn resolve_admin_pin_file_not_found_error_names_path_not_content() {
         let missing = std::path::Path::new("/nonexistent/meshcadet-test-pin-does-not-exist");
-        let err = resolve_admin_pin(None, Some(missing), None, false).unwrap_err();
+        let err = resolve_admin_pin(None, Some(missing), None, false, "admin PIN").unwrap_err();
         assert!(err.to_string().contains("pin-file"));
     }
 
@@ -2064,5 +2305,170 @@ mod tests {
         let a = generate_channel_secret_hex(SecretBits::Bits256);
         let b = generate_channel_secret_hex(SecretBits::Bits256);
         assert_ne!(a, b);
+    }
+
+    // ── validate_lock_pin — host-side 4-digit check, before any byte reaches
+    //    the port ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_lock_pin_accepts_four_digits() {
+        let pin = validate_lock_pin("1234").expect("4 ASCII digits must be accepted");
+        assert_eq!(pin, *b"1234");
+    }
+
+    #[test]
+    fn validate_lock_pin_rejects_wrong_length() {
+        let err = validate_lock_pin("123").unwrap_err();
+        assert!(err.to_string().contains("exactly 4"));
+        assert!(validate_lock_pin("12345").is_err());
+        assert!(validate_lock_pin("").is_err());
+    }
+
+    #[test]
+    fn validate_lock_pin_rejects_non_digit_bytes() {
+        assert!(validate_lock_pin("12a4").is_err());
+        assert!(validate_lock_pin("12.4").is_err());
+        assert!(validate_lock_pin("            ").is_err());
+    }
+
+    #[test]
+    fn validate_lock_pin_error_never_echoes_the_pin() {
+        // Only the byte length may appear in the error — never the PIN
+        // value itself (mirrors resolve_admin_pin's non-leak contract).
+        let err = validate_lock_pin("abcd").unwrap_err().to_string();
+        assert!(!err.contains("abcd"));
+    }
+
+    // ── validate_lock_timeout — host-side bound check, bound named in the
+    //    error, never silently clamped ───────────────────────────────────
+
+    #[test]
+    fn validate_lock_timeout_accepts_the_documented_bounds() {
+        assert!(validate_lock_timeout(15).is_ok());
+        assert!(validate_lock_timeout(3600).is_ok());
+        assert!(validate_lock_timeout(300).is_ok());
+    }
+
+    #[test]
+    fn validate_lock_timeout_rejects_below_minimum_with_bound_named() {
+        let err = validate_lock_timeout(14).unwrap_err().to_string();
+        assert!(err.contains("15"), "error must name the lower bound: {err}");
+        assert!(
+            err.contains("3600"),
+            "error must name the upper bound: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_lock_timeout_rejects_above_maximum_with_bound_named() {
+        let err = validate_lock_timeout(3601).unwrap_err().to_string();
+        assert!(err.contains("15"));
+        assert!(err.contains("3600"));
+    }
+
+    #[test]
+    fn validate_lock_timeout_rejects_zero() {
+        assert!(validate_lock_timeout(0).is_err());
+    }
+
+    // ── CLI parsing — set-lock-pin / lock-config / lock-status shape ─────────
+
+    #[test]
+    fn cli_parses_set_lock_pin() {
+        let cli = Cli::try_parse_from([
+            "meshcadet",
+            "--port",
+            "/dev/ttyUSB0",
+            "set-lock-pin",
+            "--pin",
+            "1234",
+        ])
+        .expect("set-lock-pin must parse");
+        match cli.cmd {
+            Cmd::SetLockPin { pin, .. } => assert_eq!(pin.as_deref(), Some("1234")),
+            other => panic!("expected Cmd::SetLockPin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_reset_lock_pin() {
+        let cli = Cli::try_parse_from([
+            "meshcadet",
+            "--port",
+            "/dev/ttyUSB0",
+            "reset-lock-pin",
+            "--pin",
+            "5678",
+        ])
+        .expect("reset-lock-pin must parse");
+        assert!(matches!(cli.cmd, Cmd::ResetLockPin { .. }));
+    }
+
+    #[test]
+    fn cli_parses_lock_config_enable_with_timeout() {
+        let cli = Cli::try_parse_from([
+            "meshcadet",
+            "--port",
+            "/dev/ttyUSB0",
+            "lock-config",
+            "--enable",
+            "--timeout",
+            "300",
+        ])
+        .expect("lock-config --enable --timeout must parse");
+        match cli.cmd {
+            Cmd::LockConfig {
+                enable,
+                disable,
+                timeout,
+            } => {
+                assert!(enable);
+                assert!(!disable);
+                assert_eq!(timeout, Some(300));
+            }
+            other => panic!("expected Cmd::LockConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_lock_config_enable_and_disable_together() {
+        let result = Cli::try_parse_from([
+            "meshcadet",
+            "--port",
+            "/dev/ttyUSB0",
+            "lock-config",
+            "--enable",
+            "--disable",
+            "--timeout",
+            "300",
+        ]);
+        assert!(
+            result.is_err(),
+            "--enable and --disable must be mutually exclusive at the arg-parsing layer"
+        );
+    }
+
+    #[test]
+    fn cli_rejects_lock_config_disable_with_timeout() {
+        let result = Cli::try_parse_from([
+            "meshcadet",
+            "--port",
+            "/dev/ttyUSB0",
+            "lock-config",
+            "--disable",
+            "--timeout",
+            "300",
+        ]);
+        assert!(
+            result.is_err(),
+            "--disable must not accept --timeout at the arg-parsing layer"
+        );
+    }
+
+    #[test]
+    fn cli_parses_lock_status() {
+        let cli = Cli::try_parse_from(["meshcadet", "--port", "/dev/ttyUSB0", "lock-status"])
+            .expect("lock-status must parse");
+        assert!(matches!(cli.cmd, Cmd::LockStatus));
     }
 }
