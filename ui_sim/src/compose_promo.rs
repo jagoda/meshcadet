@@ -22,6 +22,26 @@
 //! Slint enforces a process-wide `Platform` singleton, so this module's
 //! render entry point must never run in the same process as any other
 //! `ui_sim` render rig.
+//!
+//! # Known, deliberate residual drift (site-screenshot-refresh audit,
+//! 2026-08-23)
+//!
+//! `EmojiPickerGrid`'s cells still render `cell.codepoint_str` as bitmap-font
+//! `Text`, whereas the real screen's cells (`meshcadet-emoji-picker-color-
+//! cells`) render a decoded color `Image` (`EmojiCell.emoji_image`, built
+//! from `firmware/build_emoji_color.rs`'s TTF-parse + NeuQuant-quantize
+//! pipeline, `include!`-d via `firmware/src/ui/emoji_color.rs`). That
+//! pipeline is firmware-build-only (ESP-IDF build script, TTF asset,
+//! palette-quantization host tool) with no path onto this host-native
+//! `ui_sim` crate today, and porting it is a body of work in its own right
+//! — out of scope for a screenshot-fidelity pass. It does not affect this
+//! rig's actual screenshot output: the picker is never opened for this
+//! capture (`picker_open` stays `false` — see below), so the divergent cell
+//! markup is never rendered into the PNG. Flagged here as a still-open
+//! `ui_sim::contact_list_promo`-style "verbatim copy" gap for a future,
+//! dedicated mission; the `read_only` (Phase B) property/banner/Send-button
+//! gating below WAS reconciled this pass (was previously missing from this
+//! file entirely).
 
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -237,6 +257,13 @@ slint::slint! {
         in property <[string]>          category_names;
         in property <[AutocompleteEntry]> completions;
         in-out property <string>        draft;
+        // Phase B (`meshcadet-room-firmware-post-and-notify`) room-permission
+        // gate — mirrors `compose.rs`'s `read_only` property (see that
+        // file's doc). Always `false` for this promo shot (a read-only
+        // banner is not the compelling screenshot), but declared here so
+        // this rig's markup stays a structural match to the real screen
+        // rather than silently missing the gate entirely.
+        in property <bool>              read_only: false;
         in-out property <bool>          picker_open: false;
         in-out property <bool>          show_completions: false;
         // Repeater signal-meter reading (ADR-0010): 0 = direct-only,
@@ -335,6 +362,18 @@ slint::slint! {
 
                 VerticalLayout {
                     padding: 8px;
+                    spacing: 4px;
+
+                    // Read-only indicator (Phase B) — mirrors `compose.rs`'s
+                    // identical banner. Never shown for this promo shot
+                    // (`read_only` defaults `false`), but declared so the
+                    // rig's markup stays a structural match.
+                    if read_only : Text {
+                        text: "🔒 Read-only — you can't post in this room";
+                        font-size: Theme.size-preview;
+                        color: Theme.warn;
+                        wrap: word-wrap;
+                    }
 
                     draft_input := TextInput {
                         text <=> draft;
@@ -342,6 +381,7 @@ slint::slint! {
                         color: Theme.text-primary;
                         wrap: word-wrap;
                         single-line: false;
+                        read-only: root.read_only;
                         init => { self.focus(); }
                         edited => { root.draft_changed(self.text); }
                     }
@@ -386,13 +426,13 @@ slint::slint! {
 
                     Rectangle {
                         width: 80px; height: 28px;
-                        background: draft != "" ? Theme.star-gold : Theme.surface-raised;
+                        background: (draft != "" && !read_only) ? Theme.star-gold : Theme.surface-raised;
                         animate background { duration: 120ms; easing: ease-out; }
                         border-radius: 14px;
                         Text {
                             text: "📤 Send";
                             font-size: Theme.size-body; font-weight: 600;
-                            color: draft != "" ? Theme.bg-space : Theme.text-secondary;
+                            color: (draft != "" && !read_only) ? Theme.bg-space : Theme.text-secondary;
                             animate color { duration: 120ms; easing: ease-out; }
                             horizontal-alignment: center;
                             vertical-alignment: center;
@@ -400,7 +440,7 @@ slint::slint! {
                         TouchArea {
                             width: parent.width;
                             height: parent.height;
-                            enabled: draft != "" && !root.sent;
+                            enabled: draft != "" && !root.sent && !root.read_only;
                             clicked => {
                                 root.sent = true;
                                 root.send_pressed(draft);

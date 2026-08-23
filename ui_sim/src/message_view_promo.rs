@@ -43,7 +43,14 @@ slint::slint! {
         from_name:    string,
         time_str:     string,
         is_ours:      bool,
-        acked:        bool,
+        // Tri-state delivery status: 0 = Pending (grey), 1 = Acked (blue),
+        // 2 = Undelivered (red) — mirrors `message_view.rs`'s
+        // `MessageEntry.delivery_state` (see that file's doc); this rig was
+        // previously a `bool acked` field, which structurally couldn't
+        // represent the Undelivered state at all (meshcadet-dm-room-
+        // delivery-state-model landed the tri-state on the real screen
+        // without this rig being updated to match).
+        delivery_state: int,
         mention_tier: int,
     }
 
@@ -52,7 +59,7 @@ slint::slint! {
         in property <string>  from_name;
         in property <string>  time_str;
         in property <bool>    is_ours;
-        in property <bool>    acked;
+        in property <int>     delivery_state;
         in property <int>     mention_tier;
 
         height: content.preferred-height;
@@ -113,7 +120,9 @@ slint::slint! {
                     if is_ours : Text {
                         text: "✓";
                         font-size: Theme.size-caption;
-                        color: acked ? Theme.brand-signal : Theme.text-secondary;
+                        color: delivery_state == 1 ? Theme.brand-signal : (
+                            delivery_state == 2 ? Theme.alert : Theme.text-secondary
+                        );
                         animate color { duration: 150ms; easing: ease-out; }
                     }
                 }
@@ -271,7 +280,7 @@ slint::slint! {
                         from_name:    m.from_name;
                         time_str:     m.time_str;
                         is_ours:      m.is_ours;
-                        acked:        m.acked;
+                        delivery_state: m.delivery_state;
                         mention_tier: m.mention_tier;
                     }
                 }
@@ -328,12 +337,23 @@ slint::slint! {
 }
 
 /// One seeded message bubble for the promo screenshot.
+///
+/// `delivery_state` is the real screen's own tri-state contract: 0 =
+/// Pending (grey), 1 = Acked (blue), 2 = Undelivered (red) — see
+/// `MessageEntry`'s doc in the markup above / `message_view.rs`'s
+/// `MessageEntry.delivery_state`. Exposed here as the real `i32`, not a
+/// `bool acked` seed knob (an earlier version of this rig had only
+/// `acked: bool`, which meant the Undelivered state was structurally
+/// unreachable through this API even after the SLINT property itself was
+/// widened to tri-state) — see
+/// `ui_sim/tests/message_view_promo_undelivered_state.rs` for the
+/// regression guard this closes.
 pub struct PromoMessage {
     pub text: &'static str,
     pub from_name: &'static str,
     pub time_str: &'static str,
     pub is_ours: bool,
-    pub acked: bool,
+    pub delivery_state: i32,
 }
 
 struct MessageViewPromoPlatform {
@@ -402,7 +422,7 @@ impl MessageViewPromoFrame {
                 from_name: m.from_name.into(),
                 time_str: m.time_str.into(),
                 is_ours: m.is_ours,
-                acked: m.acked,
+                delivery_state: m.delivery_state,
                 mention_tier: 0,
             });
         }

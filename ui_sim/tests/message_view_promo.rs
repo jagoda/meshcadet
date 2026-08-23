@@ -47,14 +47,14 @@ fn own_message_bubble_and_write_button_render() {
                 from_name: "",
                 time_str: "2:14p",
                 is_ours: false,
-                acked: false,
+                delivery_state: 0,
             },
             PromoMessage {
                 text: "Nice catch!",
                 from_name: "",
                 time_str: "2:15p",
                 is_ours: true,
-                acked: true,
+                delivery_state: 1, // Acked
             },
         ],
     );
