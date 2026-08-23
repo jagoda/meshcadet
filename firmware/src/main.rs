@@ -1711,8 +1711,8 @@ fn run() -> anyhow::Result<()> {
         // handler can forward a `UiEvent::LockConfigChanged` to the UI thread
         // instead of writing the `mc_rts` namespace itself — the UI thread
         // stays the sole writer of that blob (the hard constraint this
-        // mission's dossier names; see `admin_server.rs`'s module doc and its
-        // `FRAME_SET_LOCK_CONFIG` handler for the full mechanism). The
+        // change's design notes name; see `admin_server.rs`'s module doc and
+        // its `FRAME_SET_LOCK_CONFIG` handler for the full mechanism). The
         // original `evt_tx` is NOT moved here — every dispatcher-loop
         // `send_ui_event(&evt_tx, ...)` call below this spawn still needs it.
         let identity_for_admin = identity.clone();
