@@ -121,6 +121,12 @@ pub mod splash_lineart;
 /// path.
 pub mod list_pane_backdrop;
 
+/// Host-sim render rig — proves `lock.rs`'s screen-lock overlay renders its
+/// four named states correctly (locked / wrong-PIN / backing-off /
+/// unread-badge). See that module's own doc for why it is a separate,
+/// narrower component/render path.
+pub mod lock_screen;
+
 /// Host-sim render rig —
 /// proves the standalone `SignalMeter` widget (`ui/signal_meter.slint`,
 /// ADR-0010 / `meshcadet-signal-meter` campaign) renders its direct-only
