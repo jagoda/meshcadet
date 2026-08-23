@@ -15,7 +15,15 @@
 // No build step: plain ES module, loaded directly by the browser or by
 // `node` for the test.
 
-import { hexToBytes, MAX_NAME_LEN, MAX_PIN_LEN, MAX_ROOM_PASSWORD_LEN } from "./codec.js";
+import {
+  hexToBytes,
+  MAX_NAME_LEN,
+  MAX_PIN_LEN,
+  MAX_ROOM_PASSWORD_LEN,
+  LOCK_PIN_LEN,
+  LOCK_TIMEOUT_MIN_S,
+  LOCK_TIMEOUT_MAX_S,
+} from "./codec.js";
 
 const HEX_ONLY_RE = /^[0-9a-fA-F]*$/;
 
@@ -155,4 +163,61 @@ export function validateRoomPassword(input) {
       ? `guest password is ${byteLen} bytes; the device only uses the first ${effectiveLimit} and will truncate it`
       : null;
   return { ok: true, truncationWarning };
+}
+
+/**
+ * Validate a screen-lock PIN.
+ * Mirrors the device's decode-path rejection (`decode_set_lock_pin`,
+ * `protocol::provisioning`) and `encodeSetLockPin`'s own caller contract
+ * (`codec.js`): unlike the admin PIN (`validatePin`, which only enforces a
+ * byte-length ceiling), the lock PIN must be **exactly** `LOCK_PIN_LEN` (4)
+ * ASCII digits — not shorter, not longer, digits only. Rejects rather than
+ * padding or truncating, so this is the client-side check that runs before
+ * `encodeSetLockPin` would otherwise throw on the same input.
+ *
+ * Deliberately does NOT return or echo the PIN in the result (it's a
+ * secret, same discipline as `validatePin`): on success it returns only
+ * `{ ok: true }`, leaving the caller's own `pin` reference as the single
+ * copy to send and then drop.
+ *
+ * Returns `{ ok: true }` or `{ ok: false, error }`.
+ */
+export function validateLockPin(input) {
+  const pin = input ?? "";
+  if (pin.length !== LOCK_PIN_LEN || !/^[0-9]+$/.test(pin)) {
+    return { ok: false, error: `lock PIN must be exactly ${LOCK_PIN_LEN} digits (0-9)` };
+  }
+  return { ok: true };
+}
+
+/**
+ * Validate a screen-lock idle timeout, in whole seconds.
+ * Mirrors `LOCK_TIMEOUT_MIN_S..=LOCK_TIMEOUT_MAX_S` (`codec.js`, itself
+ * mirroring `protocol::provisioning`'s screen-lock constants) — rejects
+ * rather than clamping, matching `validatePin`'s reject-rather-than-coerce
+ * posture: a value outside the bound is refused with the bound named, never
+ * silently clamped into range.
+ *
+ * `input` may be a string (straight from an `<input>` field's `.value`) or
+ * a number; anything that isn't a whole number, or is outside the bound, is
+ * rejected.
+ *
+ * Returns `{ ok: true, timeoutS }` or `{ ok: false, error }`.
+ */
+export function validateLockTimeout(input) {
+  const raw = typeof input === "string" ? input.trim() : input;
+  if (raw === "" || raw === null || raw === undefined) {
+    return { ok: false, error: "timeout is required" };
+  }
+  const timeoutS = Number(raw);
+  if (!Number.isInteger(timeoutS)) {
+    return { ok: false, error: `timeout must be a whole number of seconds; got ${JSON.stringify(input)}` };
+  }
+  if (timeoutS < LOCK_TIMEOUT_MIN_S || timeoutS > LOCK_TIMEOUT_MAX_S) {
+    return {
+      ok: false,
+      error: `timeout must be between ${LOCK_TIMEOUT_MIN_S} and ${LOCK_TIMEOUT_MAX_S} seconds; got ${timeoutS}`,
+    };
+  }
+  return { ok: true, timeoutS };
 }

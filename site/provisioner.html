@@ -385,8 +385,64 @@
           </form>
         </div>
 
+        <div class="flash-panel" id="lock-panel" hidden>
+          <h2>10. Screen lock</h2>
+          <p>
+            A 4-digit lock PIN, distinct from the admin PIN above — unlocking
+            the screen never opens the admin menu, and the admin PIN never
+            unlocks the screen.
+          </p>
+          <p class="muted">
+            <strong>Casual-access control, not a security boundary:</strong>
+            anyone with physical access and a USB cable can reset this PIN,
+            same as the admin PIN. It is stored on the device in plaintext.
+          </p>
+          <form id="lock-pin-form" class="inline-form footnote" autocomplete="off">
+            <label class="version-label" for="lock-pin-input">New lock PIN (exactly 4 digits)</label>
+            <input
+              id="lock-pin-input"
+              class="text-input mono"
+              type="password"
+              inputmode="numeric"
+              autocomplete="off"
+              maxlength="4"
+              placeholder="••••"
+            />
+            <p class="muted">
+              Handled entirely in this browser: the PIN is sent straight to the
+              device over USB and is never written to the page URL, browser
+              storage, the console, or any server. It's cleared from this field
+              as soon as it's sent. Takes effect at the device's next boot.
+            </p>
+            <div class="cta-row">
+              <button id="lock-pin-button" class="btn btn-primary" type="submit">Set lock PIN</button>
+            </div>
+            <p id="lock-pin-status" class="muted form-status" role="status"></p>
+          </form>
+          <form id="lock-config-form" class="inline-form">
+            <label class="checkbox-label">
+              <input id="lock-enable-input" type="checkbox" />
+              Enable the screen lock
+            </label>
+            <label class="version-label" for="lock-timeout-input">Idle timeout before locking (15-3600 seconds)</label>
+            <input
+              id="lock-timeout-input"
+              class="text-input mono"
+              type="number"
+              min="15"
+              max="3600"
+              step="1"
+              value="300"
+            />
+            <div class="cta-row">
+              <button id="lock-config-save-button" class="btn btn-primary" type="submit">Save lock config</button>
+            </div>
+            <p id="lock-config-status" class="muted form-status" role="status"></p>
+          </form>
+        </div>
+
         <div class="flash-panel" id="history-panel" hidden>
-          <h2>10. Export conversation history</h2>
+          <h2>11. Export conversation history</h2>
           <p>
             Read every stored message (DMs and channels), oldest-first, and
             save it as a local text file.
@@ -406,7 +462,7 @@
         </div>
 
         <div class="flash-panel" id="clear-history-panel" hidden>
-          <h2>11. Clear conversation history</h2>
+          <h2>12. Clear conversation history</h2>
           <p>
             Permanently erase <strong>all</strong> stored messages — every DM
             and channel conversation — from the device's flash.

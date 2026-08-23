@@ -14,6 +14,8 @@ import {
   validateDeviceName,
   validatePin,
   validateRoomPassword,
+  validateLockPin,
+  validateLockTimeout,
 } from "./validation.js";
 
 let checks = 0;
@@ -249,6 +251,119 @@ function eq(actual, expected, label) {
   const result = validateRoomPassword("é".repeat(8));
   ok(result.ok, "over-length is still accepted");
   ok(result.truncationWarning !== null, "multi-byte UTF-8 password is measured in bytes, not characters");
+}
+
+// ── validateLockPin ──────────────────────────────────────────────────────
+//
+// Unlike validatePin (the admin PIN — a byte-length ceiling, any content),
+// the lock PIN must be EXACTLY 4 ASCII digits — mirrors the device's
+// decode-path rejection (`decode_set_lock_pin`) and `encodeSetLockPin`'s own
+// throw condition.
+
+{
+  const result = validateLockPin("1234");
+  ok(result.ok, "a well-formed 4-digit lock PIN is valid");
+  eq(Object.prototype.hasOwnProperty.call(result, "pin"), false, "result never echoes the PIN back (it's a secret)");
+}
+
+{
+  const result = validateLockPin("0000");
+  ok(result.ok, "an all-zero 4-digit PIN is valid");
+}
+
+{
+  const result = validateLockPin("123");
+  ok(!result.ok, "a 3-digit PIN is rejected");
+  ok(/exactly 4 digits/.test(result.error), `error names the exact length: ${result.error}`);
+}
+
+{
+  const result = validateLockPin("12345");
+  ok(!result.ok, "a 5-digit PIN is rejected");
+}
+
+{
+  const result = validateLockPin("12a4");
+  ok(!result.ok, "a non-digit character is rejected");
+}
+
+{
+  const result = validateLockPin("");
+  ok(!result.ok, "an empty PIN is rejected");
+}
+
+{
+  const result = validateLockPin(null);
+  ok(!result.ok, "a null/undefined PIN is rejected");
+}
+
+// ── validateLockTimeout ──────────────────────────────────────────────────
+//
+// Mirrors LOCK_TIMEOUT_MIN_S..=LOCK_TIMEOUT_MAX_S (15..=3600) — reject
+// rather than clamp, matching validatePin's posture.
+
+{
+  const result = validateLockTimeout("300");
+  ok(result.ok, "an ordinary in-range timeout string is valid");
+  eq(result.timeoutS, 300, "parses to a number");
+}
+
+{
+  const result = validateLockTimeout(300);
+  ok(result.ok, "a numeric timeout is valid too");
+  eq(result.timeoutS, 300);
+}
+
+{
+  const result = validateLockTimeout("15");
+  ok(result.ok, "the minimum bound (15) is valid");
+}
+
+{
+  const result = validateLockTimeout("3600");
+  ok(result.ok, "the maximum bound (3600) is valid");
+}
+
+{
+  const result = validateLockTimeout("14");
+  ok(!result.ok, "one below the minimum bound is rejected");
+  ok(/15/.test(result.error) && /3600/.test(result.error), `error names both bounds: ${result.error}`);
+}
+
+{
+  const result = validateLockTimeout("3601");
+  ok(!result.ok, "one above the maximum bound is rejected");
+}
+
+{
+  const result = validateLockTimeout("0");
+  ok(!result.ok, "zero is rejected (no zero-sentinel; enable/disable is a separate flag)");
+}
+
+{
+  const result = validateLockTimeout("-5");
+  ok(!result.ok, "a negative timeout is rejected");
+}
+
+{
+  const result = validateLockTimeout("300.5");
+  ok(!result.ok, "a non-integer timeout is rejected");
+}
+
+{
+  const result = validateLockTimeout("abc");
+  ok(!result.ok, "a non-numeric timeout is rejected");
+}
+
+{
+  const result = validateLockTimeout("");
+  ok(!result.ok, "an empty timeout is rejected");
+  ok(/required/.test(result.error), `error explains it's required: ${result.error}`);
+}
+
+{
+  const result = validateLockTimeout(null);
+  ok(!result.ok, "a null/undefined timeout is rejected");
 }
 
 console.log(`validation.test: OK — ${checks} check(s) passed.`);

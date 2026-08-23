@@ -30,6 +30,12 @@
 // §4: the password crosses USB in the clear by design, but must never
 // linger in this module's own state, be logged, or be persisted).
 //
+// This mission (meshcadet-lock-web-provisioner) adds the screen-lock send
+// path: `setLockPin` (masked, distinct from the admin PIN — same
+// scrub-after-send discipline) and `setLockConfig` (enable flag + idle
+// timeout, a plain `#sendAndExpectOk` wrapper like `setNotifDefaults`). See
+// `docs/adr/0013-screen-lock-policy-layer.md`.
+//
 // No build step: plain ES module, loaded directly by the browser.
 
 import {
@@ -53,6 +59,8 @@ import {
   encodeSetNotifDefaults,
   encodeSetDeviceName,
   encodeSetPin,
+  encodeSetLockPin,
+  encodeSetLockConfig,
   encodeQueryAdvert,
   ProvError,
   FRAME_QUERY_STATUS,
@@ -68,6 +76,8 @@ import {
   FRAME_DEL_ROOM,
   FRAME_SET_NOTIF_DEFAULTS,
   FRAME_SET_PIN,
+  FRAME_SET_LOCK_PIN,
+  FRAME_SET_LOCK_CONFIG,
   FRAME_SET_DEVICE_NAME,
   FRAME_COMMIT_PROVISIONING,
   FRAME_EXPORT_HISTORY,
@@ -532,6 +542,52 @@ export class ProvisionerSession {
       // Scrub the PIN bytes from our buffer now that no retry can re-send it.
       payload.fill(0);
     }
+  }
+
+  /**
+   * Set the screen-lock PIN — distinct from the admin PIN (`setPin` above):
+   * unlocking the screen must never open the admin menu, and vice versa
+   * (docs/adr/0013-screen-lock-policy-layer.md, D6). `pin` must already be
+   * exactly `LOCK_PIN_LEN` (4) ASCII digits — validate with
+   * `provisioner/validation.js`'s `validateLockPin` before calling;
+   * `encodeSetLockPin` throws on anything else rather than silently
+   * truncating (unlike `encodeSetPin`).
+   *
+   * Routed through `#exclusive` like every other command added since M2's
+   * config child (unlike `setPin`/`clearHistory` above, which predate that
+   * discipline — see their own doc comments).
+   *
+   * ADR-0007 security model, same discipline as `setPin`: this method holds
+   * the PIN only in the transient `payload` buffer for the duration of the
+   * send, then scrubs it (`.fill(0)`) once the retry loop can no longer
+   * reference it. It is never stored on the instance, logged, placed in the
+   * URL, or written to `localStorage`/`sessionStorage`. The caller owns the
+   * `pin` string itself and should drop its reference and clear any input
+   * field after this resolves — see `provisioner.js`'s `handleSetLockPin`.
+   */
+  async setLockPin(pin) {
+    const payload = encodeSetLockPin(pin);
+    try {
+      await this.#exclusive(() => this.#sendAndExpectOk(FRAME_SET_LOCK_PIN, payload));
+    } finally {
+      // Scrub the PIN bytes from our buffer now that no retry can re-send it.
+      payload.fill(0);
+    }
+  }
+
+  /**
+   * Set the screen-lock enable flag(s) and idle timeout. `lockFlags` is the
+   * raw `lock_flags` byte (see `codec.js`'s `LOCK_SCREEN_ENABLE`);
+   * `lockTimeoutS` must already be within `LOCK_TIMEOUT_MIN_S..=LOCK_TIMEOUT_MAX_S`
+   * — validate with `provisioner/validation.js`'s `validateLockTimeout`
+   * before calling. `RSP_OK` here means "accepted and forwarded to the UI
+   * thread", not "persisted" — persistence completes asynchronously on the
+   * device's UI thread (docs/adr/0013-screen-lock-policy-layer.md, D2).
+   */
+  async setLockConfig(lockFlags, lockTimeoutS) {
+    await this.#exclusive(() =>
+      this.#sendAndExpectOk(FRAME_SET_LOCK_CONFIG, encodeSetLockConfig(lockFlags, lockTimeoutS))
+    );
   }
 
   /**

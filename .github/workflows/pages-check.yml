@@ -175,6 +175,20 @@ jobs:
         # test file's own header.
         run: node site/provisioner/channel-secret-recoverability.test.mjs
 
+      - name: lock-pin-hygiene — the screen-lock PIN never reaches storage/console/URL and is cleared on every exit path
+        # Mirrors admin-pin-hygiene.test.mjs/guest-password-hygiene.test.mjs/
+        # channel-secret-hygiene.test.mjs for the FOURTH browser secret this
+        # page carries: drives session.js's setLockPin for real against
+        # hostile localStorage/sessionStorage traps + a console spy, then
+        # statically asserts provisioner.js/provisioner.html's source text
+        # upholds the rest (no URL/history manipulation, type="password" +
+        # inputmode="numeric" + autocomplete="off", the PIN field cleared on
+        # every handleSetLockPin exit path — success AND catch — and on
+        # disconnect). See the test file's own header for why it's split
+        # from session.smoke.test.mjs this way, and for why the lock PIN
+        # (unlike the admin PIN) must be exactly 4 ASCII digits.
+        run: node site/provisioner/lock-pin-hygiene.test.mjs
+
       - name: secret-hygiene-coverage — every type="password" field in provisioner.html has a matching hygiene test
         # Closes a coverage gap: the three hygiene tests above were each added reactively,
         # one field at a time, only after an incident noticed that field was
