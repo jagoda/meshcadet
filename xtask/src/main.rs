@@ -49,8 +49,13 @@
 //!   `self.active_screen` directly, so the screen-lock overlay's retained
 //!   underlying screen never leaks input while locked (see
 //!   `xtask::lock_gate`'s doc).
+//! - **verify-lock-integrity-fixes** — deep-review pass 1's F2 (`trip_lock`
+//!   fails CLOSED on a `LockScreen::new()` construction failure) and F1
+//!   (`FRAME_SET_LOCK_PIN` live-forwards a `UiEvent::LockPinChanged` to the
+//!   UI thread instead of only taking effect at the next boot) — see
+//!   `xtask::lock_integrity_fixes`'s doc.
 //!
-//! Both also run as `cargo test`s, which is what CI / every downstream change
+//! All also run as `cargo test`s, which is what CI / every downstream change
 //! actually gates on; this binary exists for a quick manual re-check with a
 //! human-readable report and a nonzero exit code on failure. It runs BOTH
 //! checks and reports both before exiting, rather than short-circuiting on
@@ -325,6 +330,23 @@ fn main() -> ExitCode {
             lock_gate.len()
         );
         for v in &lock_gate {
+            eprintln!("  - {v}");
+        }
+    }
+
+    let lock_integrity_fixes = xtask::lock_integrity_fixes::check(&repo_root);
+    if lock_integrity_fixes.is_empty() {
+        println!(
+            "xtask verify-lock-integrity-fixes: OK — trip_lock fails closed (F2) and \
+             FRAME_SET_LOCK_PIN live-forwards to the UI thread (F1)."
+        );
+    } else {
+        ok = false;
+        eprintln!(
+            "xtask verify-lock-integrity-fixes: FAILED — {} violation(s):",
+            lock_integrity_fixes.len()
+        );
+        for v in &lock_integrity_fixes {
             eprintln!("  - {v}");
         }
     }

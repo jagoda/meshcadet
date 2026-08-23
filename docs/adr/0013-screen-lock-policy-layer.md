@@ -117,11 +117,24 @@ notification/telemetry/screen-sleep preference. The bump is cheap because
 `mc_rts` is device-local — no host codec and no `codec.js` mirror of it
 exists.
 
-Known, documented asymmetry: the UI thread's admin-PIN comparison state is
-boot-seeded via `UiEvent::BootSeed`, so a host-set PIN takes effect at the
-next boot. The lock PIN inherits exactly this posture (it rides the same
-`BootSeed` bundle, now carrying `lock_pin`/`lock_pin_len`) — the *existing*
-admin-PIN behavior, not a new defect.
+Known, documented asymmetry (admin PIN only, as of the deep-review pass 1
+fix below): the UI thread's admin-PIN comparison state is boot-seeded via
+`UiEvent::BootSeed`, so a host-set admin PIN still takes effect only at the
+next boot — the *existing* admin-PIN behavior, unchanged by this campaign.
+
+The **lock** PIN no longer shares that posture. It is still boot-seeded the
+same way (`BootSeed::lock_pin`/`lock_pin_len`, for the first `step()` before
+any live write arrives), but `FRAME_SET_LOCK_PIN` (`admin_server.rs`) now
+also forwards a `UiEvent::LockPinChanged` over the same `evt_tx` clone
+`FRAME_SET_LOCK_CONFIG` already uses, and `UiRuntime::handle_event` applies
+it via the existing `set_lock_pin` immediately — no reboot needed. This
+closed a same-USB-session lockout: `set-lock-pin` followed by `lock-config
+--enable` used to lock the device against a PIN the running UI thread had
+never seen (locked out until power-cycle), and `reset-lock-pin` against an
+already-locked device used to silently fail to unlock it (the live
+comparison still ran against the stale boot-time PIN). No wire-protocol
+change — `FRAME_SET_LOCK_PIN`'s payload shape is unchanged; only what
+`admin_server` does after the NVS write succeeds.
 
 ### D3 — Lock is an overlay above `ActiveScreen`, not a ninth variant
 
