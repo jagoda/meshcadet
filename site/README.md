@@ -240,18 +240,33 @@ all three in sync.
   (`session.smoke.test.mjs`'s room scenarios; `guest-password-hygiene.test.mjs`
   for the storage/console/URL/autofill invariants specifically) — see that
   test file's own header for why it's split from `session.smoke.test.mjs`.
-  `guest-password-hygiene.test.mjs`, `admin-pin-hygiene.test.mjs`, and
-  `channel-secret-hygiene.test.mjs` (one per secret-carrying field this page
-  handles) share their fixture/assertion logic — a fake Web Serial port,
-  hostile `localStorage`/`sessionStorage` traps, a console spy, the
-  never-captured-in-console-output check, a brace-balance function-body
-  extractor, and an exit-path clear-count counter — via
-  `provisioner/secret-hygiene-test-helpers.mjs`, extracted once a third
-  hand-duplicated copy of that logic crossed the project's own N=3
+  The `meshcadet-screen-lock` campaign's web child adds a **Screen lock**
+  section: a masked, `inputmode="numeric"` 4-digit lock-PIN field
+  (`session.js`'s `setLockPin`, sent then cleared from the DOM — the field's
+  own `autocomplete="off"` is set on both the `<input>` and its enclosing
+  `<form>`, since a browser can still offer to save/autofill a password field
+  whose form lacks the attribute even when the input has it) plus
+  enable/timeout controls (`setLockConfig`, `validateLockTimeout` enforcing
+  the same `15..=3600` bound as the firmware decode path and the host CLI).
+  This is the **fourth** secret-carrying handler on the page and, per
+  `checklists/meshcadet-browser-secret-handler-hygiene.md`'s third-copy
+  trigger, it reuses the shared helper below rather than hand-copying a
+  fifth ~350-line hygiene test file. The lock PIN is **distinct from the
+  admin PIN** field above — setting one never changes the other, and neither
+  unlocks what the other gates (see `README.md`'s screen-lock section for
+  why).
+  `guest-password-hygiene.test.mjs`, `admin-pin-hygiene.test.mjs`,
+  `channel-secret-hygiene.test.mjs`, and `lock-pin-hygiene.test.mjs` (one per
+  secret-carrying field this page handles) share their fixture/assertion
+  logic — a fake Web Serial port, hostile `localStorage`/`sessionStorage`
+  traps, a console spy, the never-captured-in-console-output check, a
+  brace-balance function-body extractor, and an exit-path clear-count
+  counter — via `provisioner/secret-hygiene-test-helpers.mjs`, extracted once
+  a third hand-duplicated copy of that logic crossed the project's own N=3
   dedup-or-extract threshold. `provisioner/secret-hygiene-coverage.test.mjs`
   is the mechanized counterpart: it enumerates every `type="password"`
   `<input>` in this file's shipped source text and asserts each one's `id`
-  is covered by at least one `*-hygiene.test.mjs`, so a future fourth secret
+  is covered by at least one `*-hygiene.test.mjs`, so a future new secret
   field fails CI immediately instead of waiting for a security audit to
   notice it has no hygiene test — see that test file's own header. All are
   run by `pages-check.yml`'s `check` job (each hygiene/coverage test file

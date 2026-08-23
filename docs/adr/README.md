@@ -14,6 +14,7 @@
 | [0010](0010-signal-meter.md) | Repeater Signal Meter: Hop-Gated RSSI, Max-With-Decay, Per-Screen Placement | Accepted (2026-07-13) |
 | [0011](0011-unified-esptool-js-flasher.md) | Unified esptool-js Flasher: Fresh Install Drops `<esp-web-install-button>` | Accepted (2026-07-14) |
 | [0012](0012-dispatcher-ui-task-split.md) | Dispatcher/UI Task Split: Radio on Core 0, UI on Core 1, Message Queues Across the Boundary | Accepted (2026-08-02) |
+| [0013](0013-screen-lock-policy-layer.md) | Screen Lock: Policy/UI Layer, No Wire-Protocol Change | Accepted (2026-08-23) |
 
 ADR-0001 is the project's founding charter: the design decisions made before
 any code was written. Subsequent ADRs (UI toolkit choice, provisioning wire
