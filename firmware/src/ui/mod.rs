@@ -964,6 +964,15 @@ pub struct UiRuntime<'d> {
     /// the value `firmware_core::ui::lock::attempt_unlock` returned for the
     /// most recent wrong PIN.
     lock_lockout_s: u32,
+    /// The whole-second countdown value LAST pushed to the lock screen's
+    /// `lockout_text`, `None` while no lockout is active. Dedup gate for
+    /// the per-tick countdown recompute below — without it, every `step()`
+    /// tick re-`format!`s and re-pushes the SAME displayed second (ticks run
+    /// far faster than 1 Hz), the identical alloc-and-tick-churn class this
+    /// codebase already guards elsewhere (see
+    /// `firmware_core::ui::admin_menu::battery_display_fields_changed`'s
+    /// doc for the precedent this mirrors).
+    lock_countdown_last_shown_s: Option<u32>,
 
     // ── Screen-sleep (backlight-off) state ────────────────────────────────
     //
@@ -1451,6 +1460,7 @@ impl<'d> UiRuntime<'d> {
             lock_attempt_state: LockAttemptState::default(),
             lock_lockout_started_ms: 0,
             lock_lockout_s: 0,
+            lock_countdown_last_shown_s: None,
             screen_asleep: false,
             // Overwritten by the first `step()` call — see the field doc.
             last_activity_ms: 0,
@@ -2150,9 +2160,16 @@ impl<'d> UiRuntime<'d> {
                     self.notif.fire(NotifEvent::PinError, now_ms, self.screen_asleep);
                     self.lock_lockout_s = outcome.lockout_s;
                     self.lock_lockout_started_ms = now_ms;
+                    // A fresh lockout starting must always seed its first
+                    // displayed second, even if it happens to numerically
+                    // match whatever a PRIOR lockout's countdown last
+                    // pushed — reset the dedup gate rather than leaving a
+                    // stale value that could silently skip this seed.
+                    self.lock_countdown_last_shown_s = None;
                     if let Some(ref screen) = self.lock_screen {
                         screen.trigger_reject();
                         if outcome.lockout_s > 0 {
+                            self.lock_countdown_last_shown_s = Some(outcome.lockout_s);
                             screen.set_backing_off(&format!("Try again in {}s", outcome.lockout_s));
                         }
                     }
@@ -2163,18 +2180,28 @@ impl<'d> UiRuntime<'d> {
         // ── Lock backoff countdown (D4) ──────────────────────────────────────
         // Recomputed every tick while a lockout is active so the lock
         // screen's displayed countdown visibly ticks down, independent of
-        // whether a confirm attempt was made this tick.
+        // whether a confirm attempt was made this tick. Gated on
+        // `lock_countdown_last_shown_s` actually changing — see that
+        // field's doc for why (`step()` ticks far faster than 1 Hz; without
+        // the gate every tick would re-`format!` + re-push the identical
+        // displayed second).
         if self.locked && self.lock_lockout_s > 0 {
             let elapsed_ms = now_ms.saturating_sub(self.lock_lockout_started_ms);
             let total_ms = (self.lock_lockout_s as u64).saturating_mul(1000);
             if elapsed_ms >= total_ms {
                 self.lock_lockout_s = 0;
+                self.lock_countdown_last_shown_s = None;
                 if let Some(ref screen) = self.lock_screen {
                     screen.clear_backing_off();
                 }
-            } else if let Some(ref screen) = self.lock_screen {
-                let remaining_s = (total_ms - elapsed_ms).div_ceil(1000);
-                screen.set_backing_off(&format!("Try again in {}s", remaining_s));
+            } else {
+                let remaining_s = ((total_ms - elapsed_ms).div_ceil(1000)) as u32;
+                if self.lock_countdown_last_shown_s != Some(remaining_s) {
+                    self.lock_countdown_last_shown_s = Some(remaining_s);
+                    if let Some(ref screen) = self.lock_screen {
+                        screen.set_backing_off(&format!("Try again in {}s", remaining_s));
+                    }
+                }
             }
         }
 
@@ -3924,6 +3951,7 @@ impl<'d> UiRuntime<'d> {
         }
         self.locked = false;
         self.lock_lockout_s = 0;
+        self.lock_countdown_last_shown_s = None;
         self.lock_digits.borrow_mut().clear();
         self.show_active_screen();
         self.window.request_redraw();
