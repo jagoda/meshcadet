@@ -47,6 +47,24 @@ pub const SCREEN_SLEEP_DEFAULT_S: u8 = 30;
 /// Upper bound of the screen-sleep timeout range (inclusive).
 pub const SCREEN_SLEEP_MAX_S: u8 = 120;
 
+/// Backlight brightness, as a percentage of full LEDC duty (`TDeckDisplay::
+/// set_brightness`).
+///
+/// `100` reproduces today's shipped on/off behavior exactly (`set_backlight(true)`
+/// == full duty) — the plan of record (`meshcadet-power-optimization` Phase 4)
+/// is explicit that this leg must not change the shipped default; only the
+/// user, via the admin-menu stepper, moves it below 100.
+pub const BACKLIGHT_BRIGHTNESS_DEFAULT_PCT: u8 = 100;
+/// Upper bound of the brightness range (inclusive) — 100% = full duty.
+pub const BACKLIGHT_BRIGHTNESS_MAX_PCT: u8 = 100;
+/// Lower bound of the brightness range (inclusive). Deliberately non-zero:
+/// `0` would leave the panel visibly dark while the screen is nominally
+/// *awake* — screen-off is a distinct, separately-owned state
+/// (`screen_sleep_timeout_s` / `set_backlight(false)`), never an overloaded
+/// brightness value (same non-overloading discipline `lock_timeout_s`
+/// already established for its own timeout field — see that field's doc).
+pub const BACKLIGHT_BRIGHTNESS_MIN_PCT: u8 = 10;
+
 // ── RuntimeSettings ───────────────────────────────────────────────────────────
 
 /// Mutable runtime settings that the on-device admin menu can toggle.
@@ -77,6 +95,12 @@ pub struct RuntimeSettings {
     /// overloaded timeout value (plan D1's explicit rejection of the
     /// screen-sleep sentinel pattern for this field).
     pub lock_timeout_s: u16,
+    /// Backlight brightness, `BACKLIGHT_BRIGHTNESS_MIN_PCT..=BACKLIGHT_BRIGHTNESS_MAX_PCT`
+    /// (10..=100), as a percentage of full LEDC duty applied via
+    /// `TDeckDisplay::set_brightness` while the screen is awake. Default
+    /// `BACKLIGHT_BRIGHTNESS_DEFAULT_PCT` (100%) reproduces today's
+    /// always-full-duty behavior untouched.
+    pub backlight_brightness: u8,
 }
 
 impl RuntimeSettings {
@@ -91,6 +115,7 @@ impl RuntimeSettings {
             lock_flags: 0,
             screen_sleep_timeout_s: SCREEN_SLEEP_DEFAULT_S,
             lock_timeout_s: LOCK_TIMEOUT_DEFAULT_S,
+            backlight_brightness: BACKLIGHT_BRIGHTNESS_DEFAULT_PCT,
         }
     }
 }
@@ -149,6 +174,12 @@ pub enum MenuAction {
     /// single source of truth, mirroring `SetScreenSleepTimeout`'s re-clamp
     /// regardless of what the widget/protocol frame passed.
     SetLockTimeout(u16),
+    /// Set the backlight brightness, as a percentage of full duty. Clamped
+    /// to `BACKLIGHT_BRIGHTNESS_MIN_PCT..=BACKLIGHT_BRIGHTNESS_MAX_PCT` by
+    /// `apply_menu_action` — the single source of truth, mirroring
+    /// `SetScreenSleepTimeout`/`SetLockTimeout`'s re-clamp regardless of what
+    /// the widget/protocol frame passed.
+    SetBacklightBrightness(u8),
 }
 
 // ── verify_pin ────────────────────────────────────────────────────────────────
@@ -221,6 +252,10 @@ pub fn apply_menu_action(action: &MenuAction, settings: &mut RuntimeSettings) {
         }
         MenuAction::SetLockTimeout(secs) => {
             settings.lock_timeout_s = (*secs).clamp(LOCK_TIMEOUT_MIN_S, LOCK_TIMEOUT_MAX_S);
+        }
+        MenuAction::SetBacklightBrightness(pct) => {
+            settings.backlight_brightness =
+                (*pct).clamp(BACKLIGHT_BRIGHTNESS_MIN_PCT, BACKLIGHT_BRIGHTNESS_MAX_PCT);
         }
     }
 }
@@ -529,6 +564,59 @@ mod tests {
         assert_eq!(s.lock_timeout_s, LOCK_TIMEOUT_MIN_S);
         apply_menu_action(&MenuAction::SetLockTimeout(LOCK_TIMEOUT_MAX_S), &mut s);
         assert_eq!(s.lock_timeout_s, LOCK_TIMEOUT_MAX_S);
+    }
+
+    // ── backlight brightness ────────────────────────────────────────────────
+
+    /// Acceptance: default is 100% (today's always-full-duty behavior) —
+    /// this leg must not change the shipped default (plan of record Phase 4).
+    #[test]
+    fn backlight_brightness_defaults_to_100_pct() {
+        let s = RuntimeSettings::default();
+        assert_eq!(s.backlight_brightness, 100);
+        assert_eq!(s.backlight_brightness, BACKLIGHT_BRIGHTNESS_DEFAULT_PCT);
+    }
+
+    #[test]
+    fn set_backlight_brightness_within_range() {
+        let mut s = RuntimeSettings::default();
+        apply_menu_action(&MenuAction::SetBacklightBrightness(50), &mut s);
+        assert_eq!(s.backlight_brightness, 50);
+    }
+
+    /// Acceptance: a value below `BACKLIGHT_BRIGHTNESS_MIN_PCT` (10) is
+    /// clamped UP, never accepted verbatim — `0` must never persist (that
+    /// would leave the panel dark while nominally awake; see the constant's
+    /// own doc for why there is no zero sentinel here).
+    #[test]
+    fn set_backlight_brightness_below_min_clamped_up() {
+        let mut s = RuntimeSettings::default();
+        apply_menu_action(&MenuAction::SetBacklightBrightness(0), &mut s);
+        assert_eq!(s.backlight_brightness, BACKLIGHT_BRIGHTNESS_MIN_PCT);
+    }
+
+    /// Acceptance: a value above `BACKLIGHT_BRIGHTNESS_MAX_PCT` (100) is
+    /// clamped DOWN, never accepted verbatim.
+    #[test]
+    fn set_backlight_brightness_above_max_clamped_down() {
+        let mut s = RuntimeSettings::default();
+        apply_menu_action(&MenuAction::SetBacklightBrightness(u8::MAX), &mut s);
+        assert_eq!(s.backlight_brightness, BACKLIGHT_BRIGHTNESS_MAX_PCT);
+    }
+
+    #[test]
+    fn set_backlight_brightness_bounds_are_settable_exactly() {
+        let mut s = RuntimeSettings::default();
+        apply_menu_action(
+            &MenuAction::SetBacklightBrightness(BACKLIGHT_BRIGHTNESS_MIN_PCT),
+            &mut s,
+        );
+        assert_eq!(s.backlight_brightness, BACKLIGHT_BRIGHTNESS_MIN_PCT);
+        apply_menu_action(
+            &MenuAction::SetBacklightBrightness(BACKLIGHT_BRIGHTNESS_MAX_PCT),
+            &mut s,
+        );
+        assert_eq!(s.backlight_brightness, BACKLIGHT_BRIGHTNESS_MAX_PCT);
     }
 
     /// Acceptance: wrong PIN is rejected, correct PIN is accepted,

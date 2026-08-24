@@ -364,10 +364,16 @@ slint::slint! {
         in property <bool>   lock_enabled: false;
         in property <int>    lock_timeout_s: 300;
         in property <string> lock_timeout_display: "300s";
+        // Backlight-brightness stepper (meshcadet-power-optimization Phase
+        // 4) — same apply/persist pattern as the steppers above, wired
+        // through `MenuAction::SetBacklightBrightness` (see
+        // `ui::mod::UiRuntime::navigate_to_admin_menu`).
+        in property <int>    backlight_brightness: 100;
+        in property <string> backlight_brightness_display: "100%";
         // Trackball-driven row highlight: 0=visual toggle, 1=audible toggle,
         // 2=screen-sleep stepper, 3=lock-enable toggle, 4=lock-timeout
-        // stepper, 5=GPS status row. `-1` = no highlight yet (touch taps a
-        // row directly and never sets this).
+        // stepper, 5=backlight-brightness stepper, 6=GPS status row. `-1` =
+        // no highlight yet (touch taps a row directly and never sets this).
         in property <int>    selected_index: -1;
         // Shared full-window starfield texture, set once by Rust right after
         // construction (`ui::backdrop_asset::shared_backdrop_image()`) — see
@@ -382,6 +388,8 @@ slint::slint! {
         callback toggle_lock_enabled;
         callback decrement_lock_timeout;
         callback increment_lock_timeout;
+        callback decrement_backlight_brightness;
+        callback increment_backlight_brightness;
         callback open_gps_status;
 
         // Scroll `main_flick` so `selected_index`'s row is in view — same
@@ -483,8 +491,8 @@ slint::slint! {
             }
 
             // ── Rows (scrollable — see `scroll_selected_into_view`'s doc) ────
-            // Seven rows at 40px each (280px) plus this screen's own 36px
-            // header exceed the 320x240 panel (316px total content), so —
+            // Eight rows at 40px each (320px) plus this screen's own 36px
+            // header exceed the 320x240 panel (356px total content), so —
             // unlike the pre-screen-lock 5-row layout, which fit at
             // 236/240px with no scrolling needed — this list is wrapped in a
             // `Flickable`, the same mechanism `contact_list.rs`'s row list
@@ -539,9 +547,27 @@ slint::slint! {
                         decremented => { root.decrement_lock_timeout(); }
                         incremented => { root.increment_lock_timeout(); }
                     }
+                    StepperRow {
+                        // ☀ (U+2600) — already a curated EMOJI_CPS entry
+                        // (compose.rs picker's "Nature" set), rasterised at
+                        // every EMOJI_SIZES size including this row's 14px
+                        // (Theme.size-body-lg) — see `gen_emoji_font.c`'s
+                        // frozen inventory. Deliberately NOT 🔆 (U+1F506,
+                        // "high brightness symbol"): not in that inventory,
+                        // which `xtask`'s glyph-coverage harness
+                        // (`glyph_coverage_is_complete`) statically enforces.
+                        label: "☀  Brightness";
+                        value: backlight_brightness;
+                        display_text: backlight_brightness_display;
+                        min_value: 10; // BACKLIGHT_BRIGHTNESS_MIN_PCT
+                        max_value: 100; // BACKLIGHT_BRIGHTNESS_MAX_PCT
+                        selected: selected_index == 5;
+                        decremented => { root.decrement_backlight_brightness(); }
+                        incremented => { root.increment_backlight_brightness(); }
+                    }
                     NavRow {
                         label: "📍  GPS status";
-                        selected: selected_index == 5;
+                        selected: selected_index == 6;
                         tapped => { root.open_gps_status(); }
                     }
                 }
@@ -565,6 +591,19 @@ const SCREEN_SLEEP_STEP_S: i32 = 5;
 /// widget-only step size, same discipline as `SCREEN_SLEEP_STEP_S`.
 const LOCK_TIMEOUT_STEP_S: i32 = 15;
 
+/// Step size (percentage points) applied per +/- tap on the
+/// backlight-brightness stepper (meshcadet-power-optimization Phase 4).
+/// `BACKLIGHT_BRIGHTNESS_MIN_PCT..=BACKLIGHT_BRIGHTNESS_MAX_PCT` is
+/// 10..=100 — a 10-point step reaches every bound in a small, predictable
+/// number of taps (9 taps end to end) without being so fine-grained that
+/// dialing in a value takes an unreasonable number of taps, matching the
+/// "abort if flicker at low duty" plan clause's discrete-levels fallback
+/// shape even though the underlying LEDC write stays a plain 0..=100
+/// percentage. `pin_menu::apply_menu_action` re-clamps the result
+/// regardless of this widget-only step size, same discipline as
+/// `SCREEN_SLEEP_STEP_S`/`LOCK_TIMEOUT_STEP_S`.
+const BACKLIGHT_BRIGHTNESS_STEP_PCT: i32 = 10;
+
 // `format_screen_sleep`/`format_lock_timeout`/`format_battery_display` are
 // pure Rust with no Slint dependency — they now live in
 // `firmware_core::ui::admin_menu` so their tests execute under `cargo test
@@ -575,7 +614,9 @@ const LOCK_TIMEOUT_STEP_S: i32 = 15;
 // crate-visible re-export (also called from
 // `ui::mod::UiRuntime::set_battery_status`). See
 // `docs/adr/0005-firmware-core-extraction.md`.
-use firmware_core::ui::admin_menu::{format_lock_timeout, format_screen_sleep};
+use firmware_core::ui::admin_menu::{
+    format_backlight_brightness, format_lock_timeout, format_screen_sleep,
+};
 pub(crate) use firmware_core::ui::admin_menu::format_battery_display;
 
 /// Rust-side wrapper.
@@ -624,6 +665,17 @@ impl AdminMenuScreen {
     pub fn set_lock_timeout(&self, seconds: i32) {
         self.component.set_lock_timeout_s(seconds);
         self.component.set_lock_timeout_display(format_lock_timeout(seconds).into());
+    }
+
+    /// Set the initial displayed backlight brightness
+    /// (`BACKLIGHT_BRIGHTNESS_MIN_PCT..=BACKLIGHT_BRIGHTNESS_MAX_PCT`,
+    /// 10..=100%; meshcadet-power-optimization Phase 4). Same "raw value +
+    /// precomputed display string" pair as [`Self::set_screen_sleep_timeout`]/
+    /// [`Self::set_lock_timeout`].
+    pub fn set_backlight_brightness(&self, percent: i32) {
+        self.component.set_backlight_brightness(percent);
+        self.component
+            .set_backlight_brightness_display(format_backlight_brightness(percent).into());
     }
 
     /// Set the displayed battery row — the full HIL-capture state vector,
@@ -695,8 +747,17 @@ impl AdminMenuScreen {
         self.component.invoke_increment_lock_timeout();
     }
 
+    /// Fire `increment_backlight_brightness` exactly as tapping the
+    /// brightness stepper's "+" would — used by the trackball's Click
+    /// handler when row 5 (backlight-brightness stepper) is highlighted.
+    /// Same "Click maps to increment" convention as
+    /// [`Self::invoke_increment_screen_sleep_timeout`].
+    pub fn invoke_increment_backlight_brightness(&self) {
+        self.component.invoke_increment_backlight_brightness();
+    }
+
     /// Fire `open_gps_status` exactly as tapping that row would — used by the
-    /// trackball's Click handler when row 5 is highlighted.
+    /// trackball's Click handler when row 6 is highlighted.
     pub fn invoke_open_gps_status(&self) {
         self.component.invoke_open_gps_status();
     }
@@ -791,6 +852,40 @@ impl AdminMenuScreen {
                 (comp.get_lock_timeout_s() + LOCK_TIMEOUT_STEP_S).min(protocol::provisioning::LOCK_TIMEOUT_MAX_S as i32);
             comp.set_lock_timeout_s(new_val);
             comp.set_lock_timeout_display(format_lock_timeout(new_val).into());
+            cb(new_val);
+        });
+    }
+
+    /// Fires `cb(new_percent)` when the user taps "−" on the
+    /// backlight-brightness row. Clamped to a floor of
+    /// `BACKLIGHT_BRIGHTNESS_MIN_PCT` here for the widget's own
+    /// displayed-state consistency; the caller
+    /// (`ui::mod::navigate_to_admin_menu`) applies `new_percent` via
+    /// `pin_menu::apply_menu_action`, which re-clamps to
+    /// `BACKLIGHT_BRIGHTNESS_MIN_PCT..=BACKLIGHT_BRIGHTNESS_MAX_PCT` as the
+    /// single source of truth for the persisted invariant — same division of
+    /// labor as [`Self::on_decrement_lock_timeout`].
+    pub fn on_decrement_backlight_brightness(&self, cb: impl Fn(i32) + 'static) {
+        let comp = self.component.clone_strong();
+        self.component.on_decrement_backlight_brightness(move || {
+            let new_val = (comp.get_backlight_brightness() - BACKLIGHT_BRIGHTNESS_STEP_PCT)
+                .max(firmware_core::pin_menu::BACKLIGHT_BRIGHTNESS_MIN_PCT as i32);
+            comp.set_backlight_brightness(new_val);
+            comp.set_backlight_brightness_display(format_backlight_brightness(new_val).into());
+            cb(new_val);
+        });
+    }
+
+    /// Fires `cb(new_percent)` when the user taps "+" on the
+    /// backlight-brightness row. See [`Self::on_decrement_backlight_brightness`]
+    /// for the clamp contract.
+    pub fn on_increment_backlight_brightness(&self, cb: impl Fn(i32) + 'static) {
+        let comp = self.component.clone_strong();
+        self.component.on_increment_backlight_brightness(move || {
+            let new_val = (comp.get_backlight_brightness() + BACKLIGHT_BRIGHTNESS_STEP_PCT)
+                .min(firmware_core::pin_menu::BACKLIGHT_BRIGHTNESS_MAX_PCT as i32);
+            comp.set_backlight_brightness(new_val);
+            comp.set_backlight_brightness_display(format_backlight_brightness(new_val).into());
             cb(new_val);
         });
     }

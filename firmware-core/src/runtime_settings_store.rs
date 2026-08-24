@@ -47,6 +47,7 @@
 //! bytes 5..5+N    contact_telemetry    (0/1 per slot, N = MAX_CONTACTS)
 //! byte 5+N        screen_sleep_timeout_s (0..=120)
 //! bytes 6+N..8+N  lock_timeout_s       (u16 little-endian, 15..=3600; ADDED in v0x02)
+//! byte 8+N        backlight_brightness (10..=100; ADDED additively within v0x02 — see below)
 //! ```
 //!
 //! # Backward compatibility (v0x01 → v0x02: screen-lock idle timeout)
@@ -61,16 +62,33 @@
 //! (pre-screen-sleep) and `V1_BLOB_LEN` (with the screen-sleep byte, no lock
 //! timeout) lengths, defaulting ONLY `lock_timeout_s` (to
 //! `LOCK_TIMEOUT_DEFAULT_S`) — never touching any field an old blob actually
-//! stored. A `VERSION` (`0x02`) blob is always the full current length; a
-//! v0x02 blob shorter than that is treated as corrupt (`None`), same as a
-//! too-short v0x01 blob always has been.
+//! stored.
+//!
+//! # Backward compatibility (`backlight_brightness`, additive within v0x02)
+//!
+//! `backlight_brightness` (meshcadet-power-optimization Phase 4) does NOT
+//! bump the version tag — it follows the exact additive-within-version shape
+//! the ORIGINAL screen-sleep-timeout addition used for v0x01 above
+//! (`V1_LEGACY_BLOB_LEN` / `V1_BLOB_LEN`), applied one version further: the
+//! `VERSION` (`0x02`) arm now accepts BOTH `V2_LEGACY_BLOB_LEN` (the v0x02
+//! layout as shipped before this field existed — every v0x02 firmware to
+//! date wrote exactly this length) and `BLOB_LEN` (with `backlight_brightness`
+//! appended), defaulting ONLY `backlight_brightness` (to
+//! `BACKLIGHT_BRIGHTNESS_DEFAULT_PCT`, which reproduces today's always-full-
+//! duty behavior) for the shorter length — never touching any field an old
+//! v0x02 blob actually stored. A `VERSION` blob shorter than
+//! `V2_LEGACY_BLOB_LEN` is corrupt (`None`), same as a too-short v0x01 blob
+//! always has been.
 //!
 //! The `lock_flags` byte (position 4) already exists in both versions — the
 //! screen-lock enable bit (`LOCK_SCREEN_ENABLE`, bit 0) rides that pre-
 //! existing field, so no new flags byte was needed, only the new
 //! `lock_timeout_s` field.
 
-use crate::pin_menu::{RuntimeSettings, MAX_CONTACTS, SCREEN_SLEEP_DEFAULT_S, SCREEN_SLEEP_MAX_S};
+use crate::pin_menu::{
+    RuntimeSettings, BACKLIGHT_BRIGHTNESS_DEFAULT_PCT, BACKLIGHT_BRIGHTNESS_MAX_PCT,
+    BACKLIGHT_BRIGHTNESS_MIN_PCT, MAX_CONTACTS, SCREEN_SLEEP_DEFAULT_S, SCREEN_SLEEP_MAX_S,
+};
 use protocol::provisioning::{LOCK_TIMEOUT_DEFAULT_S, LOCK_TIMEOUT_MAX_S, LOCK_TIMEOUT_MIN_S};
 
 /// Current blob version. Bumped `0x01` → `0x02` when `lock_timeout_s` was
@@ -87,9 +105,16 @@ const V1_LEGACY_BLOB_LEN: usize = 5 + MAX_CONTACTS;
 /// `VERSION_V1` blob length once `screen_sleep_timeout_s` was appended
 /// (still version `0x01` — that addition was additive-within-version).
 const V1_BLOB_LEN: usize = V1_LEGACY_BLOB_LEN + 1;
-/// Current (`VERSION` / `0x02`) blob length: the v0x01 layout plus a
-/// trailing 2-byte little-endian `lock_timeout_s`.
-pub const BLOB_LEN: usize = V1_BLOB_LEN + 2;
+/// `VERSION` (`0x02`) blob length before `backlight_brightness` was
+/// appended — the v0x01 layout plus a trailing 2-byte little-endian
+/// `lock_timeout_s`. Every v0x02 firmware to date wrote exactly this
+/// length; kept as a legacy length accepted by the `VERSION` arm below —
+/// see the module-level "Backward compatibility (`backlight_brightness`...)"
+/// note.
+const V2_LEGACY_BLOB_LEN: usize = V1_BLOB_LEN + 2;
+/// Current (`VERSION` / `0x02`) blob length: `V2_LEGACY_BLOB_LEN` plus a
+/// trailing `backlight_brightness` byte.
+pub const BLOB_LEN: usize = V2_LEGACY_BLOB_LEN + 1;
 
 /// Pure helper: `RuntimeSettings::default_enabled()` with the notification
 /// toggles overridden to the provisioned `(visual, audible)` defaults.
@@ -119,6 +144,9 @@ pub fn serialize(s: &RuntimeSettings, out: &mut [u8]) -> usize {
     let [lo, hi] = lock_timeout_s.to_le_bytes();
     out[V1_BLOB_LEN] = lo;
     out[V1_BLOB_LEN + 1] = hi;
+    out[V2_LEGACY_BLOB_LEN] = s
+        .backlight_brightness
+        .clamp(BACKLIGHT_BRIGHTNESS_MIN_PCT, BACKLIGHT_BRIGHTNESS_MAX_PCT);
     BLOB_LEN
 }
 
@@ -144,23 +172,38 @@ pub fn deserialize(blob: &[u8]) -> Option<RuntimeSettings> {
     }
     match blob[0] {
         VERSION => {
-            // Current version is always the full length — a short v0x02
-            // blob is corrupt, not a legitimate in-field-upgrade shape (that
-            // shape is exactly what the VERSION_V1 arm below exists for).
-            if blob.len() < BLOB_LEN {
+            // Accept both v0x02 lengths so `backlight_brightness`'s addition
+            // never resets previously-saved notif/telemetry/screen-sleep/
+            // lock-timeout prefs — same additive-within-version shape the
+            // VERSION_V1 arm below already uses for screen_sleep_timeout_s
+            // (see the module-level "Backward compatibility
+            // (`backlight_brightness`...)" note). Only the NEW field
+            // (`backlight_brightness`, which no v0x02 blob had before this
+            // leg) is defaulted for the shorter length. A blob shorter than
+            // `V2_LEGACY_BLOB_LEN` is corrupt, not a legitimate
+            // in-field-upgrade shape.
+            if blob.len() < V2_LEGACY_BLOB_LEN {
                 return None;
             }
             let mut s = parse_common_fields(blob);
             s.screen_sleep_timeout_s = blob[V1_LEGACY_BLOB_LEN].min(SCREEN_SLEEP_MAX_S);
             let raw = u16::from_le_bytes([blob[V1_BLOB_LEN], blob[V1_BLOB_LEN + 1]]);
             s.lock_timeout_s = raw.clamp(LOCK_TIMEOUT_MIN_S, LOCK_TIMEOUT_MAX_S);
+            s.backlight_brightness = if blob.len() >= BLOB_LEN {
+                blob[V2_LEGACY_BLOB_LEN]
+                    .clamp(BACKLIGHT_BRIGHTNESS_MIN_PCT, BACKLIGHT_BRIGHTNESS_MAX_PCT)
+            } else {
+                // Old-length v0x02 blob predates this field — fall back to the documented default.
+                BACKLIGHT_BRIGHTNESS_DEFAULT_PCT
+            };
             Some(s)
         }
         VERSION_V1 => {
             // Accept both legacy v0x01 lengths so an in-field upgrade never
             // resets previously-saved notif/telemetry/screen-sleep prefs —
             // see the module-level "Backward compatibility" note. Only the
-            // NEW field (lock_timeout_s, which v0x01 never had) is defaulted.
+            // NEW fields (lock_timeout_s / backlight_brightness, which v0x01
+            // never had) are defaulted.
             if blob.len() < V1_LEGACY_BLOB_LEN {
                 return None;
             }
@@ -172,6 +215,7 @@ pub fn deserialize(blob: &[u8]) -> Option<RuntimeSettings> {
                 SCREEN_SLEEP_DEFAULT_S
             };
             s.lock_timeout_s = LOCK_TIMEOUT_DEFAULT_S;
+            s.backlight_brightness = BACKLIGHT_BRIGHTNESS_DEFAULT_PCT;
             Some(s)
         }
         _ => None,
@@ -216,6 +260,7 @@ mod tests {
         assert_eq!(s.lock_flags, 0);
         assert_eq!(s.screen_sleep_timeout_s, SCREEN_SLEEP_DEFAULT_S);
         assert_eq!(s.lock_timeout_s, LOCK_TIMEOUT_DEFAULT_S);
+        assert_eq!(s.backlight_brightness, BACKLIGHT_BRIGHTNESS_DEFAULT_PCT);
         for &v in &s.contact_telemetry {
             assert!(!v);
         }
@@ -302,6 +347,10 @@ mod tests {
             restored.lock_timeout_s, LOCK_TIMEOUT_DEFAULT_S,
             "v0x01 never had this field — must default, never zero/garbage"
         );
+        assert_eq!(
+            restored.backlight_brightness, BACKLIGHT_BRIGHTNESS_DEFAULT_PCT,
+            "v0x01 never had this field either — must default, never zero/garbage"
+        );
     }
 
     /// Acceptance (this mission's hard constraint): a v0x01 blob that DOES
@@ -334,6 +383,10 @@ mod tests {
             restored.lock_timeout_s, LOCK_TIMEOUT_DEFAULT_S,
             "only the genuinely new field defaults"
         );
+        assert_eq!(
+            restored.backlight_brightness, BACKLIGHT_BRIGHTNESS_DEFAULT_PCT,
+            "backlight_brightness is also genuinely new to v0x01 — must default too"
+        );
     }
 
     #[test]
@@ -342,14 +395,111 @@ mod tests {
         assert!(deserialize(&short).is_none());
     }
 
-    /// A v0x02-tagged blob shorter than the full current length is corrupt,
-    /// not a legitimate migration shape (unlike a short v0x01 blob) — v0x02
-    /// is only ever written at full length by this crate's own `serialize`.
+    /// A v0x02-tagged blob shorter than `V2_LEGACY_BLOB_LEN` (the minimum
+    /// valid v0x02 length, pre-`backlight_brightness`) is corrupt — unlike
+    /// `V2_LEGACY_BLOB_LEN` itself, which is now a legitimate migration
+    /// shape (see `v2_legacy_length_blob_preserves_existing_fields_and_
+    /// defaults_brightness` below).
     #[test]
-    fn v2_tagged_blob_shorter_than_full_length_returns_none() {
-        let mut short = [0u8; BLOB_LEN - 1];
+    fn v2_tagged_blob_shorter_than_legacy_length_returns_none() {
+        let mut short = [0u8; V2_LEGACY_BLOB_LEN - 1];
         short[0] = VERSION;
         assert!(deserialize(&short).is_none());
+    }
+
+    // ── backlight_brightness round-trip (additive within v0x02) ────────────
+
+    #[test]
+    fn roundtrip_preserves_backlight_brightness() {
+        let mut s = RuntimeSettings::default_enabled();
+        s.backlight_brightness = 50;
+        let mut blob = [0u8; BLOB_LEN];
+        let n = serialize(&s, &mut blob);
+        assert_eq!(n, BLOB_LEN);
+        assert_eq!(
+            blob[0], VERSION,
+            "backlight_brightness is additive within v0x02 — serialize does not bump the version"
+        );
+        let restored = deserialize(&blob[..n]).expect("valid blob");
+        assert_eq!(restored.backlight_brightness, 50);
+    }
+
+    #[test]
+    fn roundtrip_preserves_backlight_brightness_bounds() {
+        let mut s = RuntimeSettings::default_enabled();
+        s.backlight_brightness = BACKLIGHT_BRIGHTNESS_MIN_PCT;
+        let mut blob = [0u8; BLOB_LEN];
+        let n = serialize(&s, &mut blob);
+        assert_eq!(
+            deserialize(&blob[..n]).unwrap().backlight_brightness,
+            BACKLIGHT_BRIGHTNESS_MIN_PCT
+        );
+
+        s.backlight_brightness = BACKLIGHT_BRIGHTNESS_MAX_PCT;
+        let n = serialize(&s, &mut blob);
+        assert_eq!(
+            deserialize(&blob[..n]).unwrap().backlight_brightness,
+            BACKLIGHT_BRIGHTNESS_MAX_PCT
+        );
+    }
+
+    /// Acceptance (this mission's hard constraint — legacy-upgrade
+    /// round-trip): a v0x02 blob at the pre-`backlight_brightness` length
+    /// (`V2_LEGACY_BLOB_LEN` — every v0x02 firmware in the field today) must
+    /// not reset ANY previously-saved field to defaults just because
+    /// firmware grew one more byte — it must fall back ONLY the genuinely
+    /// new field (`backlight_brightness`) to `BACKLIGHT_BRIGHTNESS_DEFAULT_PCT`,
+    /// preserving everything that old blob actually stored, including the
+    /// v0x02-only `lock_timeout_s`. Same additive-within-version shape as
+    /// `v1_blob_with_screen_sleep_preserves_it_and_defaults_lock_timeout`
+    /// above, applied one version further.
+    #[test]
+    fn v2_legacy_length_blob_preserves_existing_fields_and_defaults_brightness() {
+        let mut v2_blob = [0u8; V2_LEGACY_BLOB_LEN];
+        v2_blob[0] = VERSION;
+        v2_blob[1] = 0; // notif_visual = false (non-default, proves it round-trips)
+        v2_blob[2] = 1; // notif_audible = true
+        v2_blob[3] = 4; // contact_count
+        v2_blob[4] = 0x01; // lock_flags = LOCK_SCREEN_ENABLE already set
+        v2_blob[5 + 1] = 1; // contact_telemetry[1] = true
+        v2_blob[V1_LEGACY_BLOB_LEN] = 75; // screen_sleep_timeout_s = 75 (non-default)
+        let [lo, hi] = 600u16.to_le_bytes(); // lock_timeout_s = 600 (non-default)
+        v2_blob[V1_BLOB_LEN] = lo;
+        v2_blob[V1_BLOB_LEN + 1] = hi;
+
+        let restored = deserialize(&v2_blob).expect("legacy-length v0x02 blob must still parse");
+        assert!(!restored.notif_visual);
+        assert!(restored.notif_audible);
+        assert_eq!(restored.contact_count, 4);
+        assert_eq!(restored.lock_flags, 0x01);
+        assert!(restored.contact_telemetry[1]);
+        assert_eq!(
+            restored.screen_sleep_timeout_s, 75,
+            "a field the OLD v0x02 layout already carried must round-trip untouched"
+        );
+        assert_eq!(
+            restored.lock_timeout_s, 600,
+            "a field the OLD v0x02 layout already carried must round-trip untouched"
+        );
+        assert_eq!(
+            restored.backlight_brightness, BACKLIGHT_BRIGHTNESS_DEFAULT_PCT,
+            "only the genuinely new field defaults"
+        );
+    }
+
+    #[test]
+    fn deserialize_clamps_out_of_range_backlight_brightness_byte() {
+        // Defensive: a corrupt/rogue blob byte outside 10..=100 must not
+        // silently load an out-of-spec brightness.
+        let mut blob = [0u8; BLOB_LEN];
+        blob[0] = VERSION;
+        blob[V2_LEGACY_BLOB_LEN] = 255;
+        let restored = deserialize(&blob).expect("valid blob");
+        assert_eq!(restored.backlight_brightness, BACKLIGHT_BRIGHTNESS_MAX_PCT);
+
+        blob[V2_LEGACY_BLOB_LEN] = 0;
+        let restored = deserialize(&blob).expect("valid blob");
+        assert_eq!(restored.backlight_brightness, BACKLIGHT_BRIGHTNESS_MIN_PCT);
     }
 
     #[test]
