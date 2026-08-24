@@ -273,8 +273,7 @@ and a dim-before-sleep step on top of Phase 4's `set_brightness`
 (`firmware_core::ui::idle_tick::screen_idle_action`/`dim_brightness_pct`).
 
 **Expected win.** Order a few mA of average idle draw `[ESTIMATE —
-datasheet-order, per the plan of record (flight-manuals/plans/
-meshcadet-power-optimization.md Phase 5): eliminating ~62 I²C transaction
+datasheet-order, per the plan of record (Phase 5): eliminating ~62 I²C transaction
 pairs/s (GT911 touch poll + keyboard co-processor poll) plus periodic
 full-region SPI flushes to a dark panel, and putting the ST7789 in
 sleep-in, is a small, second-order term next to the GPS (row 9) and
