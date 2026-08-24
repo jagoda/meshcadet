@@ -33,6 +33,21 @@ pub fn format_lock_timeout(seconds: i32) -> String {
     format!("{}s", seconds.max(0))
 }
 
+/// Format the backlight-brightness percentage value for display
+/// (meshcadet-power-optimization Phase 4).
+///
+/// No zero sentinel here either — same reasoning as `format_lock_timeout`:
+/// the admin-menu stepper only ever shows a value in
+/// `crate::pin_menu::BACKLIGHT_BRIGHTNESS_MIN_PCT..=
+/// BACKLIGHT_BRIGHTNESS_MAX_PCT` (10..=100), since `0` would leave the panel
+/// visibly dark while nominally awake (see that constant's own doc).
+/// Deliberately always plain percent (`"<n>%"`), not a coarser label, for
+/// the same live-feedback-while-adjusting reason `format_lock_timeout`
+/// documents.
+pub fn format_backlight_brightness(percent: i32) -> String {
+    format!("{}%", percent.max(0))
+}
+
 /// Minimum `raw_mv` movement (since the value the AdminMenu row LAST
 /// ACTUALLY DISPLAYED — see [`battery_display_fields_changed`]'s doc for why
 /// that's a different basis than "last polled") before that movement alone
@@ -203,6 +218,28 @@ mod tests {
         // called directly with an out-of-range value.
         assert_eq!(format_lock_timeout(0), "0s");
         assert_eq!(format_lock_timeout(-5), "0s");
+    }
+
+    // ── format_backlight_brightness ─────────────────────────────────────
+
+    #[test]
+    fn format_backlight_brightness_at_bounds() {
+        assert_eq!(format_backlight_brightness(10), "10%"); // BACKLIGHT_BRIGHTNESS_MIN_PCT
+        assert_eq!(format_backlight_brightness(100), "100%"); // BACKLIGHT_BRIGHTNESS_MAX_PCT
+    }
+
+    #[test]
+    fn format_backlight_brightness_default() {
+        assert_eq!(format_backlight_brightness(100), "100%");
+    }
+
+    #[test]
+    fn format_backlight_brightness_never_negative() {
+        // Unlike format_screen_sleep, 0 is not a valid on-device value, but
+        // the formatter itself must not panic or go negative if ever called
+        // directly with an out-of-range value.
+        assert_eq!(format_backlight_brightness(0), "0%");
+        assert_eq!(format_backlight_brightness(-5), "0%");
     }
 
     /// Test-only convenience constructor — every field explicit so a reader

@@ -1035,6 +1035,14 @@ pub struct UiRuntime<'d> {
     /// function's doc. Without a single owner, the two rules would fight
     /// over the keyboard backlight state.
     kb_backlight_on: bool,
+    /// Last backlight brightness percentage actually written to the LEDC
+    /// channel via `TDeckDisplay::set_brightness` — the arbiter
+    /// `sync_backlight_brightness` compares `RuntimeSettings.
+    /// backlight_brightness` against this and writes only on a change,
+    /// same write-only-on-change discipline as `kb_backlight_on` above.
+    /// Never consulted/written while `screen_asleep` — that state is owned
+    /// entirely by `wake_screen`/`sleep_screen`'s on/off transition.
+    backlight_brightness_applied: u8,
 
     // ── Boot splash state ──────────────────────────────────────────────────
     //
@@ -1490,6 +1498,11 @@ impl<'d> UiRuntime<'d> {
             // so the arbiter's first `step()` call is a no-op rather than a
             // redundant re-write of the same state.
             kb_backlight_on: true,
+            // Matches the boot-time `TDeckDisplay::new` write (full duty),
+            // so the arbiter's first `step()` call only writes a non-default
+            // NVS-loaded value instead of redundantly re-writing 100 — same
+            // convention as `kb_backlight_on` just above.
+            backlight_brightness_applied: pin_menu::BACKLIGHT_BRIGHTNESS_DEFAULT_PCT,
             initial_is_provisioned: is_provisioned,
             initial_pubkey_hex: pubkey_hex.to_string(),
             // Overwritten by the first `step()` call — see the field doc.
@@ -2630,6 +2643,12 @@ impl<'d> UiRuntime<'d> {
         // just-arrived message. See `sync_keyboard_backlight`'s doc.
         self.sync_keyboard_backlight(now_ms);
 
+        // ── Backlight-brightness arbiter (meshcadet-power-optimization
+        // Phase 4) ───────────────────────────────────────────────────────
+        // Picks up any admin-menu stepper edit to `RuntimeSettings.
+        // backlight_brightness` — see `sync_backlight_brightness`'s doc.
+        self.sync_backlight_brightness();
+
         // ── Lock-overlay reassertion (defense in depth, D3) ─────────────────
         // Every screen shares ONE Slint window (`platform.rs`'s module doc:
         // "the window's currently-set component" is singular) — a screen's
@@ -3216,19 +3235,21 @@ impl<'d> UiRuntime<'d> {
         }
     }
 
-    /// AdminMenu: Up/Down moves `admin_menu_selected` across the four rows
-    /// (visual-notif toggle, audible-notif toggle, screen-sleep stepper, GPS
-    /// status row); Click activates the highlighted row via the SAME callback
-    /// its touch control uses — a toggle flips, the stepper increments (its
-    /// "+"; there's no single obvious "activate" for a bidirectional stepper,
-    /// so this picks the more common direction and leaves fine adjustment to
-    /// touch), and the GPS-status row navigates. Left goes back to ContactList.
+    /// AdminMenu: Up/Down moves `admin_menu_selected` across the rows
+    /// (visual-notif toggle, audible-notif toggle, screen-sleep stepper,
+    /// lock-enable toggle, lock-timeout stepper, backlight-brightness
+    /// stepper, GPS status row); Click activates the highlighted row via the
+    /// SAME callback its touch control uses — a toggle flips, a stepper
+    /// increments (its "+"; there's no single obvious "activate" for a
+    /// bidirectional stepper, so this picks the more common direction and
+    /// leaves fine adjustment to touch), and the GPS-status row navigates.
+    /// Left goes back to ContactList.
     fn handle_trackball_admin_menu(&mut self, ev: trackball::TrackballEvent) {
         use trackball::TrackballEvent::*;
         // 0=visual toggle, 1=audible toggle, 2=screen-sleep stepper,
-        // 3=lock-enable toggle, 4=lock-timeout stepper, 5=GPS status row —
-        // see `AdminMenuScreenUi.selected_index`'s doc.
-        const ROW_COUNT: i32 = 6;
+        // 3=lock-enable toggle, 4=lock-timeout stepper, 5=backlight-brightness
+        // stepper, 6=GPS status row — see `AdminMenuScreenUi.selected_index`'s doc.
+        const ROW_COUNT: i32 = 7;
         let ActiveScreen::AdminMenu(ref screen) = self.active_screen else { return };
         match ev {
             Up | Down => {
@@ -3242,7 +3263,8 @@ impl<'d> UiRuntime<'d> {
                 2 => screen.invoke_increment_screen_sleep_timeout(),
                 3 => screen.invoke_toggle_lock_enabled(),
                 4 => screen.invoke_increment_lock_timeout(),
-                5 => screen.invoke_open_gps_status(),
+                5 => screen.invoke_increment_backlight_brightness(),
+                6 => screen.invoke_open_gps_status(),
                 _ => {} // nothing highlighted yet — click has no target
             },
             Left => screen.invoke_back_pressed(),
@@ -3534,6 +3556,7 @@ impl<'d> UiRuntime<'d> {
             screen.set_screen_sleep_timeout(settings.screen_sleep_timeout_s as i32);
             screen.set_lock_enabled(settings.lock_flags & LOCK_SCREEN_ENABLE != 0);
             screen.set_lock_timeout(settings.lock_timeout_s as i32);
+            screen.set_backlight_brightness(settings.backlight_brightness as i32);
         }
         // Seed the battery row from the cached snapshot (refreshed every
         // dispatcher-loop iteration by `set_battery_status`) so the freshly
@@ -3628,6 +3651,38 @@ impl<'d> UiRuntime<'d> {
             let mut s = settings.borrow_mut();
             pin_menu::apply_menu_action(&pin_menu::MenuAction::SetLockTimeout(new_val.max(0) as u16), &mut s);
             log::info!("pin_menu: lock_timeout_s -> {}", s.lock_timeout_s);
+            persist_runtime_settings(&cmd_tx, &s);
+        });
+
+        // Backlight-brightness stepper (meshcadet-power-optimization Phase
+        // 4): same apply/persist pattern as the screen-sleep/lock-timeout
+        // steppers above. `new_val` is the widget's own already-clamped-to-
+        // 10/100 i32; `apply_menu_action` re-clamps to
+        // BACKLIGHT_BRIGHTNESS_MIN_PCT..=BACKLIGHT_BRIGHTNESS_MAX_PCT as the
+        // single source of truth (see `MenuAction::SetBacklightBrightness`).
+        // The actual LEDC duty write happens on the next `step()` tick, via
+        // `sync_backlight_brightness` — see that method's doc for why this
+        // callback itself only touches `RuntimeSettings`.
+        let settings = self.runtime_settings.clone();
+        let cmd_tx = self.cmd_tx.clone();
+        screen.on_decrement_backlight_brightness(move |new_val| {
+            let mut s = settings.borrow_mut();
+            pin_menu::apply_menu_action(
+                &pin_menu::MenuAction::SetBacklightBrightness(new_val.max(0) as u8),
+                &mut s,
+            );
+            log::info!("pin_menu: backlight_brightness -> {}", s.backlight_brightness);
+            persist_runtime_settings(&cmd_tx, &s);
+        });
+        let settings = self.runtime_settings.clone();
+        let cmd_tx = self.cmd_tx.clone();
+        screen.on_increment_backlight_brightness(move |new_val| {
+            let mut s = settings.borrow_mut();
+            pin_menu::apply_menu_action(
+                &pin_menu::MenuAction::SetBacklightBrightness(new_val.min(100) as u8),
+                &mut s,
+            );
+            log::info!("pin_menu: backlight_brightness -> {}", s.backlight_brightness);
             persist_runtime_settings(&cmd_tx, &s);
         });
 
@@ -4260,10 +4315,22 @@ impl<'d> UiRuntime<'d> {
     /// (`refresh_contact_list_lists`) — closes the sleep→wake gap where the
     /// on-screen unread badges had no explicit refresh trigger of their own
     /// at the moment the panel becomes visible again (see that method's doc).
+    ///
+    /// Applies the CONFIGURED brightness (`RuntimeSettings.
+    /// backlight_brightness`, meshcadet-power-optimization Phase 4), not a
+    /// hardcoded full duty — `TDeckDisplay::set_backlight`'s caller-facing
+    /// on/off contract is preserved everywhere else, but the screen's own
+    /// wake transition is the one call site that must honor the user's
+    /// brightness setting, and unconditionally re-asserts it here (rather
+    /// than gating on `backlight_brightness_applied`, see that field's doc)
+    /// so a value the admin-menu stepper changed while asleep still takes
+    /// effect on the very next wake, not one `step()` later.
     fn wake_screen(&mut self, now_ms: u64) {
-        if let Err(e) = self.display.set_backlight(true) {
+        let brightness = self.runtime_settings.borrow().backlight_brightness;
+        if let Err(e) = self.display.set_brightness(brightness) {
             log::warn!("ui: wake_screen backlight-on failed: {:?}", e);
         }
+        self.backlight_brightness_applied = brightness;
         self.notif.stop_blink();
         self.screen_asleep = false;
         self.last_activity_ms = now_ms;
@@ -4345,6 +4412,35 @@ impl<'d> UiRuntime<'d> {
                 }
             }
             self.kb_backlight_on = desired;
+        }
+    }
+
+    /// Single arbiter for the display's LEDC brightness duty while the
+    /// screen is awake (meshcadet-power-optimization Phase 4).
+    ///
+    /// The admin-menu stepper's `'static` Slint callbacks (see
+    /// `navigate_to_admin_menu`'s `on_*_backlight_brightness` wiring) can
+    /// only reach `Rc<RefCell<RuntimeSettings>>`, not `&mut self.display` —
+    /// so a stepper edit doesn't write the LEDC channel directly. Instead it
+    /// only updates `RuntimeSettings`, and this arbiter — called once per
+    /// `step()`, same "write only on change" discipline as
+    /// `sync_keyboard_backlight` — notices the change and applies it, giving
+    /// the stepper live visual feedback within one tick while the admin menu
+    /// (always on-screen, i.e. awake) is open. A no-op while `screen_asleep`:
+    /// that state's LEDC duty is owned entirely by `wake_screen`/
+    /// `sleep_screen`'s on/off transition, and `wake_screen` re-asserts the
+    /// current setting unconditionally on every wake regardless of this
+    /// arbiter's cached `backlight_brightness_applied` (see that field's doc).
+    fn sync_backlight_brightness(&mut self) {
+        if self.screen_asleep {
+            return;
+        }
+        let desired = self.runtime_settings.borrow().backlight_brightness;
+        if desired != self.backlight_brightness_applied {
+            if let Err(e) = self.display.set_brightness(desired) {
+                log::warn!("ui: backlight brightness sync({}) failed: {:?}", desired, e);
+            }
+            self.backlight_brightness_applied = desired;
         }
     }
 }

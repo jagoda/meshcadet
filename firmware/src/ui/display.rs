@@ -206,8 +206,43 @@ impl<'d> TDeckDisplay<'d> {
         Ok(TDeckDisplay { inner: display, backlight })
     }
 
-    /// Turn the backlight on (full duty) or off (zero duty) via the LEDC PWM
-    /// channel.
+    /// Maximum brightness percentage accepted by [`Self::set_brightness`]
+    /// (100 = full duty).
+    pub const BRIGHTNESS_MAX_PCT: u8 = 100;
+
+    /// Set the backlight to `percent` (0..=100) of full duty via the LEDC
+    /// PWM channel on GPIO42 (2 kHz, 10-bit timer — `main.rs`'s `bl_timer`
+    /// construction). `percent` is clamped to `0..=100` defensively — a
+    /// stray out-of-range value must not compute a duty above
+    /// `get_max_duty()` or silently wrap.
+    ///
+    /// Integer-scales (`max_duty * percent / 100`) rather than going through
+    /// floating point: `max_duty` is 10-bit (`<=1023`), so `max_duty *
+    /// percent` fits comfortably in `u32` with no overflow, and this avoids
+    /// any float<->duty rounding surprises on this target.
+    ///
+    /// meshcadet-power-optimization Phase 4: this is the mechanism the
+    /// admin-menu brightness stepper (`RuntimeSettings::backlight_brightness`)
+    /// drives; [`Self::set_backlight`] below is now a thin wrapper over it so
+    /// every existing on/off call site is unaffected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LEDC duty-cycle write fails.
+    pub fn set_brightness(&mut self, percent: u8) -> anyhow::Result<()> {
+        let percent = percent.min(Self::BRIGHTNESS_MAX_PCT) as u32;
+        let max_duty = self.backlight.get_max_duty();
+        let duty = max_duty * percent / 100;
+        self.backlight
+            .set_duty(duty)
+            .map_err(|e| anyhow::anyhow!("backlight set_duty failed: {:?}", e))
+    }
+
+    /// Turn the backlight on (full duty) or off (zero duty) via
+    /// [`Self::set_brightness`]. Thin wrapper — `set_backlight(true)` ==
+    /// `set_brightness(100)`, `set_backlight(false)` == `set_brightness(0)` —
+    /// so every existing call site keeps its exact prior on/off behavior
+    /// regardless of the configured brightness setting.
     ///
     /// # Sleep depth
     ///
@@ -222,10 +257,7 @@ impl<'d> TDeckDisplay<'d> {
     ///
     /// Returns an error if the LEDC duty-cycle write fails.
     pub fn set_backlight(&mut self, on: bool) -> anyhow::Result<()> {
-        let duty = if on { self.backlight.get_max_duty() } else { 0 };
-        self.backlight
-            .set_duty(duty)
-            .map_err(|e| anyhow::anyhow!("backlight set_duty failed: {:?}", e))
+        self.set_brightness(if on { Self::BRIGHTNESS_MAX_PCT } else { 0 })
     }
 
     /// Flush a partial horizontal strip to the display.
