@@ -17,7 +17,16 @@ use ui_sim::splash_promo::SplashPromoFrame;
 
 fn main() {
     let frame = SplashPromoFrame::new();
-    frame.set_version("v0.2.0");
+    // Mirrors firmware's release-build version string (`firmware/build.rs`'s
+    // `MESHCADET_RELEASE_VERSION` seam, `firmware/release-container/build.sh`'s
+    // `VERSION="${1}"` == the `vX.Y.Z` release tag): a "v" prefix + the bare
+    // semver, sourced from the workspace version at compile time
+    // (`ui_sim/Cargo.toml`'s `version.workspace = true`) so this promo
+    // screenshot tracks the current release instead of re-staling at the next
+    // one. Deliberately NOT the firmware dev-build path (`git rev-parse
+    // --short HEAD`, no "v" prefix) — the promo screenshot represents a
+    // release, not a dev build.
+    frame.set_version(concat!("v", env!("CARGO_PKG_VERSION")));
     let framebuffer = frame.render();
 
     let img = ui_sim::splash_promo::framebuffer_to_rgb_image(
