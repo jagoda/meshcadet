@@ -102,6 +102,7 @@ pub mod golden;
 pub mod lock_gate;
 pub mod lock_integrity_fixes;
 pub mod partition_budget;
+pub mod power_provenance;
 pub mod room_aggregate_notification;
 pub mod room_drain_window_periodic_reeval;
 pub mod room_post_history_timestamp;

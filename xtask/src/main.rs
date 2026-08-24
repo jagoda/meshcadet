@@ -54,6 +54,11 @@
 //!   (`FRAME_SET_LOCK_PIN` live-forwards a `UiEvent::LockPinChanged` to the
 //!   UI thread instead of only taking effect at the next boot) — see
 //!   `xtask::lock_integrity_fixes`'s doc.
+//! - **verify-power-provenance** — ADR-0014 D2's estimate-labelling rule,
+//!   mechanized: every power-current figure (`mA`/`µA`/`uA`) anywhere under
+//!   `docs/` carries one of the three D2 provenance tags
+//!   (`[DATASHEET]`/`[ESTIMATE]`/`[MEASURED]`) nearby (see
+//!   `xtask::power_provenance`'s doc).
 //!
 //! All also run as `cargo test`s, which is what CI / every downstream change
 //! actually gates on; this binary exists for a quick manual re-check with a
@@ -347,6 +352,23 @@ fn main() -> ExitCode {
             lock_integrity_fixes.len()
         );
         for v in &lock_integrity_fixes {
+            eprintln!("  - {v}");
+        }
+    }
+
+    let power_provenance = xtask::power_provenance::check(&repo_root);
+    if power_provenance.is_empty() {
+        println!(
+            "xtask verify-power-provenance: OK — every power-current figure under docs/ \
+             carries a [DATASHEET]/[ESTIMATE]/[MEASURED] provenance tag nearby (ADR-0014 D2)."
+        );
+    } else {
+        ok = false;
+        eprintln!(
+            "xtask verify-power-provenance: FAILED — {} violation(s):",
+            power_provenance.len()
+        );
+        for v in &power_provenance {
             eprintln!("  - {v}");
         }
     }
