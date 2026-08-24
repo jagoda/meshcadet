@@ -262,6 +262,61 @@ procedure list and does not compete with §9. Concretely:
   resulting deferred predicate is a §9 entry (D13), added by that leg itself
   as part of its abort's reshape pass, not duplicated here.
 
+### D7 — Idle-screen leg (`meshcadet-power-idle-screen`): landed estimate and the honest wake-latency re-derivation
+
+Landed as specified in the plan of record — no abort taken: `SLPIN`/`DISPOFF`
+on sleep and `SLPOUT`/`DISPON` + one forced full repaint on wake
+(`firmware/src/ui/display.rs`'s `TDeckDisplay::sleep`/`wake`), `render_if_needed`
+skipped entirely while asleep (`firmware_core::ui::idle_tick::render_gate`),
+an adaptive asleep tick (`firmware_core::ui::idle_tick::next_tick_period_ms`),
+and a dim-before-sleep step on top of Phase 4's `set_brightness`
+(`firmware_core::ui::idle_tick::screen_idle_action`/`dim_brightness_pct`).
+
+**Expected win.** Order a few mA of average idle draw `[ESTIMATE —
+datasheet-order, per the plan of record (Phase 5): eliminating ~62 I²C transaction
+pairs/s (GT911 touch poll + keyboard co-processor poll) plus periodic
+full-region SPI flushes to a dark panel, and putting the ST7789 in
+sleep-in, is a small, second-order term next to the GPS (row 9) and
+backlight (row 4) levers — this leg's LARGER value is structural, not this
+milliwatt-class number: an unconditional 62 Hz tick defeats tickless idle
+outright, so `meshcadet-power-dfs` (Phase 7) cannot deliver anything
+without this leg landing first]`.
+
+**Honest wake-latency bound — CORRECTS the plan's rough "~150 ms"
+aspiration, does not merely restate it.** The ST7789's own `SLPOUT`
+settling delay is a mandatory, non-tunable 120 ms (datasheet requirement —
+`mipidsi::Display::wake`, wrapped by `TDeckDisplay::wake`), and this leg's
+forced full repaint on wake costs ~30.7 ms
+(`docs/perf/ui-perf-baseline.md` §4.1, currency 2026-08-03) — together already ~150.7 ms BEFORE
+the asleep tick's own poll-latency contribution is even added. Worst-case
+touch/keyboard wake-to-first-paint is therefore `ASLEEP_IDLE_TICK_MS`
+(120 ms) + 120 ms + 30.7 ms ≈ 270.7 ms
+(`firmware_core::ui::idle_tick::ASLEEP_IDLE_TICK_MS`'s own doc carries the
+identical derivation). The plan's aspirational ~150 ms bound turns out to
+be unreachable once the mandatory `SLPOUT` settling delay it ALSO requires
+is accounted for — that fixed floor alone already sits at the aspiration,
+before this leg's own tunable tick period is even added. This is the
+constraint-P2 finding Milestone 2 (`meshcadet-power-m2-gate`) must
+re-derive and record as a number, not silently pass.
+
+**Constraint P3 (notifications) — a correctness bound, not a nicety.** The
+incoming-message blink is RENDERED, not merely fired, at the tick period
+(`sync_keyboard_backlight`'s `notif.poll_blink` call). The asleep tick only
+slows to `ASLEEP_IDLE_TICK_MS` while no blink burst is live; a live burst
+forces the tick back to `ASLEEP_BLINK_TICK_MS` (50 ms), inside the Nyquist
+bound against `BLINK_PHASE_MS` (150 ms, `firmware_core::notification`) —
+`next_tick_period_ms`'s own host tests re-derive this bound directly against
+the real constant rather than a hardcoded literal.
+
+**Software-observable proxy (`[SIM]`, not `[MEASURED]` — no device/HIL/QEMU
+path exists for `perf_loop_model`).** Re-running the existing
+`split_ui_idle_tick` parameter at the Phase 5 asleep-idle cadence
+(`perf_loop_model::report::asleep_tick_comparison`, `Corner::High`):
+`ui_task`'s own service rate drops from 21.31 Hz (awake, `UI_TICK_MS` =
+16 ms ceiling) to 6.63 Hz (asleep-idle, `ASLEEP_IDLE_TICK_MS` = 120 ms
+ceiling) — reproduce with `cargo test -p perf_loop_model
+asleep_idle_tick_reduces_ui_task_service_rate_vs_awake -- --nocapture`.
+
 ## Consequences
 
 - Every leg of this campaign now has one place to look for the shared

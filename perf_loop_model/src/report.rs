@@ -9,10 +9,12 @@
 //! milestone over milestone rather than re-derived per document.
 
 use firmware_core::radio_wait::Dio1WaitKind;
+use firmware_core::ui::idle_tick::ASLEEP_IDLE_TICK_MS;
 
 use crate::params::{Corner, LoopModelParams};
 use crate::sim::{
-    dominance_check, simulate, simulate_with_dio1_wait, DominanceVerdict, SimResult, Topology,
+    dominance_check, simulate, simulate_split_ui_task, simulate_with_dio1_wait, DominanceVerdict,
+    GapStats, SimResult, Topology,
 };
 use crate::workload::Workload;
 
@@ -198,6 +200,46 @@ fn topology_label(t: Topology) -> &'static str {
     }
 }
 
+/// One row of [`asleep_tick_comparison`]'s awake-vs-asleep-idle comparison.
+pub struct AsleepTickRow {
+    pub label: &'static str,
+    pub split_ui_idle_tick_ms: f64,
+    pub result: GapStats,
+}
+
+/// meshcadet-power-optimization Phase 5 (idle-screen enabler) — [SIM]-tagged
+/// software-observable proxy for the adaptive asleep tick, per the plan of
+/// record: re-runs `simulate_split_ui_task` (the SPLIT topology's own
+/// `ui_task` service-gap model, `Corner::High`) with `split_ui_idle_tick`
+/// widened from the documented AWAKE ceiling (`UI_TICK_MS` = 16ms) to the
+/// Phase 5 asleep-and-idle ceiling
+/// (`firmware_core::ui::idle_tick::ASLEEP_IDLE_TICK_MS`).
+///
+/// Still SIMULATED, never MEASURED (no device/HIL/QEMU path — crate root
+/// doc) — a caller embedding this must keep the `[SIM]` tag, exactly like
+/// every other number this crate produces.
+pub fn asleep_tick_comparison(duration_ms: f64) -> Vec<AsleepTickRow> {
+    let awake_r = LoopModelParams::documented_defaults().resolve(Corner::High);
+    let awake = simulate_split_ui_task(&awake_r, duration_ms);
+
+    let mut asleep_r = awake_r;
+    asleep_r.split_ui_idle_tick = ASLEEP_IDLE_TICK_MS as f64;
+    let asleep = simulate_split_ui_task(&asleep_r, duration_ms);
+
+    vec![
+        AsleepTickRow {
+            label: "awake (UI_TICK_MS ceiling)",
+            split_ui_idle_tick_ms: awake_r.split_ui_idle_tick,
+            result: awake,
+        },
+        AsleepTickRow {
+            label: "Phase 5 asleep-idle (ASLEEP_IDLE_TICK_MS ceiling)",
+            split_ui_idle_tick_ms: asleep_r.split_ui_idle_tick,
+            result: asleep,
+        },
+    ]
+}
+
 /// Render the full report as plain text — the exact bytes that get pasted
 /// into `docs/perf/perf-loop-model-baseline.md`, labelled SIMULATED.
 pub fn render_text_report() -> String {
@@ -372,6 +414,32 @@ pub fn render_text_report_with_params(params: &LoopModelParams) -> String {
         )
         .unwrap();
     }
+    writeln!(out).unwrap();
+
+    writeln!(
+        out,
+        "-- ui_task idle-tick comparison — meshcadet-power-optimization Phase 5 [SIM] --"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "{:<48} {:>18} {:>12} {:>12} {:>12} {:>12}",
+        "scenario", "idle_tick_ceil_ms", "longest_ms", "p95_ms", "mean_ms", "service_hz"
+    )
+    .unwrap();
+    for row in asleep_tick_comparison(SIM_DURATION_MS) {
+        writeln!(
+            out,
+            "{:<48} {:>18.1} {:>12.2} {:>12.2} {:>12.2} {:>12.2}",
+            row.label,
+            row.split_ui_idle_tick_ms,
+            row.result.longest_gap_ms,
+            row.result.p95_gap_ms,
+            row.result.mean_gap_ms,
+            row.result.service_hz,
+        )
+        .unwrap();
+    }
 
     out
 }
@@ -422,6 +490,49 @@ mod tests {
         assert!(text.contains("DIO1 wait comparison"));
     }
 
+    /// meshcadet-power-optimization Phase 5's own regression guard: the
+    /// asleep-idle ceiling must genuinely slow `ui_task`'s own service rate
+    /// relative to the awake ceiling — if `ASLEEP_IDLE_TICK_MS` were ever
+    /// set at or below `UI_TICK_MS` by mistake, this fails loudly instead of
+    /// silently reporting a no-op "improvement". Also the reproduction site
+    /// for the `[SIM]`-tagged figure the plan of record asks Phase 5 to
+    /// report: run `cargo test -p perf_loop_model asleep_idle_tick -- \
+    /// --nocapture` to see the two printed lines.
+    #[test]
+    fn asleep_idle_tick_reduces_ui_task_service_rate_vs_awake() {
+        let rows = asleep_tick_comparison(SIM_DURATION_MS);
+        assert_eq!(rows.len(), 2);
+        let awake = &rows[0];
+        let asleep = &rows[1];
+
+        for row in [awake, asleep] {
+            println!(
+                "[SIM] ui_task idle-tick comparison — {}: idle_tick_ceiling={:.1}ms \
+                 longest={:.2}ms p95={:.2}ms mean={:.2}ms service_hz={:.2}",
+                row.label,
+                row.split_ui_idle_tick_ms,
+                row.result.longest_gap_ms,
+                row.result.p95_gap_ms,
+                row.result.mean_gap_ms,
+                row.result.service_hz,
+            );
+        }
+
+        assert!(
+            asleep.result.mean_gap_ms > awake.result.mean_gap_ms,
+            "asleep-idle mean gap ({:.2}ms) should exceed the awake mean gap ({:.2}ms)",
+            asleep.result.mean_gap_ms,
+            awake.result.mean_gap_ms,
+        );
+        assert!(
+            asleep.result.service_hz < awake.result.service_hz,
+            "Phase 5's whole point is fewer ui_task iterations/sec while asleep and idle: \
+             asleep {:.2}Hz should be less than awake {:.2}Hz",
+            asleep.result.service_hz,
+            awake.result.service_hz,
+        );
+    }
+
     #[test]
     fn every_dominance_row_dominates() {
         // The report's own headline claim: across the FULL sensitivity
@@ -443,6 +554,12 @@ mod tests {
         let text = render_text_report();
         assert!(text.contains("SIMULATED"));
         assert!(text.contains("dominates"));
+    }
+
+    #[test]
+    fn render_text_report_mentions_the_asleep_idle_tick_comparison() {
+        let text = render_text_report();
+        assert!(text.contains("ui_task idle-tick comparison"));
     }
 
     #[test]

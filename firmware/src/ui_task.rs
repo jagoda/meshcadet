@@ -71,9 +71,16 @@
 //! # Steady state (C7, D7)
 //!
 //! Once construction succeeds: TWDT-subscribe, then loop on
-//! `evt_rx.recv_timeout(UI_TICK_MS)` — waking on a message OR the 16ms tick
+//! `evt_rx.recv_timeout(tick_ms)` — waking on a message OR the tick
 //! ceiling, so animations advance on a steady cadence with no busy-wait.
-//! `UiEvent::AppReady` is intercepted directly by this loop (D8 step 9,
+//! `tick_ms` starts at `UI_TICK_MS` (16ms) and is recomputed after every
+//! `ui.step()` call via `UiRuntime::next_tick_period_ms`
+//! (meshcadet-power-optimization Phase 5): it stays at `UI_TICK_MS` whenever
+//! the screen is awake OR an incoming-message blink burst is live, and only
+//! slows down while genuinely asleep and quiet — see that method's doc for
+//! the full decision and the Nyquist bound that keeps the blink rendering
+//! correctly regardless. `UiEvent::AppReady` is intercepted directly by this
+//! loop (D8 step 9,
 //! `run_splash_ripple`'s ~1.15s dedicated render loop has no business
 //! running inside `UiRuntime::step()`'s per-tick body); every other event is
 //! forwarded to [`crate::ui::UiRuntime::post_event`] for `step()` to process
@@ -118,6 +125,14 @@ use crate::ui::{BuzzerDriver, UiCommand, UiEvent, UiRuntime};
 /// again in the steady state as well as under the event bursts it already
 /// covers. Either direction wants §4.1's argument re-derived, not just
 /// re-read.
+///
+/// meshcadet-power-optimization Phase 5: this is now specifically the
+/// AWAKE-state (and blink-active) tick period, not the loop's only one —
+/// see `UiRuntime::next_tick_period_ms`, called at the bottom of the
+/// steady-state loop below, for the asleep-and-idle case that slows this
+/// down. This constant stays the single source of truth for the awake
+/// value; `next_tick_period_ms` takes it as a parameter rather than
+/// duplicating it in `firmware_core::ui::idle_tick`.
 const UI_TICK_MS: u64 = 16;
 
 /// D3: dispatcher → UI event queue capacity. Steady-state production is
@@ -391,12 +406,22 @@ fn ui_task_main<C>(
     #[cfg(feature = "diagnostics")]
     let mut last_ui_step_ms: Option<u64> = None;
 
+    // meshcadet-power-optimization Phase 5: the WAIT period for the next
+    // `recv_timeout`, recomputed after every `ui.step()` call from that
+    // tick's freshly-settled screen-asleep/blink state (see
+    // `UiRuntime::next_tick_period_ms`'s doc). Starts at `UI_TICK_MS` so the
+    // very first iteration — before `ui.step()` has ever run once — behaves
+    // exactly as it always did.
+    let mut tick_ms = UI_TICK_MS;
+
     loop {
-        // D7 item 3: `recv_timeout(UI_TICK_MS)` guarantees a pet at least
-        // every 16 ms in steady state, with or without traffic.
+        // D7 item 3: `recv_timeout(tick_ms)` guarantees a pet at least every
+        // `tick_ms` in steady state, with or without traffic — `tick_ms` is
+        // never more than `ASLEEP_IDLE_TICK_MS` (120ms today), still far
+        // under the 30s TWDT timeout regardless of which period is active.
         unsafe { esp_idf_svc::sys::esp_task_wdt_reset(); }
 
-        match evt_rx.recv_timeout(Duration::from_millis(UI_TICK_MS)) {
+        match evt_rx.recv_timeout(Duration::from_millis(tick_ms)) {
             // D8 step 9: on the FIRST AppReady, fire the boot splash's
             // dedicated-render-loop ripple (D7 item 2 pets the TWDT inside
             // its own tight loop — see `run_splash_ripple`'s doc). Guarded
@@ -422,6 +447,13 @@ fn ui_task_main<C>(
         if let Err(e) = ui.step(crate::uptime_ms()) {
             log::warn!("ui_task: step error: {:?}", e);
         }
+
+        // meshcadet-power-optimization Phase 5: recompute the WAIT period
+        // for the NEXT iteration from this tick's freshly-settled
+        // screen-asleep/blink state. Awake (or an incoming-message blink
+        // burst live) always wins back to `UI_TICK_MS`; only a quiet asleep
+        // window ever slows the loop down.
+        tick_ms = ui.next_tick_period_ms(UI_TICK_MS);
 
         // D9 row 10 restore (diagnostics-only): `ui_step`'s own call
         // duration, same "phase" shape `main.rs` used pre-split, plus the

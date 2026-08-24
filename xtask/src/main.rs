@@ -59,6 +59,10 @@
 //!   `docs/` carries one of the three D2 provenance tags
 //!   (`[DATASHEET]`/`[ESTIMATE]`/`[MEASURED]`) nearby (see
 //!   `xtask::power_provenance`'s doc).
+//! - **verify-render-asleep-gate** — `UiRuntime::step()`'s render section
+//!   never reaches `render_if_needed` without `render_gate(self.screen_asleep)`
+//!   guarding it first (meshcadet-power-optimization Phase 5 — see
+//!   `xtask::render_asleep_gate`'s doc).
 //!
 //! All also run as `cargo test`s, which is what CI / every downstream change
 //! actually gates on; this binary exists for a quick manual re-check with a
@@ -369,6 +373,24 @@ fn main() -> ExitCode {
             power_provenance.len()
         );
         for v in &power_provenance {
+            eprintln!("  - {v}");
+        }
+    }
+
+    let render_asleep_gate = xtask::render_asleep_gate::check(&repo_root);
+    if render_asleep_gate.is_empty() {
+        println!(
+            "xtask verify-render-asleep-gate: OK — {}'s render section is gated on \
+             `render_gate(self.screen_asleep)` before `render_if_needed`.",
+            xtask::render_asleep_gate::UI_MOD_REL_PATH
+        );
+    } else {
+        ok = false;
+        eprintln!(
+            "xtask verify-render-asleep-gate: FAILED — {} violation(s):",
+            render_asleep_gate.len()
+        );
+        for v in &render_asleep_gate {
             eprintln!("  - {v}");
         }
     }

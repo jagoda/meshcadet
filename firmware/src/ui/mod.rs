@@ -169,6 +169,16 @@ use firmware_core::ui::touch::touch_wake_transition;
 // doc for the full division of labor.
 use firmware_core::ui::lock::{attempt_unlock, boots_locked, idle_lock_due, unlock_attempt_allowed, LockAttemptState};
 use firmware_core::lock_store::verify as verify_lock_pin;
+// meshcadet-power-optimization Phase 5 (idle-screen enabler): the
+// dim-before-sleep decision, the render-skip/forced-repaint invariants, and
+// the adaptive `ui_task` tick period — see `firmware_core::ui::idle_tick`'s
+// module doc. `next_tick_period_ms` is aliased to avoid shadowing this
+// module's own `UiRuntime::next_tick_period_ms` wrapper method below.
+use firmware_core::ui::idle_tick::{
+    dim_brightness_pct, next_tick_period_ms as pure_next_tick_period_ms, render_gate,
+    screen_idle_action, wake_forces_full_repaint, ScreenIdleAction, ASLEEP_BLINK_TICK_MS,
+    ASLEEP_IDLE_TICK_MS, DIM_LEAD_MS,
+};
 use screens::contact_list::{build_channel_items, build_contact_items};
 use screens::message_view::{build_message_items, wrap_outgoing_mentions};
 
@@ -1043,6 +1053,15 @@ pub struct UiRuntime<'d> {
     /// Never consulted/written while `screen_asleep` — that state is owned
     /// entirely by `wake_screen`/`sleep_screen`'s on/off transition.
     backlight_brightness_applied: u8,
+    /// `true` while the dim-before-sleep step (meshcadet-power-optimization
+    /// Phase 5) is in effect: the screen is still awake
+    /// (`screen_asleep == false`) but the LEDC duty has been stepped down
+    /// as an early warning that `sleep_screen` is about to fire. Owned by
+    /// the screen-sleep inactivity check (via `screen_idle_action`) and
+    /// consumed by `sync_backlight_brightness`, the same
+    /// single-arbiter/write-only-on-change split `kb_backlight_on` already
+    /// uses for the keyboard backlight's two writers.
+    dim_applied: bool,
 
     // ── Boot splash state ──────────────────────────────────────────────────
     //
@@ -1503,6 +1522,7 @@ impl<'d> UiRuntime<'d> {
             // NVS-loaded value instead of redundantly re-writing 100 — same
             // convention as `kb_backlight_on` just above.
             backlight_brightness_applied: pin_menu::BACKLIGHT_BRIGHTNESS_DEFAULT_PCT,
+            dim_applied: false,
             initial_is_provisioned: is_provisioned,
             initial_pubkey_hex: pubkey_hex.to_string(),
             // Overwritten by the first `step()` call — see the field doc.
@@ -2607,15 +2627,25 @@ impl<'d> UiRuntime<'d> {
         // never touches it) — only the touch/keyboard blocks above do, so a
         // message arriving does not wake or extend the screen's awake window
         // (explicit design decision).
+        //
+        // meshcadet-power-optimization Phase 5: also owns the dim-before-
+        // sleep decision. `screen_idle_action` folds BOTH the sleep decision
+        // and the early "about to sleep" dim warning into one pure,
+        // host-tested function (`firmware_core::ui::idle_tick`), driven by
+        // the same `last_activity_ms` clock the sleep check already used.
+        // This block only OWNS `self.dim_applied`'s value; the actual LEDC
+        // write happens in `sync_backlight_brightness` below (single-arbiter
+        // discipline, same split `sync_keyboard_backlight` already uses) so
+        // the dim step and a live admin-menu brightness edit can never race
+        // within one `step()` call.
         if !self.screen_asleep {
             let timeout_s = self.runtime_settings.borrow().screen_sleep_timeout_s;
-            if timeout_s != 0 {
-                let timeout_ms = (timeout_s as u64) * 1000;
-                if now_ms.saturating_sub(self.last_activity_ms) >= timeout_ms {
-                    self.sleep_screen();
-                }
+            let elapsed_ms = now_ms.saturating_sub(self.last_activity_ms);
+            match screen_idle_action(elapsed_ms, timeout_s, DIM_LEAD_MS) {
+                ScreenIdleAction::Sleep => self.sleep_screen(),
+                ScreenIdleAction::Dim => self.dim_applied = true,
+                ScreenIdleAction::Awake => self.dim_applied = false,
             }
-            // timeout_s == 0 is the "never sleep" sentinel — no check at all.
         }
 
         // ── Idle-lock inactivity check (plan D1) ────────────────────────────
@@ -2738,23 +2768,57 @@ impl<'d> UiRuntime<'d> {
         //    unconditionally true on the tick after one. Raising the constant
         //    would only start dropping frames from the CHEAP motif
         //    animations (14–28 lines, ~1.8–3.6 ms) it was never aimed at.
-        let render_due = !self.render_settling
-            || now_ms.saturating_sub(self.last_render_ms) >= Self::RENDER_MIN_INTERVAL_MS;
-        if render_due {
-            self.window.render_if_needed(&mut self.display)?;
-            self.last_render_ms = now_ms;
-            self.render_settling = self.window.has_active_animations();
-            // Attribute any pending input to THIS render attempt — see
-            // `pending_input_ms`'s doc for why "render attempt", not a
-            // confirmed paint.
-            #[cfg(feature = "diagnostics")]
-            if let Some(input_ms) = self.pending_input_ms.take() {
-                let latency_ms = now_ms.saturating_sub(input_ms) as u32;
-                self.input_paint_stats.record(latency_ms);
+        //
+        // meshcadet-power-optimization Phase 5: `render_gate` skips this
+        // WHOLE section — not merely the throttle above it — while
+        // `screen_asleep`. The ST7789 is fully powered down (`SLPIN` +
+        // `DISPOFF`, `TDeckDisplay::sleep`) for that entire window, so a
+        // flush has nowhere observable to land; it would be pure wasted
+        // SPI-bus/CPU time on a panel nobody can see. `wake_screen`'s
+        // forced full repaint (`window.request_redraw()`, gated by
+        // `wake_forces_full_repaint`) is what restores correctness the
+        // instant the screen wakes back up — see that function's doc.
+        if render_gate(self.screen_asleep) {
+            let render_due = !self.render_settling
+                || now_ms.saturating_sub(self.last_render_ms) >= Self::RENDER_MIN_INTERVAL_MS;
+            if render_due {
+                self.window.render_if_needed(&mut self.display)?;
+                self.last_render_ms = now_ms;
+                self.render_settling = self.window.has_active_animations();
+                // Attribute any pending input to THIS render attempt — see
+                // `pending_input_ms`'s doc for why "render attempt", not a
+                // confirmed paint.
+                #[cfg(feature = "diagnostics")]
+                if let Some(input_ms) = self.pending_input_ms.take() {
+                    let latency_ms = now_ms.saturating_sub(input_ms) as u32;
+                    self.input_paint_stats.record(latency_ms);
+                }
             }
         }
 
         Ok(())
+    }
+
+    /// Select `ui_task`'s next `evt_rx.recv_timeout` period
+    /// (meshcadet-power-optimization Phase 5's adaptive asleep tick).
+    ///
+    /// Call once per `ui_task` loop iteration, AFTER `step()` returns, so it
+    /// reflects THIS tick's freshly-settled `screen_asleep`/blink state for
+    /// the iteration that's about to wait. `awake_tick_ms` is `ui_task::
+    /// UI_TICK_MS`, passed in rather than duplicated here so there is
+    /// exactly one place that owns the awake-state tick period (see that
+    /// constant's own "COUPLED CONSTANT" doc).
+    ///
+    /// See `firmware_core::ui::idle_tick::next_tick_period_ms`'s doc for the
+    /// full decision and the Nyquist argument behind `ASLEEP_BLINK_TICK_MS`.
+    pub fn next_tick_period_ms(&self, awake_tick_ms: u64) -> u64 {
+        pure_next_tick_period_ms(
+            self.screen_asleep,
+            self.notif.blink_active(),
+            awake_tick_ms,
+            ASLEEP_IDLE_TICK_MS,
+            ASLEEP_BLINK_TICK_MS,
+        )
     }
 
     fn handle_event(&mut self, event: UiEvent, now_ms: u64) {
@@ -4299,12 +4363,12 @@ impl<'d> UiRuntime<'d> {
 
     // ── Screen-sleep (backlight-off) ──────────────────────────────────────────
 
-    /// Turn the display backlight on, mark the screen awake, reset the
-    /// inactivity clock to `now_ms`, and stop any running incoming-message
-    /// blink loop immediately (waking
-    /// must halt the loop on the spot). Called from `step()`'s touch/keyboard
-    /// poll blocks the moment a wake-triggering input is detected while
-    /// asleep.
+    /// Bring the ST7789 controller out of sleep, turn the display backlight
+    /// on, mark the screen awake, reset the inactivity clock to `now_ms`,
+    /// force one full repaint, and stop any running incoming-message blink
+    /// loop immediately (waking must halt the loop on the spot). Called
+    /// from `step()`'s touch/keyboard poll blocks the moment a
+    /// wake-triggering input is detected while asleep.
     ///
     /// Does NOT touch the keyboard co-processor's backlight directly — that
     /// is `sync_keyboard_backlight`'s job, the single arbiter that both this
@@ -4324,36 +4388,75 @@ impl<'d> UiRuntime<'d> {
     /// brightness setting, and unconditionally re-asserts it here (rather
     /// than gating on `backlight_brightness_applied`, see that field's doc)
     /// so a value the admin-menu stepper changed while asleep still takes
-    /// effect on the very next wake, not one `step()` later.
+    /// effect on the very next wake, not one `step()` later. Also resets
+    /// `dim_applied` — a wake fully cancels any in-progress dim-before-sleep
+    /// warning, and `sync_backlight_brightness` (later this same `step()`)
+    /// needs the flag clear to arbitrate the real configured brightness.
+    ///
+    /// meshcadet-power-optimization Phase 5: `TDeckDisplay::wake` (`SLPOUT` +
+    /// the controller's documented 120ms settling delay, then `DISPON`) runs
+    /// FIRST, before the backlight comes back on, so nothing is ever
+    /// visibly lit before the controller itself is actually awake.
+    /// `window.request_redraw()` (gated by `wake_forces_full_repaint`) then
+    /// forces the render section later in THIS SAME `step()` call to
+    /// repaint the WHOLE window rather than whatever partial dirty-region
+    /// state Slint happens to hold — see `render_gate`'s doc for why the
+    /// GRAM can no longer be trusted current after any asleep window.
     fn wake_screen(&mut self, now_ms: u64) {
+        let was_asleep = self.screen_asleep;
+        if let Err(e) = self.display.wake() {
+            log::warn!("ui: wake_screen ST7789 SLPOUT/DISPON failed: {:?}", e);
+        }
         let brightness = self.runtime_settings.borrow().backlight_brightness;
         if let Err(e) = self.display.set_brightness(brightness) {
             log::warn!("ui: wake_screen backlight-on failed: {:?}", e);
         }
         self.backlight_brightness_applied = brightness;
+        self.dim_applied = false;
         self.notif.stop_blink();
         self.screen_asleep = false;
         self.last_activity_ms = now_ms;
         self.refresh_contact_list_lists();
+        if wake_forces_full_repaint(was_asleep) {
+            self.window.request_redraw();
+        }
     }
 
-    /// Turn the display backlight off and mark the screen asleep.
+    /// Turn the display backlight off, put the ST7789 controller itself to
+    /// sleep, and mark the screen asleep.
     ///
-    /// Sleep depth is backlight-only: the ST7789 display controller and the
-    /// Slint cooperative render loop both keep running untouched (see
-    /// `TDeckDisplay::set_backlight`), so the panel is already showing the
-    /// correct pixels the instant the backlight comes back on in
-    /// `wake_screen` — no re-render latency on wake.
+    /// **CORRECTED (meshcadet-power-optimization Phase 5):** sleep depth is
+    /// no longer backlight-only. `TDeckDisplay::sleep` issues `DISPOFF` then
+    /// `SLPIN` — the ST7789's own analog/digital circuitry powers down, not
+    /// just the LEDC backlight PWM. The panel's GRAM contents are therefore
+    /// no longer guaranteed correct the instant the backlight comes back on:
+    /// `step()`'s render section skips `render_if_needed` entirely while
+    /// `screen_asleep` (`render_gate`), so any battery/GPS/clock/message
+    /// model update that arrives during the sleep window is never flushed
+    /// to the panel. Correctness on wake now comes entirely from
+    /// `wake_screen`'s forced full repaint instead of from "the render loop
+    /// never stopped" — this doc used to claim the latter ("the panel is
+    /// already showing the correct pixels the instant the backlight comes
+    /// back on"), which was true only while `render_if_needed` ran
+    /// unconditionally; Phase 5 deliberately stops that.
     ///
     /// Does NOT touch the keyboard co-processor's backlight directly — see
     /// `wake_screen`'s doc; `sync_keyboard_backlight` picks up the new
     /// `screen_asleep` state (and turns the keyboard backlight off, absent an
-    /// active blink loop) on its next call this same `step()`.
+    /// active blink loop) on its next call this same `step()`. Also resets
+    /// `dim_applied` (defensive — the caller only ever reaches this from
+    /// `ScreenIdleAction::Sleep`, which its own pure-function contract never
+    /// pairs with a live dim, but `screen_asleep == true` should never leave
+    /// a stale `true` behind for the next wake cycle to inherit).
     fn sleep_screen(&mut self) {
         if let Err(e) = self.display.set_backlight(false) {
             log::warn!("ui: sleep_screen backlight-off failed: {:?}", e);
         }
+        if let Err(e) = self.display.sleep() {
+            log::warn!("ui: sleep_screen ST7789 DISPOFF/SLPIN failed: {:?}", e);
+        }
         self.screen_asleep = true;
+        self.dim_applied = false;
         log::info!("ui: screen sleep (inactivity timeout)");
     }
 
@@ -4416,7 +4519,8 @@ impl<'d> UiRuntime<'d> {
     }
 
     /// Single arbiter for the display's LEDC brightness duty while the
-    /// screen is awake (meshcadet-power-optimization Phase 4).
+    /// screen is awake (meshcadet-power-optimization Phase 4, extended by
+    /// Phase 5's dim-before-sleep step).
     ///
     /// The admin-menu stepper's `'static` Slint callbacks (see
     /// `navigate_to_admin_menu`'s `on_*_backlight_brightness` wiring) can
@@ -4431,11 +4535,27 @@ impl<'d> UiRuntime<'d> {
     /// `sleep_screen`'s on/off transition, and `wake_screen` re-asserts the
     /// current setting unconditionally on every wake regardless of this
     /// arbiter's cached `backlight_brightness_applied` (see that field's doc).
+    ///
+    /// meshcadet-power-optimization Phase 5: folds in `self.dim_applied`
+    /// (set by the screen-sleep inactivity check via `screen_idle_action`)
+    /// as a SECOND desired-brightness input — same "single arbiter, write
+    /// only on change" shape `sync_keyboard_backlight` already uses to
+    /// reconcile two writers of one piece of hardware. The dim step and a
+    /// live admin-menu brightness edit can never fight over the LEDC duty
+    /// because both are read HERE, in one place: `dim_brightness_pct`
+    /// always wins over the raw configured value while `dim_applied` is
+    /// set, and the moment activity clears it (`ScreenIdleAction::Awake`)
+    /// this arbiter restores the configured value on the very next `step()`.
     fn sync_backlight_brightness(&mut self) {
         if self.screen_asleep {
             return;
         }
-        let desired = self.runtime_settings.borrow().backlight_brightness;
+        let configured = self.runtime_settings.borrow().backlight_brightness;
+        let desired = if self.dim_applied {
+            dim_brightness_pct(configured)
+        } else {
+            configured
+        };
         if desired != self.backlight_brightness_applied {
             if let Err(e) = self.display.set_brightness(desired) {
                 log::warn!("ui: backlight brightness sync({}) failed: {:?}", desired, e);
@@ -4449,7 +4569,9 @@ impl<'d> UiRuntime<'d> {
 // `message_view_compose_seed`, `compose_return_should_send`,
 // `keyboard_drain_should_stop`, `send_nav_deferral_elapsed`,
 // `incoming_message_is_unread`, `roll_selection`,
-// `battery_display_fields_changed`, and `notif_prefs_from_toggles` are all
+// `battery_display_fields_changed`, `notif_prefs_from_toggles`, and (Phase 5)
+// `screen_idle_action`/`dim_brightness_pct`/`render_gate`/
+// `wake_forces_full_repaint`/`next_tick_period_ms` (`idle_tick`) are all
 // pure functions with no hardware/Slint dependency — they now live in
 // `firmware_core::ui` and its screen-named submodules (see the grouped
 // imports near the top of this file) so their tests execute under `cargo
