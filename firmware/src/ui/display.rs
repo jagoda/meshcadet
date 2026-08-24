@@ -44,6 +44,7 @@
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use mipidsi::Builder;
+use mipidsi::dcs;
 use mipidsi::models::ST7789;
 use mipidsi::options::{ColorInversion, ColorOrder, Orientation, Rotation};
 
@@ -246,18 +247,92 @@ impl<'d> TDeckDisplay<'d> {
     ///
     /// # Sleep depth
     ///
-    /// This is a backlight-only sleep: the ST7789 display controller and its
-    /// framebuffer contents are left running untouched, and the Slint
-    /// cooperative render loop keeps ticking (`render_if_needed` still flushes
-    /// dirty regions over SPI even with the backlight off) — so the panel is
+    /// This function ONLY changes the GPIO42 LEDC PWM duty cycle — it does
+    /// not touch the ST7789 controller itself. **CORRECTED
+    /// (meshcadet-power-optimization Phase 5):** this doc used to claim the
+    /// Slint cooperative render loop "keeps ticking... so the panel is
     /// showing the correct pixels the instant the backlight comes back on,
-    /// with no re-render latency. Only the GPIO42 PWM duty cycle changes.
+    /// with no re-render latency." That was true only while
+    /// `UiRuntime::step()`'s render section ran unconditionally; Phase 5
+    /// deliberately skips it entirely while `screen_asleep` (see
+    /// `firmware_core::ui::idle_tick::render_gate`), so the panel's GRAM is
+    /// no longer guaranteed current the instant the backlight returns. Real
+    /// panel sleep depth — and the one actual caller of this function that
+    /// puts the WHOLE device to sleep — is [`Self::sleep`]/[`Self::wake`],
+    /// paired with `UiRuntime::sleep_screen`'s call to both; see
+    /// `wake_screen`'s doc for how correctness is restored on wake (a forced
+    /// full repaint), not by this function.
     ///
     /// # Errors
     ///
     /// Returns an error if the LEDC duty-cycle write fails.
     pub fn set_backlight(&mut self, on: bool) -> anyhow::Result<()> {
         self.set_brightness(if on { Self::BRIGHTNESS_MAX_PCT } else { 0 })
+    }
+
+    /// Put the ST7789 controller itself into its documented low-power sleep
+    /// state — `DISPOFF` (raw DCS 0x28) then `SLPIN` (`mipidsi::Display::
+    /// sleep`, which bundles the datasheet-mandated 120ms settling delay
+    /// before any other command may be sent) — meshcadet-power-optimization
+    /// Phase 5.
+    ///
+    /// Does NOT touch the backlight: `UiRuntime::sleep_screen` is the sole
+    /// caller and already turns the backlight off itself (before calling
+    /// this, so nothing is ever visibly lit mid-transition); ordering the
+    /// two is that caller's concern, not this driver's.
+    ///
+    /// `DISPOFF` is sent via the `unsafe` `Display::dcs()` escape hatch —
+    /// mipidsi's safe API only exposes `sleep`/`wake` (`SLPIN`/`SLPOUT`), not
+    /// `DISPOFF`/`DISPON`. See [`Self::wake`] for the caller obligation this
+    /// imposes: no other command may reach `self.inner` between a `sleep()`
+    /// and its matching `wake()` (the only other method here that touches
+    /// it is `flush_line_range`, and the render-skip gate above means
+    /// `UiRuntime::step()` never calls it while asleep).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either DCS command fails to send.
+    pub fn sleep(&mut self) -> anyhow::Result<()> {
+        // SAFETY: DISPOFF is sent before SLPIN — the controller's DBI
+        // interface is still fully awake at this point, `sleep()`'s own
+        // 120ms settling delay hasn't started yet, so this ordering imposes
+        // no additional constraint beyond the one documented above.
+        unsafe {
+            self.inner
+                .dcs()
+                .write_command(dcs::SetDisplayOff)
+                .map_err(|e| anyhow::anyhow!("ST7789 DISPOFF failed: {:?}", e))?;
+        }
+        self.inner
+            .sleep(&mut FreeRtos)
+            .map_err(|e| anyhow::anyhow!("ST7789 SLPIN failed: {:?}", e))
+    }
+
+    /// Reverse [`Self::sleep`]: `SLPOUT` (`mipidsi::Display::wake`, same
+    /// 120ms settling delay) then `DISPON`.
+    ///
+    /// Does NOT force a Slint repaint itself — `UiRuntime::wake_screen` owns
+    /// that (`window.request_redraw()`), since the ST7789's GRAM contents
+    /// are unknown-stale after any model update that arrived during the
+    /// sleep window had its render skipped (`render_gate`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either DCS command fails to send.
+    pub fn wake(&mut self) -> anyhow::Result<()> {
+        self.inner
+            .wake(&mut FreeRtos)
+            .map_err(|e| anyhow::anyhow!("ST7789 SLPOUT failed: {:?}", e))?;
+        // SAFETY: DISPON is sent only after SLPOUT's 120ms settling delay
+        // has already elapsed (`Display::wake` blocks for it above) — the
+        // controller is documented to require exactly that ordering before
+        // accepting any other command.
+        unsafe {
+            self.inner
+                .dcs()
+                .write_command(dcs::SetDisplayOn)
+                .map_err(|e| anyhow::anyhow!("ST7789 DISPON failed: {:?}", e))
+        }
     }
 
     /// Flush a partial horizontal strip to the display.

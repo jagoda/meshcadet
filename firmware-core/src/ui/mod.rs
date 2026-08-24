@@ -34,6 +34,7 @@ pub mod buzzer;
 pub mod compose;
 pub mod contact_list;
 pub mod gps_status;
+pub mod idle_tick;
 pub mod keyboard;
 pub mod lock;
 pub mod message_view;

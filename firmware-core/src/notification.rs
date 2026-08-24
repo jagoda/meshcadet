@@ -323,7 +323,12 @@ pub fn tone_sequence(event: NotifEvent) -> &'static [ToneBurst] {
 /// Number of on/off blinks fired per burst.
 const BLINK_COUNT: u32 = 3;
 /// Duration of each blink phase (on, then off), in milliseconds.
-const BLINK_PHASE_MS: u64 = 150;
+///
+/// `pub` (meshcadet-power-optimization Phase 5): `ui::idle_tick`'s adaptive
+/// asleep-tick logic derives its Nyquist bound (`ASLEEP_BLINK_TICK_MS`)
+/// against this constant directly, rather than duplicating the 150 as a
+/// second literal that could silently drift out of sync.
+pub const BLINK_PHASE_MS: u64 = 150;
 /// Period between the *start* of one burst and the start of the next, in
 /// milliseconds. Must be `>=` the burst's own on/off window
 /// (`BLINK_COUNT * 2 * BLINK_PHASE_MS` = 900 ms) or bursts would overlap.
@@ -463,11 +468,14 @@ impl NotifDispatcher {
         self.blink.stop();
     }
 
-    /// `true` while the incoming-message blink loop is running. Exposed for
-    /// tests (reads `BlinkLoop`'s private field directly, same module — no
-    /// production code needs this, only `poll_blink`, so no public accessor
-    /// is added just to avoid a dead-code warning on a real build).
-    #[cfg(test)]
+    /// `true` while the incoming-message blink loop is running.
+    ///
+    /// meshcadet-power-optimization Phase 5: a real production caller now
+    /// exists — `UiRuntime::next_tick_period_ms` reads this once per
+    /// `ui_task` loop iteration to decide whether the asleep tick may slow
+    /// down (`false`) or must stay within the Nyquist bound against
+    /// `BLINK_PHASE_MS` (`true`, see `ui::idle_tick::next_tick_period_ms`'s
+    /// doc). Previously `#[cfg(test)]`-only, with no production caller.
     pub fn blink_active(&self) -> bool {
         self.blink.active
     }
