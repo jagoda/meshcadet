@@ -136,10 +136,20 @@ fn tag_nearby(
 ) -> bool {
     // Forward: bounded by TAG_WINDOW_CHARS, text end, the next figure's
     // start, and a paragraph/table-row break — whichever comes first.
-    let fwd_end = fig_end
-        .saturating_add(TAG_WINDOW_CHARS)
-        .min(text.len())
-        .min(next_start);
+    // `floor_char_boundary` (post-green review, criterion 1): the raw
+    // TAG_WINDOW_CHARS arithmetic is a byte offset, not a char offset — a
+    // figure/tag pair separated by a multi-byte character (this doc corpus's
+    // own en/em dashes) could otherwise land the slice mid-character and
+    // panic `cargo test`/`xtask verify-power-provenance` outright. Floor
+    // (never ceil) so the bound only ever shrinks, never grows past the
+    // already-safe `text.len()`/`next_start` boundary it was derived from.
+    let fwd_end = floor_char_boundary(
+        text,
+        fig_end
+            .saturating_add(TAG_WINDOW_CHARS)
+            .min(text.len())
+            .min(next_start),
+    );
     let mut fwd = &text[fig_end..fwd_end.max(fig_end)];
     if let Some(bm) = boundary_re.find(fwd) {
         fwd = &fwd[..bm.start()];
@@ -149,13 +159,42 @@ fn tag_nearby(
     }
     // Backward: same bounds, mirrored — TAG_WINDOW_CHARS, text start, the
     // previous figure's end, and a paragraph/table-row break, whichever is
-    // nearest to `fig_start`.
-    let bwd_start = fig_start.saturating_sub(TAG_WINDOW_CHARS).max(prev_end);
+    // nearest to `fig_start`. `ceil_char_boundary` mirrors the forward
+    // direction's `floor`: the bound only ever shrinks toward `fig_start`,
+    // never below the already-safe `prev_end` boundary it was derived from.
+    let bwd_start = ceil_char_boundary(
+        text,
+        fig_start.saturating_sub(TAG_WINDOW_CHARS).max(prev_end),
+    );
     let mut bwd = &text[bwd_start.min(fig_start)..fig_start];
     if let Some(bm) = boundary_re.find_iter(bwd).last() {
         bwd = &bwd[bm.end()..];
     }
     tag_re.is_match(bwd)
+}
+
+/// Round `idx` down to the nearest UTF-8 char boundary at or before it —
+/// stable-Rust equivalent of the nightly-only `str::floor_char_boundary`.
+/// Never returns below 0; a caller deriving `idx` from an already-safe
+/// LOWER bound (e.g. `.max(fig_end)`, itself always a real match boundary)
+/// cannot floor below that lower bound, since a boundary at or above it is
+/// found first.
+fn floor_char_boundary(text: &str, mut idx: usize) -> usize {
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+/// Round `idx` up to the nearest UTF-8 char boundary at or after it — the
+/// mirror of [`floor_char_boundary`], used for the backward window's start
+/// so it only ever shrinks toward `fig_start`, never past an already-safe
+/// UPPER bound.
+fn ceil_char_boundary(text: &str, mut idx: usize) -> usize {
+    while idx < text.len() && !text.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
 }
 
 /// Pure-logic check over one document's text: returns `(1-indexed line,
@@ -351,6 +390,34 @@ mod tests {
             "the tag belongs to the SECOND figure (4.6 mA) and must not be credited \
              backward to the first; got: {violations:?}"
         );
+    }
+
+    /// Regression guard (post-green review, criterion 1): the raw
+    /// `TAG_WINDOW_CHARS` arithmetic is a byte offset, not a char offset —
+    /// 399 ASCII bytes plus a 3-byte em dash places `fig_end +
+    /// TAG_WINDOW_CHARS` exactly one byte INTO the dash's UTF-8 encoding,
+    /// the precise shape that panics a naive `text[a..b]` slice. Must not
+    /// panic, and the figure (no tag anywhere in the text) must still be
+    /// correctly flagged once the window is safely floored.
+    #[test]
+    fn forward_window_arithmetic_does_not_panic_on_multibyte_boundary() {
+        let filler = "x".repeat(399);
+        let text = format!("10 mA {filler}—more text with no tag at all, well past the window.");
+        let violations = check_text(&text);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].1.contains("10 mA"));
+    }
+
+    /// Mirror of the above for the backward-window direction (`ceil_char_boundary`).
+    #[test]
+    fn backward_window_arithmetic_does_not_panic_on_multibyte_boundary() {
+        let filler = "x".repeat(399);
+        let text = format!(
+            "Some text with no tag at all, well before the window—{filler} 10 mA continuously."
+        );
+        let violations = check_text(&text);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].1.contains("10 mA"));
     }
 
     /// A tag that PRECEDES its own figure (the backward-search direction
