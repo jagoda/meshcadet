@@ -175,6 +175,7 @@ use esp_idf_hal::{delay::FreeRtos, uart::UartDriver, units::Hertz};
 use esp_idf_svc::nvs::{EspNvsPartition, NvsDefault};
 
 use crate::gps_baud_store;
+use crate::pm::ApbFreqMaxLock;
 
 // Pure NMEA parsing, checksum/baud validation, duty-cycle math, and the
 // baud-rate/init-command tables now live in `firmware_core::gps` so their
@@ -469,6 +470,13 @@ pub struct GpsDriver<'d> {
     active: bool,
     /// Uptime ms when the current period (active or quiet) started.
     period_start_ms: u64,
+    /// `ESP_PM_APB_FREQ_MAX` lock (meshcadet-power-optimization Phase 7) —
+    /// see `crate::pm`'s module doc. Held for the entire ACTIVE window
+    /// (constraint P1: the GPS UART's baud divisor is APB-derived) and
+    /// released for the entire QUIET window — see
+    /// `firmware_core::gps::active_window_pm_lock_action`, which decides
+    /// every acquire/release this driver issues.
+    apb_lock: ApbFreqMaxLock,
 
     // ── NMEA line accumulator ─────────────────────────────────────────────────
     /// Partial NMEA sentence accumulation buffer.
@@ -545,9 +553,15 @@ impl<'d> GpsDriver<'d> {
     ///     Option::<AnyIOPin>::None,                       // RTS unused
     ///     &UartConfig::new().baudrate(gps::GPS_BAUD.Hz()), // opened at the first candidate; `new` probes+locks from there
     /// )?;
-    /// let gps = GpsDriver::new(uart, uptime_ms(), nvs_partition.clone());
+    /// let apb_lock = crate::pm::ApbFreqMaxLock::create(b"gps_apb\0")?;
+    /// let gps = GpsDriver::new(uart, uptime_ms(), nvs_partition.clone(), apb_lock);
     /// ```
-    pub fn new(uart: UartDriver<'d>, now_ms: u64, nvs_partition: EspNvsPartition<NvsDefault>) -> Self {
+    pub fn new(
+        uart: UartDriver<'d>,
+        now_ms: u64,
+        nvs_partition: EspNvsPartition<NvsDefault>,
+        apb_lock: ApbFreqMaxLock,
+    ) -> Self {
         let cached = gps_baud_store::load_cached_baud(nvs_partition.clone());
         let (detected_baud, baud_confirmed) = match cached {
             Some(cached_baud) if cached_baud != GPS_BAUD_CANDIDATES[0] => {
@@ -587,6 +601,12 @@ impl<'d> GpsDriver<'d> {
 
         Self::send_init_commands(&uart, detected_baud);
 
+        // The driver starts ACTIVE (see `active: true` below) — acquire the
+        // APB lock to match, per `firmware_core::gps::active_window_pm_lock_
+        // action(false, true) == Acquire` (this construction is exactly
+        // that transition's real-world occurrence).
+        apb_lock.acquire();
+
         Self {
             uart,
             nvs_partition,
@@ -605,6 +625,7 @@ impl<'d> GpsDriver<'d> {
             last_sat_count: 0,
             active: true,          // start active to obtain first fix quickly
             period_start_ms: now_ms,
+            apb_lock,
             line_buf: [0u8; 128],
             line_len: 0,
             #[cfg(feature = "diagnostics")]
@@ -919,6 +940,21 @@ impl<'d> GpsDriver<'d> {
     /// the normal drain/duty-cycle handling below to a later call: the UART
     /// is parked at a candidate rate under test, not `detected_baud`, so
     /// normal NMEA parsing would just see garbage until the probe concludes.
+    ///
+    /// **`apb_lock` coverage of the reprobe path (meshcadet-power-optimization
+    /// Phase 7):** `maybe_reprobe_stale_cached_baud`/`service_reprobe` read the
+    /// UART independently of `self.active`, not gated by it — but a reprobe can
+    /// only ever BEGIN when zero NMEA sentences of any kind have been observed
+    /// since construction (`last_nmea_seen_uptime_ms.is_none()`; any sentence
+    /// at all latches `baud_confirmed` first and skips the reprobe). That is a
+    /// strictly weaker condition than "a fix has been captured"
+    /// (`cached_fix.is_some()`), so whenever it holds, `should_close_active_
+    /// window`'s `has_fix` gate has also never been satisfied — meaning
+    /// `self.active` cannot yet have transitioned away from its construction-
+    /// time `true`. The `apb_lock` acquired at construction (this driver
+    /// starts ACTIVE) is therefore still held for the entire span a reprobe
+    /// can possibly run; no separate bracket is needed around the reprobe
+    /// path itself.
     pub fn poll(&mut self, now_ms: u64) {
         if self.reprobe_candidate_idx.is_some() {
             self.service_reprobe(now_ms);
@@ -936,6 +972,11 @@ impl<'d> GpsDriver<'d> {
 
             let elapsed = now_ms.saturating_sub(self.period_start_ms);
             if should_close_active_window(self.cached_fix.is_some(), elapsed) {
+                debug_assert_eq!(
+                    active_window_pm_lock_action(self.active, false),
+                    PmLockAction::Release
+                );
+                self.apb_lock.release();
                 self.active = false;
                 self.period_start_ms = now_ms;
                 log::debug!("GPS: active window closed — entering quiet interval");
@@ -944,6 +985,11 @@ impl<'d> GpsDriver<'d> {
             // QUIET: check whether it is time to reopen the active window.
             let elapsed = now_ms.saturating_sub(self.period_start_ms);
             if should_reopen_active_window(elapsed) {
+                debug_assert_eq!(
+                    active_window_pm_lock_action(self.active, true),
+                    PmLockAction::Acquire
+                );
+                self.apb_lock.acquire();
                 self.active = true;
                 self.period_start_ms = now_ms;
                 log::debug!("GPS: quiet interval done — opening active window");

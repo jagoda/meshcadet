@@ -507,6 +507,12 @@ pub struct Radio<'d> {
     /// the radio out of RX; `ensure_continuous_rx` re-arms only when it is clear,
     /// so the steady state issues SetRx exactly once and never re-arms per loop.
     in_continuous_rx: bool,
+    /// `ESP_PM_APB_FREQ_MAX` lock (meshcadet-power-optimization Phase 7) —
+    /// see `crate::pm`'s module doc. Acquired/released around every SPI2
+    /// transaction (`write_cmd`/`spi_transfer`, the two funnel points every
+    /// command on this driver goes through) so an APB frequency change can
+    /// never land mid-transaction.
+    apb_lock: crate::pm::ApbFreqMaxLock,
 }
 
 impl<'d> Radio<'d> {
@@ -521,6 +527,7 @@ impl<'d> Radio<'d> {
         busy: PinDriver<'d, Input>,
         dio1: PinDriver<'d, Input>,
         #[cfg(feature = "diagnostics")] probe: PinDriver<'d, Output>,
+        apb_lock: crate::pm::ApbFreqMaxLock,
     ) -> Result<Self, RadioError> {
         let dio1 = GpioDio1Wait::new(dio1)?;
         let mut radio = Self {
@@ -531,6 +538,7 @@ impl<'d> Radio<'d> {
             #[cfg(feature = "diagnostics")]
             probe,
             in_continuous_rx: false,
+            apb_lock,
         };
         radio.hardware_reset()?;
         radio.configure_tcxo()?;
@@ -928,7 +936,13 @@ impl<'d> Radio<'d> {
         // transfer. Cost argued in `docs/perf/ui-perf-baseline.md` §9.1 (D9).
         #[cfg(feature = "diagnostics")]
         let _ = self.probe.set_high();
+        // `ESP_PM_APB_FREQ_MAX` bracket (meshcadet-power-optimization
+        // Phase 7, `crate::pm`) — SPI2's clock is APB-derived (constraint
+        // P4); this must hold across the whole transaction, same span as
+        // the diagnostics probe above.
+        self.apb_lock.acquire();
         let result = self.spi.write(&buf[..n]).map_err(|_| RadioError::Spi);
+        self.apb_lock.release();
         #[cfg(feature = "diagnostics")]
         let _ = self.probe.set_low();
         result
@@ -938,7 +952,11 @@ impl<'d> Radio<'d> {
         // Same D9/D11 probe bracket as `write_cmd` — see that fn's comment.
         #[cfg(feature = "diagnostics")]
         let _ = self.probe.set_high();
+        // Same `ESP_PM_APB_FREQ_MAX` bracket as `write_cmd` — see that fn's
+        // comment.
+        self.apb_lock.acquire();
         let result = self.spi.transfer_in_place(buf).map_err(|_| RadioError::Spi);
+        self.apb_lock.release();
         #[cfg(feature = "diagnostics")]
         let _ = self.probe.set_low();
         result

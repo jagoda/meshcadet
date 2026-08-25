@@ -325,6 +325,44 @@ pub fn should_reopen_active_window(elapsed_ms: u64) -> bool {
     elapsed_ms >= GPS_QUIET_INTERVAL_MS
 }
 
+// ── APB power-management lock bracketing (meshcadet-power-optimization Phase 7) ─
+
+/// What `firmware::gps::GpsDriver` should do to its `ESP_PM_APB_FREQ_MAX`
+/// lock (`firmware::pm::ApbFreqMaxLock`) at an ACTIVE/QUIET transition.
+///
+/// The GPS UART's baud-rate divisor is derived from the APB clock (P1): an
+/// APB frequency change mid-window would desync framing. The lock is held
+/// for the *entire* ACTIVE window (drained on every `poll()` call) and
+/// released for the entire QUIET window (UART untouched) — never
+/// re-acquired/released per individual byte read, so the bracket is exactly
+/// one `Acquire` per window open and one `Release` per window close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmLockAction {
+    /// The window just opened (QUIET → ACTIVE, or the initial construction
+    /// state, which starts ACTIVE — see `firmware::gps::GpsDriver::new`).
+    Acquire,
+    /// The window just closed (ACTIVE → QUIET).
+    Release,
+    /// No transition — the caller must not touch the lock.
+    None,
+}
+
+/// Decide the lock action for a `was_active` → `is_active` transition.
+///
+/// Pure and total over every `(bool, bool)` pair, so the caller can feed it
+/// every `self.active` assignment in `GpsDriver::poll` (and the initial
+/// `true` at construction, against a synthetic `was_active = false`)
+/// without needing to duplicate the ACTIVE/QUIET decision logic itself —
+/// see [`should_close_active_window`]/[`should_reopen_active_window`] for
+/// where `is_active` actually comes from.
+pub fn active_window_pm_lock_action(was_active: bool, is_active: bool) -> PmLockAction {
+    match (was_active, is_active) {
+        (false, true) => PmLockAction::Acquire,
+        (true, false) => PmLockAction::Release,
+        _ => PmLockAction::None,
+    }
+}
+
 // ── RMC date/time parsing + calendar arithmetic ────────────────────────────────
 
 /// A UTC calendar date+time decoded from an NMEA `$..RMC` sentence.
@@ -1173,6 +1211,75 @@ mod tests {
         assert!(!should_reopen_active_window(GPS_QUIET_INTERVAL_MS - 1));
         assert!(should_reopen_active_window(GPS_QUIET_INTERVAL_MS));
         assert!(should_reopen_active_window(GPS_QUIET_INTERVAL_MS + 1));
+    }
+
+    // ── active_window_pm_lock_action ─────────────────────────────────────────
+
+    #[test]
+    fn pm_lock_acquires_on_window_open() {
+        assert_eq!(
+            active_window_pm_lock_action(false, true),
+            PmLockAction::Acquire
+        );
+    }
+
+    #[test]
+    fn pm_lock_releases_on_window_close() {
+        assert_eq!(
+            active_window_pm_lock_action(true, false),
+            PmLockAction::Release
+        );
+    }
+
+    #[test]
+    fn pm_lock_no_action_when_state_holds() {
+        assert_eq!(active_window_pm_lock_action(true, true), PmLockAction::None);
+        assert_eq!(
+            active_window_pm_lock_action(false, false),
+            PmLockAction::None
+        );
+    }
+
+    /// The bracket is symmetric: over any sequence of transitions, the
+    /// number of `Acquire`s never diverges from the number of `Release`s by
+    /// more than the currently-open-or-closed state accounts for — walk a
+    /// representative ACTIVE/QUIET/ACTIVE/QUIET sequence (mirroring
+    /// `GpsDriver::poll`'s real transition order, starting from the
+    /// construction-time `active: true`) and assert the lock is acquired
+    /// exactly once per open and released exactly once per close, ending
+    /// back at net-zero (still held, since the sequence ends ACTIVE).
+    #[test]
+    fn pm_lock_bracket_is_symmetric_across_a_transition_sequence() {
+        // `GpsDriver::new` starts `active: true` — model that as an initial
+        // synthetic `false -> true` transition, exactly as `firmware::gps`
+        // does at construction.
+        let states = [true, true, false, false, true, false, true, true];
+        let mut was_active = false;
+        let mut acquires = 0u32;
+        let mut releases = 0u32;
+        let mut held = false;
+        for is_active in states {
+            match active_window_pm_lock_action(was_active, is_active) {
+                PmLockAction::Acquire => {
+                    assert!(!held, "acquired while already held — not symmetric");
+                    held = true;
+                    acquires += 1;
+                }
+                PmLockAction::Release => {
+                    assert!(held, "released while not held — not symmetric");
+                    held = false;
+                    releases += 1;
+                }
+                PmLockAction::None => {}
+            }
+            was_active = is_active;
+        }
+        // Sequence: [T,T,F,F,T,F,T,T] from an implicit prior `false` — opens
+        // at indices 0, 4, 6 (three Acquire) and closes at indices 2, 5 (two
+        // Release), ending ACTIVE (still held).
+        assert_eq!(acquires, 3);
+        assert_eq!(releases, 2);
+        assert!(held, "sequence ends ACTIVE — lock should still be held");
     }
 
     // ── parse_rmc_datetime ────────────────────────────────────────────────────

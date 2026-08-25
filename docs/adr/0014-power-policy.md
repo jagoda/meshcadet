@@ -334,6 +334,108 @@ ceiling, post-M2-gate-correction — see the note above; was 6.63 Hz at the
 original 120 ms) — reproduce with `cargo test -p perf_loop_model
 asleep_idle_tick_reduces_ui_task_service_rate_vs_awake -- --nocapture`.
 
+### D8 — DFS leg (`meshcadet-power-dfs`): landed as specified, no abort, one sdkconfig correction applied
+
+Landed as amended at the M2 gate (this ADR's own Phase 7 amendment): `CONFIG_PM_ENABLE=y`,
+`esp_pm_configure(max_freq_mhz=240, min_freq_mhz=80, light_sleep_enable=false)`
+(`firmware/src/pm.rs`), called once at the top of `main.rs::run()` before any peripheral driver
+is constructed. `CONFIG_FREERTOS_USE_TICKLESS_IDLE` is **not** enabled — amendment item 1 is
+followed exactly: `CONFIG_PM_ENABLE` does not `depend on` it
+(`esp_pm/Kconfig`, confirmed by reading the shipped v5.2.2 Kconfig directly), and it exists
+solely to let a core enter *automatic light sleep* between ticks, which this leg never does
+(`light_sleep_enable: false`). Enabling it would have added cross-compile surface for zero
+effect. DFS ONLY, per the brief: no `light_sleep_enable = true` anywhere, and the two stages are
+not combined.
+
+**`min_freq_mhz = 80`, not the plan's "40–80" range's lower end, and why that is not a hedge.**
+ESP32-S3's `rtc_clk_cpu_freq_mhz_to_config` (`esp_hw_support/port/esp32s3/rtc_clk.c`) accepts
+80/160/240 unconditionally (PLL-sourced) but accepts a value below the board's XTAL frequency
+only if it divides that XTAL exactly — a fact this repo has no on-hardware measurement of for the
+T-Deck Plus's specific crystal, and `esp_pm_configure` returns `ESP_ERR_INVALID_ARG` (logged, not
+fatal — `pm::configure_dynamic_frequency_scaling`) if it doesn't. 80 MHz sidesteps that
+uncertainty entirely (see `firmware/src/pm.rs`'s module doc for the full derivation) while still
+landing a 3× idle-frequency reduction.
+
+**The CPU does not sit at 80 MHz whenever idle-eligible in the naive sense — ESP-IDF's own
+FreeRTOS port already restores 240 MHz automatically the instant either core has real work.**
+`esp_pm_impl_init` (`pm_impl.c`) creates one internal `ESP_PM_CPU_FREQ_MAX` lock per core
+(`"rtos0"`/`"rtos1"`), held from boot; it is released only when that core's FreeRTOS idle task
+runs (`esp_pm_impl_idle_hook`) and re-acquired the instant the core leaves idle
+(`leave_idle()`, called from `esp_pm_impl_isr_hook`/the scheduler) — i.e. whenever an ISR fires or
+a task becomes ready. This is the actual mechanism behind the plan's "only the idle floor moves"
+claim, not merely an assumption: both cores run at the unchanged 240 MHz ceiling for the entire
+span either is doing real work (dispatcher loop iteration, ISR handling, `ui_task` rendering), and
+only reach the 80 MHz floor during a core's genuinely-idle stretches (blocked, nothing ready).
+Neither this leg nor any earlier one needs to acquire `ESP_PM_CPU_FREQ_MAX` itself for that
+property to hold.
+
+**`ESP_PM_APB_FREQ_MAX` locks (`firmware/src/pm.rs::ApbFreqMaxLock`) bracket the radio's SPI2
+transactions and the GPS UART's ACTIVE window, per the plan.** `Radio::write_cmd`/`spi_transfer`
+(the two funnel points every SX1262 command goes through, `radio.rs`) acquire/release around each
+individual `self.spi.write`/`transfer_in_place` call — the same bracket span as the existing D9/D11
+diagnostics probe. `GpsDriver` acquires the lock at construction (the driver starts ACTIVE) and at
+every QUIET→ACTIVE reopen, releasing at every ACTIVE→QUIET close
+(`firmware_core::gps::active_window_pm_lock_action`, a pure, host-tested decision function pinning
+the bracket's symmetry — see `firmware-core/src/gps.rs`'s `pm_lock_bracket_is_symmetric_across_a_
+transition_sequence` test). **Worth recording plainly: with `min_freq_mhz = 80` specifically, these
+locks are not currently load-bearing for P1/P4 by themselves** — `esp_pm`'s own mode derivation
+(`pm_impl.c`, non-ESP32 branch) computes `apb_max_freq = MIN(max_freq_mhz, esp_clk_apb_freq())`,
+and ESP32-S3's real APB peripheral clock is a fixed 80 MHz tap off the 480 MHz PLL whenever the CPU
+runs off PLL (80/160/240) — so with `min_freq_mhz = 80` the actual APB clock is 80 MHz in *every*
+reachable PM mode and never itself changes, and the radio's SPI2 transactions are additionally
+already covered by the automatic per-core `ESP_PM_CPU_FREQ_MAX` lock above for the common case (a
+single blocking SPI transfer keeps its calling task off the idle task throughout). The locks are
+still implemented exactly as the plan directs: correct defense-in-depth against any future
+`min_freq_mhz` change that WOULD move the APB clock (an XTAL-sourced value below 80), and against
+an SPI DMA transfer that internally yields to the scheduler — a case the automatic per-core lock
+does not cover, since a core going idle mid-yield inside a nominally-single "transaction" is
+exactly the gap this campaign has no measurement path to rule out on this board. Holding them costs
+nothing today and removes that gap entirely regardless of any future config change.
+
+**HARD ABORT condition checked directly, not merely inferred from CI.** `CONFIG_PM_ENABLE=y`
+together with `CONFIG_SPIRAM_MODE_OCT=y` does **not** conflict — confirmed by an actual
+`xtensa-esp32s3-espidf` release cross-compile run to completion (cmake configure, full ESP-IDF C
+build, Rust link, `esptool elf2image`) in this leg's own sandbox (not CI), after working around two
+environment-local gaps unrelated to the sdkconfig combination itself (a missing `libxml2.so.2` for
+the bundled `esp-clang`, and `ldproxy` not on `PATH`). No abort taken.
+
+**Fresh, absolute app-image measurement (never a delta, per the brief) —
+`cargo run -p xtask --bin xtask -- verify-partition-budget`, run locally against this leg's own
+tree:**
+
+```
+measured 4,678,800 B (4.46 MiB) vs. baseline 4,641,888 B (4.43 MiB) — drift +0.80%
+(threshold ±5.0%). factory partition 6,291,456 B (6.00 MiB); headroom 1,612,656 B (1.54 MiB).
+```
+
+Under the ±5% drift threshold — `firmware/app-image-budget-baseline.txt` is not bumped.
+
+**Expected win, restated downward per the M2/R4 amendment (items 2/3) — a duty-cycle-weighted
+figure, not a sleep-fraction one, and explicitly not re-measured.** Order **low-single-digit to
+low-double-digit mA** of average draw across both cores combined `[ESTIMATE — datasheet-order:
+ESP32-S3 active-mode current is broadly linear in core clock for the CPU-bound term — community
+measurements against the Espressif datasheet's active-mode range report roughly 33–47 mA at
+80 MHz with both cores active vs. a documented range up to ~107 mA at 240 MHz under load
+(https://esp32.com/viewtopic.php?t=29964), i.e. a full per-core delta of very roughly 20–40 mA IF
+a core ran 100% idle-eligible. The automatic per-core `ESP_PM_CPU_FREQ_MAX` lock (see above) means
+that full delta is reachable only during each core's genuinely-idle fraction, not its whole
+schedule: core 0's shortest periodic wake is the unchanged 20 ms `RX_POLL_YIELD_MS` dispatcher
+cadence (50 Hz — the limiter per M2-amendment item 2, not Phase 5), and core 1's is
+`ui_task`'s tick (16 ms awake / 50 ms asleep, post-R4-correction 20 Hz asleep — item 3's
+re-derivation). This campaign has no on-device idle-time profiler to state either core's actual
+idle fraction within its wake period directly (D2's no-measurement-kit ruling), so this is a wide
+band restating the plan's original "10–25 mA" order downward to reflect a duty-cycle-weighted
+mechanism, not a re-measurement of it]`.
+
+**Acceptance evidence.** Host tests: `firmware-core/src/gps.rs`'s
+`pm_lock_acquires_on_window_open`/`pm_lock_releases_on_window_close`/
+`pm_lock_no_action_when_state_holds`/`pm_lock_bracket_is_symmetric_across_a_transition_sequence`
+pin the GPS-side bracket's symmetry. An `xtask` static guard
+(`xtask::pm_apb_lock_gate`) asserts, over the raw source, that every SPI2 transaction funnel
+(`write_cmd`/`spi_transfer`) and both GPS ACTIVE-window transition sites acquire/release the lock
+in the correct order — the SPI/UART critical-section guard D3 calls for. Workspace
+test/clippy/fmt green; cross-compile verified directly (above), not merely delegated to CI.
+
 ## Consequences
 
 - Every leg of this campaign now has one place to look for the shared

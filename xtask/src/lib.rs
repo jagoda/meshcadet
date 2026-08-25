@@ -102,6 +102,7 @@ pub mod golden;
 pub mod lock_gate;
 pub mod lock_integrity_fixes;
 pub mod partition_budget;
+pub mod pm_apb_lock_gate;
 pub mod power_provenance;
 pub mod render_asleep_gate;
 pub mod room_aggregate_notification;

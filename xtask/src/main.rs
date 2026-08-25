@@ -63,6 +63,10 @@
 //!   never reaches `render_if_needed` without `render_gate(self.screen_asleep)`
 //!   guarding it first (meshcadet-power-optimization Phase 5 — see
 //!   `xtask::render_asleep_gate`'s doc).
+//! - **verify-pm-apb-lock-gate** — every SPI2 transaction the radio driver
+//!   issues, and the GPS driver's whole UART ACTIVE window, is bracketed by
+//!   an `ESP_PM_APB_FREQ_MAX` lock acquire/release pair (meshcadet-power-
+//!   optimization Phase 7 — see `xtask::pm_apb_lock_gate`'s doc).
 //!
 //! All also run as `cargo test`s, which is what CI / every downstream change
 //! actually gates on; this binary exists for a quick manual re-check with a
@@ -391,6 +395,25 @@ fn main() -> ExitCode {
             render_asleep_gate.len()
         );
         for v in &render_asleep_gate {
+            eprintln!("  - {v}");
+        }
+    }
+
+    let pm_apb_lock_gate = xtask::pm_apb_lock_gate::check(&repo_root);
+    if pm_apb_lock_gate.is_empty() {
+        println!(
+            "xtask verify-pm-apb-lock-gate: OK — every SPI2 transaction ({}) and the GPS ACTIVE \
+             window ({}) is bracketed by an ESP_PM_APB_FREQ_MAX lock.",
+            xtask::pm_apb_lock_gate::RADIO_REL_PATH,
+            xtask::pm_apb_lock_gate::GPS_REL_PATH
+        );
+    } else {
+        ok = false;
+        eprintln!(
+            "xtask verify-pm-apb-lock-gate: FAILED — {} violation(s):",
+            pm_apb_lock_gate.len()
+        );
+        for v in &pm_apb_lock_gate {
             eprintln!("  - {v}");
         }
     }
