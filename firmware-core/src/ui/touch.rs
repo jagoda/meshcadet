@@ -15,6 +15,29 @@
 //! site (`TouchEvent { kind: TouchKind::Pressed, .. }`, etc.) resolves
 //! unchanged. See `docs/adr/0005-firmware-core-extraction.md`.
 
+/// Reference floor for "a tap this UI must not lose while asleep", in
+/// milliseconds.
+///
+/// The GT911 does not queue events: `TouchDriver::poll_event`
+/// (`firmware/src/ui/touch.rs`) reads one status snapshot per call, and a
+/// tap whose entire press-then-release cycle completes between two polls
+/// leaves no trace — the status register has already settled back to
+/// `touch_count == 0` with `self.last == None`, so the poll returns
+/// `Ok(None)` and the tap is lost outright, not merely delayed (M2-gate
+/// finding, `meshcadet-power-m2-gate-20260823-223120079`). This constant
+/// pins the shortest physical tap the asleep-tick poll period is required to
+/// still observe: any poll period no longer than this value guarantees at
+/// least one status read lands while the finger is still down (a tap of
+/// this duration cannot fit entirely inside a shorter gap), so the loss
+/// mode above is structurally impossible for taps at or above this floor.
+/// 100ms is a comfortably-representative human tap duration, not a
+/// worst-case guarantee — an unusually fast partial-tap ("tap-and-drag off"
+/// under 100ms) can still be missed, same as before this fix; the floor
+/// exists to make the COMMON case reliable, not every physical possibility.
+/// See [`firmware_core::ui::idle_tick::ASLEEP_IDLE_TICK_MS`](crate::ui::idle_tick::ASLEEP_IDLE_TICK_MS)'s
+/// own doc and host test, which is bound by this constant.
+pub const GT911_MIN_RELIABLE_TAP_MS: u64 = 100;
+
 /// Touch gesture kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TouchKind {
@@ -125,6 +148,13 @@ mod tests {
         // `now_ms` is somehow behind `last_update_ms`.
         assert!(!silence_implies_release(500, 1_000, 40));
     }
+
+    // ── GT911_MIN_RELIABLE_TAP_MS ────────────────────────────────────────
+    // The cross-module bound lives as a host test on the consuming
+    // constant, `idle_tick::asleep_idle_tick_bounds_gt911_tap_loss` — see
+    // that test's doc for why the assertion is pinned there rather than
+    // here (it is `ASLEEP_IDLE_TICK_MS` that must not regress past this
+    // floor, not this floor that varies).
 
     // ── touch_wake_transition ─────────────────────────────────────────────
     //

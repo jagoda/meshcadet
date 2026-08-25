@@ -128,24 +128,36 @@ pub fn wake_forces_full_repaint(was_asleep: bool) -> bool {
 /// `ui_task`'s asleep-and-idle (no blink burst live) `recv_timeout` period,
 /// in milliseconds.
 ///
-/// Constraint P2 (responsiveness) bounds this, but the HONEST worst-case
-/// wake-to-first-paint number is dominated by a FIXED cost this same phase
-/// introduces, not by this constant: `TDeckDisplay::wake`'s mandatory
-/// `SLPOUT` settling delay (120ms — the ST7789's own datasheet requirement,
-/// not tunable) plus one forced full-repaint flush (~30.7ms,
-/// `docs/perf/ui-perf-baseline.md` §4.1, currency 2026-08-03) already totals ~150.7ms BEFORE
-/// this period's own contribution is added. **Stated bound (this phase's
-/// own re-derivation, not the plan-of-record's rough "~150ms" aspiration):
-/// worst-case wake-to-first-paint ≈ `ASLEEP_IDLE_TICK_MS` + 120ms + 30.7ms
-/// ≈ 270.7ms.** The plan's aspirational figure turns out to be unreachable
-/// once the mandatory SLPOUT settling delay it ALSO requires is accounted
-/// for — that fixed floor alone already sits at the aspiration. 120ms
-/// keeps this constant's OWN contribution the same order of magnitude as
-/// that fixed floor (not several times larger), while still cutting the
-/// touch/keyboard I²C poll rate from ~62 Hz (awake) down to ~8 Hz. The M2
-/// gate re-derives this number against the merged tree rather than trusting
-/// this comment.
-pub const ASLEEP_IDLE_TICK_MS: u64 = 120;
+/// Constraint P2 (responsiveness) bounds this from the wake-latency side,
+/// but a SECOND, harder constraint bounds it from above and is now the
+/// binding one: `TouchDriver::poll_event`'s cadence contract
+/// (`firmware/src/ui/touch.rs`). The GT911 does not queue events — a tap
+/// whose entire press-then-release cycle completes inside one poll gap is
+/// lost outright, not delayed (M2-gate finding,
+/// `meshcadet-power-m2-gate-20260823-223120079`; at the previous 120ms
+/// value this dropped ~17% of 100ms taps). This constant MUST NOT exceed
+/// [`crate::ui::touch::GT911_MIN_RELIABLE_TAP_MS`] — see that constant's
+/// doc for the tap-loss mechanism — and
+/// `asleep_idle_tick_bounds_gt911_tap_loss` below pins the two against each
+/// other so a future edit to either one that breaks the bound fails loudly
+/// instead of silently reintroducing wake-tap loss.
+///
+/// The HONEST worst-case wake-to-first-paint number is dominated by a FIXED
+/// cost this same phase introduces, not by this constant:
+/// `TDeckDisplay::wake`'s mandatory `SLPOUT` settling delay (120ms — the
+/// ST7789's own datasheet requirement, not tunable) plus one forced
+/// full-repaint flush (~30.7ms, `docs/perf/ui-perf-baseline.md` §4.1,
+/// currency 2026-08-03) already totals ~150.7ms BEFORE this period's own
+/// contribution is added. **Stated bound (this phase's own re-derivation,
+/// not the plan-of-record's rough "~150ms" aspiration): worst-case
+/// wake-to-first-paint ≈ `ASLEEP_IDLE_TICK_MS` + 120ms + 30.7ms ≈ 200.7ms.**
+/// 50ms — equal to [`ASLEEP_BLINK_TICK_MS`] — is the largest value that
+/// still satisfies the GT911 tap-loss bound above; it still cuts the
+/// touch/keyboard I²C poll rate from ~62.5 Hz (awake) down to 20 Hz, most of
+/// this leg's win even though it is no longer the number the wake-latency
+/// aspiration alone would have picked. The M2 gate re-derives this number
+/// against the merged tree rather than trusting this comment.
+pub const ASLEEP_IDLE_TICK_MS: u64 = 50;
 
 /// `ui_task`'s asleep-but-blink-burst-live `recv_timeout` period, in
 /// milliseconds.
@@ -199,6 +211,28 @@ pub fn next_tick_period_ms(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::touch::GT911_MIN_RELIABLE_TAP_MS;
+
+    // ── ASLEEP_IDLE_TICK_MS vs. the GT911 tap-loss bound ─────────────────
+    //
+    // The binding invariant this pins: `TouchDriver::poll_event`
+    // (`firmware/src/ui/touch.rs`) can only guarantee catching a physical
+    // tap if it is called at least once during that tap's press-to-release
+    // window. `ASLEEP_IDLE_TICK_MS` widening past
+    // `GT911_MIN_RELIABLE_TAP_MS` reopens the M2-gate wake-tap-loss finding
+    // (`meshcadet-power-m2-gate-20260823-223120079`) for taps at or above
+    // that floor — a regression this host test catches without any I2C/HIL
+    // rig, same rationale as `touch::touch_wake_transition`'s tests.
+    #[test]
+    fn asleep_idle_tick_bounds_gt911_tap_loss() {
+        assert!(
+            ASLEEP_IDLE_TICK_MS <= GT911_MIN_RELIABLE_TAP_MS,
+            "ASLEEP_IDLE_TICK_MS ({ASLEEP_IDLE_TICK_MS}ms) exceeds \
+             GT911_MIN_RELIABLE_TAP_MS ({GT911_MIN_RELIABLE_TAP_MS}ms) — a tap of the \
+             reference floor duration can now complete entirely inside one asleep poll \
+             gap and be lost outright, not merely delayed (see both constants' docs)",
+        );
+    }
 
     // ── screen_idle_action ───────────────────────────────────────────────
 
