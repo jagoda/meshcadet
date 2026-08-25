@@ -264,6 +264,18 @@ procedure list and does not compete with §9. Concretely:
 
 ### D7 — Idle-screen leg (`meshcadet-power-idle-screen`): landed estimate and the honest wake-latency re-derivation
 
+**M2-gate correction (`meshcadet-power-m2-gate-20260823-223120079`,
+`meshcadet-power-asleep-tick-touch-wake-loss-20260825-000816136`):**
+`ASLEEP_IDLE_TICK_MS` shipped at 120ms below, but the M2 gate found that
+value silently drops screen-tap wakes — the GT911 does not queue events, so
+a tap whose entire press-then-release cycle completes inside one 120ms poll
+gap is lost outright (not delayed), at ~17% of 100ms taps. It is now 50ms
+(`firmware_core::ui::idle_tick::ASLEEP_IDLE_TICK_MS`), bound above by
+`firmware_core::ui::touch::GT911_MIN_RELIABLE_TAP_MS` and pinned by that
+module's own host test. The wake-latency and I²C-poll-rate figures below
+are re-derived against 50ms, not the original 120ms; the D7 narrative below
+is otherwise left as landed (no other part of the idle-screen leg changed).
+
 Landed as specified in the plan of record — no abort taken: `SLPIN`/`DISPOFF`
 on sleep and `SLPOUT`/`DISPON` + one forced full repaint on wake
 (`firmware/src/ui/display.rs`'s `TDeckDisplay::sleep`/`wake`), `render_if_needed`
@@ -290,14 +302,18 @@ forced full repaint on wake costs ~30.7 ms
 (`docs/perf/ui-perf-baseline.md` §4.1, currency 2026-08-03) — together already ~150.7 ms BEFORE
 the asleep tick's own poll-latency contribution is even added. Worst-case
 touch/keyboard wake-to-first-paint is therefore `ASLEEP_IDLE_TICK_MS`
-(120 ms) + 120 ms + 30.7 ms ≈ 270.7 ms
+(50 ms, post-M2-gate-correction — see the note above; 120 ms as originally
+landed) + 120 ms + 30.7 ms ≈ 200.7 ms
 (`firmware_core::ui::idle_tick::ASLEEP_IDLE_TICK_MS`'s own doc carries the
 identical derivation). The plan's aspirational ~150 ms bound turns out to
 be unreachable once the mandatory `SLPOUT` settling delay it ALSO requires
 is accounted for — that fixed floor alone already sits at the aspiration,
 before this leg's own tunable tick period is even added. This is the
 constraint-P2 finding Milestone 2 (`meshcadet-power-m2-gate`) must
-re-derive and record as a number, not silently pass.
+re-derive and record as a number, not silently pass — the M2 gate then
+found `ASLEEP_IDLE_TICK_MS` itself was over-wide against a THIRD constraint
+(GT911 tap-loss, see the note above), correcting 120ms to 50ms and this
+figure from ~270.7ms to ~200.7ms in turn.
 
 **Constraint P3 (notifications) — a correctness bound, not a nicety.** The
 incoming-message blink is RENDERED, not merely fired, at the tick period
@@ -313,8 +329,9 @@ path exists for `perf_loop_model`).** Re-running the existing
 `split_ui_idle_tick` parameter at the Phase 5 asleep-idle cadence
 (`perf_loop_model::report::asleep_tick_comparison`, `Corner::High`):
 `ui_task`'s own service rate drops from 21.31 Hz (awake, `UI_TICK_MS` =
-16 ms ceiling) to 6.63 Hz (asleep-idle, `ASLEEP_IDLE_TICK_MS` = 120 ms
-ceiling) — reproduce with `cargo test -p perf_loop_model
+16 ms ceiling) to 12.36 Hz (asleep-idle, `ASLEEP_IDLE_TICK_MS` = 50 ms
+ceiling, post-M2-gate-correction — see the note above; was 6.63 Hz at the
+original 120 ms) — reproduce with `cargo test -p perf_loop_model
 asleep_idle_tick_reduces_ui_task_service_rate_vs_awake -- --nocapture`.
 
 ## Consequences

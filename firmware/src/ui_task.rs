@@ -417,7 +417,7 @@ fn ui_task_main<C>(
     loop {
         // D7 item 3: `recv_timeout(tick_ms)` guarantees a pet at least every
         // `tick_ms` in steady state, with or without traffic — `tick_ms` is
-        // never more than `ASLEEP_IDLE_TICK_MS` (120ms today), still far
+        // never more than `ASLEEP_IDLE_TICK_MS` (50ms today), still far
         // under the 30s TWDT timeout regardless of which period is active.
         unsafe { esp_idf_svc::sys::esp_task_wdt_reset(); }
 

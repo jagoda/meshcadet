@@ -203,11 +203,26 @@ impl<'d> TouchDriver<'d> {
     /// Returns `Ok(Some(event))` if a state change occurred (press, move,
     /// release), `Ok(None)` if no new data is available.
     ///
-    /// Call this once per dispatcher loop iteration (≥ every 20 ms is
-    /// sufficient for interactive response). `now_ms` is the caller's
-    /// monotonic uptime clock (same clock as `UiRuntime::step`'s `now_ms`) —
-    /// used only to debounce the release-by-silence inference below; it does
-    /// not gate how often the caller may call this function.
+    /// Call this once per dispatcher loop iteration. While awake, ≥ every
+    /// 20 ms is sufficient for smooth interactive response (a visual-latency
+    /// budget, not a correctness one). While ASLEEP a HARDER, correctness
+    /// bound applies: the GT911 does not queue events, so a physical tap
+    /// whose entire press-then-release cycle completes between two polls is
+    /// lost OUTRIGHT — the status register has already settled back to
+    /// `touch_count == 0` with `self.last == None` by the next read, so this
+    /// function returns `Ok(None)` having never observed the tap at all,
+    /// not merely delayed it (M2-gate finding,
+    /// `meshcadet-power-m2-gate-20260823-223120079`). The caller's asleep
+    /// poll period (`firmware_core::ui::idle_tick::ASLEEP_IDLE_TICK_MS`)
+    /// is therefore bound above by
+    /// `firmware_core::ui::touch::GT911_MIN_RELIABLE_TAP_MS` — pinned by
+    /// `idle_tick`'s own host test
+    /// (`asleep_idle_tick_bounds_gt911_tap_loss`) — not by the 20 ms
+    /// interactive-response figure above, which is looser and does not
+    /// protect against this loss mode. `now_ms` is the caller's monotonic
+    /// uptime clock (same clock as `UiRuntime::step`'s `now_ms`) — used only
+    /// to debounce the release-by-silence inference below; it does not gate
+    /// how often the caller may call this function.
     pub fn poll_event(&mut self, now_ms: u64) -> anyhow::Result<Option<TouchEvent>> {
         let mut status_buf = [0u8; 1];
         self.read_reg(REG_STATUS, &mut status_buf)?;
