@@ -225,13 +225,20 @@ mod tests {
     // rig, same rationale as `touch::touch_wake_transition`'s tests.
     #[test]
     fn asleep_idle_tick_bounds_gt911_tap_loss() {
-        assert!(
-            ASLEEP_IDLE_TICK_MS <= GT911_MIN_RELIABLE_TAP_MS,
-            "ASLEEP_IDLE_TICK_MS ({ASLEEP_IDLE_TICK_MS}ms) exceeds \
-             GT911_MIN_RELIABLE_TAP_MS ({GT911_MIN_RELIABLE_TAP_MS}ms) — a tap of the \
-             reference floor duration can now complete entirely inside one asleep poll \
-             gap and be lost outright, not merely delayed (see both constants' docs)",
-        );
+        // Both operands are `const`, so this is decidable at compile time —
+        // clippy's `assertions_on_constants` correctly flags a runtime
+        // `assert!` here as dead weight and points at the inline-const-block
+        // form instead. Wrapping it in `const { .. }` keeps the invariant
+        // exactly as binding (a violation now fails the *build*, not just
+        // this test) while satisfying `-D warnings`.
+        const {
+            assert!(
+                ASLEEP_IDLE_TICK_MS <= GT911_MIN_RELIABLE_TAP_MS,
+                "ASLEEP_IDLE_TICK_MS exceeds GT911_MIN_RELIABLE_TAP_MS — a tap of the \
+                 reference floor duration can now complete entirely inside one asleep poll \
+                 gap and be lost outright, not merely delayed (see both constants' docs)",
+            );
+        }
     }
 
     // ── screen_idle_action ───────────────────────────────────────────────
