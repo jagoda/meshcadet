@@ -230,7 +230,7 @@ jobs:
         run: scripts/check-vocabulary-leak.sh
 
   test:
-    name: cargo test (protocol, host, xtask, ui_sim, ui_perf)
+    name: cargo test --workspace --locked
     needs: changes
     # See the `changes` job above. `workflow_dispatch` always runs the full
     # suite regardless of what the filter computed. `needs.changes.result !=
@@ -318,6 +318,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `test`'s job-level `if:` (above) only runs `cargo test --workspace`
+      # — which is where all 17 xtask static guards (pm_apb_lock_gate,
+      # lock_gate, lock_integrity_fixes, render_asleep_gate,
+      # ui_event_parity, power_provenance, slint_thread_affinity, the
+      # glyph/font-table/emoji-subset trio, and the seven room_* guards)
+      # actually execute, as #[test]s — when `needs.changes.outputs.full`
+      # and `.host` are both false. A firmware-only diff (this job's own
+      # trigger condition) sets exactly that, so without this step every
+      # guard above is silently skipped on precisely the PRs whose diffs
+      # they exist to scan (firmware/src/**). `cargo run -p xtask --bin
+      # xtask` (no args) runs the identical checks as a host-native binary
+      # instead of via `cargo test` — same pure static source scan, no `esp`
+      # cross-toolchain needed — printing a report and exiting non-zero on
+      # any violation. Placed before the esp-toolchain install below so a
+      # guard violation fails fast without waiting on that bootstrap.
+      - name: cargo run -p xtask --bin xtask (static guard battery)
+        run: cargo run -p xtask --bin xtask
+
       # Same native build.rs prerequisites as the host jobs (see comment
       # above `test`) — firmware/build.rs runs the identical FreeType/DejaVu
       # emoji-font gen step.
@@ -364,6 +382,29 @@ jobs:
         with:
           workspaces: "firmware -> target"
 
+      # `firmware/` is a DETACHED workspace (its own `[workspace]` table in
+      # firmware/Cargo.toml — see this file's header comment), so the root
+      # `fmt`/`clippy` jobs above, which run `cargo fmt --all`/`cargo clippy
+      # --workspace` from the repo root, can never reach it: root-workspace
+      # `cargo fmt --all`/`cargo clippy --workspace` only walks the members
+      # listed in the ROOT Cargo.toml's `[workspace]` table, and `firmware`
+      # is not one of them, so firmware/ source has never been fmt- or
+      # clippy-checked by CI at all. Adding `cd firmware && cargo fmt --all
+      # -- --check` / `cd firmware && cargo clippy --all-targets -- -D
+      # warnings` steps here was tried in this same change and reverted —
+      # both fail today on real, pre-existing debt, not a config mistake:
+      # fmt reports 447 diffs across 30 files, clippy reports 56 findings
+      # (mostly `clippy::doc_lazy_continuation`/`doc_markdown` on doc
+      # comments, plus real ones: unused imports, dead code, a `Box` that
+      # doesn't need boxing, `payload.get(0)` instead of `.first()`, a
+      # `CStr::from_bytes_with_nul` that should be a `c""` literal). Landing
+      # either gate as-is would turn CI red on the very next PR, for every
+      # contributor, with no relation to their own change — see
+      # CONTRIBUTING.md's "Known gaps" for the counts and the follow-up this
+      # needs before either check can land. `cargo fmt`/`cargo clippy` on
+      # `firmware/` remain a pre-submit human step (see "Code style" below)
+      # until that cleanup lands.
+      #
       # The canonical firmware build gate — same command CONTRIBUTING.md
       # documents for a human to run manually before landing firmware
       # changes. Builds default (production) + diagnostics; the hil combos
