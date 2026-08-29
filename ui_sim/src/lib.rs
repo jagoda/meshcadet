@@ -56,6 +56,34 @@ mod fallback_image {
     include!(concat!(env!("OUT_DIR"), "/fallback_image.rs"));
 }
 
+/// The real on-device `MeshCadetEmoji` bitmap font — see that module's own
+/// doc for how it's generated. `register_device_font` below is the public
+/// entry point every promo/host-sim screenshot rig uses.
+mod emoji_font;
+
+/// Register the real on-device `MeshCadetEmoji` bitmap font on `window`,
+/// mirroring `firmware/src/ui/platform.rs::TDeckPlatform::install`'s
+/// registration exactly — same font, same "registered first, before any
+/// component init" ordering, so the renderer's first-registered-wins
+/// fallback resolves every text run against it regardless of what
+/// `SLINT_EMBED_TEXTURES`'s compile-time host-fontconfig bake managed to
+/// embed for that literal.
+///
+/// # Contract
+/// Callers MUST call this immediately after
+/// `slint::platform::set_platform(...)` and BEFORE constructing/showing the
+/// screen's Slint component (`Ui::new()` / `.show()`) — Slint resolves each
+/// `Text` element's font at component-init time, so a call after `.show()`
+/// misses those init-time runs. `build.rs::lint_font_provisioning` enforces
+/// this ordering at build time for every promo/host-sim screenshot
+/// entrypoint this crate ships — see that function's doc for why the
+/// compile-time bake alone is a silent-glyph-drop hazard.
+pub fn register_device_font(window: &Rc<MinimalSoftwareWindow>) {
+    window
+        .renderer()
+        .register_bitmap_font(emoji_font::emoji_bitmap_font());
+}
+
 /// Process-wide counting allocator for `ui_sim`'s Slint-rendering rigs —
 /// the render-path allocation
 /// hook for the UI perf-pass baseline. See `alloc_count.rs`'s module doc for why installing this here is
