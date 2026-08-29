@@ -46,17 +46,37 @@ header comment for the full rationale). The `firmware` job:
   here because the `test`/`fmt`/`clippy` jobs above are skipped by their
   path-filter `if:` on a diff scoped entirely to `firmware/**`, and every
   one of those guards exists specifically to scan `firmware/src/**`;
-- runs `cd firmware && cargo fmt --all -- --check` and
-  `cd firmware && cargo clippy --all-targets -- -D warnings` — `firmware/`
-  being a detached workspace means the root `fmt`/`clippy` jobs' `--all`/
-  `--workspace` flags never reach it, so these are firmware's own, separate
-  fmt/clippy pass;
 - runs `cd firmware && bash check-all-features.sh` — the same command
   described below, now run by CI on every PR instead of only by a human
   before landing firmware changes;
 - runs `cargo run -p xtask --bin xtask -- verify-partition-budget` (a fresh
   release build's app-image size, diffed against the committed flash-budget
   baseline; see "Flash-budget changes" below).
+
+`firmware/` does **not** get a CI fmt/clippy pass yet — see "Known gaps"
+below for why and what closes it.
+
+### Known gaps
+
+- **`firmware/` has no CI-enforced `cargo fmt`/`cargo clippy` pass.** Being a
+  detached workspace, it's invisible to the root `fmt`/`clippy` jobs above,
+  and adding `cd firmware && cargo fmt --all -- --check` /
+  `cd firmware && cargo clippy --all-targets -- -D warnings` steps to the
+  `firmware` job was tried alongside the fix in this section's git history
+  and reverted: as of that check, `cargo fmt --all -- --check` reports 447
+  diffs across 30 files, and `cargo clippy --all-targets -- -D warnings`
+  reports 56 findings (mostly `clippy::doc_lazy_continuation`/
+  `doc_markdown` on doc-comment formatting, plus real ones — two unused
+  imports, two dead functions, a needlessly-boxed local, a
+  `payload.get(0)` that should be `.first()`, a `CStr::from_bytes_with_nul`
+  that should be a `c""` literal, an empty `loop {}`, a manual
+  `Option::map`). Landing either gate unconditionally would turn CI red for
+  every future firmware PR regardless of that PR's own content, which is
+  worse than the status quo. Until a dedicated cleanup PR lands (fmt is a
+  mechanical `cargo fmt --all` in `firmware/`; clippy needs each finding
+  triaged, since some are real bugs worth fixing on their own merits, not
+  just silenced), format and lint `firmware/` by hand before submitting
+  (see "Code style" below) — CI cannot catch a regression there yet.
 
 ## Building and testing
 

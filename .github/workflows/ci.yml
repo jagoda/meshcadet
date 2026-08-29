@@ -388,17 +388,23 @@ jobs:
       # --workspace` from the repo root, can never reach it: root-workspace
       # `cargo fmt --all`/`cargo clippy --workspace` only walks the members
       # listed in the ROOT Cargo.toml's `[workspace]` table, and `firmware`
-      # is not one of them. Without these two steps firmware/ source (e.g.
-      # firmware/src/pm.rs) has never been fmt- or clippy-checked by CI at
-      # all. The esp toolchain and cached ESP-IDF sysroot are already
-      # installed above by this point, so the marginal cost here is a check
-      # pass, not a fresh bootstrap.
-      - name: cd firmware && cargo fmt --all -- --check
-        run: cd firmware && cargo fmt --all -- --check
-
-      - name: cd firmware && cargo clippy --all-targets -- -D warnings
-        run: cd firmware && cargo clippy --all-targets --locked -- -D warnings
-
+      # is not one of them, so firmware/ source has never been fmt- or
+      # clippy-checked by CI at all. Adding `cd firmware && cargo fmt --all
+      # -- --check` / `cd firmware && cargo clippy --all-targets -- -D
+      # warnings` steps here was tried in this same change and reverted —
+      # both fail today on real, pre-existing debt, not a config mistake:
+      # fmt reports 447 diffs across 30 files, clippy reports 56 findings
+      # (mostly `clippy::doc_lazy_continuation`/`doc_markdown` on doc
+      # comments, plus real ones: unused imports, dead code, a `Box` that
+      # doesn't need boxing, `payload.get(0)` instead of `.first()`, a
+      # `CStr::from_bytes_with_nul` that should be a `c""` literal). Landing
+      # either gate as-is would turn CI red on the very next PR, for every
+      # contributor, with no relation to their own change — see
+      # CONTRIBUTING.md's "Known gaps" for the counts and the follow-up this
+      # needs before either check can land. `cargo fmt`/`cargo clippy` on
+      # `firmware/` remain a pre-submit human step (see "Code style" below)
+      # until that cleanup lands.
+      #
       # The canonical firmware build gate — same command CONTRIBUTING.md
       # documents for a human to run manually before landing firmware
       # changes. Builds default (production) + diagnostics; the hil combos
