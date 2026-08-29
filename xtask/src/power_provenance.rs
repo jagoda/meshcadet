@@ -11,8 +11,19 @@
 //! rule that lapses the next time someone drops a number into a table cell
 //! under review pressure. This module is the host-runnable, mechanical half
 //! of D2, in the same spirit as `xtask::check`'s glyph-coverage harness:
-//! plain text scanning, no toolchain required, run by `cargo test` on every
-//! change to `docs/`.
+//! plain text scanning, no toolchain required.
+//!
+//! This IS run by `cargo test` on every PR/push, including one scoped only
+//! to `docs/` — but that depends on `.github/workflows/ci.yml`'s `changes`
+//! job routing a `docs/**`-only diff to a job that runs `cargo test` at
+//! all. It didn't, for a long stretch: `docs/**` matched none of that
+//! filter's `full`/`host`/`firmware` buckets, so a docs-only PR set all
+//! three false and the `test` job — the only job that actually executes
+//! this check, as a `#[test]` — was skipped outright (proven live: PR #184
+//! added bare mA figures to `docs/` with `cargo test :: skipped`). ci.yml's
+//! `host` filter now carries a fail-safe catch-all specifically so this
+//! claim stays true for any future top-level path, not just the ones
+//! enumerated today — see that file's header comment.
 //!
 //! # Scope
 //!

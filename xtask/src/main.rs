@@ -71,12 +71,25 @@
 //!   outside the `firmware/src/ui/`/`firmware/src/ui_task.rs` boundary names
 //!   `UiRuntime`, `slint::`, or `i_slint*` (ADR-0012 R8 — see
 //!   `xtask::slint_thread_affinity`'s doc).
+//! - **verify-ci-filter-coverage** — every root Cargo workspace member is
+//!   explicitly wired into `.github/workflows/ci.yml`'s `changes` job path
+//!   filter, under `full:` or `host:` (see `xtask::ci_filter_coverage`'s
+//!   doc).
 //!
-//! All also run as `cargo test`s, which is what CI / every downstream change
-//! actually gates on; this binary exists for a quick manual re-check with a
-//! human-readable report and a nonzero exit code on failure. It runs BOTH
-//! checks and reports both before exiting, rather than short-circuiting on
-//! the first — a manual re-check should surface everything in one pass.
+//! All also run as `cargo test`s. That used to be unconditionally "what CI
+//! actually gates on" and this binary a mere convenience for a human's
+//! quick manual re-check — it no longer is: `.github/workflows/ci.yml`'s
+//! `firmware` job runs `cargo run -p xtask --bin xtask` directly (not
+//! `cargo test`) as its own CI gate on firmware-only PRs, precisely because
+//! the `test` job (where these run as `#[test]`s) is skipped for those
+//! diffs. Believing this binary was purely a manual convenience — the exact
+//! belief this doc comment stated — is what let that firmware-only-PR gap
+//! open in the first place (deep-review pass 3 F4). Treat every check
+//! above as CI-gating either way: via `cargo test` on a host/full-lane PR,
+//! or via this binary directly on a firmware-only one. It runs every check
+//! in the battery and reports all of them before exiting, rather than
+//! short-circuiting on the first — a full pass (manual or CI) should
+//! surface everything in one go.
 //!
 //! One check is deliberately NOT part of that default battery and is NOT a
 //! `cargo test`, because it needs the `esp` cross-toolchain and takes
@@ -438,6 +451,23 @@ fn main() -> ExitCode {
             slint_thread_affinity.len()
         );
         for v in &slint_thread_affinity {
+            eprintln!("  - {v}");
+        }
+    }
+
+    let ci_filter_coverage = xtask::ci_filter_coverage::check(&repo_root);
+    if ci_filter_coverage.is_empty() {
+        println!(
+            "xtask verify-ci-filter-coverage: OK — every root Cargo workspace member has an \
+             explicit entry in ci.yml's `full:`/`host:` path filter."
+        );
+    } else {
+        ok = false;
+        eprintln!(
+            "xtask verify-ci-filter-coverage: FAILED — {} violation(s):",
+            ci_filter_coverage.len()
+        );
+        for v in &ci_filter_coverage {
             eprintln!("  - {v}");
         }
     }
