@@ -402,8 +402,11 @@ fn main() -> ExitCode {
     let pm_apb_lock_gate = xtask::pm_apb_lock_gate::check(&repo_root);
     if pm_apb_lock_gate.is_empty() {
         println!(
-            "xtask verify-pm-apb-lock-gate: OK — every SPI2 transaction ({}) and the GPS ACTIVE \
-             window ({}) is bracketed by an ESP_PM_APB_FREQ_MAX lock.",
+            "xtask verify-pm-apb-lock-gate: OK — the radio's two SPI2 funnel points \
+             (write_cmd/spi_transfer, {}) and the GPS ACTIVE window ({}) are bracketed by an \
+             ESP_PM_APB_FREQ_MAX lock. This does NOT cover the ST7789 display controller, which \
+             also shares SPI2, nor the GT911/keyboard I2C or LEDC backlight timer — see ADR-0014 \
+             D4.3/D8 for why that coverage is deliberately partial.",
             xtask::pm_apb_lock_gate::RADIO_REL_PATH,
             xtask::pm_apb_lock_gate::GPS_REL_PATH
         );

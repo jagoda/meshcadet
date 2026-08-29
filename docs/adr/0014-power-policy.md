@@ -169,8 +169,17 @@ clause below rather than inherit an implicit one from here.
    controller's — they share the bus, ADR-0012 §7) and across the GPS UART's
    ACTIVE window (`firmware/src/gps.rs:938`–`949`). Anywhere a peripheral
    clock or bus state must not be disturbed mid-transaction by a sleep entry
-   is a lock site; an unbracketed one is the failure mode, symmetric with
-   `meshcadet-power-dfs`'s own `ESP_PM_APB_FREQ_MAX` lock discipline.
+   is a lock site; an unbracketed one is the failure mode. **Record
+   correction (`meshcadet-power-record-corrections`): this clause is NOT, in
+   fact, symmetric with `meshcadet-power-dfs`'s own landed `ESP_PM_APB_FREQ_
+   MAX` lock discipline** — D8 records that DFS brackets only the radio's two
+   SPI2 funnel points (`write_cmd`/`spi_transfer`) and the GPS UART ACTIVE
+   window; the ST7789 display controller (also SPI2), the GT911/keyboard I2C
+   bus, and the LEDC backlight timer are deliberately unbracketed there (see
+   D8's own amendment). A future leg implementing THIS clause must satisfy
+   "both the radio's and the display controller's" itself, in full — it
+   cannot lean on DFS's discipline as a precedent for display coverage,
+   because DFS never established one.
 4. **Octal PSRAM retention — an unresolved hazard, not a solved problem.**
    `CONFIG_SPIRAM_MODE_OCT=y` (`firmware/sdkconfig.defaults:99`) backs the UI
    framebuffers and the rotating conversation history. Whether this
@@ -285,14 +294,33 @@ and a dim-before-sleep step on top of Phase 4's `set_brightness`
 (`firmware_core::ui::idle_tick::screen_idle_action`/`dim_brightness_pct`).
 
 **Expected win.** Order a few mA of average idle draw `[ESTIMATE —
-datasheet-order, per the plan of record (Phase 5): eliminating ~62 I²C transaction
-pairs/s (GT911 touch poll + keyboard co-processor poll) plus periodic
+datasheet-order, per the plan of record (Phase 5): removing ~42 I²C
+transaction pairs/s (GT911 touch poll + keyboard co-processor poll — the
+asleep-idle tick cuts this poll rate from ~62.5 Hz awake to 20 Hz
+asleep-idle, post-M2-gate-correction; it does not eliminate the poll
+entirely, contrary to an earlier draft of this estimate that read
+"eliminating ~62 I²C transaction pairs/s" — the asleep-idle tick still
+polls, only 42.5/s slower, matching
+`firmware_core::ui::idle_tick::ASLEEP_IDLE_TICK_MS`'s own doc) plus periodic
 full-region SPI flushes to a dark panel, and putting the ST7789 in
 sleep-in, is a small, second-order term next to the GPS (row 9) and
-backlight (row 4) levers — this leg's LARGER value is structural, not this
-milliwatt-class number: an unconditional 62 Hz tick defeats tickless idle
-outright, so `meshcadet-power-dfs` (Phase 7) cannot deliver anything
-without this leg landing first]`.
+backlight (row 4) levers. This "few mA" conclusion is unaffected by the
+pairs/s correction above — this leg's LARGER value was originally argued as
+structural rather than this milliwatt-class number: an unconditional 62 Hz
+tick defeats tickless idle outright, so `meshcadet-power-dfs` (Phase 7)
+cannot deliver anything without this leg landing first. **RETRACTED by D8's
+own landing:** `meshcadet-power-dfs` deliberately does NOT enable
+`CONFIG_FREERTOS_USE_TICKLESS_IDLE` — that Kconfig option exists solely to
+support automatic light sleep between ticks, which the DFS leg never
+attempts (`light_sleep_enable: false`, D8) — so DFS's win never depended on
+this leg's tick slowdown, and this leg landing first was never a
+precondition for it. D8 also records the actual limiter on core 0 reaching
+its own idle floor: the unchanged 20ms `RX_POLL_YIELD_MS` dispatcher
+cadence, not `ui_task`'s tick. This structural framing is amended, not
+deleted, the same way the M2-gate correction note above amends this leg's
+120ms figure rather than erasing it — this leg's real independent value is
+the I²C/render savings this estimate otherwise argues, not a DFS
+precondition that never existed]`.
 
 **Honest wake-latency bound — CORRECTS the plan's rough "~150 ms"
 aspiration, does not merely restate it.** The ST7789's own `SLPOUT`
@@ -370,15 +398,23 @@ Neither this leg nor any earlier one needs to acquire `ESP_PM_CPU_FREQ_MAX` itse
 property to hold.
 
 **`ESP_PM_APB_FREQ_MAX` locks (`firmware/src/pm.rs::ApbFreqMaxLock`) bracket the radio's SPI2
-transactions and the GPS UART's ACTIVE window, per the plan.** `Radio::write_cmd`/`spi_transfer`
+transactions and the GPS UART's ACTIVE window — ONE of the two SPI2 masters, not both, and this
+is deliberate, not an oversight (record correction, `meshcadet-power-record-corrections`; see
+below).** `Radio::write_cmd`/`spi_transfer`
 (the two funnel points every SX1262 command goes through, `radio.rs`) acquire/release around each
 individual `self.spi.write`/`transfer_in_place` call — the same bracket span as the existing D9/D11
 diagnostics probe. `GpsDriver` acquires the lock at construction (the driver starts ACTIVE) and at
 every QUIET→ACTIVE reopen, releasing at every ACTIVE→QUIET close
-(`firmware_core::gps::active_window_pm_lock_action`, a pure, host-tested decision function pinning
-the bracket's symmetry — see `firmware-core/src/gps.rs`'s `pm_lock_bracket_is_symmetric_across_a_
-transition_sequence` test). **Worth recording plainly: with `min_freq_mhz = 80` specifically, these
-locks are not currently load-bearing for P1/P4 by themselves** — `esp_pm`'s own mode derivation
+(`firmware_core::gps::active_window_pm_lock_action`, a pure, host-tested decision function whose
+host tests pin the bracket's symmetry; in a **release** firmware build the `debug_assert_eq!` call
+sites in `GpsDriver::poll` that cross-check the live acquire/release calls against this function
+compile out entirely — `firmware/Cargo.toml`'s `[profile.release]` does not set
+`debug-assertions = true` — so in the shipped binary the bracket's correctness is pinned
+structurally only by `xtask::pm_apb_lock_gate`'s static source guard plus this function's own host
+tests, not by anything the release binary itself runs; the earlier framing ("decided by the pure,
+host-tested function," this leg's own PR body) overstated the release-build mechanism). **Worth
+recording plainly: with `min_freq_mhz = 80` specifically, these locks are not currently
+load-bearing for P1/P4 by themselves** — `esp_pm`'s own mode derivation
 (`pm_impl.c`, non-ESP32 branch) computes `apb_max_freq = MIN(max_freq_mhz, esp_clk_apb_freq())`,
 and ESP32-S3's real APB peripheral clock is a fixed 80 MHz tap off the 480 MHz PLL whenever the CPU
 runs off PLL (80/160/240) — so with `min_freq_mhz = 80` the actual APB clock is 80 MHz in *every*
@@ -390,7 +426,28 @@ still implemented exactly as the plan directs: correct defense-in-depth against 
 an SPI DMA transfer that internally yields to the scheduler — a case the automatic per-core lock
 does not cover, since a core going idle mid-yield inside a nominally-single "transaction" is
 exactly the gap this campaign has no measurement path to rule out on this board. Holding them costs
-nothing today and removes that gap entirely regardless of any future config change.
+nothing today and removes that gap entirely regardless of any future config change — **for the
+radio and GPS UART specifically.**
+
+**Record correction: the ST7789 display controller, the GT911/keyboard I2C bus, and the LEDC
+backlight timer are also APB-derived and are deliberately left unbracketed — a partial, not
+complete, instance of the lock discipline D4.3 specifies for the (unimplemented) light-sleep
+contract.** The ST7789 shares SPI2 with the radio (`firmware/src/main.rs:742`, `:788`, `:853`);
+neither `TDeckDisplay::flush_line_range` (the hot render path, up to 240 SPI transactions per full
+repaint) nor any GT911/keyboard I2C call site nor the LEDC backlight PWM timer acquires
+`apb_lock`. The recommended fix is this record, not the code: `flush_line_range` is the exact hot
+path a prior mission (`meshcadet-power-idle-screen`) spent its whole budget de-allocating on, and a
+lock bracket around up to 240 ESP-IDF calls per repaint is not a change to make casually against
+that budget. Two reasons this exclusion is acceptable as recorded, not merely unexamined: (1) the
+same APB-pinned-at-80 argument above applies identically to the display/I2C/LEDC — with
+`min_freq_mhz = 80` the APB clock never moves regardless of which peripheral is transacting, so
+none of these brackets are load-bearing today either; (2) unlike a corrupted SX1262 command
+(P4) or a corrupted GPS UART frame (P1), a corrupted pixel row from an APB glitch mid-transaction
+is cosmetic and self-heals on the very next repaint — there is no P1–P4 invariant this omission
+threatens. **Consequently, the defense-in-depth this discipline offers against a future
+`min_freq_mhz` below 80 is PARTIAL, not complete: it protects the radio and GPS today, and would
+need a genuinely new bracket added to `flush_line_range`/the I2C call sites/the LEDC timer before
+any future config change actually moved the APB clock, not merely a re-read of this record.**
 
 **HARD ABORT condition checked directly, not merely inferred from CI.** `CONFIG_PM_ENABLE=y`
 together with `CONFIG_SPIRAM_MODE_OCT=y` does **not** conflict — confirmed by an actual

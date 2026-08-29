@@ -473,9 +473,17 @@ pub struct GpsDriver<'d> {
     /// `ESP_PM_APB_FREQ_MAX` lock (meshcadet-power-optimization Phase 7) —
     /// see `crate::pm`'s module doc. Held for the entire ACTIVE window
     /// (constraint P1: the GPS UART's baud divisor is APB-derived) and
-    /// released for the entire QUIET window — see
-    /// `firmware_core::gps::active_window_pm_lock_action`, which decides
-    /// every acquire/release this driver issues.
+    /// released for the entire QUIET window. The actual acquire/release
+    /// calls below (`poll`) are two unconditional statements, not a call
+    /// through `firmware_core::gps::active_window_pm_lock_action` — that
+    /// pure function only *cross-checks* them, via `debug_assert_eq!`,
+    /// against what it would decide; `firmware/Cargo.toml`'s
+    /// `[profile.release]` does not set `debug-assertions = true`, so that
+    /// cross-check compiles out of release firmware entirely. In a release
+    /// build this bracket's correctness is pinned structurally only by
+    /// `xtask::pm_apb_lock_gate`'s static guard over the source, plus the
+    /// pure function's own host tests against the SAME decision table —
+    /// not by anything the release binary itself runs.
     apb_lock: ApbFreqMaxLock,
 
     // ── NMEA line accumulator ─────────────────────────────────────────────────
