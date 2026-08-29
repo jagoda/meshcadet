@@ -67,6 +67,10 @@
 //!   issues, and the GPS driver's whole UART ACTIVE window, is bracketed by
 //!   an `ESP_PM_APB_FREQ_MAX` lock acquire/release pair (meshcadet-power-
 //!   optimization Phase 7 — see `xtask::pm_apb_lock_gate`'s doc).
+//! - **verify-slint-thread-affinity** — no file under `firmware/src/`
+//!   outside the `firmware/src/ui/`/`firmware/src/ui_task.rs` boundary names
+//!   `UiRuntime`, `slint::`, or `i_slint*` (ADR-0012 R8 — see
+//!   `xtask::slint_thread_affinity`'s doc).
 //!
 //! All also run as `cargo test`s, which is what CI / every downstream change
 //! actually gates on; this binary exists for a quick manual re-check with a
@@ -417,6 +421,23 @@ fn main() -> ExitCode {
             pm_apb_lock_gate.len()
         );
         for v in &pm_apb_lock_gate {
+            eprintln!("  - {v}");
+        }
+    }
+
+    let slint_thread_affinity = xtask::slint_thread_affinity::check(&repo_root);
+    if slint_thread_affinity.is_empty() {
+        println!(
+            "xtask verify-slint-thread-affinity: OK — no file outside firmware/src/ui/ or \
+             firmware/src/ui_task.rs names UiRuntime, slint::, or i_slint* (ADR-0012 R8)."
+        );
+    } else {
+        ok = false;
+        eprintln!(
+            "xtask verify-slint-thread-affinity: FAILED — {} violation(s):",
+            slint_thread_affinity.len()
+        );
+        for v in &slint_thread_affinity {
             eprintln!("  - {v}");
         }
     }
