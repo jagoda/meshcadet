@@ -203,35 +203,31 @@ jobs:
     # firmware/src/ui/theme.slint, firmware/src/ui/screens/splash.rs) — both
     # would false-positive if added here.
     #
-    # This job alone only catches a leak once it's already landed in a
-    # generated file (e.g. CHANGELOG.md, which release-please bakes from
-    # commit subjects) — by which point the offending commit is already
-    # merged to `main` and un-rewritable. scripts/check-commit-format.sh's
-    # "Lint commit messages" CI job closes that recurrence path by rejecting
-    # any commit *subject* carrying one of these terms before it can merge;
-    # both jobs source the same scripts/banned-vocabulary.sh so the term
-    # list can't drift between them (2026-08-04, CHANGELOG.md:49 leak).
+    # This job used to be the ONLY write-time-adjacent guard for banned
+    # terms landing in tracked file content, which meant it always caught a
+    # leak post-hoc — after a PR was already open. scripts/check-commit-
+    # format.sh's "Lint commit messages" CI job closes the recurrence path
+    # for banned terms in commit *subjects* specifically (release-please
+    # bakes those into CHANGELOG.md verbatim on merge, 2026-08-04); it never
+    # covered file content, so three more leaks (source comments, an ADR
+    # paragraph) went through that gap. scripts/check-vocabulary-leak.sh
+    # closes it: this job and CONTRIBUTING.md's pre-PR-publish step both
+    # invoke that ONE script (which itself sources
+    # scripts/banned-vocabulary.sh), so the scan's scope — not just its term
+    # list — can never drift apart between local and CI.
     steps:
       - uses: actions/checkout@v4
 
+      - name: Self-test scripts/check-vocabulary-leak.sh
+        # Regression guard on the shared script itself (isolated throwaway
+        # repo, not this checkout's tracked files) — a future edit that
+        # silently narrows the scan scope fails loudly here instead of
+        # quietly reopening the local/CI scope gap this script exists to
+        # close.
+        run: scripts/check-vocabulary-leak.test.sh
+
       - name: Grep for internal-ops vocabulary
-        run: |
-          set -euo pipefail
-          # shellcheck source=scripts/banned-vocabulary.sh
-          source scripts/banned-vocabulary.sh
-          # Exclude this workflow file and scripts/banned-vocabulary.sh
-          # themselves: the comments in each necessarily spell out every
-          # banned term to document why it's banned, which would otherwise
-          # make this job flag itself on every run.
-          if hits=$(grep -rnoiE "$BANNED_VOCAB_PATTERN" \
-              --exclude-dir=.git --exclude-dir=target --exclude-dir=node_modules \
-              --exclude=ci.yml --exclude=banned-vocabulary.sh \
-              .); then
-            echo "::error::Internal ops-automation vocabulary found in the public repo (see below). Rewrite these to plain language a repo outsider can follow — see docs/adr/0004-release-architecture.md and 0008-nondestructive-update-artifacts.md history for prior fixes of this exact class." >&2
-            echo "$hits"
-            exit 1
-          fi
-          echo "No internal-ops vocabulary leaks found."
+        run: scripts/check-vocabulary-leak.sh
 
   test:
     name: cargo test (protocol, host, xtask, ui_sim, ui_perf)
