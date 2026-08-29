@@ -31,17 +31,32 @@ setup. Summary:
 `main`, as four separate jobs: `cargo test --workspace`,
 `cargo fmt --all -- --check`, and
 `cargo clippy --workspace --all-targets -- -D warnings` against the
-host-native workspace, plus a dedicated `firmware` job that installs the
-`esp`/Xtensa cross-toolchain + ESP-IDF sysroot and runs
-`cd firmware && bash check-all-features.sh` — the same command described
-below, now run by CI on every PR instead of only by a human before landing
-firmware changes — followed by `cargo run -p xtask --bin xtask --
-verify-partition-budget` (a fresh release build's app-image size, diffed
-against the committed flash-budget baseline; see "Flash-budget changes"
-below). `firmware` is a separate job (not folded into `test`/ `clippy`)
-precisely so a transient Espressif-toolchain hiccup can never block the fast
-host lane; see the workflow file's own header comment for the full
-rationale.
+host-native workspace, plus a dedicated `firmware` job. `firmware/` is a
+DETACHED workspace (its own `[workspace]` table in `firmware/Cargo.toml`),
+so none of the root-workspace jobs above ever touch it, and — since it
+cross-compiles for `xtensa-esp32s3-espidf` under the Espressif `esp` Rust
+fork — it's kept as its own job precisely so a transient Espressif-toolchain
+hiccup can never block the fast host lane (see the workflow file's own
+header comment for the full rationale). The `firmware` job:
+
+- installs the `esp`/Xtensa cross-toolchain + ESP-IDF sysroot;
+- runs `cargo run -p xtask --bin xtask` (no args) — the same host-native,
+  no-esp-toolchain-needed static guard battery `cargo test --workspace`
+  exercises as `#[test]`s (see "Building and testing" below), run again
+  here because the `test`/`fmt`/`clippy` jobs above are skipped by their
+  path-filter `if:` on a diff scoped entirely to `firmware/**`, and every
+  one of those guards exists specifically to scan `firmware/src/**`;
+- runs `cd firmware && cargo fmt --all -- --check` and
+  `cd firmware && cargo clippy --all-targets -- -D warnings` — `firmware/`
+  being a detached workspace means the root `fmt`/`clippy` jobs' `--all`/
+  `--workspace` flags never reach it, so these are firmware's own, separate
+  fmt/clippy pass;
+- runs `cd firmware && bash check-all-features.sh` — the same command
+  described below, now run by CI on every PR instead of only by a human
+  before landing firmware changes;
+- runs `cargo run -p xtask --bin xtask -- verify-partition-budget` (a fresh
+  release build's app-image size, diffed against the committed flash-budget
+  baseline; see "Flash-budget changes" below).
 
 ## Building and testing
 
