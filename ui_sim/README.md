@@ -171,12 +171,8 @@ build`/`run`/`test`, not just a pre-flight checklist step a human can skip):
 it fails the build with a named, actionable error if any of the five promo
 rigs, `lock_screen`, or `splash_lineart` stops calling
 `ui_sim::register_device_font` before showing its UI, or moves the call
-after `.show()`. See
-`flight-manuals/checklists/meshcadet-ui-sim-screenshot-font-provisioning.md`
-and
-`flight-manuals/library/compile-time-host-font-bake-diverges-from-device-font.md`
-for the full incident writeup and the checklist's residual (now much
-narrower) manual steps.
+after `.show()`. See `build.rs::lint_font_provisioning`'s doc comment for
+the full incident writeup and the mechanism this enforces.
 
 Still required on the build machine (`build_emoji_font`'s own
 prerequisites, same as `firmware/build.rs`'s): `gcc`, `pkg-config`,

@@ -20,7 +20,7 @@
 //!
 //! `ui_sim::lock_screen::LockScreenFrame::new` now calls
 //! `ui_sim::register_device_font` (mechanized 2026-08-29 — see
-//! `flight-manuals/checklists/meshcadet-ui-sim-screenshot-font-provisioning.md`),
+//! `build.rs::lint_font_provisioning`),
 //! registering the SAME real on-device `MeshCadetEmoji` bitmap font
 //! `firmware/src/ui/platform.rs::TDeckPlatform::install` does, so the
 //! "🔒"/"✉"/"⏳" emoji codepoints this screen uses now actually render here

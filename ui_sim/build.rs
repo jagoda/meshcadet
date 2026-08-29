@@ -32,8 +32,8 @@
 //! (`build_emoji_font()` below) and runs a static, build-time lint
 //! (`lint_font_provisioning()`) enforcing that every promo/host-sim
 //! screenshot render entrypoint registers it before rendering — see those
-//! functions' own doc comments and
-//! `flight-manuals/library/compile-time-host-font-bake-diverges-from-device-font.md`.
+//! functions' own doc comments for why the compile-time font bake alone is
+//! a silent-glyph-drop hazard.
 
 use std::env;
 use std::fmt::Write as _;
@@ -126,9 +126,8 @@ fn is_up_to_date(output: &Path, inputs: &[&Path]) -> bool {
 /// This is what lets `register_device_font` (`src/lib.rs`) register the
 /// REAL device font instead of relying solely on `SLINT_EMBED_TEXTURES`'s
 /// compile-time bake from whatever the build host's fontconfig resolves —
-/// see
-/// `flight-manuals/library/compile-time-host-font-bake-diverges-from-device-font.md`
-/// for why that bake alone is a silent-glyph-drop hazard.
+/// see `lint_font_provisioning`'s doc comment below for why that bake alone
+/// is a silent-glyph-drop hazard.
 ///
 /// # Prerequisites (build machine) — same as `firmware/build.rs`'s
 /// - `gcc` in PATH
@@ -213,9 +212,8 @@ fn build_emoji_font() {
 
 /// Static, build-time enforcement of the on-device font-registration
 /// invariant this crate's promo/host-sim screenshot rigs depend on —
-/// mechanizing
-/// `flight-manuals/checklists/meshcadet-ui-sim-screenshot-font-provisioning.md`'s
-/// step 1 (previously a human pre-flight review step only).
+/// mechanizing what was previously a human-only pre-flight review step
+/// before publishing a promo/host-sim screenshot.
 ///
 /// `SLINT_EMBED_TEXTURES=1` (root `.cargo/config.toml`) bakes glyph bitmaps
 /// at PROC-MACRO-EXPANSION time from whatever the build host's fontconfig
@@ -289,8 +287,7 @@ fn lint_font_provisioning() {
                  2026-08-23). Add `crate::register_device_font(&window);` \
                  right after `slint::platform::set_platform(...)` and before \
                  `Ui::new()`, mirroring \
-                 firmware/src/ui/platform.rs::TDeckPlatform::install. See \
-                 flight-manuals/checklists/meshcadet-ui-sim-screenshot-font-provisioning.md."
+                 firmware/src/ui/platform.rs::TDeckPlatform::install."
             ),
             (Some(_), None) => panic!(
                 "font-provisioning lint: {rel} calls `register_device_font` \

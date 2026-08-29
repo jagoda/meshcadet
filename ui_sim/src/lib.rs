@@ -76,11 +76,8 @@ mod emoji_font;
 /// `Text` element's font at component-init time, so a call after `.show()`
 /// misses those init-time runs. `build.rs::lint_font_provisioning` enforces
 /// this ordering at build time for every promo/host-sim screenshot
-/// entrypoint named in
-/// `flight-manuals/checklists/meshcadet-ui-sim-screenshot-font-provisioning.md`
-/// — see that function's doc for why the compile-time bake alone is a
-/// silent-glyph-drop hazard
-/// (`flight-manuals/library/compile-time-host-font-bake-diverges-from-device-font.md`).
+/// entrypoint this crate ships — see that function's doc for why the
+/// compile-time bake alone is a silent-glyph-drop hazard.
 pub fn register_device_font(window: &Rc<MinimalSoftwareWindow>) {
     window
         .renderer()
