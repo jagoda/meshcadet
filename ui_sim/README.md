@@ -144,28 +144,46 @@ binary(-ies) — see `site/README.md`'s `assets/` bullet for the site-side
 half of this contract.
 
 **Font provisioning is a silent regeneration hazard, distinct from markup
-drift.** None of these five rigs registers the real on-device
-`MeshCadetEmoji` bitmap font (`firmware/gen_emoji_font.c`'s output) — that
-pipeline is firmware-build-only, see `contact_list_promo.rs`'s module doc.
-Instead, `SLINT_EMBED_TEXTURES=1` (root `.cargo/config.toml`) bakes glyph
-bitmaps at **compile time**, from whatever the build host's `fontconfig`
-resolves "sans-serif" to. A host whose font stack is DejaVu-only (no
+drift — now closed by automated registration + a build-time lint, not human
+pre-flight review.** `SLINT_EMBED_TEXTURES=1` (root `.cargo/config.toml`)
+bakes glyph bitmaps at **compile time**, from whatever the build host's
+`fontconfig` resolves "sans-serif" to — NOT from the real on-device
+`MeshCadetEmoji` bitmap font. A host whose font stack is DejaVu-only (no
 emoji-covering fallback) doesn't render a visible tofu box for a Unicode
 emoji glyph these markups reference (📻, 😀, 📤, 🔒, …) — it renders
 **nothing**, a blank gap indistinguishable from a correct render on casual
 inspection. Confirmed 2026-08-23
 (`meshcadet-site-screenshot-refresh-20260822-174709190`): a container with
 only `fonts-dejavu-core` installed silently dropped splash's 📻 glyph and
-compose's 📤 Send-button glyph entirely from the regenerated PNGs. Fix:
-add `firmware/assets/NotoEmoji-Regular.ttf` — the SAME source font
-`gen_emoji_font.c` rasterizes the real on-device bitmap font from — to the
-build host's fontconfig search path, e.g. a `fonts.conf` `<dir>` entry
-pointing at a copy of that file, then **force a rebuild** (`cargo clean -p
-ui_sim`, or `touch` the affected `*_promo.rs` files) before re-running the
-binaries — `cargo run` alone reuses the last compiled artifact's baked
-glyphs and will NOT pick up a font-stack change on its own, since
-`SLINT_EMBED_TEXTURES`'s host-font resolution isn't a cargo rebuild
-trigger.
+compose's 📤 Send-button glyph entirely from the regenerated PNGs.
+
+Fix (2026-08-29): `build.rs::build_emoji_font` now runs the SAME
+`firmware/gen_emoji_font.c` generator against the SAME
+`firmware/assets/NotoEmoji-Regular.ttf` firmware's own build does, producing
+the IDENTICAL on-device `MeshCadetEmoji` bitmap font this crate's own
+`register_device_font` (`src/lib.rs`) registers on every promo/host-sim
+render rig — mirroring `firmware/src/ui/platform.rs::TDeckPlatform::
+install`'s "registered first, before any component init" ordering, so it
+structurally shadows whatever the `SLINT_EMBED_TEXTURES` compile-time bake
+did or didn't manage to embed, regardless of the build host's fontconfig.
+`build.rs::lint_font_provisioning` enforces this at BUILD time (`cargo
+build`/`run`/`test`, not just a pre-flight checklist step a human can skip):
+it fails the build with a named, actionable error if any of the five promo
+rigs, `lock_screen`, or `splash_lineart` stops calling
+`ui_sim::register_device_font` before showing its UI, or moves the call
+after `.show()`. See
+`flight-manuals/checklists/meshcadet-ui-sim-screenshot-font-provisioning.md`
+and
+`flight-manuals/library/compile-time-host-font-bake-diverges-from-device-font.md`
+for the full incident writeup and the checklist's residual (now much
+narrower) manual steps.
+
+Still required on the build machine (`build_emoji_font`'s own
+prerequisites, same as `firmware/build.rs`'s): `gcc`, `pkg-config`,
+`libfreetype6-dev`, and DejaVu Sans at
+`/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf` (`fonts-dejavu-core`) —
+already installed by CI's "Install native build prerequisites" step for
+every `ui_sim`/`firmware` job.
 
 ## Env requirements
 

@@ -15,19 +15,22 @@
 //! `LockScreen` wrapper is actually driven — see `lock_screen.rs`'s module
 //! doc.
 
-//! # Emoji glyphs are out of scope for this rig
+//! # Emoji glyphs are out of scope for this test, even though the rig now
+//! # registers the real device font
 //!
-//! This rig registers no custom bitmap font (unlike `firmware/`'s real
-//! `platform.rs`, or `ui_sim`'s own `emoji_blank_cell_probe.rs`/
-//! `emoji_color_probe.rs`, which hand-build a minimal one specifically to
-//! prove emoji rendering) — the host's default fontconfig sans-serif face
-//! renders plain ASCII correctly but not the "🔒"/"✉"/"⏳" emoji codepoints
-//! this screen also uses (those render blank here, harmlessly — emoji glyph
-//! coverage is proven separately by `xtask`'s glyph-coverage harness against
-//! the REAL font tables, not by rendering this host-native rig). Every
-//! assertion below therefore targets a `Rectangle` fill color (the reject
-//! dots, the badge pill) or a plain-ASCII `Text` color (`lockout_text`,
-//! "Try again in Ns") — never an emoji glyph's own pixels.
+//! `ui_sim::lock_screen::LockScreenFrame::new` now calls
+//! `ui_sim::register_device_font` (mechanized 2026-08-29 — see
+//! `flight-manuals/checklists/meshcadet-ui-sim-screenshot-font-provisioning.md`),
+//! registering the SAME real on-device `MeshCadetEmoji` bitmap font
+//! `firmware/src/ui/platform.rs::TDeckPlatform::install` does, so the
+//! "🔒"/"✉"/"⏳" emoji codepoints this screen uses now actually render here
+//! rather than silently blanking. This test still deliberately never
+//! asserts on an emoji glyph's own pixels, though: per-codepoint glyph
+//! coverage against the curated `gen_emoji_font.c` tables is proven
+//! separately by `xtask`'s glyph-coverage harness, not by rendering this
+//! rig. Every assertion below therefore targets a `Rectangle` fill color
+//! (the reject dots, the badge pill) or a plain-ASCII `Text` color
+//! (`lockout_text`, "Try again in Ns").
 
 use ui_sim::lock_screen::{
     rgb8, LockScreenFrame, DOT_ROW_HEIGHT, LOWER_PANEL_HEIGHT, TITLE_HEIGHT, WIDTH,

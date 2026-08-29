@@ -467,6 +467,7 @@ impl ContactListPromoFrame {
             start: Instant::now(),
         }))
         .expect("Slint platform already set in this process");
+        crate::register_device_font(&window);
 
         let ui = ContactListPromoUi::new().expect("ContactListPromoUi::new");
         ui.show().expect("ContactListPromoUi::show");

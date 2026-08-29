@@ -172,6 +172,7 @@ impl SplashLineartFrame {
             start: Instant::now(),
         }))
         .expect("Slint platform already set in this process");
+        crate::register_device_font(&window);
 
         let ui = SplashLineartUi::new().expect("SplashLineartUi::new");
         ui.show().expect("SplashLineartUi::show");

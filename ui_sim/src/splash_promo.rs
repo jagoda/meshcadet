@@ -178,6 +178,7 @@ impl SplashPromoFrame {
             start: Instant::now(),
         }))
         .expect("Slint platform already set in this process");
+        crate::register_device_font(&window);
 
         let ui = SplashPromoUi::new().expect("SplashPromoUi::new");
         ui.show().expect("SplashPromoUi::show");

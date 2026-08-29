@@ -27,10 +27,19 @@
 //! `src/lib.rs` unpacks each word into a `SharedPixelBuffer<Rgb8Pixel>` at
 //! runtime, exactly the shape the plan describes ("fed to Image::from_rgb8
 //! / SharedPixelBuffer at runtime").
+//!
+//! Also generates the REAL on-device `MeshCadetEmoji` bitmap font
+//! (`build_emoji_font()` below) and runs a static, build-time lint
+//! (`lint_font_provisioning()`) enforcing that every promo/host-sim
+//! screenshot render entrypoint registers it before rendering — see those
+//! functions' own doc comments and
+//! `flight-manuals/library/compile-time-host-font-bake-diverges-from-device-font.md`.
 
 use std::env;
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::SystemTime;
 
 const SIZE: usize = 24;
 
@@ -81,4 +90,223 @@ fn main() {
 
     std::fs::write(&out_rs, src).expect("write fallback_image.rs");
     println!("cargo:rerun-if-changed=build.rs");
+
+    build_emoji_font();
+    lint_font_provisioning();
+}
+
+/// True when `output` exists and is at least as new as every `input`.
+/// A missing output, or any input we cannot stat, forces regeneration
+/// (fail-safe: we would rather rebuild than serve a stale artifact).
+/// Copied verbatim from `firmware/build.rs`'s identical helper — see that
+/// file for the sibling `build_emoji_font()` this mirrors.
+fn is_up_to_date(output: &Path, inputs: &[&Path]) -> bool {
+    let out_mtime: SystemTime = match std::fs::metadata(output).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    for input in inputs {
+        match std::fs::metadata(input).and_then(|m| m.modified()) {
+            Ok(t) if t > out_mtime => return false,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+/// Generates `$OUT_DIR/emoji_font.rs` — the SAME on-device `MeshCadetEmoji`
+/// bitmap font `firmware/src/ui/platform.rs::TDeckPlatform::install`
+/// registers, produced by running the SAME `firmware/gen_emoji_font.c`
+/// generator against the SAME `firmware/assets/NotoEmoji-Regular.ttf`
+/// (relative-path single source of truth — not a fork/copy, matching every
+/// other `ui_sim` rig's `../firmware/...` import convention). `src/
+/// emoji_font.rs` `include!`s this output — see that file's module doc.
+///
+/// This is what lets `register_device_font` (`src/lib.rs`) register the
+/// REAL device font instead of relying solely on `SLINT_EMBED_TEXTURES`'s
+/// compile-time bake from whatever the build host's fontconfig resolves —
+/// see
+/// `flight-manuals/library/compile-time-host-font-bake-diverges-from-device-font.md`
+/// for why that bake alone is a silent-glyph-drop hazard.
+///
+/// # Prerequisites (build machine) — same as `firmware/build.rs`'s
+/// - `gcc` in PATH
+/// - `libfreetype6-dev` installed (provides freetype2 headers + pkg-config)
+/// - `pkg-config` in PATH
+/// - DejaVu Sans at `/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf`
+///   (package `fonts-dejavu-core` on Debian/Ubuntu)
+fn build_emoji_font() {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    // One level up from `ui_sim/` to the repo root, then into `firmware/` —
+    // same relative-path convention every `ui_sim` rig's `slint::slint!{}`
+    // imports already use for `theme.slint`/`motifs.slint`/assets.
+    let firmware_dir = manifest_dir.join("../firmware");
+
+    let c_src = firmware_dir.join("gen_emoji_font.c");
+    let gen_exe = out_dir.join("gen_emoji_font");
+    let out_rs = out_dir.join("emoji_font.rs");
+    let emoji_ttf = firmware_dir.join("assets/NotoEmoji-Regular.ttf");
+    let latin_ttf = PathBuf::from("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf");
+
+    println!("cargo:rerun-if-changed={}", c_src.display());
+    println!("cargo:rerun-if-changed={}", emoji_ttf.display());
+
+    // ── Incremental guard — identical shape to firmware/build.rs's ─────────
+    if is_up_to_date(&out_rs, &[&c_src, &emoji_ttf]) {
+        return;
+    }
+
+    let ft_cflags_out = Command::new("pkg-config")
+        .args(["--cflags", "freetype2"])
+        .output()
+        .expect("pkg-config failed — install libfreetype6-dev");
+    let ft_libs_out = Command::new("pkg-config")
+        .args(["--libs", "freetype2"])
+        .output()
+        .expect("pkg-config failed — install libfreetype6-dev");
+
+    let ft_cflags: Vec<String> = String::from_utf8(ft_cflags_out.stdout)
+        .unwrap()
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect();
+    let ft_libs: Vec<String> = String::from_utf8(ft_libs_out.stdout)
+        .unwrap()
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect();
+
+    // `-lm`: gen_emoji_font.c's emoji alpha-gamma correction calls `pow()` —
+    // link libm explicitly (same note as firmware/build.rs's identical step).
+    let gcc_status = Command::new("gcc")
+        .arg("-O2")
+        .args(&ft_cflags)
+        .arg(&c_src)
+        .args(&ft_libs)
+        .arg("-lm")
+        .arg("-o")
+        .arg(&gen_exe)
+        .status()
+        .expect("gcc not found — install build-essential");
+
+    assert!(
+        gcc_status.success(),
+        "Failed to compile gen_emoji_font.c (exit {:?})",
+        gcc_status.code()
+    );
+
+    let run_status = Command::new(&gen_exe)
+        .arg(&latin_ttf)
+        .arg(&emoji_ttf)
+        .arg(&out_rs)
+        .status()
+        .expect("Failed to spawn gen_emoji_font");
+
+    assert!(
+        run_status.success(),
+        "gen_emoji_font exited with error (exit {:?})",
+        run_status.code()
+    );
+}
+
+/// Static, build-time enforcement of the on-device font-registration
+/// invariant this crate's promo/host-sim screenshot rigs depend on —
+/// mechanizing
+/// `flight-manuals/checklists/meshcadet-ui-sim-screenshot-font-provisioning.md`'s
+/// step 1 (previously a human pre-flight review step only).
+///
+/// `SLINT_EMBED_TEXTURES=1` (root `.cargo/config.toml`) bakes glyph bitmaps
+/// at PROC-MACRO-EXPANSION time from whatever the build host's fontconfig
+/// resolves — NOT from the real on-device `MeshCadetEmoji` bitmap font. Any
+/// glyph the build host can't resolve is silently dropped: no build error,
+/// no runtime panic, just a blank gap in the rendered PNG (confirmed
+/// 2026-08-23,
+/// `meshcadet-site-screenshot-refresh-20260822-174709190`: splash's 📻,
+/// compose's 📤). `register_device_font` (`src/lib.rs`) closes that
+/// exposure by ALSO registering the identical on-device font at runtime,
+/// mirroring `firmware/src/ui/platform.rs::TDeckPlatform::install`'s
+/// ordering exactly (registered first, before any component init, so the
+/// renderer's first-registered-wins fallback resolves every text run
+/// against the real font regardless of what the compile-time bake managed
+/// to embed).
+///
+/// This function is what turns that into an automated, unbypassable build
+/// failure instead of a step a human can forget: it scans each of the
+/// checklist's own named entrypoint source files (five promo rigs — one
+/// module, `contact_list_promo.rs`, backs both the `contact_list_promo` and
+/// `groups_promo` binaries — plus `lock_screen.rs` and `splash_lineart.rs`)
+/// and fails `cargo build`/`run`/`test` if any of them stops calling
+/// `register_device_font` before showing its UI, or moves the call after
+/// `.show()` (Slint resolves fonts at component-init time, so a
+/// post-`.show()` registration would miss init-time text runs).
+///
+/// Deliberately an explicit, curated file list (matching the checklist's
+/// own named scope) rather than a generic AST scan of every `ui_sim`
+/// module: several other rigs (`emoji_blank_cell_probe`, `emoji_color_probe`,
+/// `motif_library`, …) intentionally register a narrower, hand-built probe
+/// font instead of the full device font, to isolate a single mechanism —
+/// see each of those modules' own doc comments. **Update this list — and
+/// the checklist — whenever a new promo/host-sim screenshot rig is added.**
+fn lint_font_provisioning() {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+
+    const ENTRYPOINTS: &[&str] = &[
+        "src/contact_list_promo.rs",
+        "src/message_view_promo.rs",
+        "src/compose_promo.rs",
+        "src/splash_promo.rs",
+        "src/lock_screen.rs",
+        "src/splash_lineart.rs",
+    ];
+
+    for rel in ENTRYPOINTS {
+        println!("cargo:rerun-if-changed={rel}");
+
+        let path = manifest_dir.join(rel);
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "font-provisioning lint: cannot read {}: {e}",
+                path.display()
+            )
+        });
+
+        let register_pos = src.find("register_device_font(");
+        let show_pos = src.find(".show().expect(");
+
+        match (register_pos, show_pos) {
+            (Some(r), Some(s)) if r < s => {
+                // OK: registered before the UI is shown.
+            }
+            (None, _) => panic!(
+                "font-provisioning lint: {rel} does not call \
+                 `register_device_font` before rendering — it silently relies \
+                 on the SLINT_EMBED_TEXTURES compile-time host-font bake \
+                 instead of the real on-device MeshCadetEmoji bitmap font, \
+                 which can drop glyphs the build host's fontconfig can't \
+                 resolve with no error (splash's 📻, compose's 📤, confirmed \
+                 2026-08-23). Add `crate::register_device_font(&window);` \
+                 right after `slint::platform::set_platform(...)` and before \
+                 `Ui::new()`, mirroring \
+                 firmware/src/ui/platform.rs::TDeckPlatform::install. See \
+                 flight-manuals/checklists/meshcadet-ui-sim-screenshot-font-provisioning.md."
+            ),
+            (Some(_), None) => panic!(
+                "font-provisioning lint: {rel} calls `register_device_font` \
+                 but this lint could not find the expected `.show().expect(` \
+                 render call to confirm registration happens before showing \
+                 the UI — update `lint_font_provisioning` in build.rs if this \
+                 rig's render-call shape changed."
+            ),
+            (Some(r), Some(s)) => panic!(
+                "font-provisioning lint: {rel} calls `register_device_font` \
+                 AFTER `.show()` (byte offset {r} vs {s}) — Slint resolves \
+                 fonts at component-init time, so registering the on-device \
+                 font after the UI is already shown misses text runs \
+                 resolved during init. Move the call to right after \
+                 `slint::platform::set_platform(...)`, before `Ui::new()`."
+            ),
+        }
+    }
 }
