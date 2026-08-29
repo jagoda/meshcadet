@@ -185,6 +185,39 @@ CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
+# ── Dynamic frequency scaling (DFS) — SoC power management ──────────────────────
+#
+# meshcadet-power-optimization Phase 7 (see docs/adr/0014-power-policy.md
+# §D8 for the full decision record). DFS ONLY —
+# light sleep is explicitly out of scope for this leg (ADR-0014's
+# light-sleep/RX-integrity contract is recorded but deliberately NOT
+# implemented here).
+#
+# CONFIG_PM_ENABLE=y is the master gate `esp_pm_configure`/`esp_pm_lock_*`
+# need (components/esp_pm/include/esp_pm.h) — without it every one of those
+# calls returns ESP_ERR_NOT_SUPPORTED. `firmware/src/pm.rs`'s
+# `configure_dynamic_frequency_scaling` calls `esp_pm_configure` once at
+# boot with `max_freq_mhz = 240` UNCHANGED (constraints P2/P4 depend on the
+# peak clock never moving) and a conservative `min_freq_mhz`; see that
+# module's doc for the exact value and why. CONFIG_PM_DFS_INIT_AUTO is left
+# at its Kconfig default `n` — the app configures DFS explicitly via
+# `esp_pm_configure` rather than the Kconfig auto-init path, which only sets
+# `min_freq_mhz` to the XTAL frequency and offers no lever for the
+# conservative-but-PLL-sourced value this leg deliberately picked instead.
+#
+# CONFIG_FREERTOS_USE_TICKLESS_IDLE is deliberately NOT enabled here (M2-gate
+# amendment #1 to Phase 7 — see docs/adr/0014-power-policy.md §D8):
+# `CONFIG_PM_ENABLE` does not `depend on` it (components/esp_pm/Kconfig — only
+# the LIGHT-SLEEP-specific sub-options PM_SLP_IRAM_OPT/PM_RTOS_IDLE_OPT/
+# PM_SLP_DISABLE_GPIO/PM_LIGHT_SLEEP_CALLBACKS do), and tickless idle exists
+# solely to extend the FreeRTOS tick period so the CPU can actually enter
+# automatic light sleep between ticks. This leg sets `light_sleep_enable =
+# false`, so there is no light sleep for tickless idle to enable — turning it
+# on would buy nothing and only add sdkconfig surface to this leg's
+# cross-compile risk (the one place this combination is genuinely validated;
+# see CONTRIBUTING.md's partition-budget note and this leg's PR).
+CONFIG_PM_ENABLE=y
+
 # ── Reproducible builds (release pipeline, docs/release-reproducibility.md) ─────
 #
 # CONFIG_APP_REPRODUCIBLE_BUILD=y (components/esp_app_format/Kconfig, esp-idf

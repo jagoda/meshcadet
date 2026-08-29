@@ -145,6 +145,10 @@ mod history_store;
 // threat model this store defends against).
 #[cfg(not(feature = "hil"))]
 mod inbound_replay_store;
+// Dynamic frequency scaling config + the `ESP_PM_APB_FREQ_MAX` lock wrapper
+// `radio.rs`/`gps.rs` bracket their APB-clock-sensitive critical sections
+// with (meshcadet-power-optimization Phase 7).
+mod pm;
 mod radio;
 // Room-server client session — the pure decode/ACK/dedup state machine lives
 // in `firmware_core::room_session` (re-exported); this file additionally
@@ -678,6 +682,14 @@ fn run() -> anyhow::Result<()> {
             );
         }
     }
+
+    // 1.6. Configure dynamic frequency scaling (meshcadet-power-optimization
+    // Phase 7) before any peripheral driver whose bus divisor assumes a
+    // fixed APB clock is initialised — see `pm.rs`'s module doc for the
+    // exact config and why the SPI2 (radio) and GPS UART drivers each
+    // additionally bracket their own critical sections with an
+    // `ESP_PM_APB_FREQ_MAX` lock rather than relying on init-order alone.
+    pm::configure_dynamic_frequency_scaling();
 
     let peripherals = Peripherals::take()?;
     let _sysloop = EspSystemEventLoop::take()?;
@@ -1499,6 +1511,10 @@ fn run() -> anyhow::Result<()> {
     #[cfg(feature = "diagnostics")]
     let probe = PinDriver::output(peripherals.pins.gpio39)?;
 
+    // `ESP_PM_APB_FREQ_MAX` lock the radio brackets every SPI2 transaction
+    // with (meshcadet-power-optimization Phase 7 — `pm.rs`'s module doc).
+    let radio_apb_lock = pm::ApbFreqMaxLock::create(b"radio_apb\0")?;
+
     let mut radio = Radio::init(
         spi_device,
         rst,
@@ -1506,6 +1522,7 @@ fn run() -> anyhow::Result<()> {
         dio1,
         #[cfg(feature = "diagnostics")]
         probe,
+        radio_apb_lock,
     )?;
     log::info!("radio initialised");
 
@@ -1542,7 +1559,11 @@ fn run() -> anyhow::Result<()> {
         &uart_config,
     )?;
     let now0 = uptime_ms();
-    let mut gps = GpsDriver::new(gps_uart, now0, nvs_partition.clone());
+    // `ESP_PM_APB_FREQ_MAX` lock the GPS driver holds across its whole
+    // ACTIVE window (meshcadet-power-optimization Phase 7 — `pm.rs`'s
+    // module doc; constraint P1, the UART baud divisor is APB-derived).
+    let gps_apb_lock = pm::ApbFreqMaxLock::create(b"gps_apb\0")?;
+    let mut gps = GpsDriver::new(gps_uart, now0, nvs_partition.clone(), gps_apb_lock);
     log::info!(
         "GPS UART1 initialised — GPIO43 TX / GPIO44 RX / baud auto-detected (cached in NVS; \
          see \"GPS: baud\" log lines above) (active window: {}s every {}s duty cycle)",
