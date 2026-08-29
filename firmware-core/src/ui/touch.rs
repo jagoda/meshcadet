@@ -25,11 +25,15 @@
 /// `touch_count == 0` with `self.last == None`, so the poll returns
 /// `Ok(None)` and the tap is lost outright, not merely delayed (M2-gate
 /// finding, `meshcadet-power-m2-gate-20260823-223120079`). This constant
-/// pins the shortest physical tap the asleep-tick poll period is required to
-/// still observe: any poll period no longer than this value guarantees at
-/// least one status read lands while the finger is still down (a tap of
-/// this duration cannot fit entirely inside a shorter gap), so the loss
-/// mode above is structurally impossible for taps at or above this floor.
+/// pins the shortest physical tap the asleep poll GAP — `ASLEEP_IDLE_TICK_MS`
+/// plus `ui_task`'s own `UiRuntime::step()` duration plus the GT911's own
+/// ~10ms internal refresh latency, not the `recv_timeout` PERIOD alone — is
+/// required to still observe. `ASLEEP_IDLE_TICK_MS`'s own host test can only
+/// compare the tick PERIOD (the dominant, host-observable term) against this
+/// floor, not the other two runtime terms, so a poll period no longer than
+/// this value does not mathematically PROVE at least one status read lands
+/// while the finger is still down — it ASSERTS a margin (currently ~50ms,
+/// 100ms floor − 50ms tick) against the unmeasured remainder of the gap.
 /// 100ms is a comfortably-representative human tap duration, not a
 /// worst-case guarantee — an unusually fast partial-tap ("tap-and-drag off"
 /// under 100ms) can still be missed, same as before this fix; the floor

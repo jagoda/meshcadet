@@ -132,15 +132,25 @@ pub fn wake_forces_full_repaint(was_asleep: bool) -> bool {
 /// but a SECOND, harder constraint bounds it from above and is now the
 /// binding one: `TouchDriver::poll_event`'s cadence contract
 /// (`firmware/src/ui/touch.rs`). The GT911 does not queue events — a tap
-/// whose entire press-then-release cycle completes inside one poll gap is
+/// whose entire press-then-release cycle completes inside one poll GAP is
 /// lost outright, not delayed (M2-gate finding,
 /// `meshcadet-power-m2-gate-20260823-223120079`; at the previous 120ms
-/// value this dropped ~17% of 100ms taps). This constant MUST NOT exceed
+/// value this dropped ~17% of 100ms taps).
+///
+/// The physical quantity the tap-loss mechanism bounds is that poll GAP —
+/// this constant (the `recv_timeout` PERIOD) plus `ui_task`'s own
+/// `UiRuntime::step()` duration plus the GT911's ~10ms internal refresh
+/// latency — not this constant alone; this constant is the dominant term,
+/// not the whole gap. `asleep_idle_tick_bounds_gt911_tap_loss` below can
+/// only compare this constant against
 /// [`crate::ui::touch::GT911_MIN_RELIABLE_TAP_MS`] — see that constant's
-/// doc for the tap-loss mechanism — and
-/// `asleep_idle_tick_bounds_gt911_tap_loss` below pins the two against each
-/// other so a future edit to either one that breaks the bound fails loudly
-/// instead of silently reintroducing wake-tap loss.
+/// doc for the tap-loss mechanism — the other two terms are runtime
+/// quantities no host test can observe, so the ~50ms headroom between them
+/// (100ms floor − 50ms tick) is ASSERTED margin for those terms, not a
+/// mathematically proven bound on the actual poll gap. The test still pins
+/// the two constants against each other, so a future edit to either one
+/// that erases even that asserted margin fails loudly instead of silently
+/// reintroducing wake-tap loss.
 ///
 /// The HONEST worst-case wake-to-first-paint number is dominated by a FIXED
 /// cost this same phase introduces, not by this constant:
@@ -229,8 +239,18 @@ mod tests {
         // clippy's `assertions_on_constants` correctly flags a runtime
         // `assert!` here as dead weight and points at the inline-const-block
         // form instead. Wrapping it in `const { .. }` keeps the invariant
-        // exactly as binding (a violation now fails the *build*, not just
-        // this test) while satisfying `-D warnings`.
+        // exactly as binding as a runtime assert would have been (a
+        // violation still fails loudly, not silently) while satisfying
+        // `-D warnings` — but this whole `mod tests` is `#[cfg(test)]`, so
+        // that failure is scoped to test compilation: a seeded violation
+        // (`ASLEEP_IDLE_TICK_MS` widened past `GT911_MIN_RELIABLE_TAP_MS`)
+        // leaves `cargo build -p firmware-core` exiting 0 — this module
+        // never compiles into that artifact — and only fails `cargo test`
+        // (or `cargo test --no-run`, which compiles but does not execute
+        // the suite) with E0080 at this `const` block. Confirmed directly:
+        // seeding `ASLEEP_IDLE_TICK_MS = 150` leaves `cargo build
+        // -p firmware-core` at exit 0 while `cargo test --no-run
+        // -p firmware-core` fails with exactly that E0080.
         const {
             assert!(
                 ASLEEP_IDLE_TICK_MS <= GT911_MIN_RELIABLE_TAP_MS,

@@ -121,6 +121,16 @@ impl ApbFreqMaxLock {
     /// failed to construct would be worse than a boot abort: every
     /// `acquire`/`release` call downstream would need to degrade to a
     /// no-op, exactly defeating the bracket this module exists to provide.
+    // Record note (`meshcadet-power-record-corrections`): `name`'s
+    // NUL-termination is enforced only by the `debug_assert!` below, which
+    // compiles out of release builds (`firmware/Cargo.toml`'s
+    // `[profile.release]` does not set `debug-assertions = true`) — a
+    // release build passing a non-NUL-terminated slice would hand ESP-IDF's
+    // C API an unterminated string with no host-observable failure. A
+    // `&'static CStr` parameter would make this structural (enforced by the
+    // type, not a debug-only runtime check) instead; not changed here since
+    // this mission is a record-accuracy pass with no behavioural code
+    // change, but recorded so the gap is not silently load-bearing.
     pub fn create(name: &'static [u8]) -> anyhow::Result<Self> {
         debug_assert!(
             name.last() == Some(&0),
