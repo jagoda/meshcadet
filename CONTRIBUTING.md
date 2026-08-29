@@ -141,6 +141,18 @@ manual verification checklist used before landing changes in these areas.
    run `gh pr create` — CI lints that separately (`lint-pr-title`), and on
    this squash-merge-only repo the PR title becomes the commit subject that
    lands on `main`.
+6. **Also required, before `git push` / `gh pr create`:** run
+   `scripts/check-vocabulary-leak.sh` from the repo root. This repo is
+   public; its docs and code comments have occasionally picked up
+   internal ops-automation vocabulary (role names, per-task tracking-file
+   jargon, etc.) that means nothing to an outside reader — see
+   `scripts/banned-vocabulary.sh` for the exact term list. That script
+   scans every tracked file's *content* — not just commit subjects — for
+   those terms, the same way `.github/workflows/ci.yml`'s "no internal-ops
+   vocabulary leaks in public docs" job checks tree-wide in CI (both invoke
+   this one script — see its own header), so a leak in a source comment or
+   a doc paragraph is caught locally instead of showing up as a red check
+   after the PR is already open.
 
 ## Reporting security issues
 

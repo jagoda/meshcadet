@@ -3,22 +3,28 @@
 # internal-ops-vocabulary banned-term pattern.
 #
 # Sourced (not executed) by:
-#   - .github/workflows/ci.yml's "no internal-ops vocabulary leaks in public
-#     docs" job, which greps the whole tree for these terms.
+#   - scripts/check-vocabulary-leak.sh, which greps all tracked file CONTENT
+#     tree-wide for these terms. Both ci.yml's "no internal-ops vocabulary
+#     leaks in public docs" job and the local pre-PR-publish step
+#     (CONTRIBUTING.md "Submitting changes") invoke that ONE script, so the
+#     scan's scope can't drift between "what fails CI" and "what fails
+#     locally before push" the way it did 2026-08-17/-08-24/-08-29 (three
+#     content leaks that landed in already-open PRs before check-commit-
+#     format.sh's commit-subject-only local check could catch them).
 #   - scripts/check-commit-format.sh, which rejects any commit *subject*
 #     containing one of these terms before it can reach `main` — closing the
-#     recurrence path the ci.yml job alone can't: that job only catches a
-#     leak once it's already landed in a generated file like CHANGELOG.md
-#     (sourced from commit subjects by release-please), by which point the
-#     offending commit is already merged and un-rewritable.
+#     recurrence path a content-only scan alone can't: a banned term in a
+#     commit subject lands in a generated file like CHANGELOG.md (sourced
+#     from commit subjects by release-please) the moment the commit merges,
+#     by which point it's already un-rewritable history.
 #
-# Both call sites `source` this file so the term list can never drift
-# between "what fails a merged PR's docs scan" and "what fails a commit
-# before it can merge" — see docs/adr/0004-release-architecture.md and
+# All call sites source this file so the term list can never drift between
+# "what fails a docs/content scan" and "what fails a commit before it can
+# merge" — see docs/adr/0004-release-architecture.md and
 # 0008-nondestructive-update-artifacts.md for the history of leaks this
 # guards against.
 #
 # This file necessarily spells out every banned term (to document what's
-# banned), so both call sites exclude it from their own scans the same way
-# they already exclude themselves.
+# banned), so every call site excludes it from its own scan the same way it
+# already excludes itself.
 BANNED_VOCAB_PATTERN='\b(dossier|commander|capcom|flight[- ]director|eecom|flight-manuals)\b'
