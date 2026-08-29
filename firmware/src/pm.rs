@@ -2,9 +2,8 @@
 //! ESP-IDF dynamic frequency scaling (DFS) — SoC-level power management.
 //!
 //! Phase 7 of the `meshcadet-power-optimization` campaign
-//! (`docs/adr/0014-power-policy.md`;
-//! `flight-manuals/plans/meshcadet-power-optimization.md` Phase 7). **DFS
-//! only** — light sleep is explicitly out of scope for this leg (see
+//! (see `docs/adr/0014-power-policy.md` §D8 for the full decision record).
+//! **DFS only** — light sleep is explicitly out of scope for this leg (see
 //! ADR-0014's light-sleep/RX-integrity contract, recorded there but NOT
 //! implemented by this campaign): [`configure_dynamic_frequency_scaling`]
 //! hard-sets `light_sleep_enable = false`, and `CONFIG_FREERTOS_USE_

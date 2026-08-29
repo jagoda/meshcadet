@@ -187,8 +187,8 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # ── Dynamic frequency scaling (DFS) — SoC power management ──────────────────────
 #
-# meshcadet-power-optimization Phase 7 (docs/adr/0014-power-policy.md;
-# flight-manuals/plans/meshcadet-power-optimization.md Phase 7). DFS ONLY —
+# meshcadet-power-optimization Phase 7 (see docs/adr/0014-power-policy.md
+# §D8 for the full decision record). DFS ONLY —
 # light sleep is explicitly out of scope for this leg (ADR-0014's
 # light-sleep/RX-integrity contract is recorded but deliberately NOT
 # implemented here).
@@ -206,7 +206,7 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # conservative-but-PLL-sourced value this leg deliberately picked instead.
 #
 # CONFIG_FREERTOS_USE_TICKLESS_IDLE is deliberately NOT enabled here (M2-gate
-# amendment #1 to Phase 7, flight-manuals/plans/meshcadet-power-optimization.md):
+# amendment #1 to Phase 7 — see docs/adr/0014-power-policy.md §D8):
 # `CONFIG_PM_ENABLE` does not `depend on` it (components/esp_pm/Kconfig — only
 # the LIGHT-SLEEP-specific sub-options PM_SLP_IRAM_OPT/PM_RTOS_IDLE_OPT/
 # PM_SLP_DISABLE_GPIO/PM_LIGHT_SLEEP_CALLBACKS do), and tickless idle exists
