@@ -97,6 +97,7 @@ use std::path::{Path, PathBuf};
 /// data rather than a hand-maintained count proxy.
 use protocol::emoji::EMOJI_TABLE;
 
+pub mod ci_filter_coverage;
 /// Provisioning-codec golden-vector generator — see `golden`'s module doc.
 pub mod golden;
 pub mod lock_gate;
