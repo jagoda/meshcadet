@@ -8,6 +8,87 @@ Versioning is managed by [release-please](https://github.com/googleapis/release-
 The entry below documents everything landed before release-please's first
 `chore(release): vX.Y.Z` PR.
 
+## [0.8.0](https://github.com/jagoda/meshcadet/compare/v0.7.0...v0.8.0) (2026-09-05)
+
+
+### Added
+
+* **firmware-core:** land the screen-lock core-state decisions ([1baae58](https://github.com/jagoda/meshcadet/commit/1baae580421e6bd77760674c12695a06e7f63557))
+* **firmware-core:** land the screen-lock core-state decisions ([346e28f](https://github.com/jagoda/meshcadet/commit/346e28f7459aed734aeb8b1cae154b286a87d911))
+* **firmware-core:** lock PIN comparison + admin-menu timeout formatter ([b54aa8d](https://github.com/jagoda/meshcadet/commit/b54aa8d3f203d8bbb820740fa7e05cc3152c3eaa))
+* **firmware:** land the screen-lock firmware transport ([db20d85](https://github.com/jagoda/meshcadet/commit/db20d85d80e6fc72965cc40751eccc625dba78af))
+* **firmware:** land the screen-lock firmware transport (NVS, admin frames, boot seed) ([56edde5](https://github.com/jagoda/meshcadet/commit/56edde5c63f8de2f75ac5cb2b8b6cc882cabb111))
+* **firmware:** land the screen-lock overlay, lock screen, and admin-menu controls ([a295699](https://github.com/jagoda/meshcadet/commit/a295699121c53ff8e21f1fec940392137f29a626))
+* **firmware:** land the screen-lock overlay, lock screen, and admin-menu controls ([37650f4](https://github.com/jagoda/meshcadet/commit/37650f424c27ac2557fddd8538daaf7605cad6c1))
+* **firmware:** register the lock screen's three new glyphs in gen_emoji_font.c ([13eebbf](https://github.com/jagoda/meshcadet/commit/13eebbf2d4d970f783aa49309c241d991aac53c3))
+* **host:** land the screen-lock host CLI surface ([f195702](https://github.com/jagoda/meshcadet/commit/f19570212bd4ec688cb82c6e55e1dd380463fe99))
+* **host:** land the screen-lock host CLI surface ([1144b14](https://github.com/jagoda/meshcadet/commit/1144b14f04f6397324af7789acd30cc69d13df5c))
+* **power:** backlight brightness control, admin-menu stepper ([7fe015a](https://github.com/jagoda/meshcadet/commit/7fe015ab7d0815d9500bf81ed8f2d7ebc40e7efa))
+* **power:** backlight brightness control, admin-menu stepper, provenance-guard hardening ([9cefba8](https://github.com/jagoda/meshcadet/commit/9cefba8b22df09345957d9d4c3a13fa1d75eb0a8))
+* **power:** ESP-IDF dynamic frequency scaling (DFS only) ([432e456](https://github.com/jagoda/meshcadet/commit/432e456d86b519327f110c9766f02237d426dae7))
+* **power:** ESP-IDF dynamic frequency scaling (DFS only) ([f433311](https://github.com/jagoda/meshcadet/commit/f43331141021fc0c86aa559adec12759458df213))
+* **power:** idle-screen — ST7789 sleep, render-skip, adaptive tick, dim-before-sleep ([d96b4ac](https://github.com/jagoda/meshcadet/commit/d96b4ac7c64370e17a3c444d8720317c76f04982))
+* **power:** idle-screen enabler — ST7789 sleep, render-skip, adaptive tick, dim-before-sleep ([0ce0f61](https://github.com/jagoda/meshcadet/commit/0ce0f61e4c73c8b045e88cdc49f52ad9e665382f))
+* **protocol:** land the screen-lock wire contract (Rust + JS) ([bf679df](https://github.com/jagoda/meshcadet/commit/bf679df89f47cef4676a04260e6e4565bb9c4628))
+* **protocol:** land the screen-lock wire contract (Rust + JS) ([9f0a2d2](https://github.com/jagoda/meshcadet/commit/9f0a2d2864299697daa301791f0ff49b48ab0374))
+* **provisioner:** land the screen-lock web-provisioner surface ([3873c33](https://github.com/jagoda/meshcadet/commit/3873c33aeaab84be890ec9044d9716a745d76db2))
+* **provisioner:** screen-lock web-provisioner surface ([141bc5a](https://github.com/jagoda/meshcadet/commit/141bc5a744eda715dba208d22fb4f239271cda10))
+* **ui_sim:** register the real on-device font on promo/host-sim rigs, lint enforces it ([93dced1](https://github.com/jagoda/meshcadet/commit/93dced115679b8a03c7baaa536f6654815e78e31))
+* **ui_sim:** register the real on-device font on promo/host-sim rigs, lint enforces it ([56a20e0](https://github.com/jagoda/meshcadet/commit/56a20e0f769cbead9e05d6788b3bb448e9881bf4))
+
+
+### Fixed
+
+* **battery:** rebuild display pipeline as a three-state voltage-domain bucket ([1f11774](https://github.com/jagoda/meshcadet/commit/1f11774a98bd116adde5493e8115b39f0e051e8f))
+* **battery:** rebuild display pipeline as a three-state voltage-domain bucket ([6ff89a7](https://github.com/jagoda/meshcadet/commit/6ff89a74ea5135fe0ca97dc3af9c95e042bfc895))
+* **ci:** make the paths-filter table total, not a list of known lanes ([9026390](https://github.com/jagoda/meshcadet/commit/9026390a4c1cea5bf995160d5f7430e3529f4978))
+* **ci:** make the paths-filter table total, not a list of known lanes ([7d43fa0](https://github.com/jagoda/meshcadet/commit/7d43fa07db79167124dc5566b01a97ed7e20cbaa))
+* **ci:** run xtask's static guard battery on firmware-only PRs ([c648d6f](https://github.com/jagoda/meshcadet/commit/c648d6f98a2f3bc47393536eda32e9acde49d3f7))
+* **ci:** run xtask's static guard battery on firmware-only PRs ([843af65](https://github.com/jagoda/meshcadet/commit/843af65d8fd923b2c1492857656982237236e32c))
+* **ci:** scrub internal doc-path leaks from ui_sim font-provisioning docs ([ceac521](https://github.com/jagoda/meshcadet/commit/ceac5215114234b9a36f3ff15aaa33537f92d4ee))
+* **ci:** widen local vocabulary guard from commit-subjects to tracked file content ([c30d00e](https://github.com/jagoda/meshcadet/commit/c30d00e53152b6bde2dc2b6f153cd5a3962fcb76))
+* **ci:** widen local vocabulary guard from commit-subjects to tracked file content ([6e4684b](https://github.com/jagoda/meshcadet/commit/6e4684b5541a4d87af5836cdb6988e065dc57cb9))
+* **docs:** ADR-0014 provenance tags — mechanize D2's estimate-labelling rule ([4f8c4d2](https://github.com/jagoda/meshcadet/commit/4f8c4d2b6f13853afdbd54030819e6fe219fb97d))
+* **docs:** correct Phase 7 record-accuracy gaps (deep-review pass 1) ([df89f6d](https://github.com/jagoda/meshcadet/commit/df89f6d444297a2aa019f38d720b67d3a348e2ef))
+* **docs:** correct Phase 7 record-accuracy gaps left open by deep-review pass 1 ([fb86c76](https://github.com/jagoda/meshcadet/commit/fb86c765883e61ad9142c70a4af57819cd55e343))
+* **docs:** re-pin ADR-0014's gps.rs line citation after the record-corrections shift ([98cdde4](https://github.com/jagoda/meshcadet/commit/98cdde4a9ef35943dcc370e53f39dfcb569db407))
+* **docs:** rewrite internal-ops path leaks to public ADR citations ([f698bab](https://github.com/jagoda/meshcadet/commit/f698bab3b431e526963479419d11f62bf4b84628))
+* **docs:** rewrite internal-ops vocabulary leaks in lock docs ([b1fa575](https://github.com/jagoda/meshcadet/commit/b1fa575011afc96ff0ca9290c8aaa1aaab72c152))
+* **docs:** tag ADR-0014 D5's bare power figures, give row 9/D4 inline arithmetic, mechanize D2 ([3aaf95c](https://github.com/jagoda/meshcadet/commit/3aaf95c016963e97b9642a090596da2f28a794e4))
+* **docs:** update README's stale 'no CI yet' claim ([c59d620](https://github.com/jagoda/meshcadet/commit/c59d620bed5b3ce75c92bac11ac0ba5f71dc0ef7))
+* **docs:** update README's stale 'no CI yet' claim to match ci.yml ([30c793c](https://github.com/jagoda/meshcadet/commit/30c793c0af80b6ecc89c2289b11ed7bb3ffbd354))
+* **firmware:** dedup the lock backoff countdown's per-tick Slint push ([240729a](https://github.com/jagoda/meshcadet/commit/240729adc8c8fed8f9642fa443bf7d63110d5a55))
+* **firmware:** keep the lock screen's D5 badge live while locked ([8d0f55f](https://github.com/jagoda/meshcadet/commit/8d0f55f820dfcebbd5477b13e106275eb5e8df27))
+* **firmware:** rephrase admin_server comment to avoid banned internal-ops term ([1f160f9](https://github.com/jagoda/meshcadet/commit/1f160f921e5ad3b8211c847971150ed23e122fa3))
+* **firmware:** screen-lock integrity fixes from deep-review pass 1 ([9d4a376](https://github.com/jagoda/meshcadet/commit/9d4a376dd47c50765bcf26246994f534507b0533))
+* **firmware:** screen-lock integrity fixes from deep-review pass 1 ([77401e5](https://github.com/jagoda/meshcadet/commit/77401e5c7211fd08dcb1e6b04afc4524ab797bf1))
+* **power:** bound ASLEEP_IDLE_TICK_MS by GT911 tap-loss, not just wake-latency ([901dfcd](https://github.com/jagoda/meshcadet/commit/901dfcde65d5877313efa7b05471cb509be08bb0))
+* **power:** bound ASLEEP_IDLE_TICK_MS by GT911 tap-loss, not just wake-latency ([e7f9c9a](https://github.com/jagoda/meshcadet/commit/e7f9c9a45f29794af70c56e58eff60593b523a51))
+* **power:** const-block the GT911 tap-loss bound assertion for clippy ([dbfff83](https://github.com/jagoda/meshcadet/commit/dbfff83e2d5b151797a84bc34f50fdb3b9eadb16))
+* **power:** guard power_provenance's new bidirectional window against UTF-8 mid-char slicing ([5284722](https://github.com/jagoda/meshcadet/commit/528472245393f2c45184a6df4b728065bfa6cfb1))
+* **protocol:** dedup a transport-coded frame's payload correctly ([924c471](https://github.com/jagoda/meshcadet/commit/924c4715cc7410ff0e973e18e0126bf3ebaee452))
+* **protocol:** reject malformed inner PATH-return path_len instead of panicking ([5863e02](https://github.com/jagoda/meshcadet/commit/5863e026935aa3c91213830231b65758f94d9d5e))
+* transport-coded dedup mis-slicing and inner PATH-return path_len panic ([54dfdf0](https://github.com/jagoda/meshcadet/commit/54dfdf0cbae95e784465ff591e1ccd65293bc810))
+* **ui_sim:** derive splash promo version from workspace, regenerate PNG ([2a63a5e](https://github.com/jagoda/meshcadet/commit/2a63a5ebabd485ec4040a69d9c6008aaf0fe9b20))
+* **ui_sim:** derive splash promo version from workspace, regenerate PNG ([f3d779f](https://github.com/jagoda/meshcadet/commit/f3d779ff848b09d45d39e62f22b551564f551726))
+* **ui_sim:** reconcile promo-screenshot rig drift, regenerate PNGs ([8e892b9](https://github.com/jagoda/meshcadet/commit/8e892b97c2c91c4b69a0d1a82a85f7cb048665c7))
+* **ui_sim:** reconcile promo-screenshot rig drift, regenerate PNGs ([561cb40](https://github.com/jagoda/meshcadet/commit/561cb403d84f769291a4b74e03378bdec9d6cf62))
+* v1.17 currency bump, group-sender-name disclosure, transport-code RX fix ([465036d](https://github.com/jagoda/meshcadet/commit/465036df5165da1c717e3c425b492d5a7726133a))
+* v1.17 currency bump, group-sender-name disclosure, transport-code RX fix ([420f084](https://github.com/jagoda/meshcadet/commit/420f084c20b6d5e3e5ee7bf5bbe235020eb23a5d))
+* **xtask:** wire slint_thread_affinity into default guard battery ([84c174e](https://github.com/jagoda/meshcadet/commit/84c174e46ab2b45345cbec4d17c440c3e0aea6b6))
+
+
+### Documentation
+
+* **adr:** strip internal-ops path reference from ADR-0014 ([55c7528](https://github.com/jagoda/meshcadet/commit/55c7528d28668b21018b8d1f6335afc4a0879934))
+* **firmware:** correct the RESPONSE-arm's stale justification comment ([b85fd82](https://github.com/jagoda/meshcadet/commit/b85fd82313ad979d7502be5a07e19154596a6b06))
+* **lock:** screen-lock README section, ADR-0013, and bench procedure ([ce31718](https://github.com/jagoda/meshcadet/commit/ce3171840c08ed3dc63c9e9a077bd118c99fa304))
+* **lock:** screen-lock README, ADR-0013, and bench procedure ([d117b73](https://github.com/jagoda/meshcadet/commit/d117b73ab63cfa56130d72a2fbf351bf41596675))
+* **power:** ADR-0014 power policy — invariants, estimate labelling, light-sleep contract ([f165d99](https://github.com/jagoda/meshcadet/commit/f165d993f02820461f6dce6f1d2cb95743e723a5))
+* **power:** ADR-0014 power policy — invariants, estimate labelling, light-sleep contract ([2c0957e](https://github.com/jagoda/meshcadet/commit/2c0957e8382328ada4d03866daec9e2c98c5ce9b))
+* **power:** document GPS standby's negative result — no ASCII/checksum lever exists for either GNSS variant ([e22e95c](https://github.com/jagoda/meshcadet/commit/e22e95c3e39ad1c0faa651a84db986cff659563c))
+* **power:** GPS standby — documented negative result, both GNSS variants ([ea5b729](https://github.com/jagoda/meshcadet/commit/ea5b72970b4c5b064d1b34b9b429beb0b181fabe))
+
 ## [0.7.0](https://github.com/jagoda/meshcadet/compare/v0.6.0...v0.7.0) (2026-08-22)
 
 
