@@ -188,8 +188,19 @@ DM / ACK / channel-message / pull-telemetry paths. Before relying on it:
   [`SECURITY.md`](SECURITY.md) for the full threat model.
 - **Single-device project.** MeshCadet has been built and tested one T-Deck
   Plus at a time; multi-device fleets are not a tested configuration.
-- **No CI yet.** Tests are run locally; there is no automated build/test
-  pipeline in this repository yet.
+- **CI covers the host-native workspace, fmt/clippy, and a firmware build
+  gate — hardware testing stays local.** `.github/workflows/ci.yml` runs
+  `cargo test --workspace`, `cargo fmt --all -- --check`, and
+  `cargo clippy --workspace --all-targets -- -D warnings` against the
+  host-native crates, plus a dedicated job that cross-compiles `firmware/`
+  for the `esp` toolchain and runs its `check-all-features.sh` build gate —
+  all on every pull request and push to `main`. What CI does **not** cover:
+  `firmware/` has no CI-enforced fmt/clippy pass yet, firmware's own
+  `#[cfg(test)]` blocks compile but can only execute on real hardware, and
+  there is no hardware-in-the-loop CI — functional/interop testing against a
+  physical T-Deck Plus is done locally. See
+  [`CONTRIBUTING.md`](CONTRIBUTING.md#continuous-integration) for the full
+  breakdown and known gaps.
 
 ## Hardware prerequisites
 
