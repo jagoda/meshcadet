@@ -52,10 +52,41 @@ whether the defect has a device-only component that needs a fresh diagnosis.
   step 3 is where that would show up as a contradiction of the fixed code's
   own test suite — worth flagging loudly if it happens.
 
-None of the above rules out a device-only cause (real USB/DTR reset
-behavior, a firmware code path this static read missed, a timing
-interaction only visible on real hardware). That is exactly what this kit is
-for.
+A bisect window supplied after the initial diagnosis pass named the
+unreleased `v0.7.0..main` DFS/power and on-air-protocol commits as
+candidates alongside screen-lock. Each was evaluated, not just noted:
+
+- **Refuted, directly:** dynamic frequency scaling
+  (`feat(power): ESP-IDF dynamic frequency scaling`) as a UART/USB-timing
+  cause. The commit's own record (`docs/adr/0014-power-policy.md` D8) states
+  a HARD-ABORT-style verification that this board's real APB peripheral
+  clock is pinned at a fixed 80 MHz in *every* reachable power-management
+  mode with the shipped `min_freq_mhz = 80` config — it never itself
+  changes at runtime, regardless of which CPU frequency is active. A UART
+  baud-divisor-glitch mechanism requires the clock it derives from to
+  actually move; this one provably doesn't. Independently: provisioning
+  runs over the ESP32-S3's native USB-Serial-JTAG peripheral, not a
+  classic APB-clocked UART with a baud-rate divisor at all.
+- **Refuted, by thread/peripheral separation:** the idle-screen sleep/wake
+  feature (`feat(power): idle-screen enabler`) runs entirely on the UI
+  thread against the ST7789 display over SPI2, on its own render-tick
+  cadence — a wholly different thread and peripheral from
+  `provisioning_server`'s/`admin_server`'s USB-Serial-JTAG read loop. It has
+  no code path that touches USB-serial I/O or the provisioning frame
+  parser.
+- **Refuted, by layer:** `fix(protocol): dedup a transport-coded frame's
+  payload correctly` and the `v1.17 currency bump / transport-code RX fix`
+  commit both touch `protocol::frame`/`DuplicateFilter` — the on-air
+  MeshCore mesh **radio** packet layer (`ROUTE_TYPE_TRANSPORT_FLOOD`
+  dedup). Neither touches `protocol::provisioning` (the USB-serial wire
+  format this kit is about) at all, and the radio is never initialized
+  during unprovisioned first-boot provisioning in the first place (ADR-0002
+  §6).
+
+None of the above rules out a device-only cause this source-only pass
+cannot see (real USB/DTR reset behavior on `port.open()`, a firmware code
+path missed by this read, a timing interaction only visible on real
+hardware). That is exactly what this kit is for.
 
 ## 0. Setup
 
