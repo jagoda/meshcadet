@@ -372,7 +372,7 @@ fn process_frame(
             log::info!("prov_server: QUERY_CHANNELS — {} channel(s)", cnt);
             for i in 0..cnt {
                 let ch = &staging.channels[i];
-                let hash = channel_hash_var(&ch.secret[..ch.key_len as usize]);
+                let hash = channel_hash_var(&ch.secret[..ch.key_len_resolved()]);
                 let name = &ch.name[..ch.name_len as usize];
                 let mut pbuf = [0u8; 80];
                 let plen = encode_rsp_channel(i as u8, hash, ch.key_len, ch.primary, name, &mut pbuf);
@@ -455,6 +455,10 @@ fn process_frame(
                                     ChannelUpsert::Updated => "updated",
                                     ChannelUpsert::Added => "added",
                                 },
+                                // Safe unresolved: decode_add_channel already
+                                // rejected any key_len outside {16, 32} above,
+                                // so `ch` (an AddChannelPayload, not a stored
+                                // Channel) can't carry a bad value here.
                                 channel_hash_var(&ch.secret[..ch.key_len as usize]),
                                 ch.key_len, ch.primary, ch.name_len
                             );
@@ -480,7 +484,8 @@ fn process_frame(
                     match staging.channels[..cnt].iter().position(|ch| ch.secret == d.secret) {
                         Some(idx) => {
                             let hash = channel_hash_var(
-                                &staging.channels[idx].secret[..staging.channels[idx].key_len as usize],
+                                &staging.channels[idx].secret
+                                    [..staging.channels[idx].key_len_resolved()],
                             );
                             for j in idx..cnt - 1 {
                                 staging.channels[j] = staging.channels[j + 1];

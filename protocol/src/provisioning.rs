@@ -298,6 +298,14 @@ pub enum ProvError {
     /// A `SET_LOCK_PIN` payload is not exactly `LOCK_PIN_LEN` bytes, or
     /// contains a byte that is not an ASCII digit (`b'0'..=b'9'`).
     LockPinInvalid,
+    /// An `ADD_CHANNEL` payload's `key_len` byte is neither 16 nor 32 — the
+    /// only two channel-secret widths this protocol supports. Rejected at
+    /// decode rather than trusted downstream: every consumer indexes the
+    /// 32-byte `secret` array with `key_len` (`channel_hash_var(&secret[..
+    /// key_len])`), so an unvalidated out-of-range value is a slice-bounds
+    /// panic waiting to happen the first time the channel is hashed or
+    /// logged.
+    KeyLenInvalid,
 }
 
 // ── Payload structs ───────────────────────────────────────────────────────────
@@ -976,6 +984,9 @@ pub fn decode_add_channel(payload: &[u8]) -> Result<AddChannelPayload, ProvError
     let mut secret = [0u8; 32];
     secret.copy_from_slice(&payload[0..32]);
     let key_len = payload[32];
+    if key_len != 16 && key_len != 32 {
+        return Err(ProvError::KeyLenInvalid);
+    }
     let primary = payload[33] != 0;
     let name_len = payload[34] as usize;
     if name_len > MAX_NAME_LEN {
@@ -2079,8 +2090,50 @@ mod tests {
     #[test]
     fn decode_add_channel_name_too_long() {
         let mut payload = [0u8; 70];
+        payload[32] = 32; // key_len must be valid (16 or 32) to isolate the name_len check
         payload[34] = (MAX_NAME_LEN + 1) as u8; // name_len > MAX_NAME_LEN (now at byte 34)
         assert_eq!(decode_add_channel(&payload), Err(ProvError::NameTooLong));
+    }
+
+    /// DEFECT GUARD:
+    /// `key_len` is an attacker/corruption-controlled byte with no on-wire
+    /// constraint before this fix — every consumer (`channel_hash_var(&ch.
+    /// secret[..ch.key_len as usize])` in `provisioning_server.rs` and
+    /// `admin_server.rs`) trusted it as an index into a 32-byte `secret`
+    /// array. A malformed `ADD_CHANNEL` frame with `key_len` in `33..=255`
+    /// decoded successfully and would panic (index out of bounds) the first
+    /// time the firmware tried to hash or log the channel — an
+    /// out-of-bounds-slice panic on the firmware's own thread aborts that
+    /// task, which on this target means a device reset: the "device
+    /// reboots" crash signature the parser's error path is specifically
+    /// supposed to prevent (ADR-0002 §6's own unprovisioned-gate contract).
+    /// `decode_add_channel` must reject this at the wire boundary — the one
+    /// place ALL of ADD_CHANNEL's several downstream consumers can be
+    /// protected by a single check — rather than trusting every call site to
+    /// clamp it individually (see `Channel::key_len_resolved` in
+    /// `firmware-core::config_store` for the belt-and-suspenders defense
+    /// against a legacy/corrupted NVS blob bypassing this decode path
+    /// entirely).
+    #[test]
+    fn decode_add_channel_rejects_invalid_key_len() {
+        let secret = [0x11u8; 32];
+        let name = b"x";
+        for &bad_key_len in &[0u8, 1, 15, 17, 31, 33, 200, 255] {
+            let mut payload_buf = [0u8; 70];
+            let plen = encode_add_channel(&secret, bad_key_len, false, name, &mut payload_buf);
+            assert_eq!(
+                decode_add_channel(&payload_buf[..plen]),
+                Err(ProvError::KeyLenInvalid),
+                "key_len={} must be rejected, not silently accepted",
+                bad_key_len
+            );
+        }
+        // The two legitimate values must still decode fine.
+        for &good_key_len in &[16u8, 32] {
+            let mut payload_buf = [0u8; 70];
+            let plen = encode_add_channel(&secret, good_key_len, false, name, &mut payload_buf);
+            assert!(decode_add_channel(&payload_buf[..plen]).is_ok());
+        }
     }
 
     #[test]
