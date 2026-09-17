@@ -147,6 +147,17 @@ pub struct BatteryDriver<'d> {
     /// [`PeakWindowSampler`] and `firmware_core::battery`'s "(B)" doc
     /// section.
     peak_sampler: PeakWindowSampler,
+    /// Whether THIS boot's first peak-hold window has closed yet — gates the
+    /// *displayed* `level` in [`BatteryDriver::status`] via
+    /// [`displayed_battery_level`]; see `firmware_core::battery`'s
+    /// "Boot-settled display gate" doc section
+    /// (`meshcadet-battery-unknown-until-window-settles`). `false` at
+    /// construction; latched `true`, forever, the first time [`Self::poll`]
+    /// sees [`PeakWindowSampler::sample`] return `Some`. Deliberately
+    /// separate from `confirmed` above — `confirmed` can already be `true`
+    /// at construction on a device with NVS history, which would defeat
+    /// this gate immediately if reused (see that doc section's "trap").
+    boot_settled: bool,
     /// Last live (post-divider, averaged) ADC millivolt reading — diagnostic
     /// only, updated unconditionally on every poll, never frozen by the
     /// charging latch and never filtered by the peak-window sampler above.
@@ -244,6 +255,9 @@ impl<'d> BatteryDriver<'d> {
             confirmed,
             level,
             peak_sampler: PeakWindowSampler::new(now_ms, initial_mv),
+            // Unconditionally `false` at every boot — see this field's own
+            // doc. Never derived from `confirmed`/`persisted_mv` above.
+            boot_settled: false,
             live_mv: initial_mv,
             // Provisional boot seed — see `BatteryStatus::boot_mv`'s doc.
             // The first closed peak window below unconditionally overwrites
@@ -302,6 +316,27 @@ impl<'d> BatteryDriver<'d> {
                 self.cached_charging = charging;
                 self.confirmed = confirmed;
                 self.level = level;
+                // This boot's first peak window has now closed, genuinely —
+                // latch the display gate open. Idempotent to set on every
+                // later window close too; see this field's own doc. Log only
+                // the FIRST transition (once per boot) — a field signal for
+                // how long the boot showed Unknown, without spamming every
+                // later window close the way the charging-transition log
+                // below already avoids.
+                if !self.boot_settled {
+                    log::info!(
+                        "battery: first peak window closed this boot — displayed level now live \
+                         ({}, {} mV / {}%), no longer Unknown",
+                        if level == BatteryLevel::Charging {
+                            "charging"
+                        } else {
+                            "not charging"
+                        },
+                        settled_mv,
+                        percent_from_millivolts(settled_mv),
+                    );
+                }
+                self.boot_settled = true;
 
                 // Log the transition (not every window) — the one field
                 // signal that lets a HIL run be diagnosed after the fact
@@ -354,7 +389,11 @@ impl<'d> BatteryDriver<'d> {
     /// basis in millivolts — the SAME basis `percent`/`level` derive from.
     /// `boot_mv` is this boot's raw seed sample, fixed for the boot's
     /// lifetime. `confirmed` is the trust latch. `level` is the coarse
-    /// voltage-domain bucket.
+    /// voltage-domain bucket, gated to [`BatteryLevel::Unknown`] until this
+    /// boot's first peak-hold window has closed (see [`displayed_battery_level`]
+    /// and `firmware_core::battery`'s "Boot-settled display gate" doc
+    /// section) — every other field is reported live and unfiltered by that
+    /// gate, exactly as before.
     pub fn status(&self) -> BatteryStatus {
         BatteryStatus {
             percent: percent_from_millivolts(self.settled_mv),
@@ -363,7 +402,7 @@ impl<'d> BatteryDriver<'d> {
             held_raw_mv: self.settled_mv,
             boot_mv: self.boot_mv,
             confirmed: self.confirmed,
-            level: self.level,
+            level: displayed_battery_level(self.level, self.boot_settled),
         }
     }
 }
