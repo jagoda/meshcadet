@@ -505,15 +505,41 @@ export function decodeRspError(payload) {
 }
 
 /**
+ * Approximate percent-domain analog of firmware-core's `battery_level_bucket`
+ * (millivolt-domain), used ONLY by `decodeRspStatus`'s legacy-payload default
+ * for `battery_level` — mirrors Rust's `legacy_percent_to_battery_level`
+ * (`protocol::provisioning`) breakpoint-for-breakpoint. Returns the
+ * `level_to_indicator_level` shape directly (`Charging=1`, `Low=2`,
+ * `Partial=3`, `Full=4`).
+ */
+function legacyPercentToBatteryLevel(batteryPercent, batteryCharging) {
+  if (batteryCharging) return 1; // Charging
+  if (batteryPercent < 20) return 2; // Low
+  if (batteryPercent < 85) return 3; // Partial
+  return 4; // Full
+}
+
+/**
  * Decode an `RspStatus` payload.
  *
- * Accepts a legacy 55-byte payload (pre-`battery_raw_mv`) and a 57-byte
- * payload (pre-`battery_held_raw_mv`): each trailing field defaults to `0`
- * when absent, mirroring `decode_rsp_status`'s staged-rollout compatibility.
+ * Accepts a legacy 55-byte payload (pre-`battery_raw_mv`), a 57-byte payload
+ * (pre-`battery_held_raw_mv`), and a 59-byte payload
+ * (pre-`battery_level`/`battery_confirmed`): `battery_raw_mv` /
+ * `battery_held_raw_mv` each default to `0` when absent; `battery_level`
+ * defaults to `legacyPercentToBatteryLevel`'s derivation from
+ * `battery_percent`/`battery_charging` and `battery_confirmed` defaults to
+ * `true` (a legacy firmware predates the settling gate entirely, so its one
+ * reading is the only one there is) — mirroring `decode_rsp_status`'s
+ * staged-rollout compatibility.
  */
 export function decodeRspStatus(payload) {
   requireLen(payload, 55);
   const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+  const batteryPercent = payload[53];
+  const batteryCharging = payload[54] !== 0;
+  const batteryLevel =
+    payload.length >= 61 ? payload[59] : legacyPercentToBatteryLevel(batteryPercent, batteryCharging);
+  const batteryConfirmed = payload.length >= 61 ? payload[60] !== 0 : true;
   return {
     provisioned: payload[0] !== 0,
     pubkey: payload.slice(1, 33),
@@ -525,10 +551,12 @@ export function decodeRspStatus(payload) {
     gps_fix_age_secs: view.getUint32(44, true),
     gps_clock_synced: payload[48] !== 0,
     gps_clock_sync_age_secs: view.getUint32(49, true),
-    battery_percent: payload[53],
-    battery_charging: payload[54] !== 0,
+    battery_percent: batteryPercent,
+    battery_charging: batteryCharging,
     battery_raw_mv: payload.length >= 57 ? view.getUint16(55, true) : 0,
     battery_held_raw_mv: payload.length >= 59 ? view.getUint16(57, true) : 0,
+    battery_level: batteryLevel,
+    battery_confirmed: batteryConfirmed,
   };
 }
 

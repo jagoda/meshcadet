@@ -820,6 +820,30 @@ pub fn displayed_battery_level(level: BatteryLevel, window_settled: bool) -> Bat
     }
 }
 
+/// Map a [`BatteryStatus::level`] (i.e. already run through
+/// [`displayed_battery_level`]) to the `battery_level`/`battery_confirmed`
+/// pair `protocol::provisioning::RspStatusPayload` sends over the wire —
+/// see that struct's own field docs
+/// (`meshcadet-battery-wire-level-confirmed-status-gap`).
+///
+/// **Deliberately does NOT take [`BatteryStatus::confirmed`] as an input.**
+/// That flag is the NVS-persistence trust latch, already `true` at
+/// construction on any device with flash history (see this module's
+/// "Boot-settled display gate" section) — reusing it here would silently
+/// defeat the very settling-vs-low distinction this wire pair exists to
+/// make. `battery_level_bucket` never itself produces
+/// [`BatteryLevel::Unknown`] (only [`displayed_battery_level`]'s
+/// boot-settled gate can — see that function's doc), so
+/// `level == BatteryLevel::Unknown` is a reliable proxy for "this boot's
+/// first peak-hold window has not yet closed" without needing the
+/// `window_settled` bit threaded all the way out here.
+pub fn battery_level_to_wire(level: BatteryLevel) -> (u8, bool) {
+    (
+        crate::ui::battery_indicator::level_to_indicator_level(level) as u8,
+        level != BatteryLevel::Unknown,
+    )
+}
+
 // ── Pure helpers (host-testable, no ADC dependency) ──────────────────────────
 
 /// Clamp a `raw_mv` reading to the `battery_raw_mv: u16` wire field
@@ -2001,5 +2025,32 @@ mod tests {
             displayed_battery_level(BatteryLevel::Charging, true),
             BatteryLevel::Charging
         );
+    }
+
+    // ── battery_level_to_wire ────────────────────────────────────────────────
+
+    #[test]
+    fn battery_level_to_wire_unknown_is_unconfirmed() {
+        assert_eq!(battery_level_to_wire(BatteryLevel::Unknown), (0, false));
+    }
+
+    #[test]
+    fn battery_level_to_wire_every_other_bucket_is_confirmed() {
+        assert_eq!(battery_level_to_wire(BatteryLevel::Charging), (1, true));
+        assert_eq!(battery_level_to_wire(BatteryLevel::Low), (2, true));
+        assert_eq!(battery_level_to_wire(BatteryLevel::Partial), (3, true));
+        assert_eq!(battery_level_to_wire(BatteryLevel::Full), (4, true));
+    }
+
+    #[test]
+    fn battery_level_to_wire_composes_with_the_boot_settled_gate() {
+        // The exact composition `BatteryDriver::status()` performs: a real
+        // Low bucket computed but not yet displayed (window unsettled) must
+        // still wire as Unknown/unconfirmed, never as a trusted Low.
+        let gated = displayed_battery_level(BatteryLevel::Low, false);
+        assert_eq!(battery_level_to_wire(gated), (0, false));
+
+        let settled = displayed_battery_level(BatteryLevel::Low, true);
+        assert_eq!(battery_level_to_wire(settled), (2, true));
     }
 }

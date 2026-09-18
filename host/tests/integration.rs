@@ -175,6 +175,8 @@ impl MockDevice {
                     battery_charging: false,
                     battery_raw_mv: 0,
                     battery_held_raw_mv: 0,
+                    battery_level: 0,
+                    battery_confirmed: false,
                 };
                 let mut pbuf = [0u8; 64];
                 let plen = encode_rsp_status(&status, &mut pbuf);
@@ -1788,6 +1790,8 @@ fn test_export_history_tolerates_stray_leading_status_and_identity_frames() {
         battery_charging: false,
         battery_raw_mv: 0,
         battery_held_raw_mv: 0,
+        battery_level: 0,
+        battery_confirmed: false,
     };
     let mut stray: Vec<u8> = Vec::new();
     let mut sbuf = [0u8; 64];

@@ -234,6 +234,8 @@ fn rsp_status_expect_json(d: &RspStatusPayload) -> Json {
         ("battery_charging", b(d.battery_charging)),
         ("battery_raw_mv", n(d.battery_raw_mv as i64)),
         ("battery_held_raw_mv", n(d.battery_held_raw_mv as i64)),
+        ("battery_level", n(d.battery_level as i64)),
+        ("battery_confirmed", b(d.battery_confirmed)),
     ])
 }
 
@@ -837,6 +839,8 @@ fn build_vectors() -> Vec<Vector> {
             battery_charging: false,
             battery_raw_mv: 0,
             battery_held_raw_mv: 0,
+            battery_level: 0,
+            battery_confirmed: false,
         },
     ));
     v.push(rsp_status_vector(
@@ -856,6 +860,8 @@ fn build_vectors() -> Vec<Vector> {
             battery_charging: true,
             battery_raw_mv: 4142,
             battery_held_raw_mv: 3775,
+            battery_level: 1,
+            battery_confirmed: true,
         },
     ));
 
@@ -876,6 +882,8 @@ fn build_vectors() -> Vec<Vector> {
             battery_charging: false,
             battery_raw_mv: 0,
             battery_held_raw_mv: 0,
+            battery_level: 4,         // sliced off before decode — must not survive
+            battery_confirmed: false, // sliced off before decode — must not survive
         },
         55,
     ));
@@ -896,8 +904,32 @@ fn build_vectors() -> Vec<Vector> {
             battery_charging: false,
             battery_raw_mv: 4180,
             battery_held_raw_mv: 0,
+            battery_level: 2,         // sliced off before decode — must not survive
+            battery_confirmed: false, // sliced off before decode — must not survive
         },
         57,
+    ));
+    v.push(rsp_status_truncated_vector(
+        "rsp_status_legacy_59_byte_derived_level_confirmed_true",
+        RspStatusPayload {
+            provisioned: true,
+            pubkey: [0x33u8; 32],
+            contact_count: 0,
+            channel_count: 0,
+            gps_has_fix: false,
+            gps_lat_e7: 0,
+            gps_lon_e7: 0,
+            gps_fix_age_secs: 0,
+            gps_clock_synced: false,
+            gps_clock_sync_age_secs: 0,
+            battery_percent: 10,
+            battery_charging: false,
+            battery_raw_mv: 3550,
+            battery_held_raw_mv: 3550,
+            battery_level: 4,         // sliced off before decode — must not survive
+            battery_confirmed: false, // sliced off before decode — must not survive
+        },
+        59,
     ));
 
     v.push(rsp_identity_vector(

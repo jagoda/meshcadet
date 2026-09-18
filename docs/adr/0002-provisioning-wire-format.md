@@ -86,7 +86,7 @@ Each frame type has a fixed, documented wire layout:
 | `SET_DEVICE_NAME (0x51)` | `name_len(1) \| name(N)` |
 | `COMMIT_PROVISIONING (0x70)` | (empty) |
 | `CLEAR_HISTORY (0x72)` | (empty) |
-| `RSP_STATUS (0x82)` | `provisioned(1) \| pubkey(32) \| contacts(1) \| channels(1) \| gps_has_fix(1) \| gps_lat_e7(4 LE) \| gps_lon_e7(4 LE) \| gps_fix_age_secs(4 LE) \| gps_clock_synced(1) \| gps_clock_sync_age_secs(4 LE) \| battery_percent(1) \| battery_charging(1) \| battery_raw_mv(2 LE) \| battery_held_raw_mv(2 LE)` |
+| `RSP_STATUS (0x82)` | `provisioned(1) \| pubkey(32) \| contacts(1) \| channels(1) \| gps_has_fix(1) \| gps_lat_e7(4 LE) \| gps_lon_e7(4 LE) \| gps_fix_age_secs(4 LE) \| gps_clock_synced(1) \| gps_clock_sync_age_secs(4 LE) \| battery_percent(1) \| battery_charging(1) \| battery_raw_mv(2 LE) \| battery_held_raw_mv(2 LE) \| battery_level(1) \| battery_confirmed(1)` |
 | `RSP_IDENTITY (0x83)` | `pubkey(32) \| pub_hash(1) \| name_len(1) \| name(N)` |
 
 No TLV wrapping is applied because every field is necessary in every call —
@@ -153,6 +153,30 @@ and 57-byte (pre-`battery_held_raw_mv`) payloads, defaulting each missing
 trailing field to `0` for the same staged-rollout reason as the prior
 amendment. Same scoping as `battery_raw_mv`: host-CLI-only, not read by the
 on-device admin-menu screen or the telemetry RESPONSE.
+
+**2026-09-17 amendment — `RSP_STATUS (0x82)` gains `battery_level(1)` and
+`battery_confirmed(1)`.** Closes the wire-level gap left by
+`meshcadet-battery-unknown-until-window-settles` (same date): that mission
+fixed the on-device header indicator to show `Unknown` until this boot's
+first peak-hold window closes, but the host CLI had no equivalent signal —
+`battery_percent` is never gated, so a boot-time sag could render as a
+falsely low percentage. `battery_level` mirrors the SAME boot-settled-gated
+bucket the on-device indicator/admin-menu row show (`0..=4`, the
+`level_to_indicator_level` shape); `battery_confirmed` is `true` once that
+gate has opened. Deliberately NOT derived from the pre-existing
+`BatteryStatus::confirmed` NVS-trust latch, which is already `true` at
+construction on any device with flash history and would silently defeat
+this exact distinction — see `firmware_core::battery::battery_level_to_wire`'s
+doc. Payload grows 59→61 bytes; `decode_rsp_status` accepts the legacy
+59-byte (pre-this-amendment) payload too, deriving `battery_level` from
+`battery_percent`/`battery_charging` via an approximate percent-domain
+analog of the millivolt-domain bucket thresholds and defaulting
+`battery_confirmed` to `true` (a legacy firmware predates the settling gate
+entirely, so its one reading is the only one there is). Not read by the
+on-device admin-menu screen or the telemetry RESPONSE, which already read
+the gated `level`/ungated `confirmed` directly off `BatteryStatus` — this
+pair exists purely to carry that same distinction across the wire to the
+host CLI.
 
 **2026-09-17 amendment — `decode_add_channel` now rejects a `key_len` byte
 outside `{16, 32}`, returning `ProvError::KeyLenInvalid`.** `key_len` had

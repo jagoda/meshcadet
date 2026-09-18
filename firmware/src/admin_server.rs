@@ -371,6 +371,13 @@ fn handle_frame(
             // Same poisoned-mutex fallback for battery: report "unknown"
             // (0%, not charging) rather than propagating the poison.
             let battery = battery_status.lock().map(|b| *b).unwrap_or_else(|e| *e.into_inner());
+            // `battery.level` is already the DISPLAYED (boot-settled-gated)
+            // bucket `BatteryDriver::status()` computes — see
+            // `firmware_core::battery::battery_level_to_wire`'s doc for why
+            // this derives `battery_confirmed` from `level` rather than
+            // reusing `battery.confirmed` (the NVS-trust latch).
+            let (battery_level, battery_confirmed) =
+                crate::battery::battery_level_to_wire(battery.level);
             let status = RspStatusPayload {
                 provisioned: true,
                 pubkey: identity.pubkey,
@@ -386,6 +393,8 @@ fn handle_frame(
                 battery_charging: battery.charging,
                 battery_raw_mv: crate::battery::clamp_raw_mv_for_wire(battery.raw_mv),
                 battery_held_raw_mv: crate::battery::clamp_raw_mv_for_wire(battery.held_raw_mv),
+                battery_level,
+                battery_confirmed,
             };
             let mut pbuf = [0u8; 64];
             let plen = encode_rsp_status(&status, &mut pbuf);

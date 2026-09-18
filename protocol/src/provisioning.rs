@@ -507,6 +507,40 @@ pub struct RspStatusPayload {
     /// CLI) surfaces the true pre-charge pack voltage, contamination-free.
     /// `0` before the first ADC sample / on an unprovisioned device.
     pub battery_held_raw_mv: u16,
+    /// Coarse battery bucket, `0..=4` — the same shape as
+    /// `firmware_core::ui::battery_indicator::level_to_indicator_level`'s
+    /// output (`Unknown=0`, `Charging=1`, `Low=2`, `Partial=3`, `Full=4`).
+    /// This is the SAME gated value the on-device header indicator and
+    /// admin-menu `L:` row show — `Unknown` until this boot's first
+    /// peak-hold window has closed (see firmware `battery` module docs'
+    /// "Boot-settled display gate" section), not a live, possibly
+    /// boot-sagged bucket. Added alongside `battery_confirmed` (below) to
+    /// close the wire-level gap left by
+    /// `meshcadet-battery-unknown-until-window-settles`: without this pair,
+    /// a host/companion client reading only `battery_percent` cannot tell
+    /// "still settling" from "genuinely low." On a legacy payload that
+    /// predates this field (`payload.len() < 61`), `decode_rsp_status`
+    /// derives this from `battery_percent`/`battery_charging` via
+    /// approximate percent-domain analogs of firmware-core's
+    /// `LEVEL_LOW_PARTIAL_MV`/`LEVEL_PARTIAL_FULL_MV` thresholds, so an old
+    /// device continues to render its real bucket rather than being
+    /// misread as permanently unsettled — see `decode_rsp_status`'s own doc.
+    pub battery_level: u8,
+    /// `true` once THIS boot's first peak-hold window has closed and
+    /// `battery_level`/`battery_percent` are a trustworthy read rather than
+    /// a boot-time seed that can sag below its true bucket. Deliberately
+    /// NOT the firmware `BatteryStatus::confirmed` NVS-trust latch — that
+    /// flag is already `true` at construction on any device with persisted
+    /// flash history (see firmware `battery` module docs' "Boot-settled
+    /// display gate" section, "trap" note), which would silently defeat the
+    /// exact settling-vs-low distinction this field exists to make (see
+    /// `flight-manuals/library/rate-limiter-must-gate-on-confirmed-prior.md`
+    /// for the general shape of that failure). `false` on an unprovisioned
+    /// device (no ADC sample taken yet) and on a legacy pre-field payload
+    /// decode default is `true` (see `battery_level`'s doc) — an old
+    /// firmware predates the settling gate entirely, so its one reading is
+    /// the only one there is.
+    pub battery_confirmed: bool,
 }
 
 /// Payload for `FRAME_RSP_IDENTITY`.
@@ -828,7 +862,9 @@ pub fn encode_rsp_status(payload: &RspStatusPayload, out: &mut [u8]) -> usize {
     out[54] = payload.battery_charging as u8;
     out[55..57].copy_from_slice(&payload.battery_raw_mv.to_le_bytes());
     out[57..59].copy_from_slice(&payload.battery_held_raw_mv.to_le_bytes());
-    59
+    out[59] = payload.battery_level;
+    out[60] = payload.battery_confirmed as u8;
+    61
 }
 
 /// Encode an `RspIdentity` payload.  Returns bytes written.
@@ -1154,26 +1190,58 @@ pub fn decode_rsp_lock(payload: &[u8]) -> Result<RspLockPayload, ProvError> {
     })
 }
 
+/// Approximate percent-domain analog of firmware-core's
+/// `battery_level_bucket` (millivolt-domain), used ONLY by
+/// [`decode_rsp_status`]'s legacy-payload default for `battery_level`: a
+/// pre-`battery_level` firmware has no bucket on the wire at all, so this
+/// derives a reasonable one from the `battery_percent`/`battery_charging`
+/// pair it does send, rather than reporting a permanent `Unknown`. The two
+/// breakpoints are `RESTING_SOC_CURVE`'s own percent readings at
+/// firmware-core's `LEVEL_LOW_PARTIAL_MV` (3700 mV -> 20%) and
+/// `LEVEL_PARTIAL_FULL_MV` (4000 mV -> 85%) — see that module's docs. No
+/// hysteresis (this runs once per decode, not across polls); returns the
+/// `level_to_indicator_level` shape directly (`Charging=1`, `Low=2`,
+/// `Partial=3`, `Full=4`).
+fn legacy_percent_to_battery_level(battery_percent: u8, battery_charging: bool) -> u8 {
+    if battery_charging {
+        1 // Charging
+    } else if battery_percent < 20 {
+        2 // Low
+    } else if battery_percent < 85 {
+        3 // Partial
+    } else {
+        4 // Full
+    }
+}
+
 /// Decode an `RspStatus` payload.
 ///
-/// Accepts a legacy 55-byte payload (pre-`battery_raw_mv`) and a 57-byte
-/// payload (pre-`battery_held_raw_mv`) for backward compatibility with a
-/// not-yet-updated firmware/host pairing during a staged rollout:
+/// Accepts a legacy 55-byte payload (pre-`battery_raw_mv`), a 57-byte
+/// payload (pre-`battery_held_raw_mv`), and a 59-byte payload
+/// (pre-`battery_level`/`battery_confirmed`) for backward compatibility with
+/// a not-yet-updated firmware/host pairing during a staged rollout:
 /// `battery_raw_mv` / `battery_held_raw_mv` each default to `0` when their
-/// trailing bytes are absent, rather than truncating-erroring the whole
-/// frame.
+/// trailing bytes are absent; `battery_level` defaults to
+/// [`legacy_percent_to_battery_level`]'s derivation from
+/// `battery_percent`/`battery_charging` and `battery_confirmed` defaults to
+/// `true` (an old firmware predates the settling gate entirely, so its one
+/// reading is the only one there is — see `RspStatusPayload::battery_level`'s
+/// doc) — none of this truncating-errors the whole frame.
 pub fn decode_rsp_status(payload: &[u8]) -> Result<RspStatusPayload, ProvError> {
     // provisioned(1) + pubkey(32) + contact_count(1) + channel_count(1) +
     // gps_has_fix(1) + gps_lat_e7(4) + gps_lon_e7(4) + gps_fix_age_secs(4) +
     // gps_clock_synced(1) + gps_clock_sync_age_secs(4) + battery_percent(1) +
-    // battery_charging(1) + battery_raw_mv(2) + battery_held_raw_mv(2)
-    // = 59 (57 pre-held_raw_mv, 55 pre-raw_mv)
+    // battery_charging(1) + battery_raw_mv(2) + battery_held_raw_mv(2) +
+    // battery_level(1) + battery_confirmed(1)
+    // = 61 (59 pre-level/confirmed, 57 pre-held_raw_mv, 55 pre-raw_mv)
     if payload.len() < 55 {
         return Err(ProvError::TruncatedPayload);
     }
     let provisioned = payload[0] != 0;
     let mut pubkey = [0u8; 32];
     pubkey.copy_from_slice(&payload[1..33]);
+    let battery_percent = payload[53];
+    let battery_charging = payload[54] != 0;
     let battery_raw_mv = if payload.len() >= 57 {
         u16::from_le_bytes(payload[55..57].try_into().unwrap())
     } else {
@@ -1183,6 +1251,14 @@ pub fn decode_rsp_status(payload: &[u8]) -> Result<RspStatusPayload, ProvError> 
         u16::from_le_bytes(payload[57..59].try_into().unwrap())
     } else {
         0
+    };
+    let (battery_level, battery_confirmed) = if payload.len() >= 61 {
+        (payload[59], payload[60] != 0)
+    } else {
+        (
+            legacy_percent_to_battery_level(battery_percent, battery_charging),
+            true,
+        )
     };
     Ok(RspStatusPayload {
         provisioned,
@@ -1195,10 +1271,12 @@ pub fn decode_rsp_status(payload: &[u8]) -> Result<RspStatusPayload, ProvError> 
         gps_fix_age_secs: u32::from_le_bytes(payload[44..48].try_into().unwrap()),
         gps_clock_synced: payload[48] != 0,
         gps_clock_sync_age_secs: u32::from_le_bytes(payload[49..53].try_into().unwrap()),
-        battery_percent: payload[53],
-        battery_charging: payload[54] != 0,
+        battery_percent,
+        battery_charging,
         battery_raw_mv,
         battery_held_raw_mv,
+        battery_level,
+        battery_confirmed,
     })
 }
 
@@ -1674,10 +1752,12 @@ mod tests {
             battery_charging: false,
             battery_raw_mv: 0,
             battery_held_raw_mv: 0,
+            battery_level: 0,
+            battery_confirmed: false,
         };
         let mut payload_buf = [0u8; 64];
         let plen = encode_rsp_status(&status, &mut payload_buf);
-        assert_eq!(plen, 59);
+        assert_eq!(plen, 61);
 
         let mut frame_buf = [0u8; 72];
         let n = encode_frame(FRAME_RSP_STATUS, &payload_buf[..plen], &mut frame_buf);
@@ -1695,6 +1775,8 @@ mod tests {
         assert!(!decoded.battery_charging);
         assert_eq!(decoded.battery_raw_mv, 0);
         assert_eq!(decoded.battery_held_raw_mv, 0);
+        assert_eq!(decoded.battery_level, 0);
+        assert!(!decoded.battery_confirmed);
     }
 
     #[test]
@@ -1714,16 +1796,20 @@ mod tests {
             battery_charging: true,
             battery_raw_mv: 4142,
             battery_held_raw_mv: 3775,
+            battery_level: 1, // Charging
+            battery_confirmed: true,
         };
         let mut payload_buf = [0u8; 64];
         let plen = encode_rsp_status(&status, &mut payload_buf);
-        assert_eq!(plen, 59);
+        assert_eq!(plen, 61);
         let decoded = decode_rsp_status(&payload_buf[..plen]).unwrap();
         assert_eq!(decoded, status);
         assert_eq!(decoded.battery_percent, 76);
         assert!(decoded.battery_charging);
         assert_eq!(decoded.battery_raw_mv, 4142);
         assert_eq!(decoded.battery_held_raw_mv, 3775);
+        assert_eq!(decoded.battery_level, 1);
+        assert!(decoded.battery_confirmed);
     }
 
     #[test]
@@ -1755,10 +1841,12 @@ mod tests {
             battery_charging: false,
             battery_raw_mv: 0,
             battery_held_raw_mv: 0,
+            battery_level: 4, // sliced off before decode — must not survive (would be Full)
+            battery_confirmed: false, // sliced off before decode — must not survive
         };
         let mut payload_buf = [0u8; 64];
         let plen = encode_rsp_status(&status, &mut payload_buf);
-        assert_eq!(plen, 59);
+        assert_eq!(plen, 61);
 
         // Truncate to the legacy 55-byte length before decoding.
         let decoded = decode_rsp_status(&payload_buf[..55]).unwrap();
@@ -1770,6 +1858,15 @@ mod tests {
         assert_eq!(
             decoded.battery_held_raw_mv, 0,
             "held_raw_mv absent on the wire must default to 0"
+        );
+        // 50% not charging falls in the [20, 85) legacy Partial band.
+        assert_eq!(
+            decoded.battery_level, 3,
+            "level/confirmed absent on the wire must derive from percent/charging, not decode zeroed"
+        );
+        assert!(
+            decoded.battery_confirmed,
+            "a legacy payload predates the settling gate entirely — its one reading is confirmed"
         );
     }
 
@@ -1793,10 +1890,12 @@ mod tests {
             battery_charging: false,
             battery_raw_mv: 4180,
             battery_held_raw_mv: 0,
+            battery_level: 2, // sliced off before decode — must not survive (would be Low)
+            battery_confirmed: false, // sliced off before decode — must not survive
         };
         let mut payload_buf = [0u8; 64];
         let plen = encode_rsp_status(&status, &mut payload_buf);
-        assert_eq!(plen, 59);
+        assert_eq!(plen, 61);
 
         // Truncate to the legacy 57-byte length before decoding.
         let decoded = decode_rsp_status(&payload_buf[..57]).unwrap();
@@ -1806,6 +1905,99 @@ mod tests {
             decoded.battery_held_raw_mv, 0,
             "held_raw_mv absent on the wire must default to 0"
         );
+        // 82% not charging falls in the [20, 85) legacy Partial band.
+        assert_eq!(
+            decoded.battery_level, 3,
+            "level/confirmed absent on the wire must derive from percent/charging, not decode zeroed"
+        );
+        assert!(
+            decoded.battery_confirmed,
+            "a legacy payload predates the settling gate entirely — its one reading is confirmed"
+        );
+    }
+
+    #[test]
+    fn rsp_status_legacy_59_byte_payload_decodes_with_derived_level_and_confirmed_true() {
+        // A pre-`battery_level`/`battery_confirmed` 59-byte payload (raw_mv
+        // and held_raw_mv present, level/confirmed trailing bytes absent)
+        // must still decode — the new fields derive from
+        // `battery_percent`/`battery_charging` rather than the whole frame
+        // being rejected.
+        let status = RspStatusPayload {
+            provisioned: true,
+            pubkey: [0x33u8; 32],
+            contact_count: 0,
+            channel_count: 0,
+            gps_has_fix: false,
+            gps_lat_e7: 0,
+            gps_lon_e7: 0,
+            gps_fix_age_secs: 0,
+            gps_clock_synced: false,
+            gps_clock_sync_age_secs: 0,
+            battery_percent: 10,
+            battery_charging: false,
+            battery_raw_mv: 3550,
+            battery_held_raw_mv: 3550,
+            battery_level: 4, // sliced off before decode — must not survive (would be Full)
+            battery_confirmed: false, // sliced off before decode — must not survive
+        };
+        let mut payload_buf = [0u8; 64];
+        let plen = encode_rsp_status(&status, &mut payload_buf);
+        assert_eq!(plen, 61);
+
+        // Truncate to the legacy 59-byte length before decoding.
+        let decoded = decode_rsp_status(&payload_buf[..59]).unwrap();
+        assert_eq!(decoded.battery_percent, 10);
+        assert_eq!(decoded.battery_raw_mv, 3550);
+        assert_eq!(decoded.battery_held_raw_mv, 3550);
+        // 10% not charging falls below the 20% legacy Low/Partial boundary.
+        assert_eq!(
+            decoded.battery_level, 2,
+            "level absent on the wire must derive from percent/charging, not decode zeroed"
+        );
+        assert!(
+            decoded.battery_confirmed,
+            "a legacy payload predates the settling gate entirely — its one reading is confirmed"
+        );
+    }
+
+    #[test]
+    fn rsp_status_current_payload_carries_level_and_confirmed_through_unchanged() {
+        // A CURRENT (61-byte) payload's explicit battery_level/
+        // battery_confirmed must round-trip exactly, not be re-derived from
+        // percent/charging the way a legacy payload's absent bytes are.
+        let status = RspStatusPayload {
+            provisioned: true,
+            pubkey: [0x44u8; 32],
+            contact_count: 0,
+            channel_count: 0,
+            gps_has_fix: false,
+            gps_lat_e7: 0,
+            gps_lon_e7: 0,
+            gps_fix_age_secs: 0,
+            gps_clock_synced: false,
+            gps_clock_sync_age_secs: 0,
+            // Deliberately contradicts what the legacy derivation would
+            // produce for this percent/charging pair (90% not charging
+            // would legacy-derive to Full=4) to prove the explicit byte
+            // wins, not a re-derivation.
+            battery_percent: 90,
+            battery_charging: false,
+            battery_raw_mv: 4100,
+            battery_held_raw_mv: 4100,
+            battery_level: 0, // Unknown — still settling despite a high percent
+            battery_confirmed: false,
+        };
+        let mut payload_buf = [0u8; 64];
+        let plen = encode_rsp_status(&status, &mut payload_buf);
+        assert_eq!(plen, 61);
+        let decoded = decode_rsp_status(&payload_buf[..plen]).unwrap();
+        assert_eq!(decoded, status);
+        assert_eq!(
+            decoded.battery_level, 0,
+            "an explicit on-wire level must win over any percent-derived guess"
+        );
+        assert!(!decoded.battery_confirmed);
     }
 
     // ── RspIdentity roundtrip ────────────────────────────────────────────────
