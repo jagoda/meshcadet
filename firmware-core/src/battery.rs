@@ -450,6 +450,24 @@
 //! reports each one's absolute value. A user-run HIL capture (this build
 //! ships the probes, not the capture itself — that needs real device time)
 //! is what locks them.
+//!
+//! ## Boot-settled display gate (2026-09-17)
+//!
+//! `meshcadet-battery-unknown-until-window-settles`: [`BatteryDriver::new`]'s
+//! `initial_mv` seed above is taken at the highest-load moment of boot
+//! (backlight 100% duty, radio up, GPS acquiring), and can sag below
+//! [`LEVEL_LOW_PARTIAL_MV`] even on a healthy pack — showing a false red
+//! `Low` for up to one [`PEAK_WINDOW_MS`] window every boot. This is a
+//! **display-only** fix, not a rework of the measurement pipeline: nothing
+//! above (peak-hold, the external-power threshold, the `confirmed` latch,
+//! NVS persistence) changed. [`displayed_battery_level`] gates the
+//! *displayed* [`BatteryLevel`] on a new, distinct "this boot's first peak
+//! window has closed" flag, deliberately independent of `confirmed` (which
+//! already starts `true` at construction on any device with NVS history —
+//! see that function's own doc section, just below, for why reusing
+//! `confirmed` would silently defeat this fix). See
+//! `firmware::battery::BatteryDriver`'s own `boot_settled` field for the
+//! real driver's side of the latch.
 
 // This module is pure Rust with no ADC/hardware dependency — see
 // `firmware::battery` for `BatteryDriver` (the real ADC1 read path), which
@@ -758,6 +776,48 @@ fn hysteresis_bucket_index_mv(prev_idx: u8, settled_mv: u32) -> u8 {
         idx -= 1;
     }
     idx
+}
+
+// ── Boot-settled display gate ────────────────────────────────────────────────
+//
+// `meshcadet-battery-unknown-until-window-settles`: `BatteryDriver::new`
+// computes a real `settled_mv`/`level` immediately from the FIRST live ADC
+// sample — taken at the highest-load moment of boot (backlight at 100%
+// duty, radio up, GPS acquiring). That sagged reading can land below
+// `LEVEL_LOW_PARTIAL_MV` even on a healthy pack, so the indicator falsely
+// shows red `Low` for up to one [`PEAK_WINDOW_MS`] window (~30 s) every
+// boot, until the peak-hold sampler's first window closes and corrects it.
+//
+// The fix is display-only: `settled_mv`/`level`/`confirmed`/NVS persistence/
+// the peak sampler all keep computing exactly as before (every consumer of
+// the RAW `level` still sees the true bucket the instant it's computed);
+// only what gets SHOWN is gated, via [`displayed_battery_level`], on a new,
+// distinct "this boot's first peak window has closed" flag.
+//
+// **Deliberately NOT the `confirmed` latch.** `confirmed` starts `true` at
+// construction on any device with a persisted NVS `settled_mv` (see
+// [`seed_boot_state`]: `persisted.is_some() || !charging`), so gating on it
+// would show a real bucket immediately for every returning device — exactly
+// the case this fix exists to hold back, and the one a virgin-device-only
+// test suite would never catch. This flag is unconditionally `false` at
+// every boot, with no code path that starts it `true`, and latches `true`
+// only once — the first time [`PeakWindowSampler::sample`] returns `Some`
+// for this boot — never before, never re-derived from `confirmed` or any
+// other already-existing flag.
+
+/// Gate the *displayed* [`BatteryLevel`] on whether this boot's first
+/// peak-hold window has closed yet — see the "Boot-settled display gate"
+/// section above. `level` is the true, already-computed bucket (unaffected
+/// by this gate); `window_settled` is the new, `confirmed`-independent latch
+/// described above. Returns [`BatteryLevel::Unknown`] until `window_settled`
+/// is `true`, then passes `level` through unchanged, forever (nothing in
+/// this function can make a settled boot revert to `Unknown`).
+pub fn displayed_battery_level(level: BatteryLevel, window_settled: bool) -> BatteryLevel {
+    if window_settled {
+        level
+    } else {
+        BatteryLevel::Unknown
+    }
 }
 
 // ── Pure helpers (host-testable, no ADC dependency) ──────────────────────────
@@ -1584,6 +1644,11 @@ mod tests {
         confirmed: bool,
         level: BatteryLevel,
         peak_sampler: PeakWindowSampler,
+        /// Mirrors `BatteryDriver`'s own boot-settled latch — see the "Boot-
+        /// settled display gate" module section. `false` at construction,
+        /// latched `true` the first time `peak_sampler.sample` returns
+        /// `Some`, exactly like the real driver.
+        window_settled: bool,
     }
 
     impl SimDriver {
@@ -1596,6 +1661,7 @@ mod tests {
                 confirmed,
                 level,
                 peak_sampler: PeakWindowSampler::new(now_ms, initial_mv),
+                window_settled: false,
             }
         }
 
@@ -1613,6 +1679,7 @@ mod tests {
                 self.charging = charging;
                 self.confirmed = confirmed;
                 self.level = level;
+                self.window_settled = true;
             }
         }
 
@@ -1629,6 +1696,13 @@ mod tests {
         /// voltage-domain bucket" section).
         fn percent(&self) -> u8 {
             percent_from_millivolts(self.settled_mv)
+        }
+
+        /// What the UI actually shows — gated on `window_settled`, per
+        /// [`displayed_battery_level`]. Distinct from `self.level`, which is
+        /// the true, already-computed (but possibly not-yet-shown) bucket.
+        fn displayed_level(&self) -> BatteryLevel {
+            displayed_battery_level(self.level, self.window_settled)
         }
     }
 
@@ -1823,6 +1897,109 @@ mod tests {
             d.percent() < 10,
             "percent must also snap to the true low reading, got {}%",
             d.percent()
+        );
+    }
+
+    // ── Boot-settled display gate (meshcadet-battery-unknown-until-window-
+    // settles) — the displayed level must be `Unknown` until this boot's
+    // first peak window closes, real thereafter, and the gate must NOT be
+    // the `confirmed` latch. ────────────────────────────────────────────
+
+    #[test]
+    fn displayed_level_is_unknown_before_the_first_window_closes() {
+        // A virgin, off-power boot at a plainly-Full voltage would compute a
+        // real `Full` bucket immediately (see
+        // `bucket_plain_assignment_from_unknown_or_charging`) — but nothing
+        // has been SHOWN yet: the first peak window hasn't closed.
+        let d = SimDriver::boot(None, RESTING_FULL_MV, 0);
+        assert_eq!(
+            d.level,
+            BatteryLevel::Full,
+            "the true bucket is already computed at construction"
+        );
+        assert_eq!(
+            d.displayed_level(),
+            BatteryLevel::Unknown,
+            "but nothing must be SHOWN until the first window closes"
+        );
+    }
+
+    #[test]
+    fn displayed_level_shows_the_real_bucket_immediately_after_the_first_window_closes() {
+        let mut d = SimDriver::boot(None, RESTING_FULL_MV, 0);
+        let mut now = 0u64;
+        d.run(&mut now, 15, RESTING_FULL_MV); // closes exactly one window
+        assert_eq!(
+            d.displayed_level(),
+            BatteryLevel::Full,
+            "the real bucket must show the instant the first window closes"
+        );
+    }
+
+    #[test]
+    fn displayed_level_is_unknown_before_first_close_even_with_a_persisted_confirmed_basis() {
+        // The regression test for the `confirmed`-latch trap: a device with
+        // NVS history is `confirmed == true` from the very first sample
+        // (see `seed_boot_state`), which would defeat a gate built on
+        // `confirmed` instead of the dedicated `window_settled` flag. This
+        // must FAIL against a `confirmed`-based gate.
+        let d = SimDriver::boot(Some(3_775), 3_900, 0); // persisted 36% basis, boots off power
+        assert!(
+            d.confirmed,
+            "a persisted basis is confirmed immediately — this is the trap"
+        );
+        assert_eq!(
+            d.displayed_level(),
+            BatteryLevel::Unknown,
+            "must still show Unknown before THIS boot's first window closes, \
+             regardless of the persisted basis's own confirmed status"
+        );
+    }
+
+    #[test]
+    fn displayed_level_flag_never_unlatches() {
+        let mut d = SimDriver::boot(None, RESTING_FULL_MV, 0);
+        let mut now = 0u64;
+        d.run(&mut now, 15, RESTING_FULL_MV); // first window closes: latches settled
+        assert_ne!(d.displayed_level(), BatteryLevel::Unknown);
+
+        // Drive many more windows, including a charging session and a drop
+        // to Low — the settled latch must never revert to Unknown no matter
+        // what the underlying reading does.
+        d.run(&mut now, 15, EXTERNAL_POWER_MV_THRESHOLD + 500);
+        assert_ne!(
+            d.displayed_level(),
+            BatteryLevel::Unknown,
+            "must not revert to Unknown while charging"
+        );
+        d.run(&mut now, 15, BATTERY_EMPTY_MV + 50);
+        d.run(&mut now, 15, BATTERY_EMPTY_MV + 50);
+        assert_ne!(
+            d.displayed_level(),
+            BatteryLevel::Unknown,
+            "must not revert to Unknown on a genuine discharge to Low"
+        );
+    }
+
+    #[test]
+    fn displayed_battery_level_pure_function_gate() {
+        // Direct unit coverage of the pure gate itself, independent of
+        // `SimDriver`.
+        assert_eq!(
+            displayed_battery_level(BatteryLevel::Low, false),
+            BatteryLevel::Unknown
+        );
+        assert_eq!(
+            displayed_battery_level(BatteryLevel::Full, false),
+            BatteryLevel::Unknown
+        );
+        assert_eq!(
+            displayed_battery_level(BatteryLevel::Low, true),
+            BatteryLevel::Low
+        );
+        assert_eq!(
+            displayed_battery_level(BatteryLevel::Charging, true),
+            BatteryLevel::Charging
         );
     }
 }
