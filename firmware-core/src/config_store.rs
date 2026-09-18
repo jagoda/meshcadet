@@ -210,6 +210,36 @@ pub struct Channel {
     pub name_len: u8,
 }
 
+impl Channel {
+    /// The significant secret length (16 or 32) to actually use when hashing
+    /// or indexing `secret` — clamps a malformed/corrupted raw `key_len` byte
+    /// to one of the two supported widths, defensively.
+    ///
+    /// `protocol::decode_add_channel` rejects an out-of-range `key_len` at
+    /// the wire boundary, so a freshly-provisioned `Channel` can never carry
+    /// one — but this
+    /// entry's `key_len` can also arrive via `deserialize_config` loading a
+    /// legacy or corrupted NVS blob (see this module's own doc: `key_len`
+    /// has been a raw persisted byte since `v0x02`, with no decode-path
+    /// guard of its own). Every call site that turns `key_len` into a slice
+    /// bound on `secret` (`channel_hash_var(&secret[..key_len])` in both
+    /// `provisioning_server.rs` and `admin_server.rs`) MUST go through this
+    /// method rather than casting `key_len` directly, mirroring
+    /// [`ProvisionedConfig::resolve_channel_secret`]'s identical clamp for
+    /// the radio TX/RX path — an unclamped cast is exactly the "malformed
+    /// NVS blob → out-of-bounds slice → panic → device reboot" defect fixed
+    /// at the wire layer (`decode_add_channel`); this is the same fix
+    /// applied at the persistence-layer boundary too, so a corrupted blob
+    /// can't reopen it.
+    pub fn key_len_resolved(&self) -> usize {
+        if self.key_len == 16 {
+            16
+        } else {
+            32
+        }
+    }
+}
+
 /// Room-specific persisted state for a `role == ROLE_ROOM` contact.
 ///
 /// Keyed by [`pubkey`](Self::pubkey), NOT a positional index into
@@ -432,7 +462,7 @@ impl ProvisionedConfig {
         let count = self.channel_count as usize;
         self.primary_channel()
             .or_else(|| self.channels[..count].first())
-            .map(|ch| (ch.secret, if ch.key_len == 16 { 16 } else { 32 }))
+            .map(|ch| (ch.secret, ch.key_len_resolved()))
     }
 
     /// Insert or update a channel, keyed on its `secret` (the channel's
@@ -1146,6 +1176,37 @@ mod tests {
             Some(([0x33u8; 32], 16)),
             "a 128-bit channel must resolve key_len=16, not the full 32-byte buffer"
         );
+    }
+
+    /// DEFECT GUARD:
+    /// `Channel::key_len_resolved` is the defense-in-depth clamp for a
+    /// `key_len` byte arriving via a legacy/corrupted persisted blob rather
+    /// than a decode-path-validated `ADD_CHANNEL` frame. Every possible raw
+    /// byte value (0..=255) must resolve to exactly 16 or 32, and slicing a
+    /// 32-byte `secret` with the resolved length must never panic —
+    /// `protocol::decode_add_channel`'s own wire-level rejection (see that
+    /// crate's `decode_add_channel_rejects_invalid_key_len`) covers freshly
+    /// provisioned channels; this covers every OTHER path `key_len` can
+    /// reach a `Channel` through.
+    #[test]
+    fn channel_key_len_resolved_is_always_16_or_32_for_any_raw_byte() {
+        for raw in 0u8..=255 {
+            let ch = Channel {
+                secret: [0xAB; 32],
+                key_len: raw,
+                primary: false,
+                name: [0u8; MAX_NAME_LEN],
+                name_len: 0,
+            };
+            let resolved = ch.key_len_resolved();
+            assert!(
+                resolved == 16 || resolved == 32,
+                "key_len_resolved({raw}) = {resolved}, must be 16 or 32"
+            );
+            // The actual downstream operation every call site performs —
+            // must never panic regardless of the raw byte.
+            let _ = &ch.secret[..resolved];
+        }
     }
 
     #[test]

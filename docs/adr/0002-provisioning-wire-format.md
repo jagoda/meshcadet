@@ -3,7 +3,8 @@
 - **Status:** Accepted (2026-06-13); amended 2026-06-15 (ADD_CHANNEL key_len + blob v0x02);
   amended 2026-07-03 (retired `SET_RADIO_PRESET`/`SET_LOCKS` — see §3 note);
   amended 2026-07-25 (room-server contacts: `ADD_ROOM`/`DEL_ROOM`/`QUERY_ROOMS`,
-  blob v0x03, room URI — see §7)
+  blob v0x03, room URI — see §7);
+  amended 2026-09-17 (`decode_add_channel` enforces `key_len ∈ {16, 32}` — see §3 note)
 - **Deciders:** Maintainer design review
 - **Supersedes:** —
 - **Implements:** ADR-0001 §4 (admin configuration interface via USB-serial)
@@ -152,6 +153,28 @@ and 57-byte (pre-`battery_held_raw_mv`) payloads, defaulting each missing
 trailing field to `0` for the same staged-rollout reason as the prior
 amendment. Same scoping as `battery_raw_mv`: host-CLI-only, not read by the
 on-device admin-menu screen or the telemetry RESPONSE.
+
+**2026-09-17 amendment — `decode_add_channel` now rejects a `key_len` byte
+outside `{16, 32}`, returning `ProvError::KeyLenInvalid`.** `key_len` had
+never been validated at decode — every downstream consumer trusted it as a
+direct index into the 32-byte `secret` array
+(`channel_hash_var(&secret[..key_len])`, five call sites across
+`provisioning_server.rs`/`admin_server.rs`), so a malformed or corrupted
+`ADD_CHANNEL` frame with `key_len` outside the two supported widths decoded
+successfully and then panicked the firmware thread the first time the
+channel was hashed or logged — an out-of-bounds-slice panic, which the
+ESP-IDF panic handler turns into a device reset. Neither shipping client
+(the host CLI's argument parser, the web provisioner's secret-length
+validation) can produce an invalid `key_len` through normal use, so this
+was a latent defect, not (on the evidence available) the proximate cause of
+any specific field report — but it is a real crash reachable by any
+corrupted or adversarial frame, so it is fixed at the wire boundary
+regardless. Defense in depth: `firmware_core::config_store::Channel::
+key_len_resolved()` clamps the same field to 16-or-32 at every read site
+too, so a legacy/corrupted NVS blob predating this fix (which bypasses the
+wire decoder entirely) can't reopen the same panic. No wire-format change —
+`key_len`'s valid values were always exactly 16 and 32 per this table; this
+amendment only closes the enforcement gap.
 
 ### 4. Security model
 

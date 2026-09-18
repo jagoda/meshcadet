@@ -490,8 +490,9 @@ fn handle_frame(
                 // NVS blob with key_len > 32 or name_len > MAX_NAME_LEN would
                 // otherwise panic the thread (panic=abort → device reboot),
                 // surfacing to the host as a hung / empty channel enumeration.
-                let key_len = (ch.key_len as usize).min(ch.secret.len());
-                let hash = channel_hash_var(&ch.secret[..key_len]);
+                // `key_len_resolved()` is the shared clamp — see its doc comment
+                // and `ProvisionedConfig::resolve_channel_secret`'s identical use.
+                let hash = channel_hash_var(&ch.secret[..ch.key_len_resolved()]);
                 let name_len = (ch.name_len as usize).min(ch.name.len());
                 let name = &ch.name[..name_len];
                 let mut pbuf = [0u8; 80];
@@ -608,6 +609,10 @@ fn handle_frame(
                                     ChannelUpsert::Updated => "updated",
                                     ChannelUpsert::Added => "added",
                                 },
+                                // Safe unresolved: decode_add_channel already
+                                // rejected any key_len outside {16, 32} above,
+                                // so `ch` (an AddChannelPayload, not a stored
+                                // Channel) can't carry a bad value here.
                                 channel_hash_var(&ch.secret[..ch.key_len as usize]),
                                 ch.key_len, ch.primary, ch.name_len
                             );
@@ -632,7 +637,8 @@ fn handle_frame(
                     match config.channels[..cnt].iter().position(|ch| ch.secret == d.secret) {
                         Some(idx) => {
                             let hash = channel_hash_var(
-                                &config.channels[idx].secret[..config.channels[idx].key_len as usize],
+                                &config.channels[idx].secret
+                                    [..config.channels[idx].key_len_resolved()],
                             );
                             for j in idx..cnt - 1 {
                                 config.channels[j] = config.channels[j + 1];

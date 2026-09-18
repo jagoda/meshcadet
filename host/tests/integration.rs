@@ -698,6 +698,45 @@ fn test_add_channel() {
     assert_eq!(&ch.name[..ch.name_len as usize], b"family");
 }
 
+/// DEFECT GUARD:
+/// `Session::add_channel` forwards whatever `key_len` byte it is given
+/// straight onto the wire — it is the device's decode path
+/// (`protocol::decode_add_channel`), not this host-side method, that must
+/// reject an invalid value. Before that decode-path fix, an out-of-range
+/// `key_len` (anything but 16 or 32) decoded successfully into a `Channel`
+/// whose `key_len` every downstream consumer trusted as a valid index into
+/// its 32-byte `secret` array (`channel_hash_var(&secret[..key_len])` in
+/// both `provisioning_server.rs` and `admin_server.rs`, mirrored by this
+/// file's own `MockDevice::handle` at the `FRAME_ADD_CHANNEL` arm) — a
+/// slice-bounds panic on the firmware's own thread, which aborts it: the
+/// "device reboots" crash signature this mission traced to its wire-level
+/// origin. This test proves the device-side response is now a clean
+/// `RSP_ERROR` (surfaced here as a `DeviceError`), never a panic/hang, for
+/// every out-of-range `key_len` byte a corrupted or malicious frame could
+/// carry — exercised through the same `MockDevice` arm the real firmware's
+/// `channel_hash_var` call sites mirror.
+#[test]
+fn test_add_channel_rejects_invalid_key_len() {
+    let mut session = make_session_v2([0x23_u8; 32]);
+    let channel_secret = [0x6D_u8; 32];
+
+    for bad_key_len in [0u8, 1, 15, 17, 31, 33, 200, 255] {
+        let err = session
+            .add_channel(&channel_secret, bad_key_len, false, b"bad")
+            .expect_err(&format!(
+                "key_len={bad_key_len} must be rejected with a device error, not accepted"
+            ));
+        assert!(
+            format!("{err}").contains("KeyLenInvalid"),
+            "expected a KeyLenInvalid device error for key_len={bad_key_len}, got: {err}"
+        );
+    }
+
+    // No channel was ever staged by the rejected attempts above.
+    let status = session.query_status().expect("query_status");
+    assert_eq!(status.channel_count, 0);
+}
+
 /// Regression for the HIL list-channels defect (status count vs enumeration
 /// divergence): with MORE than one channel configured, the streamed enumeration
 /// must return every channel — in index order, with matching hashes — and the
@@ -2074,6 +2113,49 @@ fn test_query_status_retries_on_dropped_frame() {
     assert!(
         !status.provisioned,
         "fresh mock device must not be provisioned"
+    );
+}
+
+/// A transport backing a device that never responds at all — no bytes, ever,
+/// on `recv()` (simulating a device that panicked/rebooted mid-handshake and
+/// never came back up in time, or was never there to begin with: wrong port,
+/// unplugged cable, etc.). `send()` always succeeds (the write side of a USB
+/// serial link doesn't know the far end isn't listening).
+struct SilentTransport;
+
+impl Transport for SilentTransport {
+    fn send(&mut self, _data: &[u8]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn recv(&mut self, _buf: &mut [u8]) -> anyhow::Result<usize> {
+        Ok(0) // mirrors SerialTransport::recv's timeout-as-zero-bytes contract
+    }
+}
+
+/// DEFECT GUARD: "the
+/// host CLI hangs with no result" is one of this mission's two reported
+/// symptoms. This test pins the invariant the mission's fix must hold
+/// regardless of what caused the device to go quiet: against a transport
+/// that never delivers a single byte back, `query_status()` must return an
+/// `Err` carrying an actionable diagnostic — not block forever, and not
+/// silently return an empty/default result. `Session::send_recv_with_retry`
+/// bounds this by `retry_total_ms` (overridden here to keep the test fast);
+/// `Session::new`'s production defaults (500 ms/attempt, 10 s overall) apply
+/// the identical bound to every real CLI invocation.
+#[test]
+fn test_query_status_fails_with_diagnostic_against_an_unresponsive_device() {
+    // frame_secs=1, retry_attempt_ms=20, retry_total_ms=100 — bounds this
+    // test to ~100 ms of real wall-clock time instead of the production 10 s.
+    let mut session = Session::with_retry_params(SilentTransport, 1, 20, 100);
+
+    let err = session
+        .query_status()
+        .expect_err("query_status against a silent device must fail, not hang or succeed");
+    let msg = format!("{err}");
+    assert!(
+        msg.to_lowercase().contains("timeout"),
+        "error must name the timeout as the diagnostic, got: {msg}"
     );
 }
 
