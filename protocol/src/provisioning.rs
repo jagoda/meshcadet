@@ -533,9 +533,11 @@ pub struct RspStatusPayload {
     /// flag is already `true` at construction on any device with persisted
     /// flash history (see firmware `battery` module docs' "Boot-settled
     /// display gate" section, "trap" note), which would silently defeat the
-    /// exact settling-vs-low distinction this field exists to make (see
-    /// `flight-manuals/library/rate-limiter-must-gate-on-confirmed-prior.md`
-    /// for the general shape of that failure). `false` on an unprovisioned
+    /// exact settling-vs-low distinction this field exists to make — the
+    /// general failure shape is reusing a differently-scoped "confirmed"
+    /// flag as the gate for something it was never meant to gate, when
+    /// that flag is already latched true for an unrelated reason. `false`
+    /// on an unprovisioned
     /// device (no ADC sample taken yet) and on a legacy pre-field payload
     /// decode default is `true` (see `battery_level`'s doc) — an old
     /// firmware predates the settling gate entirely, so its one reading is
