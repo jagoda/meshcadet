@@ -67,7 +67,11 @@ import { ProvisionerSession, DeviceError } from "./session.js";
  * calls behave exactly as they would against a real port. `onWrite(chunk)`
  * is called synchronously for every frame the session writes (used to drive
  * scripted device responses and to assert what was sent); the returned
- * `push(bytes)` enqueues bytes as if the device sent them.
+ * `push(bytes)` enqueues bytes as if the device sent them; `signalsCalls`
+ * records every `setSignals()` invocation in order (used to assert
+ * `connect()`'s post-open DTR/RTS de-assert — see session.js's `connect()`
+ * doc comment); `error(err)` makes the readable stream error out, as if the
+ * device vanished mid-read (e.g. a USB re-enumeration from a hard reset).
  */
 function makeFakePort(onWrite) {
   let controller;
@@ -81,10 +85,15 @@ function makeFakePort(onWrite) {
       onWrite(chunk);
     },
   });
+  const signalsCalls = [];
   const port = {
     readable,
     writable,
+    signalsCalls,
     async open() {},
+    async setSignals(signals) {
+      signalsCalls.push(signals);
+    },
     async close() {
       try {
         controller.close();
@@ -96,6 +105,7 @@ function makeFakePort(onWrite) {
   return {
     port,
     push: (bytes) => controller.enqueue(bytes),
+    error: (err) => controller.error(err),
   };
 }
 
@@ -246,6 +256,124 @@ async function happyPathWithLogNoiseResync() {
 
   await session.disconnect();
   assert.equal(session.isConnected, false);
+}
+
+// ── Scenario 1b: connect() de-asserts DTR/RTS immediately after open() ───
+//
+// Regression guard for this mission's own defect: PR #197 fixed the host
+// CLI (`host/src/transport.rs`) to leave DTR/RTS untouched, but the browser
+// client never got the equivalent treatment — Chromium's `SerialPort.open()`
+// asserts both lines unconditionally, which on this board's CH343
+// auto-program wiring (EN/IO0) triggers a device reset. `connect()` must
+// call `setSignals({ dataTerminalReady: false, requestToSend: false })`
+// straight after `open()`, best-effort, every time.
+
+async function connectDeassertsDtrRtsImmediatelyAfterOpen() {
+  const { port } = makeFakePort(() => {});
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  assert.deepEqual(port.signalsCalls, [{ dataTerminalReady: false, requestToSend: false }]);
+
+  await session.disconnect();
+}
+
+// ── Scenario 1b-2: a setSignals() rejection is truly best-effort — connect()
+//    must still succeed, not fail the whole connection over a mitigation ──
+//
+// Post-green review catch: the doc comment on `connect()` calls the
+// de-assert "best-effort", but the first version of this fix `await`ed it
+// with no `try`/`catch` — an unusual driver/OS that rejects `setSignals()`
+// on an otherwise-successfully-opened port would have made `connect()`
+// itself throw, turning a mitigation's failure into a total connect
+// failure. Fixed to catch-and-warn; this pins it.
+
+async function connectSucceedsEvenWhenSetSignalsRejects() {
+  const { port } = makeFakePort(() => {});
+  port.setSignals = async () => {
+    throw new Error("setSignals not supported on this platform");
+  };
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect(); // must not throw
+  assert.equal(session.isConnected, true);
+
+  await session.disconnect();
+}
+
+// ── Scenario 1c: connect survives a device reset it cannot prevent — a
+//    full ESP-IDF boot banner across the first (dropped) attempt, resolved
+//    on retry ────────────────────────────────────────────────────────────
+//
+// Even a "successful" de-assert (Scenario 1b) may not beat an
+// already-in-flight reset pulse (see session.js's `connect()` doc comment):
+// the reset-tolerant path is what actually has to hold. This drives
+// `queryStatus()` — the very first command `provisioner.js` issues right
+// after `connect()` resolves — against a device that answers with a plain
+// ESP-IDF reboot banner (no valid frame anywhere in it) for the whole first
+// 500ms attempt, then goes silent long enough for that attempt to time out,
+// then answers for real once `#sendRecvWithRetry` retries. Proves the
+// "settle, drain the banner, retry" sequence is already load-bearing in the
+// existing retry/resync machinery — no separate boot-wait step needed in
+// `connect()` itself.
+
+async function connectSurvivesResetBootBannerBeforeFirstQueryStatus() {
+  let writeCount = 0;
+  const { port, push } = makeFakePort(() => {
+    writeCount++;
+    if (writeCount === 1) {
+      // Mid-reboot: a burst of ESP-IDF boot log lines, no valid frame
+      // anywhere in them, delivered immediately. No further data follows —
+      // the 500ms per-attempt timeout fires and #sendRecvWithRetry retries.
+      const banner = new TextEncoder().encode(
+        "ets Jul 29 2019 12:21:46\n" +
+          "rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)\n" +
+          "I (412) boot: ESP-IDF v5.2 2nd stage bootloader\n" +
+          "I (890) prov_server: starting provisioning server\n"
+      );
+      push(banner);
+    } else if (writeCount === 2) {
+      // The retry: the device has finished booting and answers for real.
+      setTimeout(() => {
+        push(statusFrame);
+        push(identityFrame);
+      }, 5);
+    }
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+  assert.deepEqual(port.signalsCalls, [{ dataTerminalReady: false, requestToSend: false }]);
+
+  const { status, identity } = await session.queryStatus();
+  assertStatusAndIdentity(status, identity);
+  assert.equal(writeCount, 2, "expected exactly one retry to survive the boot banner");
+
+  await session.disconnect();
+}
+
+// ── Scenario 1d: a read-loop failure (e.g. the device vanishing mid-wait,
+//    as a hard EN reset re-enumerating the USB device might cause) surfaces
+//    as a real rejection to whoever is waiting — never a silent stall ────
+
+async function readLoopErrorSurfacesAsRealRejectionNotSilentStall() {
+  const { port, error } = makeFakePort(() => {
+    // The device disappears mid-attempt instead of ever answering — the
+    // underlying stream errors out rather than just going quiet.
+    setTimeout(() => error(new Error("device disappeared")), 5);
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  await assert.rejects(() => session.queryStatus(), /device disappeared/);
+
+  await session.disconnect();
 }
 
 // ── Scenario 2: send_recv_with_retry actually retries a dropped first frame ─
@@ -1177,6 +1305,10 @@ async function delRoomSendsCorrectFrame() {
 
 const scenarios = [
   ["happy path: two-frame handshake + magic-resync past log noise", happyPathWithLogNoiseResync],
+  ["connect() de-asserts DTR/RTS immediately after open()", connectDeassertsDtrRtsImmediatelyAfterOpen],
+  ["connect() succeeds even when setSignals() rejects (truly best-effort)", connectSucceedsEvenWhenSetSignalsRejects],
+  ["connect survives a device reset at open (boot banner across a retry)", connectSurvivesResetBootBannerBeforeFirstQueryStatus],
+  ["a read-loop failure surfaces as a real rejection, never a silent stall", readLoopErrorSurfacesAsRealRejectionNotSilentStall],
   ["send_recv_with_retry retries a dropped first response", retryOnDroppedFirstResponse],
   ["a retry's stale duplicate reply does not desync a later command", staleRetryDuplicateDoesNotDesyncNextCommand],
   ["disconnect() before connect() is a no-op", disconnectWithoutConnect],
