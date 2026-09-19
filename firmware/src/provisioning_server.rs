@@ -335,6 +335,10 @@ fn process_frame(
                 battery_charging: false,
                 battery_raw_mv: 0,
                 battery_held_raw_mv: 0,
+                // No reading taken yet (same rationale as the fields
+                // above) — Unknown/unconfirmed, not a real settled bucket.
+                battery_level: 0,
+                battery_confirmed: false,
             };
             let mut pbuf = [0u8; 64];
             let plen = encode_rsp_status(&status, &mut pbuf);

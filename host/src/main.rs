@@ -574,6 +574,9 @@ fn main() -> anyhow::Result<()> {
             // telemetry RESPONSE — all three derive from the same
             // `battery::BatteryStatus` reading (see firmware `battery` module docs).
             println!("battery     : {}", format_battery(&s));
+            // Coarse bucket mirroring the on-device header indicator/
+            // admin-menu row — see `format_battery_level`'s doc.
+            println!("battery level : {}", format_battery_level(&s));
             // Diagnostic-only raw ADC millivolts (2026-07-05 ADC-calibration
             // investigation) — the live, unfrozen voltage, for comparing
             // against a multimeter / the charger's LED across charge states.
@@ -1664,11 +1667,47 @@ fn format_gps_clock(s: &protocol::provisioning::RspStatusPayload) -> String {
 /// own surface. See firmware's `battery` module docs for how the reading is
 /// derived (ADC voltage divider; charging inferred from a voltage-rise trend,
 /// not read from a dedicated hardware signal).
+///
+/// Gated on `battery_confirmed` (added by
+/// `meshcadet-battery-wire-level-confirmed-status-gap` to close the
+/// wire-level gap left by
+/// `meshcadet-battery-unknown-until-window-settles`): while `false`,
+/// `battery_percent` is either a boot-time sag (this boot's first
+/// peak-hold window hasn't closed yet) or simply not sampled at all (no
+/// battery ADC on an unprovisioned device) — either way not a trustworthy
+/// reading yet. An explicit "settling" state, distinct from a genuinely low
+/// percent, matching what the on-device header indicator already shows
+/// (`Unknown` until confirmed).
 fn format_battery(s: &protocol::provisioning::RspStatusPayload) -> String {
+    if !s.battery_confirmed {
+        return "settling (no confirmed reading yet)".to_string();
+    }
     if s.battery_charging {
         format!("{}% (charging)", s.battery_percent)
     } else {
         format!("{}%", s.battery_percent)
+    }
+}
+
+/// Format the `battery level` line: the coarse bucket name mirroring the
+/// on-device header indicator / admin-menu `L:` row
+/// (`Unknown`/`Charging`/`Low`/`Partial`/`Full`), from the wire's
+/// `battery_level` (`0..=4`, the
+/// `firmware_core::ui::battery_indicator::level_to_indicator_level` shape).
+/// Added alongside `format_battery`'s `battery_confirmed` gate above
+/// (`meshcadet-battery-wire-level-confirmed-status-gap`) so an operator can
+/// see the same coarse bucket the device's own screen shows, not just the
+/// raw percent. An out-of-range byte (a firmware/host protocol mismatch,
+/// not expected in practice) falls back to `"unknown (n)"` rather than
+/// panicking.
+fn format_battery_level(s: &protocol::provisioning::RspStatusPayload) -> String {
+    match s.battery_level {
+        0 => "Unknown".to_string(),
+        1 => "Charging".to_string(),
+        2 => "Low".to_string(),
+        3 => "Partial".to_string(),
+        4 => "Full".to_string(),
+        n => format!("unknown ({n})"),
     }
 }
 
@@ -1705,8 +1744,8 @@ mod tests {
     use super::url_encode;
     use super::{
         build_contact_add_uri, build_room_add_uri, format_battery, format_battery_held_raw_mv,
-        format_battery_raw_mv, format_gps_clock, format_gps_coords, format_gps_fix,
-        generate_channel_secret_hex, parse_channel_secret_hex, parse_contact_uri,
+        format_battery_level, format_battery_raw_mv, format_gps_clock, format_gps_coords,
+        format_gps_fix, generate_channel_secret_hex, parse_channel_secret_hex, parse_contact_uri,
         password_truncation_warning, resolve_admin_pin, resolve_channel_secret,
         resolve_guest_password, validate_lock_pin, validate_lock_timeout,
         weak_secret_pattern_warning, Cli, Cmd, SecretBits,
@@ -1737,6 +1776,8 @@ mod tests {
             battery_charging: false,
             battery_raw_mv: 0,
             battery_held_raw_mv: 0,
+            battery_level: 0,
+            battery_confirmed: true,
         }
     }
 
@@ -1758,6 +1799,25 @@ mod tests {
         battery_raw_mv: u16,
         battery_held_raw_mv: u16,
     ) -> RspStatusPayload {
+        status_with_battery_level_confirmed(
+            battery_percent,
+            battery_charging,
+            battery_raw_mv,
+            battery_held_raw_mv,
+            0,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn status_with_battery_level_confirmed(
+        battery_percent: u8,
+        battery_charging: bool,
+        battery_raw_mv: u16,
+        battery_held_raw_mv: u16,
+        battery_level: u8,
+        battery_confirmed: bool,
+    ) -> RspStatusPayload {
         RspStatusPayload {
             provisioned: true,
             pubkey: [0u8; 32],
@@ -1773,6 +1833,8 @@ mod tests {
             battery_charging,
             battery_raw_mv,
             battery_held_raw_mv,
+            battery_level,
+            battery_confirmed,
         }
     }
 
@@ -1853,6 +1915,62 @@ mod tests {
     fn battery_held_raw_mv_defaults_to_zero_when_unset() {
         let s = status_with_battery(0, false);
         assert_eq!(format_battery_held_raw_mv(&s), "0 mV");
+    }
+
+    // ── battery_level / battery_confirmed (settling-vs-low wire gap) ───────
+
+    #[test]
+    fn battery_unconfirmed_shows_settling_not_a_percent() {
+        // A boot-settling read must never be misrenderable as a real (and
+        // possibly falsely low) percentage — this is the exact wire-level
+        // gap `meshcadet-battery-wire-level-confirmed-status-gap` closes.
+        // Percent is deliberately set LOW here (a boot-sag value) to prove
+        // the settling text wins over it, not just that it wins when the
+        // percent happens to look fine.
+        let s = status_with_battery_level_confirmed(3, false, 0, 0, 0, false);
+        let out = format_battery(&s);
+        assert!(
+            out.contains("settling"),
+            "expected a settling indication, got {out:?}"
+        );
+        assert!(
+            !out.contains('%'),
+            "an unconfirmed reading must not render as a percentage: {out:?}"
+        );
+    }
+
+    #[test]
+    fn battery_confirmed_shows_ordinary_percent_even_when_low() {
+        // Once confirmed, a genuinely low percent renders normally — the
+        // settling text must NOT mask a real Low reading.
+        let s = status_with_battery_level_confirmed(3, false, 0, 0, 2, true);
+        assert_eq!(format_battery(&s), "3%");
+    }
+
+    #[test]
+    fn battery_confirmed_charging_still_shows_charging_suffix() {
+        let s = status_with_battery_level_confirmed(50, true, 0, 0, 1, true);
+        assert_eq!(format_battery(&s), "50% (charging)");
+    }
+
+    #[test]
+    fn format_battery_level_maps_every_wire_value() {
+        for (level, want) in [
+            (0u8, "Unknown"),
+            (1, "Charging"),
+            (2, "Low"),
+            (3, "Partial"),
+            (4, "Full"),
+        ] {
+            let s = status_with_battery_level_confirmed(0, false, 0, 0, level, true);
+            assert_eq!(format_battery_level(&s), want);
+        }
+    }
+
+    #[test]
+    fn format_battery_level_falls_back_on_out_of_range_byte() {
+        let s = status_with_battery_level_confirmed(0, false, 0, 0, 200, true);
+        assert_eq!(format_battery_level(&s), "unknown (200)");
     }
 
     #[test]

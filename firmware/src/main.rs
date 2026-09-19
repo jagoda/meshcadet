@@ -60,8 +60,14 @@
 //! - Single shared source (`battery::BatteryStatus`) wired into all three
 //!   consumers so every field always agrees: the native telemetry RESPONSE,
 //!   the host `status` command
-//!   (`RspStatusPayload.battery_percent/battery_charging/battery_raw_mv/battery_held_raw_mv`),
-//!   and the admin-menu screen.
+//!   (`RspStatusPayload.battery_percent/battery_charging/battery_raw_mv/battery_held_raw_mv/battery_level/battery_confirmed`),
+//!   and the admin-menu screen. `battery_level`/`battery_confirmed` (added
+//!   `meshcadet-battery-wire-level-confirmed-status-gap`) close the
+//!   wire-level gap left by `meshcadet-battery-unknown-until-window-settles`
+//!   (2026-09-17): without them, the host CLI had no way to tell a
+//!   boot-settling read from a genuinely low one — see
+//!   `admin_server::handle_frame`'s `FRAME_QUERY_STATUS` arm and
+//!   `firmware_core::battery::battery_level_to_wire`'s doc.
 //!
 //! # Policy layer
 //! [`protocol::PolicyFilter`] enforces allowlist policy for every inbound frame:
