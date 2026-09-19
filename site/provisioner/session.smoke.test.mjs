@@ -53,6 +53,7 @@ import {
   FRAME_RSP_HISTORY_ENTRY,
   FRAME_RSP_HISTORY_DONE,
   FRAME_RSP_ADVERT,
+  FRAME_RSP_LOCK,
   MAX_RSP_HISTORY_ENTRY_PAYLOAD,
   HISTORY_MSG_TYPE_DM,
   HISTORY_MSG_TYPE_GRP_TXT,
@@ -1225,6 +1226,40 @@ async function unrecognizedFrameTypeIsNotToleratedAsStray() {
   await session.disconnect();
 }
 
+// ── Scenario 21b: a stray RSP_LOCK is tolerated like every other recognized
+//    response type (ALL_RSP_FRAME_TYPES completeness regression) ─────────
+//
+// `FRAME_RSP_LOCK` (0x8D) was missing from `ALL_RSP_FRAME_TYPES` — found by
+// inspection while diagnosing `meshcadet-web-provisioner-read-timeout-
+// after-reset`, not from a live symptom (this module has no `queryLock()`
+// caller yet, so a real session can't produce this today). Guards the
+// invariant `ALL_RSP_FRAME_TYPES` exists for: every `FRAME_RSP_*` codec.js
+// defines must be tolerated as late residue here, not just the ones this
+// module currently happens to send queries for — the same gap, for a
+// different frame type, that `unrecognizedFrameTypeIsNotToleratedAsStray`
+// (Scenario 21) guards the *other* half of.
+
+async function strayRspLockIsToleratedLikeAnyOtherRecognizedType() {
+  const { port, push } = makeFakePort((chunk) => {
+    const { frameType } = decodeFrame(chunk);
+    if (frameType === FRAME_QUERY_ADVERT) {
+      // A leftover RSP_LOCK (e.g. a future queryLock() caller's late reply)
+      // arrives ahead of this command's real answer.
+      setTimeout(() => push(encodeFrame(FRAME_RSP_LOCK, new Uint8Array([0, 0, 0, 0]))), 5);
+      setTimeout(() => push(encodeFrame(FRAME_RSP_ADVERT, buildAdvertCardPayload("Cadet"))), 10);
+    }
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  const card = await session.queryAdvert();
+  assert.deepEqual(Array.from(card), Array.from(buildAdvertCardPayload("Cadet")));
+
+  await session.disconnect();
+}
+
 // ── Scenario 22: stray-frame tolerance is bounded, not infinite ──────────
 //
 // A device wedged into replaying the same well-formed-but-wrong response
@@ -1414,6 +1449,7 @@ const scenarios = [
   ["an oversized RSP_ADVERT frame survives log-noise resync (plen-guard regression)", oversizedAdvertFrameSurvivesLogNoiseResync],
   ["a stray leftover frame ahead of QUERY_ADVERT's reply does not cascade through contacts/channels (one-behind desync regression)", advertResidueDoesNotCascadeThroughContactsAndChannels],
   ["a genuinely unrecognized frame type is not tolerated as stray residue", unrecognizedFrameTypeIsNotToleratedAsStray],
+  ["a stray RSP_LOCK is tolerated like any other recognized response type (ALL_RSP_FRAME_TYPES completeness regression)", strayRspLockIsToleratedLikeAnyOtherRecognizedType],
   ["stray-frame tolerance is bounded, not infinite", strayFrameToleranceIsBounded],
   ["listRooms streams RSP_ROOM*N -> RSP_ROOMS_DONE", listRoomsStreamsToDone],
   ["addRoom sends FRAME_ADD_ROOM with the correct payload", addRoomSendsCorrectFrame],

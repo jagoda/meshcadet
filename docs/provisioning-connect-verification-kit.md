@@ -88,6 +88,119 @@ two ("no reboot" / "reboot, recovers"):**
    reset before the CLI works again — **the fix did not hold** and this is
    the single most important fact to report back.
 
+## Update, 2026-09-19 (later): "read timeout after reset" — root cause found and fixed: `admin_server`'s RX buffer has no full-buffer escape valve
+
+`meshcadet-web-provisioner-read-timeout-after-reset` picked this up right
+after PR #201 (the `setSignals()` removal above) shipped. **Two maintainer
+device datapoints made this investigation's own first two framings dead
+ends in turn** (both retractions were earned by evidence, not guessed past)
+before the decisive trace landed:
+
+```
+timeout waiting for response frame
+  (accumulated 0 bytes this attempt, 10560 bytes total this command)
+```
+
+— thrown by `#recvFrame`, i.e. a clean, bounded failure, not a hang. Two
+more facts pinned it down: the device's screen showed **normal app UI**
+throughout (it was never held in reset or in the ROM bootloader — every
+theory from rounds #200/#201 that depends on the device being
+non-functional is dead), and **the host CLI also failed against the same
+device afterward, clearing only on a physical reset** — so whatever this is,
+it is a device-side latch, not a browser-only bug.
+
+**Root cause, confirmed by source (not yet cross-build-verified — see
+caveat below): `firmware/src/admin_server.rs`'s frame-receive loop has no
+escape valve for a full RX buffer stuck on a false frame-magic match.**
+
+This firmware sets `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y`
+(`firmware/sdkconfig.defaults:121`) — `log::info!`/`log::warn!` output
+shares the *same* USB-Serial-JTAG wire the binary provisioning frames ride,
+and boot is chatty on it. `admin_server::run`'s read loop (mirroring
+`provisioning_server::run`'s, the unprovisioned-boot sibling) resyncs on
+`PROV_MAGIC` (`"MC"`) before attempting to decode a frame — but
+`find_magic_start` trusts **any** two-byte `4D 43` match unconditionally,
+with no check on what follows. Ten-plus KB of boot-time log text is more
+than enough for `4D 43` to appear by coincidence, and whatever two bytes
+happen to follow it become the frame's `plen` — a value from 0–65535 with
+no relationship to the buffer's actual contents. Once `FRAME_OVERHEAD +
+plen` exceeds the 512-byte `RX_BUF_LEN`, `decode_frame` returns
+`TruncatedFrame` and **can never do anything else** for that candidate: the
+same false match re-confirms at offset 0 every loop iteration, so
+`rx_len` only grows, until it hits `RX_BUF_LEN` and the `if rx_len <
+RX_BUF_LEN` read-gate stops admitting new bytes. The thread is now stuck
+forever, spinning `find_magic_start` → `TruncatedFrame` with **no
+`delay_ms` in that arm** — it never reads another byte, from *any* client,
+until a physical reset re-zeroes `rx_buf`.
+
+This explains every datapoint at once: normal app UI (a separate task/
+thread, unaffected by `admin_server` wedging), a clean bounded browser
+timeout (bytes did arrive — the 10560 total — they just could never
+resync), the host CLI *also* failing (same stuck thread, doesn't care which
+client asks), and only a physical reset clearing it (fresh boot re-zeroes
+the buffer). It also explains "used to work": this is a **probabilistic**
+trigger — the more boot-time log volume, the higher the odds any given boot
+happens to contain the `4D 43` byte pair with an oversized trailing length.
+Recent PRs on this path (config-store validation in #197, plus ordinary log
+growth over time) all plausibly raised that boot-time log volume, raising
+the odds of tripping this without needing any single commit to be precisely
+at fault. (An early-draft theory pinned this on two specific wire-contract
+commits as "immediately preceding #197" — that framing does not hold up
+against `git log`'s own timestamps, one of the two postdates #197 by
+minutes; not the mechanism below regardless.)
+
+**The fix, already in this branch:** `provisioning_server::run` — the
+*sibling* loop, used only during first-boot unprovisioned setup — already
+carries the missing guard:
+```rust
+Err(ProvError::TruncatedFrame) => {
+    if rx_len >= RX_BUF_LEN {
+        log::warn!("prov_server: RX buffer full with no valid frame — flushing");
+        rx_len = 0;
+    }
+}
+```
+`admin_server::run` (the loop actually running on every already-provisioned
+device — i.e. every device past first-time setup, exactly this mission's
+repro scenario) never got it. This was a **drift between two hand-duplicated
+loops**, not a deliberate omission — worth remembering next time either file
+changes: touch one, check the other. Mirrored verbatim into `admin_server`'s
+`TruncatedFrame` arm. `RX_BUF_LEN`'s own doc comment already records a prior,
+partial fix to the *identical* bug class (bumping 64→512 bytes after a
+long-name edit frame was found to hang the same way) — that raised the bar
+for the wedge to trigger without removing the underlying gap, which is
+exactly why boot-log noise could still find it.
+
+**This also refutes an earlier "provisioning session/lock never released"
+theory** raised while chasing this same symptom: no session/lock construct
+is needed to explain the host-CLI-also-hangs fact — a single, un-scoped
+shared resource (the RX buffer, and the one thread reading it) explains it
+without one.
+
+**Unrelated hardening, found by inspection while diagnosing this, fixed in
+the same pass:** the browser's `session.js` `ALL_RSP_FRAME_TYPES` set — the
+list of response types `#recvUntilExpected` tolerates as late-but-legitimate
+residue rather than treating as corruption — was missing `FRAME_RSP_LOCK`
+(0x8D), the response the screen-lock feature (`9f0a2d2`) added. It cannot be
+the cause of this mission's symptom (this module has no `queryLock()` caller
+yet, so a real session never produces an `RSP_LOCK` frame today), but every
+other `FRAME_RSP_*` codec.js defines was already listed — an oversight, not
+a deliberate exclusion — so it's fixed regardless, with a new
+`session.smoke.test.mjs` regression scenario proving it's now tolerated like
+every other recognized type.
+
+**Caveat, stated plainly:** this container's `firmware/rust-toolchain.toml`
+pins the `esp` (Xtensa) toolchain, which is not installed here — the same
+constraint PR #197's own commit message hit and disclosed. The fix could not
+be cross-build-verified in this environment. It is, however, syntactically
+and semantically a verbatim mirror of an already-compiling, already-shipped
+sibling arm in the same file/crate (`provisioning_server::run`'s identical
+guard, five lines above in the same source tree) — about as low a
+compile-risk edit as a firmware change can be. **Step 1 below is where this
+gets its real confirmation**: with the fix in hand, step 1 should land on
+the "best case" or "acceptable case" branch on the very first try, every
+time, never the wedge case this mission was opened to chase.
+
 ## What this fix found and addressed (source + host-testable surface only)
 
 - **Refuted:** a Rust/JS wire-codec divergence from the recent screen-lock
@@ -217,13 +330,31 @@ hardware). That is exactly what this kit is for.
   pre-#200, field-proven-survivable behavior. **This counts as a PASS for
   step 1** — record which of the two outcomes above actually happened in the
   result block.
+- **RX-BUFFER-STARVATION CHECK (new — `meshcadet-web-provisioner-
+  read-timeout-after-reset`): this is now the load-bearing check for this
+  fix, the same way step 1's wedge-case branch was load-bearing for #201's.**
+  With the `admin_server` RX-buffer-full flush guard in hand (see the
+  "Update, 2026-09-19 (later)" section above for the full mechanism), a
+  normal connect-after-reset should land on the "Best case" or "Acceptable
+  case" branch above **every single time** — never the wedge case below.
+  Repeat Connect several times in a row (5+), each after a fresh reset if
+  the device doesn't already reset every time, to build confidence this
+  isn't just a lucky run: the pre-fix bug was probabilistic (it needed a
+  stray `4D 43` byte pair inside that boot's log noise), so a single clean
+  pass is weaker evidence than several.
+  - **If every run lands clean** ⇒ the fix holds; this is the expected,
+    now-confirmed outcome.
+  - **If the wedge case below still reproduces even once** ⇒ this was not
+    the only contributor, or the fix has a gap — capture everything the FAIL
+    branch below asks for, plus the exact serial-monitor line count/content
+    right before the device is next queried, and flag it loudly: this would
+    mean the diagnosis needs a second pass, not just a bigger buffer.
 - **Wedge case — the connect attempt fails with a bounded, named error**
   (in the browser console / on the page: `timeout waiting for response
   frame (accumulated N bytes this attempt, M bytes total this command)`, or
   — less likely now that `connect()` no longer calls `setSignals()` — a
   `write stalled — …` message) **rather than hanging with no error at all.**
-  This is the new discriminating check (§ "Update, 2026-09-19" above) — a
-  bounded, named failure here is not automatically a FAIL. Immediately
+  A bounded, named failure here is not automatically a FAIL. Immediately
   after it, **without power-cycling the device**, run step 3 below (host CLI
   `status`):
   - **Host CLI succeeds (or fails with its own bounded timeout, but does NOT
@@ -231,9 +362,11 @@ hardware). That is exactly what this kit is for.
     correctly and boundedly instead of hanging, and the device was left in a
     reachable state. Record the exact error text.
   - **Host CLI also hangs, and only resumes after a physical reset** ⇒
-    **FAIL — this is the specific regression this mission exists to close.**
-    Capture everything below, plus the exact host CLI command and how long
-    you waited before the physical reset.
+    **FAIL — this is the exact regression `meshcadet-web-provisioner-
+    read-timeout-after-reset` diagnosed and fixed; reproducing it with the
+    fix in hand is the single most important thing to report back.** Capture
+    everything below, plus the exact host CLI command and how long you
+    waited before the physical reset.
 - **FAIL — the device reboots and the page never recovers** (stuck on
   "Reading status…", or a visible error after ~10 s), **or** the connection
   is lost outright (browser reports the port/device gone, "Disconnected."
@@ -340,6 +473,11 @@ step 1 (web provisioner connect):        PASS | FAIL
   which outcome? no reboot at all | reboot, connect recovers within ~10s | wedge case (bounded error, host CLI still reachable)
   (wedge case only) exact browser error text: <paste>
   (wedge case only) host CLI status immediately after, no power-cycle: worked | hung until physical reset
+  (wedge case only) does this happen on EVERY connect right after a reset, or only occasionally? <every time / occasional / only tested once>
+  RX-buffer-starvation fix (meshcadet-web-provisioner-read-timeout-after-reset):
+    number of Connect attempts run: <N, 5+ recommended>
+    number that landed clean (best/acceptable case, no wedge): <N>
+    number that hit the wedge case: <N, expect 0>
 step 2 (web provisioner add-channel):    PASS | FAIL
 step 3 (host CLI status):                PASS | FAIL
 step 4 (bad key_len hardening probe):    PASS | FAIL
@@ -362,6 +500,15 @@ symptoms and no further work is needed for this defect. Any FAIL should come
 back with this result block attached — the serial monitor panic text (or its
 conspicuous absence) is the single fact most likely to turn a second
 diagnosis pass from "read the source again" into "here is line X."
+
+**Fill in the RX-buffer-starvation block above even on a step-1 PASS.** It
+is the confirmation `meshcadet-web-provisioner-read-timeout-after-reset`
+needs: several repeated clean runs is meaningfully stronger evidence the
+fix holds than one, since the pre-fix bug only triggered when that boot's
+log noise happened to contain a stray `4D 43` byte pair — a probabilistic
+trigger, not a certainty on any single run. See that mission's "Update,
+2026-09-19 (later)" section above for the full root-cause mechanism and the
+fix already in this branch (`admin_server.rs`'s `TruncatedFrame` arm).
 
 **Step 1's "which outcome" line matters even on a PASS.** `connect()` no
 longer calls `setSignals()` at all (`meshcadet-provisioner-connect-
