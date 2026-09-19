@@ -69,9 +69,10 @@ import { ProvisionerSession, DeviceError } from "./session.js";
  * scripted device responses and to assert what was sent); the returned
  * `push(bytes)` enqueues bytes as if the device sent them; `signalsCalls`
  * records every `setSignals()` invocation in order (used to assert
- * `connect()`'s post-open DTR/RTS de-assert — see session.js's `connect()`
- * doc comment); `error(err)` makes the readable stream error out, as if the
- * device vanished mid-read (e.g. a USB re-enumeration from a hard reset).
+ * `connect()` never calls it at all — see session.js's `connect()` doc
+ * comment for why); `error(err)` makes the readable stream error out, as if
+ * the device vanished mid-read (e.g. a USB re-enumeration from a hard
+ * reset).
  */
 function makeFakePort(onWrite) {
   let controller;
@@ -258,50 +259,127 @@ async function happyPathWithLogNoiseResync() {
   assert.equal(session.isConnected, false);
 }
 
-// ── Scenario 1b: connect() de-asserts DTR/RTS immediately after open() ───
+// ── Scenario 1b: connect() never touches setSignals() at all ─────────────
 //
-// Regression guard for this mission's own defect: PR #197 fixed the host
-// CLI (`host/src/transport.rs`) to leave DTR/RTS untouched, but the browser
-// client never got the equivalent treatment — Chromium's `SerialPort.open()`
-// asserts both lines unconditionally, which on this board's CH343
-// auto-program wiring (EN/IO0) triggers a device reset. `connect()` must
-// call `setSignals({ dataTerminalReady: false, requestToSend: false })`
-// straight after `open()`, best-effort, every time.
+// Regression guard for TWO successive defects on the same line, in order:
+// (a) PR #197 fixed the host CLI (`host/src/transport.rs`) to leave DTR/RTS
+// untouched; the browser client never got the equivalent treatment, so PR
+// #200 added a post-open `setSignals({dataTerminalReady: false,
+// requestToSend: false})` de-assert, reasoning it might "beat" the reset
+// pulse `open()`'s own forced assert triggers on this board's CH343
+// auto-program wiring (EN/IO0). (b) `meshcadet-provisioner-connect-
+// unbounded-awaits-hang` (this mission) got the first real hardware
+// evidence against that de-assert and found it left the device unreachable
+// by the host CLI until a PHYSICAL RESET — `setSignals()`'s two line
+// changes are not guaranteed atomic below the JS call, and a staggered
+// transition on this wiring is indistinguishable from `site/flash.js`'s
+// vendored `esptool-js`'s deliberate bootloader-entry dance. The fix:
+// `connect()` must not call `setSignals()` at all — see its doc comment for
+// the full history and why relying on `open()`'s own (already
+// field-proven-survivable, pre-#200) forced assert is the smallest correct
+// fix.
 
-async function connectDeassertsDtrRtsImmediatelyAfterOpen() {
+async function connectNeverCallsSetSignals() {
   const { port } = makeFakePort(() => {});
   installFakeGlobals(port);
 
   const session = new ProvisionerSession();
   await session.connect();
 
-  assert.deepEqual(port.signalsCalls, [{ dataTerminalReady: false, requestToSend: false }]);
+  assert.deepEqual(port.signalsCalls, []);
 
   await session.disconnect();
 }
 
-// ── Scenario 1b-2: a setSignals() rejection is truly best-effort — connect()
-//    must still succeed, not fail the whole connection over a mitigation ──
+// ── Scenario 1e: writer.write() that HANGS surfaces a distinct
+//    "write stalled" error within bounded time — the other unbounded-await
+//    defect this mission fixes ──────────────────────────────────────────
 //
-// Post-green review catch: the doc comment on `connect()` calls the
-// de-assert "best-effort", but the first version of this fix `await`ed it
-// with no `try`/`catch` — an unusual driver/OS that rejects `setSignals()`
-// on an otherwise-successfully-opened port would have made `connect()`
-// itself throw, turning a mitigation's failure into a total connect
-// failure. Fixed to catch-and-warn; this pins it.
+// `#sendFrame`'s `await this.#writer.write(...)` was, pre-fix, a bare await
+// with no bound at all — reachable on every attempt of every command, not
+// just connect(). A wedged writable stream hung the whole call forever,
+// with the 10s retry budget never even consulted (it only ever wrapped the
+// receive side). This must surface its OWN cause ("write stalled"),
+// distinct from a plain receive timeout ("no response"), within bounded
+// time — not hang, and not report a generic timeout that buries which of
+// the two actually happened.
 
-async function connectSucceedsEvenWhenSetSignalsRejects() {
-  const { port } = makeFakePort(() => {});
-  port.setSignals = async () => {
-    throw new Error("setSignals not supported on this platform");
+function makeFakePortWithStallingWrite() {
+  const readable = new ReadableStream({ start() {} });
+  const writable = new WritableStream({
+    write() {
+      return new Promise(() => {}); // never settles
+    },
+  });
+  return {
+    readable,
+    writable,
+    async open() {},
+    async setSignals() {},
+    async close() {},
   };
+}
+
+async function writeStallSurfacesDistinctErrorWithinBoundedTime() {
+  const port = makeFakePortWithStallingWrite();
   installFakeGlobals(port);
 
   const session = new ProvisionerSession();
-  await session.connect(); // must not throw
-  assert.equal(session.isConnected, true);
+  await session.connect();
+
+  const start = Date.now();
+  await assert.rejects(() => session.queryStatus(), /write stalled/);
+  const elapsed = Date.now() - start;
+  assert.ok(elapsed < 4000, `write stall must surface in bounded time (took ${elapsed}ms)`);
+  assert.ok(
+    elapsed > 1000,
+    `write stall should genuinely wait out the bounded write timeout, not resolve suspiciously early (took ${elapsed}ms)`
+  );
+
+  // A stalled write is treated as fatal (mirrors #readLoop's own
+  // #fatalError latch for a dead read side) — a SECOND command must fail
+  // fast with the same cause rather than re-attempting a doomed write.
+  await assert.rejects(() => session.listContacts(), /write stalled/);
 
   await session.disconnect();
+}
+
+// ── Scenario 1f: disconnect() does not hang when reader.cancel() stalls —
+//    audited per this mission's Task 4 (teardown is a candidate too) ─────
+//
+// A hang here would strand the user with no recovery but a page reload —
+// exactly the failure mode a "disconnect and reconnect" path exists to
+// prevent.
+
+function makeFakePortWithStallingCancel() {
+  const readable = new ReadableStream({
+    start() {},
+    cancel() {
+      return new Promise(() => {}); // never settles
+    },
+  });
+  const writable = new WritableStream({ write() {} });
+  return {
+    readable,
+    writable,
+    async open() {},
+    async setSignals() {},
+    async close() {},
+  };
+}
+
+async function disconnectDoesNotHangWhenReaderCancelNeverSettles() {
+  const port = makeFakePortWithStallingCancel();
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  const start = Date.now();
+  await session.disconnect(); // must not hang
+  const elapsed = Date.now() - start;
+  assert.equal(session.isConnected, false);
+  assert.ok(elapsed < 4000, `disconnect() must not hang when reader.cancel() stalls (took ${elapsed}ms)`);
 }
 
 // ── Scenario 1c: connect survives a device reset it cannot prevent — a
@@ -347,7 +425,7 @@ async function connectSurvivesResetBootBannerBeforeFirstQueryStatus() {
 
   const session = new ProvisionerSession();
   await session.connect();
-  assert.deepEqual(port.signalsCalls, [{ dataTerminalReady: false, requestToSend: false }]);
+  assert.deepEqual(port.signalsCalls, []); // connect() no longer touches setSignals() — see its doc comment
 
   const { status, identity } = await session.queryStatus();
   assertStatusAndIdentity(status, identity);
@@ -1305,8 +1383,12 @@ async function delRoomSendsCorrectFrame() {
 
 const scenarios = [
   ["happy path: two-frame handshake + magic-resync past log noise", happyPathWithLogNoiseResync],
-  ["connect() de-asserts DTR/RTS immediately after open()", connectDeassertsDtrRtsImmediatelyAfterOpen],
-  ["connect() succeeds even when setSignals() rejects (truly best-effort)", connectSucceedsEvenWhenSetSignalsRejects],
+  [
+    "connect() never calls setSignals() (device-wedge regression — see connect()'s doc comment)",
+    connectNeverCallsSetSignals,
+  ],
+  ["a stalled writer.write() surfaces a distinct 'write stalled' error within bounded time (unbounded-await regression)", writeStallSurfacesDistinctErrorWithinBoundedTime],
+  ["disconnect() does not hang when reader.cancel() stalls (unbounded-await regression)", disconnectDoesNotHangWhenReaderCancelNeverSettles],
   ["connect survives a device reset at open (boot banner across a retry)", connectSurvivesResetBootBannerBeforeFirstQueryStatus],
   ["a read-loop failure surfaces as a real rejection, never a silent stall", readLoopErrorSurfacesAsRealRejectionNotSilentStall],
   ["send_recv_with_retry retries a dropped first response", retryOnDroppedFirstResponse],

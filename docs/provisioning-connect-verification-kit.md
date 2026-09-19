@@ -30,6 +30,64 @@ fallback for a reset the de-assert doesn't prevent. **Step 1 below is now
 the discriminating test for this specific fix** — see its expanded
 "Expect"/"If" branches.
 
+## Update, 2026-09-19: first real hardware run — the de-assert wedges the device; removed. Three outcomes now, not one.
+
+`meshcadet-provisioner-connect-unbounded-awaits-hang` got the first real
+device time any of the three rounds on this defect (#197, #200, this one)
+has had. Two datapoints, in order:
+
+1. A failed web-provisioner connect errored with `timeout waiting for
+   response frame (accumulated 0 bytes...)` — **not a hang.** The mission's
+   own stated Objective (unbounded `setSignals()`/`writer.write()` awaits
+   causing an infinite hang) was refuted as the cause of *this* symptom; both
+   awaits were still real defects and are now bounded regardless (belt and
+   suspenders — see `session.js`'s `#sendFrame`/`disconnect()` doc comments),
+   but that was not what a maintainer's own device run actually showed.
+2. **Decisive:** after a failed web connect, the **host CLI also hung**
+   against the same device — and kept hanging **until the device was
+   physically reset.** The host CLI never writes DTR/RTS at all
+   (`host/src/transport.rs:51-65`), so this was not residual browser-side
+   signal state; something on the device itself had latched. Leading
+   mechanism: `setSignals()`'s two line changes are not guaranteed atomic
+   below the JS call, and a staggered DTR/RTS transition on this board's
+   CH343 wiring (EN/IO0) is indistinguishable from the deliberate
+   bootloader-entry toggle sequence `site/flash.js`'s vendored `esptool-js`
+   implements on purpose — PR #200 appears to have accidentally reimplemented
+   the flasher's enter-download-mode dance inside the provisioner's connect
+   path.
+
+**Fix: `connect()` no longer calls `setSignals()` at all** — see its doc
+comment for the full history. This returns to the exact pre-#200 path,
+which field evidence already showed was reset-and-recoverable (never a
+wedge requiring physical intervention). `esptool-js` is unchanged — it
+deliberately wants that reset to enter its own bootloader for flashing.
+
+**Severity note, for context on why step 1 below is now the load-bearing
+check, not an optional extra:** the currently deployed web provisioner
+(Pages, from `main`, since PR #200 merged) put a device into a state
+requiring physical intervention to clear. The decision was to fix forward
+rather than revert or gate the page — this kit's job is to confirm the
+forward fix actually holds.
+
+**Step 1 below now has to discriminate THREE outcomes, not the original
+two ("no reboot" / "reboot, recovers"):**
+
+1. **No reboot at all**, or **reboot but the page recovers on its own** — the
+   pre-existing two acceptable outcomes, unchanged (see the original 2026-09-18
+   branches below).
+2. **Wedged link**: the connect attempt now fails with a *bounded, named*
+   error (`timeout waiting for response frame (accumulated N bytes this
+   attempt, M bytes total this command)`, or — much less likely now that
+   `setSignals()` is gone — `write stalled — …`) rather than hanging
+   forever. This is the new, first-class check: **after this failure, is
+   the device still reachable by the host CLI without a physical reset?**
+   If yes, the fix holds even though this particular connect attempt failed
+   (a wedged/reset link surfacing a clean, bounded, diagnosable error is the
+   correct outcome for a link problem the browser genuinely cannot always
+   avoid — see connect()'s doc comment). If no — the device needs a physical
+   reset before the CLI works again — **the fix did not hold** and this is
+   the single most important fact to report back.
+
 ## What this fix found and addressed (source + host-testable surface only)
 
 - **Refuted:** a Rust/JS wire-codec divergence from the recent screen-lock
@@ -145,26 +203,42 @@ hardware). That is exactly what this kit is for.
   0 channels") within a couple of seconds. The serial monitor shows normal
   `prov_server: QUERY_STATUS` log lines — **no panic, no reboot banner, no
   gap where the monitor goes silent and a fresh boot banner appears.** This
-  means `connect()`'s post-open `setSignals({dataTerminalReady: false,
-  requestToSend: false})` de-assert beat the reset pulse outright — the
-  ideal outcome, but not the one the fix depends on (see next bullet).
+  means `open()`'s own forced DTR/RTS assert (the one `connect()` can no
+  longer avoid or mitigate — see its doc comment for why it no longer tries)
+  did not trigger a visible reset on this run — the ideal outcome, but not
+  the one the fix depends on (see next bullet).
 - **Acceptable case — the device still reboots, but the page recovers on
   its own within ~10 seconds** (no manual reconnect needed), and the serial
   monitor shows a full, ordinary boot banner (no panic) before
-  `prov_server:` logging resumes and status appears in the browser. This
-  means the de-assert did **not** beat the pulse (worth noting explicitly —
-  it rules out "post-open de-assert is sufficient" as a claim, even though
-  the connect still succeeds), but the reset-tolerant retry path (boot-noise
-  resync + `#sendRecvWithRetry`'s 10 s budget) did its job. **This still
-  counts as a PASS for step 1** — record which of the two outcomes above
-  actually happened in the result block; both are acceptable, but they mean
-  different things about whether the de-assert itself is doing anything on
-  this specific board/browser/cable combination.
+  `prov_server:` logging resumes and status appears in the browser. This is
+  the **expected steady-state outcome** now that `connect()` relies purely
+  on `#sendRecvWithRetry`'s reset-tolerant retry path (boot-noise resync +
+  the 10 s budget) rather than trying to prevent the reset — matches the
+  pre-#200, field-proven-survivable behavior. **This counts as a PASS for
+  step 1** — record which of the two outcomes above actually happened in the
+  result block.
+- **Wedge case — the connect attempt fails with a bounded, named error**
+  (in the browser console / on the page: `timeout waiting for response
+  frame (accumulated N bytes this attempt, M bytes total this command)`, or
+  — less likely now that `connect()` no longer calls `setSignals()` — a
+  `write stalled — …` message) **rather than hanging with no error at all.**
+  This is the new discriminating check (§ "Update, 2026-09-19" above) — a
+  bounded, named failure here is not automatically a FAIL. Immediately
+  after it, **without power-cycling the device**, run step 3 below (host CLI
+  `status`):
+  - **Host CLI succeeds (or fails with its own bounded timeout, but does NOT
+    hang)** ⇒ **PASS.** The link had a bad moment, the browser reported it
+    correctly and boundedly instead of hanging, and the device was left in a
+    reachable state. Record the exact error text.
+  - **Host CLI also hangs, and only resumes after a physical reset** ⇒
+    **FAIL — this is the specific regression this mission exists to close.**
+    Capture everything below, plus the exact host CLI command and how long
+    you waited before the physical reset.
 - **FAIL — the device reboots and the page never recovers** (stuck on
   "Reading status…", or a visible error after ~10 s), **or** the connection
   is lost outright (browser reports the port/device gone, "Disconnected."
-  fires without user action): capture, verbatim, into the result block
-  below:
+  fires without user action), **or** the wedge case above's host-CLI check
+  fails: capture, verbatim, into the result block below:
   - The full serial monitor output from immediately before the click through
     the reboot and (if it happens at all) back to `prov_server:` logging
     resuming (a `panic`/`Guru Meditation Error` line here is the single most
@@ -263,7 +337,9 @@ firmware commit: <git rev flashed>
 board: <T-Deck Plus / other>
 
 step 1 (web provisioner connect):        PASS | FAIL
-  if PASS, which outcome? no reboot at all | reboot, but connect recovers within ~10s
+  which outcome? no reboot at all | reboot, connect recovers within ~10s | wedge case (bounded error, host CLI still reachable)
+  (wedge case only) exact browser error text: <paste>
+  (wedge case only) host CLI status immediately after, no power-cycle: worked | hung until physical reset
 step 2 (web provisioner add-channel):    PASS | FAIL
 step 3 (host CLI status):                PASS | FAIL
 step 4 (bad key_len hardening probe):    PASS | FAIL
@@ -276,6 +352,9 @@ for any FAIL above, paste verbatim:
 - exact command + wall-clock time waited (step 3/4)
 - (step 1 FAIL only) did the browser ever report the device as physically
   disconnected/re-enumerated, or did it just go quiet and never come back?
+- (step 1 FAIL, wedge case only) how long did you wait before physically
+  resetting the device, and did the host CLI's own hang ever resolve on its
+  own without one?
 ```
 
 A clean PASS on all four steps means the fix in hand resolves both reported
@@ -284,12 +363,14 @@ back with this result block attached — the serial monitor panic text (or its
 conspicuous absence) is the single fact most likely to turn a second
 diagnosis pass from "read the source again" into "here is line X."
 
-**Step 1's "which outcome" line matters even on a PASS.** If every run comes
-back "reboot, but connect recovers" and never "no reboot at all", that is
-itself a finding worth recording back on the
-`meshcadet-web-provisioner-webserial-dtr-rts-reset` mission (or its
-lesson/follow-on, if one exists): it means the post-open `setSignals`
-de-assert is not, in practice, beating the reset pulse on real hardware —
-the fix that is actually load-bearing is the retry/resync tolerance, not the
-de-assert, and the doc comment's "may or may not beat the pulse" hedge
-should be firmed up to "does not" rather than left open.
+**Step 1's "which outcome" line matters even on a PASS.** `connect()` no
+longer calls `setSignals()` at all (`meshcadet-provisioner-connect-
+unbounded-awaits-hang`, 2026-09-19 — see `session.js`'s `connect()` doc
+comment for why: the prior post-open de-assert was found, on the first real
+hardware run any of the three rounds on this defect has had, to wedge the
+device until a physical reset). The retry/resync tolerance is now the ONLY
+mechanism handling a reset — if every run comes back "reboot, but connect
+recovers" and never "no reboot at all", that is simply confirmation this is
+working as designed, not a finding to chase further. The finding that
+WOULD matter now is the wedge case actually reproducing — see its own
+result-block fields above.
