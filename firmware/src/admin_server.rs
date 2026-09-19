@@ -321,27 +321,21 @@ pub fn run(
             }
             Err(ProvError::TruncatedFrame) => {
                 // Not enough bytes yet — wait for more, UNLESS the buffer is
-                // already full: a false `PROV_MAGIC` match inside boot-time
-                // log noise (this device's `log::info!` output shares this
-                // same USB-Serial-JTAG wire — see the module doc's transport
-                // table) can claim, via its two fabricated length bytes, a
-                // `plen` bigger than `RX_BUF_LEN` will ever hold. Without
-                // this escape valve that candidate decodes as
-                // `TruncatedFrame` forever: `find_magic_start` re-confirms
-                // the same false match at offset 0 every iteration (it
-                // trusts any two-byte `MC` match unconditionally), `rx_len`
-                // latches at `RX_BUF_LEN` once the `if rx_len < RX_BUF_LEN`
-                // read-gate above stops accepting new bytes, and this thread
-                // spins on sync/decode with no `delay_ms` in this arm —
-                // starving every future host command (including a fresh
-                // `QUERY_STATUS` from a NEW connection) until a physical
-                // reset re-zeroes `rx_buf`. `provisioning_server::run` (the
-                // unprovisioned-boot sibling of this loop) already carries
-                // this exact guard — this was a drift between the two, not
-                // a deliberate omission; mirrored here verbatim.
-                if rx_len >= RX_BUF_LEN {
+                // already full with no valid frame in hand. Shared with
+                // `provisioning_server::run`'s identical arm via
+                // `firmware_core::rx_loop_guard::flush_if_rx_buffer_full` —
+                // see that function's doc comment for the real hazard this
+                // defends against (a host-sent oversized/desynced frame) and
+                // why "boot-time log noise" is NOT the mechanism (retracted:
+                // this device's own log output has no path back into its own
+                // RX buffer). This used to be a second hand-rolled copy of
+                // the same comparison that silently drifted out of parity
+                // with the sibling loop — see
+                // `flight-manuals/library/hand-duplicated-invariant-drift.md`'s
+                // N=2 occurrence entry for this pair — hence the shared call
+                // instead of a third hand transcription.
+                if firmware_core::rx_loop_guard::flush_if_rx_buffer_full(&mut rx_len, RX_BUF_LEN) {
                     log::warn!("admin_server: RX buffer full with no valid frame — flushing");
-                    rx_len = 0;
                 }
             }
             Err(e) => {
