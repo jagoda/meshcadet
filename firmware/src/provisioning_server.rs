@@ -267,10 +267,14 @@ pub fn run(
             }
 
             Err(protocol::provisioning::ProvError::TruncatedFrame) => {
-                // Need more data.
-                if rx_len >= RX_BUF_LEN {
+                // Need more data — UNLESS the buffer is already full with no
+                // valid frame in hand, in which case this candidate can never
+                // resolve and the loop would spin forever without a physical
+                // reset. Shared with `admin_server::run`'s identical arm —
+                // see `firmware_core::rx_loop_guard` for the full mechanism
+                // and why this must not be a second hand-rolled copy.
+                if firmware_core::rx_loop_guard::flush_if_rx_buffer_full(&mut rx_len, RX_BUF_LEN) {
                     log::warn!("prov_server: RX buffer full with no valid frame — flushing");
-                    rx_len = 0;
                 }
             }
             Err(protocol::provisioning::ProvError::BadMagic) => {
