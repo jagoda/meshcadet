@@ -321,24 +321,35 @@ pub fn run(
             }
             Err(ProvError::TruncatedFrame) => {
                 // Not enough bytes yet — wait for more, UNLESS the buffer is
-                // already full: a false `PROV_MAGIC` match inside boot-time
-                // log noise (this device's `log::info!` output shares this
-                // same USB-Serial-JTAG wire — see the module doc's transport
-                // table) can claim, via its two fabricated length bytes, a
-                // `plen` bigger than `RX_BUF_LEN` will ever hold. Without
-                // this escape valve that candidate decodes as
-                // `TruncatedFrame` forever: `find_magic_start` re-confirms
-                // the same false match at offset 0 every iteration (it
-                // trusts any two-byte `MC` match unconditionally), `rx_len`
-                // latches at `RX_BUF_LEN` once the `if rx_len < RX_BUF_LEN`
-                // read-gate above stops accepting new bytes, and this thread
-                // spins on sync/decode with no `delay_ms` in this arm —
-                // starving every future host command (including a fresh
-                // `QUERY_STATUS` from a NEW connection) until a physical
-                // reset re-zeroes `rx_buf`. `provisioning_server::run` (the
-                // unprovisioned-boot sibling of this loop) already carries
-                // this exact guard — this was a drift between the two, not
-                // a deliberate omission; mirrored here verbatim.
+                // already full. `rx_buf` is filled ONLY by
+                // `usb_serial_jtag_read_bytes` above, draining the driver RX
+                // ring `main.rs` installs at boot (`usb_serial_jtag_driver_config_t`,
+                // this file's own `run()` doc references the spawn site) —
+                // that ring carries host→device OUT transfers only. This
+                // device's own `log::info!`/`log::warn!` output leaves over
+                // the separate VFS TX path and there is no loopback anywhere
+                // in this firmware, so a real byte sequence in this buffer is
+                // always something the host sent, never this device's own
+                // log noise looping back on itself. What CAN happen with a
+                // legitimate host frame: a desynced or corrupted stream whose
+                // two length bytes decode to a `plen` bigger than
+                // `RX_BUF_LEN` will ever hold. Without this escape valve that
+                // candidate decodes as `TruncatedFrame` forever:
+                // `find_magic_start` re-confirms the same match at offset 0
+                // every iteration (it trusts any two-byte `MC` match
+                // unconditionally), `rx_len` latches at `RX_BUF_LEN` once the
+                // `if rx_len < RX_BUF_LEN` read-gate above stops accepting
+                // new bytes, and this thread spins on sync/decode with no
+                // `delay_ms` in this arm — starving every future host command
+                // (including a fresh `QUERY_STATUS` from a NEW connection)
+                // until a physical reset re-zeroes `rx_buf`. This mirrors the
+                // guard `provisioning_server::run` (the unprovisioned-boot
+                // sibling of this loop) has carried since this repo's import
+                // commit; `admin_server` never had it and there is no
+                // evidence of a specific drift/regression event that removed
+                // it — this closes that gap as defense-in-depth against the
+                // real, host-originated oversized/desynced-frame class named
+                // above, independent of how the buffer got that full.
                 if rx_len >= RX_BUF_LEN {
                     log::warn!("admin_server: RX buffer full with no valid frame — flushing");
                     rx_len = 0;
