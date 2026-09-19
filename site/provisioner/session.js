@@ -171,6 +171,57 @@ function hex2(n) {
 }
 
 /**
+ * Upper bound on every Web Serial call this module makes that the browser
+ * gives no timeout of its own for: `writer.write()` (`#sendFrame`), plus
+ * teardown's `reader.cancel()` and `port.close()` (`disconnect()`). Every
+ * one of these is normally a single USB control transfer or buffer hand-off
+ * — sub-100ms on a healthy link — so 2s is generous headroom, while still
+ * bounded well under `RETRY_TOTAL_MS` (10s) so a stalled call surfaces its
+ * own distinct cause quickly instead of hanging forever with no diagnosis
+ * at all (part of the defect this mission fixes: `writer.write()` was never
+ * guarded by `RETRY_TOTAL_MS`/`RETRY_ATTEMPT_MS`/`FRAME_TIMEOUT_MS` — those
+ * three only ever wrapped the RECEIVE side). `connect()` no longer calls
+ * `port.setSignals()` at all — see that method's doc comment for why — so
+ * it is not a caller of this helper, even though an earlier pass of this
+ * fix bounded that call too before the underlying call was removed
+ * entirely.
+ */
+const UNBOUNDED_CALL_TIMEOUT_MS = 2_000;
+
+/** Thrown by `withTimeout` when `promise` does not settle within `ms`. */
+class TimeoutError extends Error {
+  constructor(label, ms) {
+    super(`${label} timed out after ${ms}ms`);
+    this.name = "TimeoutError";
+  }
+}
+
+/**
+ * Race `promise` against a `ms` timer, rejecting with a `TimeoutError`
+ * naming `label` if the timer wins first. `promise` itself is left to
+ * settle in the background if it never does — Web Serial gives this module
+ * no way to actually cancel a `write()`/`cancel()`/`close()` call out from
+ * under the browser, so this only bounds how long THIS module waits on it,
+ * not the underlying call. Every call site below that awaits an otherwise-
+ * unbounded Web Serial promise goes through this.
+ */
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new TimeoutError(label, ms)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
+/**
  * A provisioning session over a single Web Serial port.
  *
  * Unlike `Session<T: Transport>` (synchronous, blocking `recv`), this class
@@ -187,6 +238,22 @@ export class ProvisionerSession {
   #writer = null;
   #readLoopPromise = null;
   #accBuf = new Uint8Array(0);
+  /**
+   * Total bytes received from the device since the start of the CURRENT
+   * top-level command (`#sendRecvWithRetry`'s entry) — unlike `#accBuf`,
+   * this is never cleared between retry attempts within that command, only
+   * once per command. Exists so a "timeout waiting for response frame"
+   * error can report a genuine whole-command total alongside `#accBuf`'s
+   * per-attempt count: `#accBuf` alone made a timeout's "accumulated N
+   * bytes" read as "the device sent nothing, ever" when N=0, but
+   * `#sendRecvWithRetry` clears `#accBuf` on entry AND after every failed
+   * attempt, so N=0 there only ever means "silent in the final
+   * ~`RETRY_ATTEMPT_MS` window" — an early boot banner from an earlier,
+   * already-cleared retry is invisible to that count and this is the
+   * over-reading it invites — an "accumulated 0 bytes" report against a
+   * real device was misread exactly this way before this field existed.
+   */
+  #cumulativeBytesThisCommand = 0;
   #waiters = [];
   /**
    * Set by `#readLoop`'s catch when the underlying stream itself errors
@@ -248,45 +315,77 @@ export class ProvisionerSession {
    * that as a silent cancel, not an error to surface.
    *
    * ── DTR/RTS on this board (mirrors `host/src/transport.rs`'s
-   * `SerialTransport::open` doc comment — read that one too; this is the
-   * browser-side half of the same fact, which PR #197 fixed there but left
-   * unfixed here, causing this session's own reset-on-connect defect) ──
+   * `SerialTransport::open` doc comment — read that one too) ──
    *
    * The T-Deck Plus wires DTR/RTS to EN/IO0 — the CH343's standard
    * auto-program circuit. Asserting DTR resets the chip; it is never "ready to
    * receive" on this silicon. The host CLI avoids this by never touching
-   * the lines at all (`serialport` leaves them at tty-open defaults). Web
-   * Serial gives no such option: Chromium's `SerialPort.open()` asserts
-   * both DTR and RTS unconditionally as part of opening the port, before
-   * any application code runs. There is no "open without asserting" call.
+   * the lines at all (`serialport` leaves them at tty-open defaults,
+   * `88b0456`). Web Serial gives no equivalent "open without touching the
+   * lines" call: Chromium's `SerialPort.open()` asserts both DTR and RTS
+   * unconditionally as part of opening the port, before any application
+   * code runs, and this method does not (and, per the history below, must
+   * not) do anything further to them after that.
    *
-   * So two things are true at once, and both are handled below rather than
-   * pretending either alone is sufficient:
+   * ── History: PR #200 added a post-open de-assert; hardware evidence
+   * showed it wedges the device until a physical reset. Removed. ──
    *
-   * 1. `setSignals({ dataTerminalReady: false, requestToSend: false })`
-   *    immediately post-open de-asserts both lines as fast as this code can
-   *    run. Whether this "beats the pulse" depends on whether the
-   *    EN/IO0 auto-reset trigger is edge/sequence-based (esptool's own
-   *    bootloader-entry dance requires a specific toggle order — see
-   *    `site/flash.js`'s vendored `esptool-js` `ClassicReset`/`USBJTAGSerialReset`
-   *    classes) or level-based (asserted-and-held resets on its own,
-   *    independent of how fast we clear it). This has NOT been verified
-   *    against real hardware yet (this fix was developed without a browser
-   *    or a physical device available) and may not be sufficient by
-   *    itself.
-   * 2. Regardless of whether (1) works, a reset the browser cannot prevent
-   *    must not be fatal. `#readLoop`'s magic-header resync
-   *    (`#tryExtractFrame`, gotcha #9) already tolerates an ESP-IDF boot
-   *    banner landing ahead of any real frame, and `#sendRecvWithRetry`
-   *    already retries the first command (`queryStatus`, called by
-   *    `provisioner.js` immediately after `connect()` resolves) for up to
-   *    `RETRY_TOTAL_MS` — long enough to ride out a reboot if one happens.
-   *    No separate "wait for boot" step is added here: `#sendRecvWithRetry`
-   *    clears `#accBuf` before its first send, so stale bytes accumulated
-   *    during `port.open()`/`setSignals()` are already discarded before the
-   *    first attempt, and every retry re-clears it again — that IS the
-   *    "settle, drain the banner, retry" sequence, already in place for any
-   *    caller, not something `connect()` needs to duplicate.
+   * PR #200 called `setSignals({ dataTerminalReady: false, requestToSend:
+   * false })` immediately after `open()`, reasoning that de-asserting as
+   * fast as possible might "beat" the EN/IO0 reset pulse `open()`'s own
+   * forced assert triggers — explicitly flagged in that PR's own commit
+   * message as unverified on real hardware ("developed without a browser or
+   * a physical device available").
+   *
+   * `meshcadet-provisioner-connect-unbounded-awaits-hang` (this mission)
+   * got the first real hardware run against it and found something worse
+   * than the reboot #200 was trying to avoid: a failed web-provisioner
+   * connect left the device **unreachable by the host CLI across a full
+   * process boundary, until a physical reset** — not a timeout, not a
+   * retriable error, a genuine hang that persisted after the browser tab
+   * closed and the port released. `host/src/transport.rs` never writes
+   * DTR/RTS at all, so this could not be residual browser-side signal
+   * state; something on the device itself had latched.
+   *
+   * The leading mechanism: `setSignals()`'s two line changes are not
+   * guaranteed atomic at the OS/driver layer below the single JS call — on
+   * this board's CH343 auto-program wiring, a *staggered* DTR-then-RTS (or
+   * RTS-then-DTR) transition is indistinguishable from the deliberate
+   * bootloader-entry toggle sequence `site/flash.js`'s vendored
+   * `esptool-js` (`ClassicReset`/`UsbJtagSerialReset`) implements on
+   * purpose to force entry into the ROM serial bootloader — which runs no
+   * application, answers no provisioning frames, and persists until reset.
+   * PR #200 appears to have accidentally reimplemented the flasher's
+   * enter-download-mode dance inside the provisioner's own connect path.
+   *
+   * The fix: stop touching the lines after `open()`, full stop — no
+   * de-assert, no restore/re-assert. Re-asserting would just reintroduce
+   * the plain reset PR #197/#200 were trying to avoid: DTR/RTS on this
+   * board select reset/bootloader mode, not CDC flow control (see the DTR/
+   * RTS section above), so "keep it asserted to keep RX open" is exactly
+   * the incorrect UART-flow-control analogy `host/src/transport.rs`'s own
+   * fix already retired on the host CLI side. Whatever `open()`'s own
+   * forced assert does to the chip is the one DTR/RTS
+   * transition this method cannot avoid — and it is a **known-survivable**
+   * one: pre-#200, with no `setSignals()` call anywhere in this file, the
+   * device reliably reset and came back up (visible reboot, failed first
+   * connect attempt, working retry) — never a state requiring physical
+   * intervention. Removing the post-open call returns to exactly that
+   * already-field-proven path. This is deliberately the smallest change
+   * that closes the wedge, not a rewrite of the signal-handling story.
+   *
+   * A reset `open()`'s own forced assert triggers must still not be fatal.
+   * `#readLoop`'s magic-header resync (`#tryExtractFrame`, gotcha #9)
+   * already tolerates an ESP-IDF boot banner landing ahead of any real
+   * frame, and `#sendRecvWithRetry` already retries the first command
+   * (`queryStatus`, called by `provisioner.js` immediately after
+   * `connect()` resolves) for up to `RETRY_TOTAL_MS` — long enough to ride
+   * out a reboot if one happens. No separate "wait for boot" step is added
+   * here: `#sendRecvWithRetry` clears `#accBuf` before its first send, so
+   * stale bytes accumulated during `port.open()` are already discarded
+   * before the first attempt, and every retry re-clears it again — that IS
+   * the "settle, drain the banner, retry" sequence, already in place for
+   * any caller, not something `connect()` needs to duplicate.
    *
    * What this does NOT handle: if the EN reset is severe enough to make the
    * ESP32-S3's native USB peripheral fully re-enumerate (as opposed to a
@@ -295,59 +394,89 @@ export class ProvisionerSession {
    * `#readLoop` rather than just going quiet for a while. That surfaces as
    * a real rejection (`#readLoop`'s catch rejects every waiter — never a
    * silent hang), but recovering from it means the user reconnecting, not
-   * something this method can paper over. Device-confirm both paths — see
-   * `docs/provisioning-connect-verification-kit.md`.
+   * something this method can paper over. Device-confirm this — see
+   * `docs/provisioning-connect-verification-kit.md`, whose step 1 now also
+   * checks the specific wedge this history section describes: a failed web
+   * connect must leave the device reachable by the host CLI without a
+   * physical reset.
+   *
+   * `esptool-js` itself must NOT be changed to match this — it deliberately
+   * *wants* the EN/IO0 reset to enter its own bootloader for flashing; see
+   * the gotcha doc's "Occurrences" note.
    */
   async connect() {
     const port = await navigator.serial.requestPort();
     await port.open({ baudRate: BAUD_RATE });
-    // Best-effort de-assert — see the doc comment above for why this alone
-    // is not assumed sufficient. "Best-effort" means what it says: a port
-    // that opened successfully but rejects setSignals() (an unusual
-    // driver/OS quirk this code has no way to anticipate) must not fail the
-    // whole connect() over a signal write that was only ever a mitigation,
-    // never the primary guarantee — the reset-tolerant path below is what
-    // actually has to hold regardless.
-    try {
-      await port.setSignals({ dataTerminalReady: false, requestToSend: false });
-    } catch (err) {
-      console.warn("MeshCadet provisioner: setSignals(DTR/RTS false) failed — continuing without it", err);
-    }
     this.#port = port;
     this.#writer = port.writable.getWriter();
     this.#reader = port.readable.getReader();
     this.#accBuf = new Uint8Array(0);
+    this.#cumulativeBytesThisCommand = 0;
     this.#fatalError = null;
     this.#readLoopPromise = this.#readLoop();
   }
 
-  /** Close the port and release all resources. Safe to call when not connected. */
+  /**
+   * Close the port and release all resources. Safe to call when not
+   * connected.
+   *
+   * Every `await` below is bounded by `UNBOUNDED_CALL_TIMEOUT_MS`
+   * (`withTimeout`) — `reader.cancel()`/`port.close()` are Web Serial calls
+   * the browser gives no timeout of its own for, same class of gap as
+   * `#sendFrame`'s `writer.write()` (this mission's audit — Task 4). Without
+   * this, a wedged stream at teardown time would hang `disconnect()` itself,
+   * stranding the user with no recovery but a page reload — the exact
+   * failure mode a "disconnect and reconnect" recovery path exists to
+   * prevent. A timeout here still lets teardown proceed:
+   * `releaseLock()` on a reader with a still-pending read forces that read
+   * to reject (unblocking a stuck `#readLoop`), so cleanup keeps moving even
+   * when the underlying call never actually settles.
+   */
   async disconnect() {
     if (!this.#port) {
       return;
     }
     try {
-      await this.#reader.cancel();
-    } catch {
-      // Port may already be gone (device unplugged) — fall through to cleanup.
+      await withTimeout(this.#reader.cancel(), UNBOUNDED_CALL_TIMEOUT_MS, "reader.cancel()");
+    } catch (err) {
+      // Port may already be gone (device unplugged), or cancel() itself
+      // stalled — either way, disconnect() must still finish tearing down
+      // rather than hanging indefinitely.
+      console.warn(`MeshCadet provisioner: ${err.message} — continuing teardown anyway`, err);
     }
     try {
-      await this.#readLoopPromise;
+      await withTimeout(this.#readLoopPromise, UNBOUNDED_CALL_TIMEOUT_MS, "read loop shutdown");
     } catch {
-      // #readLoop's own read() rejects when cancel()/disconnect races it; the
-      // loop's catch already swallows and returns, so this is defensive only.
+      // #readLoop's own read() rejects when cancel()/disconnect races it (its
+      // catch already swallows and returns) — this is defensive only. A
+      // timeout here just means the loop's pending read() never unblocked;
+      // continue tearing down regardless, per reader.cancel() above.
     }
-    this.#reader.releaseLock();
-    this.#writer.releaseLock();
     try {
-      await this.#port.close();
+      this.#reader.releaseLock();
     } catch {
-      // Already closed (e.g. device physically unplugged) — nothing to do.
+      // Throws if a read is still genuinely pending (cancel()/the read loop
+      // never actually settled) — nothing more this method can do about an
+      // already-wedged stream; continue tearing down the rest of the state.
+    }
+    try {
+      this.#writer.releaseLock();
+    } catch {
+      // Same as reader.releaseLock() above, write side.
+    }
+    try {
+      await withTimeout(this.#port.close(), UNBOUNDED_CALL_TIMEOUT_MS, "port.close()");
+    } catch (err) {
+      // Already closed (e.g. device physically unplugged), or close()
+      // itself stalled — either way, fall through and clear our own state
+      // so the user can still attempt a fresh connect().
+      console.warn(`MeshCadet provisioner: ${err.message} — continuing teardown anyway`, err);
     }
     this.#port = null;
     this.#reader = null;
     this.#writer = null;
     this.#accBuf = new Uint8Array(0);
+    this.#cumulativeBytesThisCommand = 0;
     this.#fatalError = null;
     this.#rejectAllWaiters(new Error("session disconnected"));
   }
@@ -764,8 +893,45 @@ export class ProvisionerSession {
     }
   }
 
+  /**
+   * Write one frame to the port. Unlike the RECEIVE side (bounded by
+   * `RETRY_ATTEMPT_MS`/`RETRY_TOTAL_MS`/`FRAME_TIMEOUT_MS` throughout this
+   * class), `writer.write()` itself was, until this mission, a bare
+   * `await` with no bound at all — a wedged writable stream (a dead link
+   * for any reason, e.g. a reset in flight — see `connect()`'s doc comment)
+   * hung here forever, with `#sendRecvWithRetry`'s loop never even reached
+   * its own `#recvUntilExpected` call, let alone its retry/deadline logic.
+   * Bounding it alone would not have been enough either: `#sendRecvWithRetry`
+   * calls this OUTSIDE its `try`/`catch`
+   * (see that method's doc comment), so whatever this throws propagates
+   * immediately — a caught-and-retried write timeout would just re-enter
+   * this same stall on the next attempt, burning the retry budget one
+   * doomed write at a time for no benefit.
+   *
+   * So a `writer.write()` that doesn't settle within
+   * `UNBOUNDED_CALL_TIMEOUT_MS`, or that rejects outright (the stream has
+   * errored — e.g. the device vanishing mid-write), is treated as fatal
+   * immediately: same `#fatalError` latch `#readLoop`'s catch already uses
+   * for a dead read side (see that field's doc comment), just discovered
+   * from the write side instead. Every current and future waiter is
+   * rejected with a "write stalled" cause distinct from a plain receive
+   * timeout ("no response" — see `#recvUntilExpected`/`#recvFrame`), so
+   * whichever of the two actually happened is what the caller — and the
+   * user — sees, per this mission's mandate that every failure name its
+   * own cause.
+   */
   async #sendFrame(frameType, payload) {
-    await this.#writer.write(encodeFrame(frameType, payload));
+    try {
+      await withTimeout(this.#writer.write(encodeFrame(frameType, payload)), UNBOUNDED_CALL_TIMEOUT_MS, "writer.write()");
+    } catch (err) {
+      const cause =
+        err instanceof TimeoutError
+          ? new Error(`write stalled — ${err.message} (writable stream is not draining; the link is likely dead)`)
+          : err;
+      this.#fatalError = cause;
+      this.#rejectAllWaiters(cause);
+      throw cause;
+    }
   }
 
   /**
@@ -883,6 +1049,7 @@ export class ProvisionerSession {
    */
   async #sendRecvWithRetry(frameType, payload, isExpected = () => true, label = "response") {
     this.#accBuf = new Uint8Array(0);
+    this.#cumulativeBytesThisCommand = 0;
     const overallDeadline = Date.now() + RETRY_TOTAL_MS;
     while (true) {
       if (this.#fatalError) {
@@ -933,7 +1100,7 @@ export class ProvisionerSession {
     while (true) {
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
-        throw new Error(`timeout waiting for response frame (accumulated ${this.#accBuf.length} bytes)`);
+        throw new Error(this.#timeoutMessage());
       }
       const frame = await this.#recvFrame(remaining);
       if (frame.frameType === FRAME_RSP_ERROR || isExpected(frame.frameType)) {
@@ -978,10 +1145,25 @@ export class ProvisionerSession {
       }
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
-        throw new Error(`timeout waiting for response frame (accumulated ${this.#accBuf.length} bytes)`);
+        throw new Error(this.#timeoutMessage());
       }
       await this.#waitForDataOrTimeout(remaining);
     }
+  }
+
+  /**
+   * Build the "timeout waiting for response frame" message shared by
+   * `#recvUntilExpected`/`#recvFrame`. Reports BOTH `#accBuf.length` (bytes
+   * accumulated in the current ~`RETRY_ATTEMPT_MS` attempt window alone —
+   * cleared on every retry) and `#cumulativeBytesThisCommand` (the whole
+   * `RETRY_TOTAL_MS` command, never cleared between retries) — see
+   * `#cumulativeBytesThisCommand`'s own doc comment for why reporting only
+   * the former invites a specific, real misreading ("N=0 means the device
+   * sent nothing, ever" when it may only mean "silent in this last window,
+   * after an earlier retry's own banner was already cleared").
+   */
+  #timeoutMessage() {
+    return `timeout waiting for response frame (accumulated ${this.#accBuf.length} bytes this attempt, ${this.#cumulativeBytesThisCommand} bytes total this command)`;
   }
 
   /**
@@ -1048,6 +1230,7 @@ export class ProvisionerSession {
           merged.set(this.#accBuf, 0);
           merged.set(value, this.#accBuf.length);
           this.#accBuf = merged;
+          this.#cumulativeBytesThisCommand += value.length;
           this.#notifyWaiters();
         }
       }
