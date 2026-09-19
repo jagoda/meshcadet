@@ -320,7 +320,29 @@ pub fn run(
                 crate::log_thread_stack_hwm("admin_server", ADMIN_SERVER_STACK_B);
             }
             Err(ProvError::TruncatedFrame) => {
-                // Not enough bytes yet — wait for more.
+                // Not enough bytes yet — wait for more, UNLESS the buffer is
+                // already full: a false `PROV_MAGIC` match inside boot-time
+                // log noise (this device's `log::info!` output shares this
+                // same USB-Serial-JTAG wire — see the module doc's transport
+                // table) can claim, via its two fabricated length bytes, a
+                // `plen` bigger than `RX_BUF_LEN` will ever hold. Without
+                // this escape valve that candidate decodes as
+                // `TruncatedFrame` forever: `find_magic_start` re-confirms
+                // the same false match at offset 0 every iteration (it
+                // trusts any two-byte `MC` match unconditionally), `rx_len`
+                // latches at `RX_BUF_LEN` once the `if rx_len < RX_BUF_LEN`
+                // read-gate above stops accepting new bytes, and this thread
+                // spins on sync/decode with no `delay_ms` in this arm —
+                // starving every future host command (including a fresh
+                // `QUERY_STATUS` from a NEW connection) until a physical
+                // reset re-zeroes `rx_buf`. `provisioning_server::run` (the
+                // unprovisioned-boot sibling of this loop) already carries
+                // this exact guard — this was a drift between the two, not
+                // a deliberate omission; mirrored here verbatim.
+                if rx_len >= RX_BUF_LEN {
+                    log::warn!("admin_server: RX buffer full with no valid frame — flushing");
+                    rx_len = 0;
+                }
             }
             Err(e) => {
                 // Bad CRC or magic mismatch.  Discard the first byte and resync.

@@ -95,6 +95,7 @@ import {
   FRAME_RSP_HISTORY_ENTRY,
   FRAME_RSP_HISTORY_DONE,
   FRAME_RSP_ADVERT,
+  FRAME_RSP_LOCK,
   MAX_RSP_HISTORY_ENTRY_PAYLOAD,
   MAX_ADVERT_CARD_LEN,
 } from "./codec.js";
@@ -128,6 +129,16 @@ const MAX_VALID_FRAME_PAYLOAD_LEN = Math.max(MAX_RSP_HISTORY_ENTRY_PAYLOAD, MAX_
  * genuine-but-late reply to an EARLIER command (any OTHER type from this
  * set) apart from truly unrecognized/corrupted wire garbage — see
  * `#recvUntilExpected`'s doc comment for why that distinction matters.
+ *
+ * `FRAME_RSP_LOCK` was missing here until
+ * `meshcadet-web-provisioner-read-timeout-after-reset` (this module has no
+ * `queryLock()`/`FRAME_QUERY_LOCK` caller yet, so it could never appear on
+ * the wire through this client's own actions — found by inspection, not a
+ * live symptom) — every OTHER `FRAME_RSP_*` codec.js defines was already
+ * listed, so the omission was an oversight, not a deliberate exclusion.
+ * Fixed for the day a `queryLock()`/lock-status UI lands and a leftover
+ * `RSP_LOCK` reply needs the same stray-tolerance every other response type
+ * already gets.
  */
 const ALL_RSP_FRAME_TYPES = new Set([
   FRAME_RSP_OK,
@@ -143,6 +154,7 @@ const ALL_RSP_FRAME_TYPES = new Set([
   FRAME_RSP_ROOM,
   FRAME_RSP_ROOMS_DONE,
   FRAME_RSP_ADVERT,
+  FRAME_RSP_LOCK,
 ]);
 
 /**
