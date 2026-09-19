@@ -41,6 +41,10 @@ export function makeFakePort(onWrite) {
     readable,
     writable,
     async open() {},
+    // `connect()` (session.js) calls this immediately post-open to de-assert
+    // DTR/RTS — see its doc comment. A no-op here is fine: these hygiene
+    // tests only care about secret handling, not signal state.
+    async setSignals() {},
     async close() {
       try {
         controller.close();

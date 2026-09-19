@@ -189,6 +189,18 @@ export class ProvisionerSession {
   #accBuf = new Uint8Array(0);
   #waiters = [];
   /**
+   * Set by `#readLoop`'s catch when the underlying stream itself errors
+   * (e.g. the device physically vanishing mid-read — plausible after a
+   * DTR/RTS-triggered EN reset severe enough to re-enumerate the USB
+   * device rather than just reboot the firmware under an unchanged USB
+   * session; see `connect()`'s doc comment). Once set, no more bytes will
+   * ever arrive on this session — `#recvFrame`/`#sendRecvWithRetry` check
+   * it so a dead link fails fast with the real cause instead of retrying
+   * blind for the full 10s budget and then reporting a generic timeout
+   * that buries what actually happened.
+   */
+  #fatalError = null;
+  /**
    * FIFO serialization queue for the command methods below (`queryStatus`,
    * `listContacts`/`listChannels`, `addContact`/`delContact`,
    * `addChannel`/`delChannel`, `setNotifDefaults`, `setDeviceName`,
@@ -234,14 +246,78 @@ export class ProvisionerSession {
    * Throws `DOMException` with `name === "NotFoundError"` if the user
    * dismisses the picker without choosing a device — callers should treat
    * that as a silent cancel, not an error to surface.
+   *
+   * ── DTR/RTS on this board (mirrors `host/src/transport.rs`'s
+   * `SerialTransport::open` doc comment — read that one too; this is the
+   * browser-side half of the same fact, which PR #197 fixed there but left
+   * unfixed here, causing this session's own reset-on-connect defect) ──
+   *
+   * The T-Deck Plus wires DTR/RTS to EN/IO0 — the CH343's standard
+   * auto-program circuit. Asserting DTR resets the chip; it is never "ready to
+   * receive" on this silicon. The host CLI avoids this by never touching
+   * the lines at all (`serialport` leaves them at tty-open defaults). Web
+   * Serial gives no such option: Chromium's `SerialPort.open()` asserts
+   * both DTR and RTS unconditionally as part of opening the port, before
+   * any application code runs. There is no "open without asserting" call.
+   *
+   * So two things are true at once, and both are handled below rather than
+   * pretending either alone is sufficient:
+   *
+   * 1. `setSignals({ dataTerminalReady: false, requestToSend: false })`
+   *    immediately post-open de-asserts both lines as fast as this code can
+   *    run. Whether this "beats the pulse" depends on whether the
+   *    EN/IO0 auto-reset trigger is edge/sequence-based (esptool's own
+   *    bootloader-entry dance requires a specific toggle order — see
+   *    `site/flash.js`'s vendored `esptool-js` `ClassicReset`/`USBJTAGSerialReset`
+   *    classes) or level-based (asserted-and-held resets on its own,
+   *    independent of how fast we clear it). This has NOT been verified
+   *    against real hardware yet (this fix was developed without a browser
+   *    or a physical device available) and may not be sufficient by
+   *    itself.
+   * 2. Regardless of whether (1) works, a reset the browser cannot prevent
+   *    must not be fatal. `#readLoop`'s magic-header resync
+   *    (`#tryExtractFrame`, gotcha #9) already tolerates an ESP-IDF boot
+   *    banner landing ahead of any real frame, and `#sendRecvWithRetry`
+   *    already retries the first command (`queryStatus`, called by
+   *    `provisioner.js` immediately after `connect()` resolves) for up to
+   *    `RETRY_TOTAL_MS` — long enough to ride out a reboot if one happens.
+   *    No separate "wait for boot" step is added here: `#sendRecvWithRetry`
+   *    clears `#accBuf` before its first send, so stale bytes accumulated
+   *    during `port.open()`/`setSignals()` are already discarded before the
+   *    first attempt, and every retry re-clears it again — that IS the
+   *    "settle, drain the banner, retry" sequence, already in place for any
+   *    caller, not something `connect()` needs to duplicate.
+   *
+   * What this does NOT handle: if the EN reset is severe enough to make the
+   * ESP32-S3's native USB peripheral fully re-enumerate (as opposed to a
+   * soft reboot that keeps the same USB session alive), the already-open
+   * `port.readable`/`port.writable` streams may error out from under
+   * `#readLoop` rather than just going quiet for a while. That surfaces as
+   * a real rejection (`#readLoop`'s catch rejects every waiter — never a
+   * silent hang), but recovering from it means the user reconnecting, not
+   * something this method can paper over. Device-confirm both paths — see
+   * `docs/provisioning-connect-verification-kit.md`.
    */
   async connect() {
     const port = await navigator.serial.requestPort();
     await port.open({ baudRate: BAUD_RATE });
+    // Best-effort de-assert — see the doc comment above for why this alone
+    // is not assumed sufficient. "Best-effort" means what it says: a port
+    // that opened successfully but rejects setSignals() (an unusual
+    // driver/OS quirk this code has no way to anticipate) must not fail the
+    // whole connect() over a signal write that was only ever a mitigation,
+    // never the primary guarantee — the reset-tolerant path below is what
+    // actually has to hold regardless.
+    try {
+      await port.setSignals({ dataTerminalReady: false, requestToSend: false });
+    } catch (err) {
+      console.warn("MeshCadet provisioner: setSignals(DTR/RTS false) failed — continuing without it", err);
+    }
     this.#port = port;
     this.#writer = port.writable.getWriter();
     this.#reader = port.readable.getReader();
     this.#accBuf = new Uint8Array(0);
+    this.#fatalError = null;
     this.#readLoopPromise = this.#readLoop();
   }
 
@@ -272,6 +348,7 @@ export class ProvisionerSession {
     this.#reader = null;
     this.#writer = null;
     this.#accBuf = new Uint8Array(0);
+    this.#fatalError = null;
     this.#rejectAllWaiters(new Error("session disconnected"));
   }
 
@@ -793,16 +870,29 @@ export class ProvisionerSession {
    * `isExpected`/`label` default to accepting whatever arrives (matching
    * the old, non-tolerant behavior) for callers — `exportHistory` — that
    * already implement their own bounded stray-frame tolerance downstream.
+   *
+   * FATAL-LINK GUARD: a per-attempt timeout means "no answer yet, worth
+   * retrying" — the device may still be rebooting (see `connect()`'s doc
+   * comment). A `#fatalError` (the read stream itself has died — the
+   * device is not coming back without a fresh `connect()`) means retrying
+   * is pointless: nothing will ever arrive again. Checked both before
+   * sending (skip a write to a dead link) and after a failed attempt
+   * (stop immediately instead of burning the rest of the 10s budget one
+   * doomed attempt at a time) so the error the caller sees names the real
+   * cause instead of a generic "timeout waiting for response frame".
    */
   async #sendRecvWithRetry(frameType, payload, isExpected = () => true, label = "response") {
     this.#accBuf = new Uint8Array(0);
     const overallDeadline = Date.now() + RETRY_TOTAL_MS;
     while (true) {
+      if (this.#fatalError) {
+        throw this.#fatalError;
+      }
       await this.#sendFrame(frameType, payload);
       try {
         return await this.#recvUntilExpected(RETRY_ATTEMPT_MS, isExpected, label);
       } catch (err) {
-        if (Date.now() >= overallDeadline) {
+        if (this.#fatalError || Date.now() >= overallDeadline) {
           throw err;
         }
         // This attempt timed out but we still have overall budget — clear
@@ -869,6 +959,12 @@ export class ProvisionerSession {
    * by `#readLoop`), then decode and return `{ frameType, payload }`.
    * Mirrors `Session::recv_frame`'s accumulation-and-resync loop, including
    * the same `find_magic_start` resync and CRC/magic recovery.
+   *
+   * A frame already fully buffered before a fatal read-loop error is still
+   * returned (checked first, below) — only once there is genuinely nothing
+   * left to extract does a `#fatalError` end the wait immediately, instead
+   * of idling out the full `timeoutMs` only to report a generic timeout
+   * that hides the real cause (see `#sendRecvWithRetry`'s FATAL-LINK GUARD).
    */
   async #recvFrame(timeoutMs) {
     const deadline = Date.now() + timeoutMs;
@@ -876,6 +972,9 @@ export class ProvisionerSession {
       const frame = this.#tryExtractFrame();
       if (frame) {
         return frame;
+      }
+      if (this.#fatalError) {
+        throw this.#fatalError;
       }
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
@@ -953,9 +1052,16 @@ export class ProvisionerSession {
         }
       }
     } catch (err) {
-      // Port error (e.g. device physically unplugged mid-read) — surface it
-      // to anyone currently waiting on new data instead of hanging them.
-      this.#rejectAllWaiters(err instanceof Error ? err : new Error(String(err)));
+      // Port error (e.g. device physically unplugged mid-read, or a
+      // DTR/RTS-triggered EN reset severe enough to re-enumerate the USB
+      // device rather than just reboot the firmware under an unchanged USB
+      // session — see `connect()`'s doc comment). Nothing will ever arrive
+      // on this session again: record it as `#fatalError` so every current
+      // AND future wait fails fast with this real cause (`#recvFrame`,
+      // `#sendRecvWithRetry`), not just the waiters that happened to be
+      // pending at this exact instant.
+      this.#fatalError = err instanceof Error ? err : new Error(String(err));
+      this.#rejectAllWaiters(this.#fatalError);
     }
   }
 
