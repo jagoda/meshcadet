@@ -35,10 +35,7 @@
 //! repo's import commit; `admin_server.rs` never had it, and there is no
 //! identified commit that removed it or introduced a regression window —
 //! this is an omission that existed for as long as the file has, not a
-//! recently-drifted copy. See
-//! `flight-manuals/library/hand-duplicated-invariant-drift.md`'s N=2
-//! occurrence entry for this pair (meshcadet vehicle) for the full
-//! incident. Both loops now call this one function from their
+//! recently-drifted copy. Both loops now call this one function from their
 //! `TruncatedFrame` arm instead of each hand-rolling the same `if rx_len >=
 //! RX_BUF_LEN { rx_len = 0 }` comparison, so a future edit to either loop
 //! cannot silently drop the guard out of one copy while leaving it in the
@@ -70,7 +67,10 @@ mod tests {
     fn below_capacity_does_not_flush() {
         let mut rx_len = 511;
         assert!(!flush_if_rx_buffer_full(&mut rx_len, 512));
-        assert_eq!(rx_len, 511, "must not touch rx_len when there is still room");
+        assert_eq!(
+            rx_len, 511,
+            "must not touch rx_len when there is still room"
+        );
     }
 
     #[test]

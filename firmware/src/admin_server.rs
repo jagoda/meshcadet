@@ -330,10 +330,8 @@ pub fn run(
                 // this device's own log output has no path back into its own
                 // RX buffer). This used to be a second hand-rolled copy of
                 // the same comparison that silently drifted out of parity
-                // with the sibling loop — see
-                // `flight-manuals/library/hand-duplicated-invariant-drift.md`'s
-                // N=2 occurrence entry for this pair — hence the shared call
-                // instead of a third hand transcription.
+                // with the sibling loop — hence the shared call instead of
+                // a third hand transcription.
                 if firmware_core::rx_loop_guard::flush_if_rx_buffer_full(&mut rx_len, RX_BUF_LEN) {
                     log::warn!("admin_server: RX buffer full with no valid frame — flushing");
                 }
