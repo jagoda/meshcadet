@@ -88,7 +88,7 @@ two ("no reboot" / "reboot, recovers"):**
    reset before the CLI works again — **the fix did not hold** and this is
    the single most important fact to report back.
 
-## Update, 2026-09-19 (later): "read timeout after reset" — root cause found and fixed: `admin_server`'s RX buffer has no full-buffer escape valve
+## Update, 2026-09-19 (later): "read timeout after reset" — hardening landed, root cause still open: `admin_server`'s RX buffer gained a full-buffer escape valve, but the mechanism first proposed for it does not hold up
 
 `meshcadet-web-provisioner-read-timeout-after-reset` picked this up right
 after PR #201 (the `setSignals()` removal above) shipped. **Two maintainer
@@ -109,49 +109,60 @@ non-functional is dead), and **the host CLI also failed against the same
 device afterward, clearing only on a physical reset** — so whatever this is,
 it is a device-side latch, not a browser-only bug.
 
-**Root cause, confirmed by source (not yet cross-build-verified — see
-caveat below): `firmware/src/admin_server.rs`'s frame-receive loop has no
-escape valve for a full RX buffer stuck on a false frame-magic match.**
+**Root cause: not established. The mechanism first proposed here — a false
+`PROV_MAGIC` match inside this device's own boot-time log noise — is
+directionally impossible and is retracted; see the audit that refuted it
+(`meshcadet-provisioner-fix-retraction-audit-20260919-141943195`).** What
+*is* landed, and correct on its own terms, is defense-in-depth hardening
+against a different, real hazard: a host-originated oversized or desynced
+frame permanently starving `admin_server`'s read loop. The two are not the
+same claim, and only the second is backed by source.
 
-This firmware sets `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y`
-(`firmware/sdkconfig.defaults:121`) — `log::info!`/`log::warn!` output
-shares the *same* USB-Serial-JTAG wire the binary provisioning frames ride,
-and boot is chatty on it. `admin_server::run`'s read loop (mirroring
-`provisioning_server::run`'s, the unprovisioned-boot sibling) resyncs on
-`PROV_MAGIC` (`"MC"`) before attempting to decode a frame — but
-`find_magic_start` trusts **any** two-byte `4D 43` match unconditionally,
-with no check on what follows. Ten-plus KB of boot-time log text is more
-than enough for `4D 43` to appear by coincidence, and whatever two bytes
-happen to follow it become the frame's `plen` — a value from 0–65535 with
-no relationship to the buffer's actual contents. Once `FRAME_OVERHEAD +
-plen` exceeds the 512-byte `RX_BUF_LEN`, `decode_frame` returns
-`TruncatedFrame` and **can never do anything else** for that candidate: the
-same false match re-confirms at offset 0 every loop iteration, so
-`rx_len` only grows, until it hits `RX_BUF_LEN` and the `if rx_len <
-RX_BUF_LEN` read-gate stops admitting new bytes. The thread is now stuck
-forever, spinning `find_magic_start` → `TruncatedFrame` with **no
-`delay_ms` in that arm** — it never reads another byte, from *any* client,
-until a physical reset re-zeroes `rx_buf`.
+Why the log-noise mechanism cannot be right: `rx_buf` is filled **only** by
+`usb_serial_jtag_read_bytes` (this file's read loop, above), which drains
+the driver RX ring `main.rs` installs at boot
+(`usb_serial_jtag_driver_config_t`, `main.rs:646-655`) — that ring carries
+**host→device OUT transfers only**. This device's own `log::info!`/
+`log::warn!` output leaves over the separate VFS **TX** path (`main.rs:676`
+disables its LF→CRLF translation specifically because `admin_server`'s
+*replies* ride that same TX path). There is no loopback anywhere in
+`firmware/src`: a byte the device writes out never reappears in a buffer
+the device reads from. The device's own boot log can therefore never enter
+its own RX buffer, regardless of how much of it there is or what byte pairs
+it happens to contain. The `10560 bytes total this command` figure in the
+trace above is a count the **browser's** `#recvFrame` kept of bytes *it*
+received from the device — it says nothing about what did or didn't enter
+`admin_server`'s RX buffer, and cannot be read as corroborating the
+log-noise theory.
 
-This explains every datapoint at once: normal app UI (a separate task/
-thread, unaffected by `admin_server` wedging), a clean bounded browser
-timeout (bytes did arrive — the 10560 total — they just could never
-resync), the host CLI *also* failing (same stuck thread, doesn't care which
-client asks), and only a physical reset clearing it (fresh boot re-zeroes
-the buffer). It also explains "used to work": this is a **probabilistic**
-trigger — the more boot-time log volume, the higher the odds any given boot
-happens to contain the `4D 43` byte pair with an oversized trailing length.
-Recent PRs on this path (config-store validation in #197, plus ordinary log
-growth over time) all plausibly raised that boot-time log volume, raising
-the odds of tripping this without needing any single commit to be precisely
-at fault. (An early-draft theory pinned this on two specific wire-contract
-commits as "immediately preceding #197" — that framing does not hold up
-against `git log`'s own timestamps, one of the two postdates #197 by
-minutes; not the mechanism below regardless.)
+Because that mechanism is the only thing this section previously offered to
+explain "used to work" (rising boot-log volume raising the odds of a stray
+match), that explanation is retracted with it — not replaced by a
+narrower version, retracted outright. There is currently no established
+account of what changed, or whether anything did.
 
-**The fix, already in this branch:** `provisioning_server::run` — the
-*sibling* loop, used only during first-boot unprovisioned setup — already
-carries the missing guard:
+**What is genuinely landed, and why it is worth keeping regardless:**
+`RX_BUF_LEN`'s own doc comment (`admin_server.rs:130-137`) already names a
+real host-originated hazard this same escape valve defends against: a
+legitimate but oversized or desynced frame stream whose length bytes decode
+to a `plen` bigger than `RX_BUF_LEN` will ever hold, or a retry burst that
+spans frame boundaries awkwardly. Without a full-buffer escape valve, that
+class hits the identical stuck-forever failure mode the log-noise theory
+described (`find_magic_start` re-confirms the same match at offset 0 every
+iteration, `rx_len` latches at `RX_BUF_LEN`, no `delay_ms` in that arm) —
+the failure mechanism downstream of "buffer stuck full" is real and correct
+source-reading; only the claim about *how* the buffer reliably gets stuck
+full in practice was wrong.
+
+`provisioning_server::run` — the *sibling* loop, used only during
+first-boot unprovisioned setup — has carried the equivalent guard since
+this repo's very first commit (`git log -S` on its log message pins it to
+`ef0374f`, the import commit); `admin_server::run` never had it. There is
+no identified commit that removed it or introduced a regression window —
+this is not evidence of a "drift between two hand-duplicated loops" that
+recently opened, only of an omission in `admin_server` that has existed for
+as long as the file has. Mirrored into `admin_server`'s `TruncatedFrame` arm
+below as hardening against the real class named above:
 ```rust
 Err(ProvError::TruncatedFrame) => {
     if rx_len >= RX_BUF_LEN {
@@ -160,22 +171,20 @@ Err(ProvError::TruncatedFrame) => {
     }
 }
 ```
-`admin_server::run` (the loop actually running on every already-provisioned
-device — i.e. every device past first-time setup, exactly this mission's
-repro scenario) never got it. This was a **drift between two hand-duplicated
-loops**, not a deliberate omission — worth remembering next time either file
-changes: touch one, check the other. Mirrored verbatim into `admin_server`'s
-`TruncatedFrame` arm. `RX_BUF_LEN`'s own doc comment already records a prior,
-partial fix to the *identical* bug class (bumping 64→512 bytes after a
-long-name edit frame was found to hang the same way) — that raised the bar
-for the wedge to trigger without removing the underlying gap, which is
-exactly why boot-log noise could still find it.
+`RX_BUF_LEN`'s own doc comment already records a prior, partial fix to a
+related bug class (bumping 64→512 bytes after a long-name edit frame was
+found to hang the same way, permanently, with no escape valve) — this
+change closes the remaining gap that fix left open for any host-originated
+stream, of any size, that manages to desync in a way that reads as an
+oversized `plen`.
 
-**This also refutes an earlier "provisioning session/lock never released"
-theory** raised while chasing this same symptom: no session/lock construct
-is needed to explain the host-CLI-also-hangs fact — a single, un-scoped
-shared resource (the RX buffer, and the one thread reading it) explains it
-without one.
+**This still stands independent of the retraction above:** a
+"provisioning session/lock never released" theory raised while chasing this
+same symptom needs no session/lock construct — a single, un-scoped shared
+resource (the RX buffer, and the one thread reading it) is sufficient to
+explain the host-CLI-also-hangs fact *if* something gets that buffer stuck
+full. What is now open again is what, on real hardware, actually gets it
+there.
 
 **Unrelated hardening, found by inspection while diagnosing this, fixed in
 the same pass:** the browser's `session.js` `ALL_RSP_FRAME_TYPES` set — the
@@ -196,9 +205,11 @@ be cross-build-verified in this environment. It is, however, syntactically
 and semantically a verbatim mirror of an already-compiling, already-shipped
 sibling arm in the same file/crate (`provisioning_server::run`'s identical
 guard, five lines above in the same source tree) — about as low a
-compile-risk edit as a firmware change can be. **Step 1 below is where this
-gets its real confirmation**: with the fix in hand, step 1 should land on
-the "best case" or "acceptable case" branch on the very first try, every
+compile-risk edit as a firmware change can be. **Step 1 below confirms the
+fix is at least harmless**, not that it addressed the reported symptom —
+those are different claims now that the mechanism above is retracted. With
+the fix in hand, step 1 should still land on the "best case" or "acceptable
+case" branch on the very first try, every
 time, never the wedge case this mission was opened to chase.
 
 ## What this fix found and addressed (source + host-testable surface only)
@@ -331,23 +342,34 @@ hardware). That is exactly what this kit is for.
   step 1** — record which of the two outcomes above actually happened in the
   result block.
 - **RX-BUFFER-STARVATION CHECK (new — `meshcadet-web-provisioner-
-  read-timeout-after-reset`): this is now the load-bearing check for this
-  fix, the same way step 1's wedge-case branch was load-bearing for #201's.**
-  With the `admin_server` RX-buffer-full flush guard in hand (see the
-  "Update, 2026-09-19 (later)" section above for the full mechanism), a
-  normal connect-after-reset should land on the "Best case" or "Acceptable
-  case" branch above **every single time** — never the wedge case below.
+  read-timeout-after-reset`): watch for the guard actually firing, not just
+  for a clean connect.** The `admin_server` RX-buffer-full flush guard is
+  landed hardening (see the "Update, 2026-09-19 (later)" section above), but
+  the mechanism originally proposed to explain why it would matter — a false
+  `PROV_MAGIC` match inside this device's own boot-time log noise — is
+  retracted as directionally impossible (the RX buffer only ever receives
+  host-sent bytes; see that section). **This means N clean connects in a row
+  proves nothing on its own: it cannot distinguish "the fix worked" from
+  "the guard never had anything to catch, and the fix is irrelevant to
+  whatever the real cause turns out to be."** The only thing that
+  discriminates those two is whether the serial monitor ever actually prints
+  the guard's own line:
+  ```
+  admin_server: RX buffer full with no valid frame — flushing
+  ```
   Repeat Connect several times in a row (5+), each after a fresh reset if
-  the device doesn't already reset every time, to build confidence this
-  isn't just a lucky run: the pre-fix bug was probabilistic (it needed a
-  stray `4D 43` byte pair inside that boot's log noise), so a single clean
-  pass is weaker evidence than several.
-  - **If every run lands clean** ⇒ the fix holds; this is the expected,
-    now-confirmed outcome.
-  - **If the wedge case below still reproduces even once** ⇒ this was not
-    the only contributor, or the fix has a gap — capture everything the FAIL
-    branch below asks for, plus the exact serial-monitor line count/content
-    right before the device is next queried, and flag it loudly: this would
+  the device doesn't already reset every time, watching the serial monitor
+  continuously, and record in the result block whether that line appears at
+  all, and how many times.
+  - **Line never appears, across every run** ⇒ the escape valve never fired.
+    A clean run tells us nothing about whether the reported symptom is
+    fixed — it only tells us the buffer never got stuck full during this
+    test. Report this plainly rather than as a PASS for the diagnosis.
+  - **Line appears, and the device recovers on its own instead of wedging**
+    ⇒ the guard did catch a real full-buffer condition and the hardening is
+    doing real work — genuine, positive evidence, worth reporting as such,
+    though still not proof of what put the buffer in that state.
+  - **If the wedge case below still reproduces even once** ⇒ this would
     mean the diagnosis needs a second pass, not just a bigger buffer.
 - **Wedge case — the connect attempt fails with a bounded, named error**
   (in the browser console / on the page: `timeout waiting for response
@@ -478,8 +500,16 @@ step 1 (web provisioner connect):        PASS | FAIL
     number of Connect attempts run: <N, 5+ recommended>
     number that landed clean (best/acceptable case, no wedge): <N>
     number that hit the wedge case: <N, expect 0>
+    "admin_server: RX buffer full with no valid frame — flushing" observed on
+      serial monitor? yes | no — if yes, how many times, and on which
+      attempt number(s)? <count / attempt#s>
 step 2 (web provisioner add-channel):    PASS | FAIL
 step 3 (host CLI status):                PASS | FAIL
+  exact command run: <paste, e.g. `cargo run -p host --release -- --port /dev/ttyACM0 status`>
+  outcome: succeeded | failed with a bounded/named error | genuinely hung
+    (no output, no error, until Ctrl-C or physical reset)
+  wall-clock elapsed before it returned (or before you gave up and
+    interrupted it): <seconds>
 step 4 (bad key_len hardening probe):    PASS | FAIL
 
 when did provisioning last definitely work (if known)? <date / "unknown">
@@ -495,20 +525,33 @@ for any FAIL above, paste verbatim:
   own without one?
 ```
 
-A clean PASS on all four steps means the fix in hand resolves both reported
-symptoms and no further work is needed for this defect. Any FAIL should come
-back with this result block attached — the serial monitor panic text (or its
-conspicuous absence) is the single fact most likely to turn a second
-diagnosis pass from "read the source again" into "here is line X."
+A clean PASS on all four steps is evidence the hardening in hand is at
+least harmless, but is **not**, by itself, evidence the reported symptom is
+resolved — see the retraction in the "Update, 2026-09-19 (later)" section
+above for why N clean runs cannot carry that claim on their own. Any FAIL
+should come back with this result block attached — the serial monitor panic
+text (or its conspicuous absence) is the single fact most likely to turn a
+second diagnosis pass from "read the source again" into "here is line X."
 
-**Fill in the RX-buffer-starvation block above even on a step-1 PASS.** It
-is the confirmation `meshcadet-web-provisioner-read-timeout-after-reset`
-needs: several repeated clean runs is meaningfully stronger evidence the
-fix holds than one, since the pre-fix bug only triggered when that boot's
-log noise happened to contain a stray `4D 43` byte pair — a probabilistic
-trigger, not a certainty on any single run. See that mission's "Update,
-2026-09-19 (later)" section above for the full root-cause mechanism and the
-fix already in this branch (`admin_server.rs`'s `TruncatedFrame` arm).
+**Fill in the RX-buffer-starvation block above, including the flush-line
+question, even on a step-1 PASS.** The flush line's presence or absence is
+the only thing in this kit that distinguishes "the guard caught a real
+full-buffer condition" from "the guard never had anything to catch, and a
+clean run says nothing about the reported symptom." Several repeated clean
+runs with the line absent every time is not strong evidence the underlying
+cause is fixed — it may simply mean this test session never reproduced
+whatever puts the buffer in that state. See the "Update, 2026-09-19 (later)"
+section above for the retraction and the mechanism that is and isn't
+established.
+
+**Step 3's outcome line matters regardless of PASS/FAIL.** `host/src/session.rs`
+and `send_recv_with_retry` are both deadline-bounded by construction — a
+genuine, unbounded hang (no output, no error, past the ~10-15s budget)
+points to something this kit's diagnosis does not reach (a different build,
+or a hang mechanism upstream of `Session`, e.g. the OS-level serial read
+itself blocking forever). A bounded failure with a named error, even if it
+counts as a step-3 FAIL, is a materially different and less alarming finding
+than a true hang — report which one occurred, not just PASS/FAIL.
 
 **Step 1's "which outcome" line matters even on a PASS.** `connect()` no
 longer calls `setSignals()` at all (`meshcadet-provisioner-connect-
