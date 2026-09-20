@@ -40,6 +40,7 @@
 //! | [`rx_frame`]      | `firmware/src/main.rs::on_receive`'s call site (radio RX buffer ownership, payload dispatch to the per-type handlers) |
 //! | [`room_admin`]    | `admin_server.rs`'s `FRAME_ADD_ROOM`/`FRAME_DEL_ROOM`/`FRAME_QUERY_ROOMS` arms and `provisioning_server.rs`'s equivalent staging arms (NVS persist, the serial write) |
 //! | [`prov_diag`]     | `provisioning_server.rs`'s `run()` raw-RX hex-dump diagnostic (the USB-serial read loop itself) |
+//! | [`rx_loop_guard`] | `admin_server.rs`'s and `provisioning_server.rs`'s `run()` `TruncatedFrame`-arm RX-buffer-full flush guard (the USB-serial read loop + `log::warn!` itself) |
 //! | [`radio_wait`]    | `radio.rs`'s `GpioDio1Wait` (GPIO ISR subscribe + FreeRTOS task notification) |
 //! | [`ui::gps_status`]| `ui::screens::gps_status::GpsStatusScreen` (the `slint!{}` view) |
 //! | [`ui::contact_list`] | `ui::screens::contact_list::{ContactListScreen, ContactItem}` (the `slint!{}` view) |
@@ -83,5 +84,6 @@ pub mod room_admin;
 pub mod room_session;
 pub mod runtime_settings_store;
 pub mod rx_frame;
+pub mod rx_loop_guard;
 pub mod signal_tracker;
 pub mod ui;
