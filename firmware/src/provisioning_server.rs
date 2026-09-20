@@ -228,6 +228,27 @@ pub fn run(
             continue;
         }
 
+        // A candidate whose length field already decodes to more than any
+        // real request could ever carry can never resolve via `TruncatedFrame`
+        // below — it would need `rx_buf` to grow to `7 + plen` bytes, which
+        // for a corrupted/oversized `plen` can exceed `RX_BUF_LEN` and would
+        // otherwise sit absorbing host traffic until the full-buffer flush
+        // fires. Reject it here instead, exactly like a bad magic/CRC match:
+        // drop 1 byte and resync immediately. Mirrors the host/browser
+        // clients' own guard against the opposite direction (see
+        // `firmware_core::rx_loop_guard::oversized_plen`'s doc comment).
+        if firmware_core::rx_loop_guard::oversized_plen(
+            &rx_buf[..rx_len],
+            firmware_core::rx_loop_guard::MAX_VALID_REQUEST_PAYLOAD_LEN,
+        ) {
+            log::warn!("prov_server: oversized plen in candidate frame — resyncing");
+            if rx_len > 0 {
+                rx_buf.copy_within(1..rx_len, 0);
+                rx_len -= 1;
+            }
+            continue;
+        }
+
         // ── Try to decode one frame ──────────────────────────────────────────
         match decode_frame(&rx_buf[..rx_len]) {
             Ok((frame_type, payload)) => {

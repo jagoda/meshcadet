@@ -553,7 +553,26 @@ fn main() -> anyhow::Result<()> {
         .port
         .as_deref()
         .context("--port is required for this command")?;
+    // Diagnostic timing marker, not gated behind a verbosity flag (matches
+    // this file's existing unconditional `eprintln!` warnings elsewhere):
+    // `SerialTransport::open` (which includes the mandatory post-open
+    // `port.clear(ClearBuffer::Input)`) is the ONLY call in this program's
+    // entire startup-to-response path that is not bounded by `Session`'s
+    // 500ms-per-attempt/10s-total retry deadlines (`host/src/session.rs`) —
+    // every `Transport::recv` after this point is capped at the 100ms
+    // per-read timeout `SerialTransport::open` itself sets
+    // (`host/src/transport.rs`). If this CLI is ever reported to hang with
+    // NO output at all — not even this line — that pins the hang inside
+    // `open()`/`clear()` (OS/USB-driver layer) rather than anywhere
+    // `Session`'s own deadline logic reaches; printing after a successful
+    // open, by contrast, means a report of a further hang points at a
+    // mechanism this deadline-bounded design does not currently explain.
+    let open_started = std::time::Instant::now();
     let transport = SerialTransport::open(port, cli.baud)?;
+    eprintln!(
+        "host CLI: serial port opened in {:?}",
+        open_started.elapsed()
+    );
     let mut session = Session::new(transport);
 
     match cli.cmd {

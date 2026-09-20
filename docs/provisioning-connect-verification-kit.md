@@ -212,6 +212,153 @@ the fix in hand, step 1 should still land on the "best case" or "acceptable
 case" branch on the very first try, every
 time, never the wedge case this mission was opened to chase.
 
+## Update, 2026-09-20 (round 5): re-diagnosed from the corrected data-flow direction — one structural fact confirmed, one new mechanism proposed, both unverified against real hardware
+
+`meshcadet-provisioner-fix-retraction-audit` refuted round 4's log-noise
+mechanism as directionally impossible. This round re-diagnosed from the
+corrected direction (host/browser RECEIVE side, not device RX) against the
+settled facts: the device runs normally throughout (normal app UI, never
+held in reset), the device→host link carried 10560 real bytes during a
+failing `query_status`, the browser parsed zero valid frames out of them,
+the host CLI also fails against the same device afterward and clears only on
+a **physical reset**, and #201's `setSignals()` removal must not be undone.
+
+**1. CONFIRMED (source fact, no device needed): `SerialTransport::open()` is
+the one call in the host CLI's entire path with no deadline.** Every byte
+read after a `Session` exists is bounded (`transport.rs`'s 100 ms per-read
+timeout, wrapped by `session.rs`'s 500 ms/10 s retry deadlines). But
+`host/src/main.rs` calls `SerialTransport::open()` — which includes the
+mandatory `port.clear(ClearBuffer::Input)` — directly in `main()`, *before*
+`Session::new` ever runs (`main.rs:556`, `transport.rs:66-78`). Neither the
+OS-level `open()` syscall nor `port.clear()` carries any timeout of its own.
+This means: if the host CLI's reported "hang" is ever confirmed to be a
+genuine, unbounded stall (no output, no error, indefinitely), it
+*structurally must* live here or in the OS/USB-driver layer beneath it —
+nowhere else in the call chain lacks a deadline. This round adds a one-line
+`eprintln!` timing marker around the `open()` call (`main.rs`) so a future
+reproduction can observe directly whether the CLI ever gets past it: no
+output at all pins the hang inside `open()`/`clear()`; a printed elapsed time
+followed by a further hang points at a mechanism `Session`'s own bounded
+retry logic does not currently explain (worth flagging loudly if it ever
+happens, per the existing step 3 guidance below).
+
+**2. LEADING HYPOTHESIS (unverified — needs a device): a genuinely truncated
+HOST-sent candidate frame gets stuck in `admin_server`'s (or
+`provisioning_server`'s) `rx_buf`, below the size the existing full-buffer
+flush guard needs to fire.** The existing guard
+(`firmware_core::rx_loop_guard::flush_if_rx_buffer_full`) only fires once
+`rx_len` reaches `RX_BUF_LEN` (512 bytes). But a stuck candidate whose
+declared `plen` is small and *individually plausible* (a real command's
+header, whose remaining payload bytes were lost — e.g. a USB transfer
+truncated by an earlier session ending mid-command) sits at offset 0
+forever: `find_magic_start` re-confirms the same magic match every
+iteration, so nothing is ever discarded, and `decode_frame` just keeps
+returning `TruncatedFrame`. Every subsequent host command's bytes — from a
+*brand-new* browser tab or host CLI process — get appended behind it and
+swallowed the same way, since nothing about a new process/connection resets
+the *device's* `rx_buf`/`rx_len` (those are stack-local to
+`admin_server::run`'s/`provisioning_server::run`'s own `loop {}`, entirely
+independent of the host-side connection). This satisfies every constraint
+this round is bound by:
+- **Physical-reset-only:** only a full reboot re-initializes that
+  stack-local state to empty — no browser/host-side action (tab close, port
+  close, process exit) touches it. This is the single most load-bearing fact
+  the kit's step 1 already flags, and this mechanism is the first one this
+  campaign has proposed that explains it *precisely*, not just plausibly.
+- **"Used to work" with no regression window:** no code change is required
+  to explain this. It only takes one earlier session's command to be
+  interrupted at exactly the wrong USB-transfer boundary to plant a stuck
+  low-`plen` candidate — this can happen at any point in the repo's history,
+  which is consistent with `git log -S` finding no drift event in the
+  admin_server/provisioning_server guard asymmetry (round 4's own finding,
+  still valid): the gap here is not that the flush guard is *missing*, it's
+  that the guard's own 512-byte threshold is far larger than a handful of
+  short retried command frames (`QUERY_STATUS`'s frame is 7 bytes; even 20
+  retries over a full 10 s budget is only ~140 bytes) can realistically
+  reach within one command's retry window.
+- **No `--host-native` dependency.**
+- **Explains the "10560 bytes, zero valid frames" browser trace without
+  requiring the guard itself to be insufficient:** see point 3 below — the
+  10560 bytes are very likely the device's own *unrelated* periodic log
+  chatter (GPS/battery/UI-pump ticks), continuing normally because this
+  mechanism never touches the UI thread; the browser correctly never
+  extracts a frame from them because the device's admin_server genuinely
+  never got to decode the incoming `QUERY_STATUS` in the first place — not
+  because a real reply arrived and was missed.
+
+**Caveat, same as round 4's fix and for the identical reason:** this
+container's `firmware/rust-toolchain.toml` pins the `esp` (Xtensa)
+toolchain, not installed here, so this round's firmware change could not be
+cross-build-verified either. `cargo test -p firmware-core` (host-testable,
+verified above) covers `oversized_plen`'s own logic exhaustively; the two
+call sites in `admin_server.rs`/`provisioning_server.rs` are a small,
+syntactically uniform insertion mirroring the existing
+`flush_if_rx_buffer_full` call convention already shipped and compiling in
+both files — about as low a compile-risk shape as a firmware change can
+take, but still unverified against the real target.
+
+**This round's landed fix (`firmware_core::rx_loop_guard::oversized_plen`,
+mirrored into both `admin_server.rs` and `provisioning_server.rs`'s decode
+loops) closes only the "garbage/oversized `plen`" sub-case of this same
+hazard family — immediately, without waiting for `RX_BUF_LEN`.** It does
+**not** close the "small, individually plausible `plen` whose payload never
+completes" sub-case described above: a genuinely truncated real-looking
+command header is, by construction, not oversized, so it still has to wait
+out the existing 512-byte escape valve (or a device reboot). Closing that
+residual case would need a different mechanism — a *staleness*, not a
+*magnitude*, check (a candidate that has stopped growing needs to expire,
+regardless of how small it is) — which is **not implemented this round**:
+it would require new state threaded through the receive loop
+(tracking how long the current unresolved candidate has sat at offset 0)
+that has not been checked against real hardware, and landing it now would
+repeat exactly the pattern this round exists to break (a confident,
+untested fix). It is recorded here as the concrete next candidate if the
+predicate below confirms this mechanism.
+
+**3. Are the host/browser receive-side `plen` guards
+(`host/src/session.rs:244`, `site/provisioner/session.js`'s
+`MAX_VALID_FRAME_PAYLOAD_LEN` check, proven by
+`oversizedAdvertFrameSurvivesLogNoiseResync`) actually sufficient against a
+10 KB boot-log-style burst? Very likely yes, on source-level byte-value
+grounds — the false-positive window is narrower than it looks.** The guard
+only misclassifies a spurious `"MC"` (0x4D 0x43) match in log text as a real
+frame if the byte exactly 4 positions after the match (`buf[4]`, the
+length field's high byte) is `0x00` — otherwise `plen` computes to at least
+`0x00xx | (0x20..0x7E)<<8`, i.e. several thousand, always past
+`MAX_VALID_FRAME_PAYLOAD_LEN` (134). Ordinary printable ESP-IDF log
+output — including ANSI color escapes (`\x1b[0;32m`: digits, `;`, `m`, all
+ASCII 0x20-0x7E) — essentially never contains a raw `0x00` byte. This is a
+source-level argument, not a device-confirmed one (a raw binary dump logged
+without hex-encoding could in principle contain a `0x00` at the wrong
+offset), but it means the "zero valid frames out of 10560 bytes" trace is
+much more likely explained by mechanism 2 above (the device never actually
+sent a real reply during that window) than by a guard failure letting real
+log noise masquerade as a frame.
+
+**Device-verification predicates for this round, folded into the result
+block below (do not create a second kit):**
+- **Self-heal-without-reset test (discriminates mechanism 2 from a harder
+  latch, e.g. a USB-peripheral-level condition no amount of retrying could
+  ever clear):** if the wedge reproduces, do **not** physically reset
+  immediately. Instead keep retrying the host CLI `status` command (a fresh
+  invocation each time, several minutes' worth, comfortably past the point
+  where cumulative retried command bytes across those invocations would
+  exceed 512) *before* resetting. If it self-heals on its own without a
+  physical reset, mechanism 2 (stuck-below-threshold small candidate) is
+  strongly supported. If it does **not** self-heal no matter how long you
+  retry, mechanism 2 is refuted and the latch is something this source read
+  does not reach (most likely a hardware/USB-peripheral-level condition).
+- **Watch for which log line fires, if any**, distinguishing the two
+  sub-cases of the same hazard family: `admin_server: oversized plen in
+  candidate frame — resyncing` (this round's new guard, firing immediately)
+  vs. `admin_server: RX buffer full with no valid frame — flushing` (the
+  existing guard, firing only after 512 bytes accumulate) vs. neither ever
+  firing (the mechanism is not this hazard family at all).
+- **Confirm whether `host CLI: serial port opened in ...` (this round's new
+  timing marker, `main.rs`) ever fails to print during a reproduced hang** —
+  decisive confirmation or refutation of the `SerialTransport::open()`
+  unbounded-hang candidate in finding 1 above.
+
 ## What this fix found and addressed (source + host-testable surface only)
 
 - **Refuted:** a Rust/JS wire-codec divergence from the recent screen-lock
@@ -503,14 +650,29 @@ step 1 (web provisioner connect):        PASS | FAIL
     "admin_server: RX buffer full with no valid frame — flushing" observed on
       serial monitor? yes | no — if yes, how many times, and on which
       attempt number(s)? <count / attempt#s>
+    "admin_server: oversized plen in candidate frame — resyncing" observed on
+      serial monitor (round 5's new immediate-reject guard)? yes | no — if
+      yes, how many times, and on which attempt number(s)? <count / attempt#s>
 step 2 (web provisioner add-channel):    PASS | FAIL
 step 3 (host CLI status):                PASS | FAIL
   exact command run: <paste, e.g. `cargo run -p host --release -- --port /dev/ttyACM0 status`>
+  "host CLI: serial port opened in ..." printed before the outcome below?
+    yes (elapsed: <duration>) | no — printed nothing at all
   outcome: succeeded | failed with a bounded/named error | genuinely hung
     (no output, no error, until Ctrl-C or physical reset)
   wall-clock elapsed before it returned (or before you gave up and
     interrupted it): <seconds>
 step 4 (bad key_len hardening probe):    PASS | FAIL
+
+round 5 self-heal-without-reset test (only if the wedge reproduces — see
+  "Update, 2026-09-20" above before physically resetting the device):
+  number of separate `status` invocations retried before giving up or
+    resetting: <N>
+  approximate total wall-clock time spent retrying: <minutes>
+  did it self-heal on its own, with NO physical reset? yes | no
+  if yes: which invocation number did it succeed on? <N>
+  if no: did you eventually reset physically to confirm that clears it?
+    yes | no
 
 when did provisioning last definitely work (if known)? <date / "unknown">
 
