@@ -59,6 +59,52 @@ pub fn flush_if_rx_buffer_full(rx_len: &mut usize, rx_buf_len: usize) -> bool {
     }
 }
 
+/// Upper bound on any legitimate HOST→DEVICE command frame payload —
+/// mirrors, on this side of the link, the same guard `host/src/session.rs`'s
+/// `MAX_VALID_FRAME_PAYLOAD_LEN` and `site/provisioner/session.js`'s
+/// `MAX_VALID_FRAME_PAYLOAD_LEN` already apply to the opposite direction
+/// (DEVICE→HOST response payloads). `FRAME_ADD_ROOM`'s payload — the widest
+/// request this protocol defines (`protocol::provisioning::encode_add_room`:
+/// `pubkey(32) + pw_len(1) + guest_password(<=MAX_ROOM_PASSWORD_LEN) +
+/// name_len(1) + name(<=MAX_NAME_LEN)`) — is ahead of `FRAME_ADD_CHANNEL`
+/// and `FRAME_ADD_CONTACT`. Computed from the same protocol constants the
+/// encoder itself is built from, rather than hand-copied as a bare number,
+/// so a future change to either constant cannot silently leave this guard's
+/// own ceiling stale.
+pub const MAX_VALID_REQUEST_PAYLOAD_LEN: usize = 32
+    + 1
+    + protocol::provisioning::MAX_ROOM_PASSWORD_LEN
+    + 1
+    + protocol::provisioning::MAX_NAME_LEN;
+
+/// Whether the candidate frame currently at the front of `rx_buf` (already
+/// synced to a confirmed two-byte magic match by the caller's own
+/// `find_magic_start`) carries a `plen` too large to ever be a real
+/// request. Returns `false` (nothing to decide yet) if fewer than 5 bytes
+/// are buffered — the length field isn't readable yet.
+///
+/// Why this matters: without this check, an oversized or desynced `plen`
+/// (a corrupted length field, or a false magic match landing on the wrong
+/// two bytes) is indistinguishable from a genuine, merely-not-fully-arrived
+/// frame — `decode_frame` reports both as `TruncatedFrame` and the loop
+/// just keeps reading, waiting for `7 + plen` bytes to show up. For an
+/// oversized `plen` that wait can never resolve; the candidate only gets
+/// dislodged once `rx_len` reaches `rx_buf_len` and
+/// [`flush_if_rx_buffer_full`] resets the whole buffer to empty — which
+/// also discards any legitimate frame that arrived right behind the bad
+/// one. Calling this first, from the same `TruncatedFrame` arm, and
+/// resyncing one byte at a time (like a `BadMagic`/`CrcMismatch` result)
+/// instead of waiting, means a desynced candidate is dislodged immediately
+/// rather than after absorbing up to `rx_buf_len` bytes of good traffic
+/// behind it.
+pub fn oversized_plen(rx_buf: &[u8], max_valid_payload_len: usize) -> bool {
+    if rx_buf.len() < 5 {
+        return false;
+    }
+    let plen = rx_buf[3] as usize | ((rx_buf[4] as usize) << 8);
+    plen > max_valid_payload_len
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,5 +141,49 @@ mod tests {
         let mut rx_len = 0;
         assert!(!flush_if_rx_buffer_full(&mut rx_len, 512));
         assert_eq!(rx_len, 0);
+    }
+
+    // ── oversized_plen ────────────────────────────────────────────────────
+
+    fn candidate(plen: u16) -> [u8; 5] {
+        let [lo, hi] = plen.to_le_bytes();
+        // magic(2) + type(1) + len_lo(1) + len_hi(1) — enough for the guard
+        // to read the length field; the magic/type bytes themselves are
+        // irrelevant to this function (the caller already confirmed them).
+        [b'M', b'C', 0, lo, hi]
+    }
+
+    #[test]
+    fn fewer_than_5_bytes_is_undecided() {
+        assert!(!oversized_plen(
+            &candidate(9999)[..4],
+            MAX_VALID_REQUEST_PAYLOAD_LEN
+        ));
+    }
+
+    #[test]
+    fn max_valid_payload_is_not_oversized() {
+        assert!(!oversized_plen(
+            &candidate(MAX_VALID_REQUEST_PAYLOAD_LEN as u16),
+            MAX_VALID_REQUEST_PAYLOAD_LEN
+        ));
+    }
+
+    #[test]
+    fn one_byte_past_max_is_oversized() {
+        assert!(oversized_plen(
+            &candidate(MAX_VALID_REQUEST_PAYLOAD_LEN as u16 + 1),
+            MAX_VALID_REQUEST_PAYLOAD_LEN
+        ));
+    }
+
+    #[test]
+    fn ascii_log_noise_reads_as_oversized() {
+        // A false "MC" match landing inside ASCII log text: the two bytes at
+        // the length-field offset are ordinary printable characters, whose
+        // high byte alone (>= 0x20) already pushes plen well past any real
+        // payload.
+        let noise = *b"MCxes"; // len_hi = b's' = 0x73
+        assert!(oversized_plen(&noise, MAX_VALID_REQUEST_PAYLOAD_LEN));
     }
 }
