@@ -475,6 +475,16 @@ hex/ASCII-dumps the first ~512 bytes it discards as noise on every timeout,
 so the next reproduction can actually read what that ~10.5KB of traffic
 contains instead of just counting it.
 
+**Noted, not fixed this round (out of this mission's explicit scope — the
+dossier named `site/provisioner/session.js` only): `host/src/session.rs`'s
+own `recv_frame` timeout message (`"timeout waiting for response frame
+(accumulated {} bytes)"`, `session.rs:213`) has the identical
+RETAINED-vs-ARRIVED conflation `session.js`'s `#timeoutMessage` had before
+this round's fix — `self.acc_buf.len()` is post-discard, not raw bytes
+received.** A future round diagnosing the host CLI's own receive side
+(distinct from this round's transmit-side fix) should give this the same
+treatment rather than rediscovering the gap from scratch.
+
 **LEADING CANDIDATE for the device-side half of the mechanism — explicitly
 UNVERIFIED, not landed as a root-cause claim, and now source-REFUTED (see
 below) rather than confirmed:** `admin_server` writes every reply via
