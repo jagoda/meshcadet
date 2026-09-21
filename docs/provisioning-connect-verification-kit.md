@@ -294,12 +294,11 @@ that is where the real hang lives. **Fixed this round:**
 `transport.rs` for the device evidence and the tradeoff — the underlying
 `tcdrain` still can't be interrupted, so this converts the hang into a
 diagnosable `anyhow::Error` rather than actually unblocking the syscall).
-The generalizable lesson this leaves for the library — a deadline wrapper
-also fails to cover a blocking call made *through* it that doesn't itself
-honor a timeout, not just the wrapper's own setup call — is flagged against
-`flight-manuals/library/bounded-retry-wrapper-excludes-its-own-setup-call.md`
-for a Houston-side follow-up; not edited from this mission (vehicle-scoped
-work only).
+The generalizable lesson this leaves — a deadline wrapper also fails to
+cover a blocking call made *through* it that doesn't itself honor a
+timeout, not just the wrapper's own setup call — is flagged for a
+process-side follow-up in the maintainer's own notes; not edited from this
+mission (vehicle-scoped work only).
 
 **2. LEADING HYPOTHESIS (unverified — needs a device): a genuinely truncated
 HOST-sent candidate frame gets stuck in `admin_server`'s (or
@@ -476,7 +475,7 @@ so the next reproduction can actually read what that ~10.5KB of traffic
 contains instead of just counting it.
 
 **Noted, not fixed this round (out of this mission's explicit scope — the
-dossier named `site/provisioner/session.js` only): `host/src/session.rs`'s
+brief named `site/provisioner/session.js` only): `host/src/session.rs`'s
 own `recv_frame` timeout message (`"timeout waiting for response frame
 (accumulated {} bytes)"`, `session.rs:213`) has the identical
 RETAINED-vs-ARRIVED conflation `session.js`'s `#timeoutMessage` had before
@@ -519,15 +518,15 @@ thread for more than ~100ms — nowhere near long enough to explain a
 persistent, reboot-required wedge.** The admin_server-blocking-stdout
 mechanism as originally framed is therefore refuted by source, not
 confirmed; no bounded-write/drop-on-overflow hardening is landed in
-`admin_server` this round (the dossier's own instruction was to land it
+`admin_server` this round (this round's own brief was to land it
 *only if* source analysis confirmed the write path could actually block —
 it didn't). What this does NOT do: explain the actual wedge mechanism.
 The real cause of a `tcdrain`-forever on the host side remains open — see
 the device predicate immediately below.
 
-**Device predicate for the Commander's next hardware session (binding scope
+**Device predicate for the maintainer's next hardware session (binding scope
 note: this mission ran no hardware tests and did not pass `--host-native` —
-this predicate is for the Commander to run, not this mission):** while the
+this predicate is for the maintainer to run, not this mission):** while the
 wedge is reproduced (host CLI hung in `tcdrain`, per the evidence above),
 without physically resetting the device, run:
 ```sh

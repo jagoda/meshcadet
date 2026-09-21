@@ -288,7 +288,9 @@ mod tests {
             }
         }
 
-        let port = Arc::new(Mutex::new(InstantWriter { written: Vec::new() }));
+        let port = Arc::new(Mutex::new(InstantWriter {
+            written: Vec::new(),
+        }));
         let result = send_bounded(&port, b"hello", Duration::from_secs(1));
         assert!(result.is_ok(), "{:?}", result);
         assert_eq!(port.lock().unwrap().written, b"hello");
