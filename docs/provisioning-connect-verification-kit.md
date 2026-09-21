@@ -59,8 +59,14 @@ has had. Two datapoints, in order:
 **Fix: `connect()` no longer calls `setSignals()` at all** — see its doc
 comment for the full history. This returns to the exact pre-#200 path,
 which field evidence already showed was reset-and-recoverable (never a
-wedge requiring physical intervention). `esptool-js` is unchanged — it
-deliberately wants that reset to enter its own bootloader for flashing.
+wedge requiring physical intervention).
+**RETRACTED — see "Update, 2026-09-19 (later)" below:** Maintainer evidence
+(2026-09-19T14:12Z) refuted the "never a wedge" claim in the sentence above:
+post-#201, on this same pre-#200 path, the device still wedged until a
+physical reset. Left in place, unedited, for the kit's chronology — read the
+later section for the current understanding, not this one. `esptool-js` is
+unchanged — it deliberately wants that reset to enter its own bootloader for
+flashing.
 
 **Severity note, for context on why step 1 below is now the load-bearing
 check, not an optional extra:** the currently deployed web provisioner
@@ -162,12 +168,16 @@ no identified commit that removed it or introduced a regression window —
 this is not evidence of a "drift between two hand-duplicated loops" that
 recently opened, only of an omission in `admin_server` that has existed for
 as long as the file has. Mirrored into `admin_server`'s `TruncatedFrame` arm
-below as hardening against the real class named above:
+below as hardening against the real class named above. (Note, added on this
+doc pass: the snippet below is `admin_server`'s actual landed arm as of PR
+#204/`251f1ee`, which extracted this comparison into a shared
+`firmware_core::rx_loop_guard::flush_if_rx_buffer_full` helper called from
+both loops — not the hand-rolled inline check this section originally
+described when it was first written.)
 ```rust
 Err(ProvError::TruncatedFrame) => {
-    if rx_len >= RX_BUF_LEN {
-        log::warn!("prov_server: RX buffer full with no valid frame — flushing");
-        rx_len = 0;
+    if firmware_core::rx_loop_guard::flush_if_rx_buffer_full(&mut rx_len, RX_BUF_LEN) {
+        log::warn!("admin_server: RX buffer full with no valid frame — flushing");
     }
 }
 ```
@@ -353,7 +363,11 @@ block below (do not create a second kit):**
   candidate frame — resyncing` (this round's new guard, firing immediately)
   vs. `admin_server: RX buffer full with no valid frame — flushing` (the
   existing guard, firing only after 512 bytes accumulate) vs. neither ever
-  firing (the mechanism is not this hazard family at all).
+  firing (the mechanism is not this hazard family at all). (On a
+  factory-reset/unprovisioned device — the state step 0 puts it in —
+  `provisioning_server::run` is the loop actually running, not
+  `admin_server::run`; expect the identical pair of lines with a
+  `prov_server:` prefix instead, `provisioning_server.rs:244` and `:298`.)
 - **Confirm whether `host CLI: serial port opened in ...` (this round's new
   timing marker, `main.rs`) ever fails to print during a reproduced hang** —
   decisive confirmation or refutation of the `SerialTransport::open()`
