@@ -60,7 +60,7 @@ has had. Two datapoints, in order:
 comment for the full history. This returns to the exact pre-#200 path,
 which field evidence already showed was reset-and-recoverable (never a
 wedge requiring physical intervention).
-**RETRACTED — see "Update, 2026-09-19 (later)" below:** Commander evidence
+**RETRACTED — see "Update, 2026-09-19 (later)" below:** Maintainer evidence
 (2026-09-19T14:12Z) refuted the "never a wedge" claim in the sentence above:
 post-#201, on this same pre-#200 path, the device still wedged until a
 physical reset. Left in place, unedited, for the kit's chronology — read the
