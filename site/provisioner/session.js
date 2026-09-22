@@ -166,6 +166,15 @@ const ALL_RSP_FRAME_TYPES = new Set([
 const MAX_STRAY_FRAMES = 64;
 
 /**
+ * Cap on `#discardPreview`'s size — "the first ~512 discarded bytes",
+ * enough for a human debugging a live wedge to actually read the content of
+ * the "N bytes received, zero valid frames" traffic (an ESP-IDF boot banner
+ * is typically a few hundred bytes) without dumping unbounded megabytes to
+ * the console on a long-running, persistently noisy session.
+ */
+const DISCARD_PREVIEW_CAP = 512;
+
+/**
  * Thrown when the device answers a command with `RSP_ERROR`.
  * Mirrors the `anyhow::bail!("device error {}: {}", ...)` sites in
  * `host/src/session.rs`.
@@ -266,6 +275,44 @@ export class ProvisionerSession {
    * real device was misread exactly this way before this field existed.
    */
   #cumulativeBytesThisCommand = 0;
+  /**
+   * Raw bytes ARRIVED from the device during the CURRENT retry attempt only
+   * — reset every time `#accBuf` is (`#sendRecvWithRetry`'s initial reset
+   * and its per-retry clear), incremented by `#readLoop` alongside
+   * `#cumulativeBytesThisCommand`, and — unlike `#accBuf.length` — never
+   * reduced by `#tryExtractFrame`'s magic-resync discard.
+   *
+   * WHY THIS EXISTS (round 6, `meshcadet-connect-wedge-round6-transmit-
+   * side`): `#timeoutMessage` used to report `#accBuf.length` as "bytes this
+   * attempt", but `#accBuf` is what `#tryExtractFrame` DISCARDS from on
+   * every resync — `findMagicStart` returns `buf.length` (i.e. "discard
+   * everything") whenever no `PROV_MAGIC` candidate is found, and
+   * `#tryExtractFrame` immediately slices that whole span out of `#accBuf`.
+   * So `#accBuf.length` at timeout time reports what's RETAINED (usually a
+   * trailing partial-frame remnant, often 0), not what ARRIVED — "0 bytes
+   * this attempt" was indistinguishable between "the device said nothing at
+   * all" and "the device said plenty, all of it non-frame noise that got
+   * discarded." `#bytesArrivedThisAttempt` is the ARRIVED count `#timeoutMessage`
+   * needed instead; `#accBuf.length` is still reported alongside it (labeled
+   * "retained") since the two together are what actually distinguish the two
+   * scenarios above.
+   */
+  #bytesArrivedThisAttempt = 0;
+  /**
+   * Preview buffer: the first up to `DISCARD_PREVIEW_CAP` bytes discarded as
+   * non-frame noise (log traffic, false `PROV_MAGIC`) during the CURRENT
+   * top-level command — reset alongside `#cumulativeBytesThisCommand`, never
+   * cleared per-attempt (so a retry doesn't lose the earliest, most useful
+   * sample). `#logDiscardedPreview` hex-dumps it to the console at the
+   * moment a timeout is about to be thrown.
+   *
+   * Six rounds of this connect-wedge investigation have theorized about the
+   * ~10.5KB of "N bytes received, zero valid frames" traffic
+   * (`#cumulativeBytesThisCommand`'s doc comment) without anyone having
+   * actually looked at its content — this exists so the next timeout report
+   * carries real bytes, not just a count.
+   */
+  #discardPreview = new Uint8Array(0);
   #waiters = [];
   /**
    * Set by `#readLoop`'s catch when the underlying stream itself errors
@@ -424,6 +471,8 @@ export class ProvisionerSession {
     this.#reader = port.readable.getReader();
     this.#accBuf = new Uint8Array(0);
     this.#cumulativeBytesThisCommand = 0;
+    this.#bytesArrivedThisAttempt = 0;
+    this.#discardPreview = new Uint8Array(0);
     this.#fatalError = null;
     this.#readLoopPromise = this.#readLoop();
   }
@@ -489,6 +538,8 @@ export class ProvisionerSession {
     this.#writer = null;
     this.#accBuf = new Uint8Array(0);
     this.#cumulativeBytesThisCommand = 0;
+    this.#bytesArrivedThisAttempt = 0;
+    this.#discardPreview = new Uint8Array(0);
     this.#fatalError = null;
     this.#rejectAllWaiters(new Error("session disconnected"));
   }
@@ -1062,6 +1113,8 @@ export class ProvisionerSession {
   async #sendRecvWithRetry(frameType, payload, isExpected = () => true, label = "response") {
     this.#accBuf = new Uint8Array(0);
     this.#cumulativeBytesThisCommand = 0;
+    this.#bytesArrivedThisAttempt = 0;
+    this.#discardPreview = new Uint8Array(0);
     const overallDeadline = Date.now() + RETRY_TOTAL_MS;
     while (true) {
       if (this.#fatalError) {
@@ -1077,8 +1130,13 @@ export class ProvisionerSession {
         // This attempt timed out but we still have overall budget — clear
         // the accumulated bytes so stale log noise from the device-side
         // processing delay doesn't confuse the next recvFrame call, then
-        // loop → send again.
+        // loop → send again. `#bytesArrivedThisAttempt` is per-attempt too
+        // (unlike `#cumulativeBytesThisCommand`/`#discardPreview`, which are
+        // whole-command) — clear it here as well so the NEXT attempt's
+        // "arrived" figure isn't inflated by bytes this now-abandoned
+        // attempt already accounted for.
         this.#accBuf = new Uint8Array(0);
+        this.#bytesArrivedThisAttempt = 0;
       }
     }
   }
@@ -1165,17 +1223,70 @@ export class ProvisionerSession {
 
   /**
    * Build the "timeout waiting for response frame" message shared by
-   * `#recvUntilExpected`/`#recvFrame`. Reports BOTH `#accBuf.length` (bytes
-   * accumulated in the current ~`RETRY_ATTEMPT_MS` attempt window alone —
-   * cleared on every retry) and `#cumulativeBytesThisCommand` (the whole
-   * `RETRY_TOTAL_MS` command, never cleared between retries) — see
-   * `#cumulativeBytesThisCommand`'s own doc comment for why reporting only
-   * the former invites a specific, real misreading ("N=0 means the device
-   * sent nothing, ever" when it may only mean "silent in this last window,
-   * after an earlier retry's own banner was already cleared").
+   * `#recvUntilExpected`/`#recvFrame`, and hex-dump `#discardPreview` to the
+   * console as a side effect (see that field's doc comment) — every timeout
+   * report goes through this one method, so it is the single place that
+   * needs to trigger the dump.
+   *
+   * Reports THREE figures, not one:
+   * - `#bytesArrivedThisAttempt`: raw bytes ARRIVED from the device during
+   *   just this attempt, regardless of whether `#tryExtractFrame` went on to
+   *   discard them as non-frame noise.
+   * - `#accBuf.length`: bytes RETAINED right now (i.e. still sitting
+   *   un-discarded in `#accBuf`, usually a trailing partial-frame remnant).
+   * - `#cumulativeBytesThisCommand`: bytes ARRIVED across the WHOLE command
+   *   (every retry attempt, never cleared until the next command starts).
+   *
+   * Round 6 (`meshcadet-connect-wedge-round6-transmit-side`) found that
+   * reporting only `#accBuf.length` as "bytes this attempt" conflated
+   * RETAINED with ARRIVED: `findMagicStart` returning `buf.length` (no magic
+   * candidate found) makes `#tryExtractFrame` discard the entire attempt's
+   * traffic, so "0 bytes this attempt" read as "the device said nothing"
+   * when it could equally mean "the device said plenty, all of it discarded
+   * as noise" — see `#bytesArrivedThisAttempt`'s own doc comment.
    */
   #timeoutMessage() {
-    return `timeout waiting for response frame (accumulated ${this.#accBuf.length} bytes this attempt, ${this.#cumulativeBytesThisCommand} bytes total this command)`;
+    this.#logDiscardedPreview();
+    return `timeout waiting for response frame (${this.#bytesArrivedThisAttempt} bytes arrived this attempt, ${this.#accBuf.length} retained, ${this.#cumulativeBytesThisCommand} bytes arrived total this command)`;
+  }
+
+  /**
+   * Hex/ASCII-dump `#discardPreview` to the console — the first (up to
+   * `DISCARD_PREVIEW_CAP`) bytes this command discarded as non-frame noise.
+   * Diagnostic only: a no-op if nothing has been discarded yet. Called from
+   * `#timeoutMessage` so a "timeout waiting for response frame" report is
+   * always accompanied by an actual look at what the device was sending,
+   * instead of just a count.
+   */
+  #logDiscardedPreview() {
+    if (this.#discardPreview.length === 0) {
+      return;
+    }
+    const hex = Array.from(this.#discardPreview, (b) => b.toString(16).padStart(2, "0")).join(" ");
+    const ascii = Array.from(this.#discardPreview, (b) =>
+      b >= 0x20 && b < 0x7f ? String.fromCharCode(b) : "."
+    ).join("");
+    console.debug(
+      `MeshCadet provisioner: first ${this.#discardPreview.length} discarded (non-frame) bytes this command —\nhex: ${hex}\nascii: ${ascii}`
+    );
+  }
+
+  /**
+   * Append `bytes` to `#discardPreview`, capped at `DISCARD_PREVIEW_CAP`
+   * total — called by `#tryExtractFrame` at every point it discards bytes as
+   * non-frame noise. A no-op once the cap is reached (or if `bytes` is
+   * empty) so this stays cheap on a long, noisy session.
+   */
+  #recordDiscarded(bytes) {
+    if (bytes.length === 0 || this.#discardPreview.length >= DISCARD_PREVIEW_CAP) {
+      return;
+    }
+    const room = DISCARD_PREVIEW_CAP - this.#discardPreview.length;
+    const take = bytes.length > room ? bytes.subarray(0, room) : bytes;
+    const merged = new Uint8Array(this.#discardPreview.length + take.length);
+    merged.set(this.#discardPreview, 0);
+    merged.set(take, this.#discardPreview.length);
+    this.#discardPreview = merged;
   }
 
   /**
@@ -1192,6 +1303,7 @@ export class ProvisionerSession {
       // binary frames (find_magic_start resync, mirroring session.rs).
       const sync = findMagicStart(this.#accBuf);
       if (sync > 0) {
+        this.#recordDiscarded(this.#accBuf.subarray(0, sync));
         this.#accBuf = this.#accBuf.slice(sync);
       }
 
@@ -1204,6 +1316,7 @@ export class ProvisionerSession {
       // "MC" bytes were ASCII log noise, not a real frame header. Advance 1
       // byte and re-scan.
       if (plen > MAX_VALID_FRAME_PAYLOAD_LEN) {
+        this.#recordDiscarded(this.#accBuf.subarray(0, 1));
         this.#accBuf = this.#accBuf.slice(1);
         continue;
       }
@@ -1220,6 +1333,7 @@ export class ProvisionerSession {
         if (err instanceof ProvError && (err.kind === "CrcMismatch" || err.kind === "BadMagic")) {
           // False PROV_MAGIC sequence in log traffic: advance 1 byte past the
           // fake magic and re-scan.
+          this.#recordDiscarded(this.#accBuf.subarray(0, 1));
           this.#accBuf = this.#accBuf.slice(1);
           continue;
         }
@@ -1243,6 +1357,7 @@ export class ProvisionerSession {
           merged.set(value, this.#accBuf.length);
           this.#accBuf = merged;
           this.#cumulativeBytesThisCommand += value.length;
+          this.#bytesArrivedThisAttempt += value.length;
           this.#notifyWaiters();
         }
       }

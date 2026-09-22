@@ -115,6 +115,23 @@ non-functional is dead), and **the host CLI also failed against the same
 device afterward, clearing only on a physical reset** — so whatever this is,
 it is a device-side latch, not a browser-only bug.
 
+**Reasoning correction, round 6 (2026-09-21):** the CONCLUSION above
+("the device was never non-functional") is right, but the REASONING —
+"screen showed normal app UI" ⇒ "the MCU was running" — is unsound on its
+own, and it was load-bearing enough to kill an entire theory family across
+rounds #200/#201. An ST7789 (this board's display controller) holds its
+last-written frame in its own on-panel GRAM independent of the host MCU;
+a halted, crashed, or ROM-bootloader-stuck MCU that had rendered a normal
+screen just before halting would look identical, on the screen alone, to
+one still running — the screen is not wired to reflect live MCU state, it
+only reflects the last SPI write. Round 6 has independent, stronger
+evidence for the same conclusion: the device was directly observed to be
+**touch-responsive** after a reproduced wedge, not just visually normal —
+touch input requires the MCU's UI thread to actually be polling and
+redrawing, which a halted MCU cannot do. Use touch/input responsiveness
+(or any other live-round-trip check), not screen content alone, to argue
+"the device was running" in any future round.
+
 **Root cause: not established. The mechanism first proposed here — a false
 `PROV_MAGIC` match inside this device's own boot-time log noise — is
 directionally impossible and is retracted; see the audit that refuted it
@@ -252,6 +269,37 @@ followed by a further hang points at a mechanism `Session`'s own bounded
 retry logic does not currently explain (worth flagging loudly if it ever
 happens, per the existing step 3 guidance below).
 
+**RETRACTED, round 6 (`meshcadet-connect-wedge-round6-transmit-side`,
+2026-09-21) — refuted by the exact device-confirmed evidence this finding
+asked for.** The reproduction this finding's own timing marker was added to
+catch happened: the host CLI printed `host CLI: serial port opened in
+201.52us` — so `open()`/`clear()` were not where it hung — and then hung
+past that point. `/proc/<pid>/wchan` for the stuck process read
+`tty_wait_until_sent`, which is `tcdrain(2)`, called from
+`SerialTransport::send -> self.port.flush()`
+(`host/src/transport.rs:86` at the time). Reading `serialport` 4.9.0's
+`posix/tty.rs` explains why this specific call was the gap this finding
+missed: `TTYPort::write` **is** bounded (`wait_write_fd` honors
+`self.timeout`), but `TTYPort::flush` calls `nix::sys::termios::tcdrain`
+with no timeout on the syscall itself — the `timeout` value there only
+bounds the local `EINTR`-retry loop *around* `tcdrain`, not `tcdrain`'s own
+wait. `Session`'s 500 ms/10 s deadlines are evaluated only *between*
+transport calls (`send_frame` then `recv_frame`), so a `send` that never
+returns is never interrupted by them — this finding's own "structurally
+must live in `open()`/`clear()` … nowhere else in the call chain lacks a
+deadline" claim was simply wrong: `send`'s `flush()` also lacked one, and
+that is where the real hang lives. **Fixed this round:**
+`SerialTransport::send` now bounds `write_all`+`flush` to `SEND_TIMEOUT`
+(3s) on a background thread (see that constant's doc comment in
+`transport.rs` for the device evidence and the tradeoff — the underlying
+`tcdrain` still can't be interrupted, so this converts the hang into a
+diagnosable `anyhow::Error` rather than actually unblocking the syscall).
+The generalizable lesson this leaves — a deadline wrapper also fails to
+cover a blocking call made *through* it that doesn't itself honor a
+timeout, not just the wrapper's own setup call — is flagged for a
+process-side follow-up in the maintainer's own notes; not edited from this
+mission (vehicle-scoped work only).
+
 **2. LEADING HYPOTHESIS (unverified — needs a device): a genuinely truncated
 HOST-sent candidate frame gets stuck in `admin_server`'s (or
 `provisioning_server`'s) `rx_buf`, below the size the existing full-buffer
@@ -372,6 +420,132 @@ block below (do not create a second kit):**
   timing marker, `main.rs`) ever fails to print during a reproduced hang** —
   decisive confirmation or refutation of the `SerialTransport::open()`
   unbounded-hang candidate in finding 1 above.
+
+## Update, 2026-09-21 (round 6): device-confirmed hang location — the wedge is on the TRANSMIT path, not receive
+
+`meshcadet-connect-wedge-round6-transmit-side` got the first DEVICE-CONFIRMED
+hang location this campaign has had (five prior rounds all inferred from
+source or from bounded/clean failures — never from an actual process stuck
+mid-syscall). With the wedge reproduced:
+
+- The host CLI printed `host CLI: serial port opened in 201.52us` and then
+  hung — `open()`/`clear()` are not where it hung.
+- `/proc/<pid>/wchan` for the stuck process read `tty_wait_until_sent` —
+  `tcdrain(2)`, called from `SerialTransport::send -> self.port.flush()`.
+  This is a genuine, unbounded-at-the-syscall-level hang: `serialport`
+  4.9.0's `TTYPort::flush` has no timeout on `tcdrain` itself (see the
+  retraction of round 5's finding 1, above, for the full mechanism).
+- A reflash to clean state still reproduced the wedge on the **next**
+  connect — this is deterministic from a known-empty `rx_buf`, not a rare
+  accidental planting of stale state.
+- The device **resets on web connect and then runs normally** — directly
+  observed touch-responsive, app healthy. It is not halted and not in ROM
+  download mode (see the reasoning correction above for why "screen looks
+  normal" alone can't establish this, and what does).
+
+**This reframes the whole "10560/10473 bytes received, zero valid frames"
+trace family (rounds 4-5) as ordinary device log chatter, not a receive-side
+parsing defect.** TX (device→host, what the browser/host receive and parse)
+and RX (host→device) are independent paths on the device
+(`main.rs:663`/`main.rs:676` handle them as separate VFS RX/TX line-ending
+configs, and `admin_server`'s RX loop at `admin_server.rs:257-272` reads via
+`usb_serial_jtag_read_bytes` directly, entirely separate from anything the
+device transmits). If the wedge is on the TRANSMIT path — the host's bytes
+never reaching the device, not a bad device reply — then the device's own
+periodic log/telemetry output continues completely normally on TX regardless
+of the RX-side wedge, and the browser correctly parses zero provisioning
+frames out of it because **no reply was ever owed**: the device's
+`admin_server`/`provisioning_server` never received the command that would
+have triggered one. Rounds 2-5 searched the receive side for a parsing bug
+because that is where the symptom (garbage, unparsed bytes) was visible —
+but the actual defect was upstream, on the side that was never producing the
+bytes an RX-side fix could act on. Round 5's "mechanism 2" (a stuck
+small-`plen` candidate in `admin_server`'s `rx_buf`) is no longer needed to
+explain this trace and is superseded, though not itself disproven.
+
+**Fixed this round, on the code side only — see "What this fix found and
+addressed" below for the full list.** In summary: `SerialTransport::send`
+is now bounded (`transport.rs`'s `SEND_TIMEOUT`, 3s), converting the
+device-confirmed hang above into a diagnosable error instead of a silent,
+permanent block; the browser's `session.js` now reports bytes ARRIVED
+per retry attempt (not bytes RETAINED after magic-resync discard — the two
+diverge exactly when a busy attempt is 100% non-frame noise) and
+hex/ASCII-dumps the first ~512 bytes it discards as noise on every timeout,
+so the next reproduction can actually read what that ~10.5KB of traffic
+contains instead of just counting it.
+
+**Noted, not fixed this round (out of this mission's explicit scope — the
+brief named `site/provisioner/session.js` only): `host/src/session.rs`'s
+own `recv_frame` timeout message (`"timeout waiting for response frame
+(accumulated {} bytes)"`, `session.rs:213`) has the identical
+RETAINED-vs-ARRIVED conflation `session.js`'s `#timeoutMessage` had before
+this round's fix — `self.acc_buf.len()` is post-discard, not raw bytes
+received.** A future round diagnosing the host CLI's own receive side
+(distinct from this round's transmit-side fix) should give this the same
+treatment rather than rediscovering the gap from scratch.
+
+**LEADING CANDIDATE for the device-side half of the mechanism — explicitly
+UNVERIFIED, not landed as a root-cause claim, and now source-REFUTED (see
+below) rather than confirmed:** `admin_server` writes every reply via
+`std::io::stdout()` (`admin_server.rs:230`, `send_frame` at
+`admin_server.rs:1298-1310`) into the ESP-IDF USB-Serial-JTAG driver's
+256-byte TX ring (`tx_buffer_size: 256`, `main.rs:647`), and `send_frame` is
+called synchronously from inside the RX-servicing loop
+(`admin_server.rs:318-332`). The hypothesis: a host that stops reading
+(closed tab, crashed process) leaves that TX ring full; if the write into it
+blocked, it would block the SAME thread that drains the RX ring, which would
+NAK the device's OUT endpoint, which would explain every host `tcdrain`
+hanging forever afterward — and would explain physical-reset-only recovery
+(nothing else restarts that thread). **Source analysis this round — no
+hardware required, done against the exact ESP-IDF v5.2.2 sources this repo
+vendors and builds against
+(`firmware/.embuild/espressif/esp-idf/v5.2.2/components/{vfs/vfs_usb_serial_jtag.c,driver/usb_serial_jtag/usb_serial_jtag.c}`)
+— REFUTES the "blocks forever" half of this hypothesis:** the driver-backed
+write path `admin_server`'s `stdout` uses
+(`esp_vfs_usb_serial_jtag_use_driver`, installed at `main.rs:656`) routes
+through `usbjtag_tx_char_via_driver`/`usb_serial_jtag_fsync`, both of which
+are bounded by `TX_FLUSH_TIMEOUT_US` (50ms, `vfs_usb_serial_jtag.c:63`) —
+the ring-buffer send itself (`xRingbufferSend`, `usb_serial_jtag.c:248`)
+genuinely honors that tick timeout rather than blocking on some other
+primitive underneath it, confirmed by reading the FreeRTOS ring-buffer call
+directly. The driver's own top-of-file comment names this as deliberate
+design: "the tx routine will fail fast" once a stall is confirmed once, then
+silently drops subsequent bytes rather than blocking — worst case, one
+`send_frame` call after the host stops draining costs roughly 2×50ms
+(one write-byte blocking retry, one flush/fsync wait), not an indefinite
+block. **This means the write path, by itself, cannot hang the RX-servicing
+thread for more than ~100ms — nowhere near long enough to explain a
+persistent, reboot-required wedge.** The admin_server-blocking-stdout
+mechanism as originally framed is therefore refuted by source, not
+confirmed; no bounded-write/drop-on-overflow hardening is landed in
+`admin_server` this round (this round's own brief was to land it
+*only if* source analysis confirmed the write path could actually block —
+it didn't). What this does NOT do: explain the actual wedge mechanism.
+The real cause of a `tcdrain`-forever on the host side remains open — see
+the device predicate immediately below.
+
+**Device predicate for the maintainer's next hardware session (binding scope
+note: this mission ran no hardware tests and did not pass `--host-native` —
+this predicate is for the maintainer to run, not this mission):** while the
+wedge is reproduced (host CLI hung in `tcdrain`, per the evidence above),
+without physically resetting the device, run:
+```sh
+timeout 30 cat /dev/ttyACM0 | xxd
+```
+- **Still shows log lines streaming** ⇒ the device's TX path is alive; the
+  block is RX-specific (host bytes not being read/serviced, not a
+  bidirectional latch). This refutes the admin_server-shared-thread
+  candidate above outright (a genuinely blocked RX-servicing thread would
+  also stop producing new log output, since logging goes through the same
+  serial console lock — `send_frame`'s `crate::serial_console::lock_tx()`,
+  `admin_server.rs:1308` — as the reply frames) and points toward something
+  further down the USB stack: the OUT endpoint itself NAK'd or halted at
+  the peripheral/driver level, independent of whether the servicing thread
+  is otherwise healthy.
+- **Silent (no output within the 30s window)** ⇒ both directions are wedged
+  from the device's side, consistent with — though still not proof of — a
+  single shared blocking point taking down both RX servicing and TX log
+  output together.
 
 ## What this fix found and addressed (source + host-testable surface only)
 
@@ -534,9 +708,18 @@ hardware). That is exactly what this kit is for.
     mean the diagnosis needs a second pass, not just a bigger buffer.
 - **Wedge case — the connect attempt fails with a bounded, named error**
   (in the browser console / on the page: `timeout waiting for response
-  frame (accumulated N bytes this attempt, M bytes total this command)`, or
-  — less likely now that `connect()` no longer calls `setSignals()` — a
+  frame (N bytes arrived this attempt, M retained, K bytes arrived total
+  this command)` — reworded, round 6, from the earlier `accumulated N bytes
+  this attempt, M bytes total this command` phrasing; see `session.js`'s
+  `#timeoutMessage` doc comment for why "arrived" vs. "retained" matters —
+  or, less likely now that `connect()` no longer calls `setSignals()`, a
   `write stalled — …` message) **rather than hanging with no error at all.**
+  **Round 6 also added a console hex/ASCII dump** (`console.debug`, browser
+  devtools) of the first ~512 bytes discarded as non-frame noise, printed
+  automatically alongside this same timeout — check it if `K` (bytes
+  arrived total this command) is nonzero but every attempt still times out;
+  it may finally show what that traffic actually contains, something six
+  rounds of this investigation have theorized about without looking at.
   A bounded, named failure here is not automatically a FAIL. Immediately
   after it, **without power-cycling the device**, run step 3 below (host CLI
   `status`):
@@ -602,17 +785,35 @@ hardware). That is exactly what this kit is for.
   ```
 - **Expect:** a status readout (pubkey, provisioned=false, 0 contacts, 0
   channels) in well under a second, or — if something IS wrong on the
-  device side — an error message naming a timeout within **at most ~10
-  seconds** (`time`'s real/user/sys line confirms this), never an unbounded
-  hang requiring Ctrl-C.
-- **If it hangs past ~10-15 seconds with no output and no error:** this
+  device side — an error message naming a timeout within **at most ~13
+  seconds** (`time`'s real/user/sys line confirms this: up to `SEND_TIMEOUT`
+  3s on the very first `send`, round 6, plus `Session`'s existing 10s
+  overall retry budget if `send` itself succeeds), never an unbounded hang
+  requiring Ctrl-C.
+- **Round 6: if the reported wedge reproduces here, expect a NEW error
+  shape specifically** — `serial send timed out after 3s (device stopped
+  accepting bytes on the transmit path — likely a blocked tcdrain(2); see
+  SEND_TIMEOUT's doc comment in transport.rs)`, printed within ~3 seconds,
+  **not a hang**. This is the device-confirmed hang this round diagnosed
+  (`/proc/<pid>/wchan` = `tty_wait_until_sent` during the original
+  reproduction) — `SerialTransport::send` now bounds it. Seeing this exact
+  error, quickly, on a reproduction is CONFIRMATION the fix is working as
+  designed, not a step-3 FAIL by itself; still capture it (see below) since
+  it's the clearest signal yet of exactly where the transmit-path wedge is.
+  If the CLI instead hangs with NO output at all past ~13s even after this
+  round's fix, that is a genuinely new finding this round's diagnosis does
+  not explain — flag it loudly, it would mean the hang moved to yet another
+  uncovered call.
+- **If it hangs past ~15-20 seconds with no output and no error:** this
   directly contradicts the fixed code's own bounded-retry logic
-  (`host/src/session.rs`) and its new regression test
-  (`test_query_status_fails_with_diagnostic_against_an_unresponsive_device`)
+  (`host/src/session.rs`, and now `transport.rs`'s `SEND_TIMEOUT`) and its
+  regression tests
+  (`test_query_status_fails_with_diagnostic_against_an_unresponsive_device`,
+  `transport::tests::send_bounded_returns_a_diagnosable_error_instead_of_hanging_forever`)
   — which would mean either a different build is running than the one just
   flashed/built, or there's a genuinely new hang mechanism this source read
   missed (e.g. the OS-level serial port read itself blocking
-  forever, upstream of anything `Session` controls). Capture:
+  forever, upstream of anything `Session`/`Transport` controls). Capture:
   - The exact command line and how long you waited before Ctrl-C.
   - `ls -l /dev/ttyACM0` (or equivalent) before and after, to check whether
     the device re-enumerated (renamed port) mid-command — a classic silent
@@ -687,6 +888,22 @@ round 5 self-heal-without-reset test (only if the wedge reproduces — see
   if yes: which invocation number did it succeed on? <N>
   if no: did you eventually reset physically to confirm that clears it?
     yes | no
+
+round 6 device predicate (only if the wedge reproduces — see "Update,
+  2026-09-21 (round 6)" above; run WITHOUT physically resetting the device
+  first):
+  `timeout 30 cat /dev/ttyACM0 | xxd` while wedged — result:
+    streaming log lines (TX alive, block is RX-specific) |
+    silent, no output within 30s (both directions wedged) |
+    not run
+  step 3's exact error text, if the round-6 `SerialTransport::send`
+    bounding fired: <paste — expect `serial send timed out after 3s
+    (device stopped accepting bytes on the transmit path — likely a
+    blocked tcdrain(2); ...)`, appearing within ~3s, not a hang>
+  browser devtools console: did the round-6 discarded-bytes hex dump
+    appear on a step-1 wedge/timeout? yes | no — if yes, paste it (this is
+    the first time six rounds of this investigation has actually looked at
+    the content of that traffic — do not discard this)
 
 when did provisioning last definitely work (if known)? <date / "unknown">
 
