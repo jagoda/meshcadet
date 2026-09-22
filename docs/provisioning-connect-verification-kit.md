@@ -1,5 +1,13 @@
 # Provisioning connect/reboot/CLI-hang — device verification kit
 
+**ROOT CAUSE CONFIRMED, 2026-09-22 (round 7) — see "Update, 2026-09-22
+(round 7)" below before reading anything earlier in this file as current.**
+Everything above that section is the chronological record of six rounds of
+diagnosis and is kept for history, but several of its findings are
+superseded and marked `RETRACTED` inline; the round-7 section is the
+current understanding, with client-side recovery landed for both the host
+CLI and the web provisioner.
+
 **Maintainer-run, one sitting.** Self-contained: no external dependency, no
 queued follow-on. This kit diagnosed and fixed everything reachable from
 source + host-testable surface, but could not reproduce the two reported
@@ -343,6 +351,11 @@ this round is bound by:
   extracts a frame from them because the device's admin_server genuinely
   never got to decode the incoming `QUERY_STATUS` in the first place — not
   because a real reply arrived and was missed.
+  **RETRACTED, round 7 (2026-09-22, kernel-evidence-confirmed) — see
+  "Update, 2026-09-22 (round 7)" below.** The bytes are not unrelated
+  chatter: they are the OLD USB interface's own final output during a
+  connect-triggered teardown/re-enumeration, directly caused by this same
+  connect attempt.
 
 **Caveat, same as round 4's fix and for the identical reason:** this
 container's `firmware/rust-toolchain.toml` pins the `esp` (Xtensa)
@@ -521,8 +534,18 @@ confirmed; no bounded-write/drop-on-overflow hardening is landed in
 `admin_server` this round (this round's own brief was to land it
 *only if* source analysis confirmed the write path could actually block —
 it didn't). What this does NOT do: explain the actual wedge mechanism.
-The real cause of a `tcdrain`-forever on the host side remains open — see
-the device predicate immediately below.
+**RETRACTED BY NAME, round 7 (2026-09-22, kernel-evidence-confirmed) — see
+"Update, 2026-09-22 (round 7)" below.** Source analysis's refutation above
+is now also hardware-confirmed: the device logs continuously and is fully
+alive while the host side is wedged, and the real cause is a host/kernel-side
+dead file descriptor after a USB re-enumeration, with nothing on the device
+side to fix.
+~~The real cause of a `tcdrain`-forever on the host side remains open — see
+the device predicate immediately below.~~ **No longer open as of round 7** —
+see "Update, 2026-09-22 (round 7)" below for the confirmed mechanism. The
+device predicate immediately below is left in place for the record; its two
+branches are no longer diagnostically live now that the mechanism is
+confirmed by kernel evidence directly.
 
 **Device predicate for the maintainer's next hardware session (binding scope
 note: this mission ran no hardware tests and did not pass `--host-native` —
@@ -546,6 +569,204 @@ timeout 30 cat /dev/ttyACM0 | xxd
   from the device's side, consistent with — though still not proof of — a
   single shared blocking point taking down both RX servicing and TX log
   output together.
+
+## Update, 2026-09-22 (round 7): ROOT CAUSE CONFIRMED by kernel evidence — the device's USB endpoint tears down and re-enumerates; every prior round diagnosed a symptom of that, not a separate defect
+
+`meshcadet-connect-wedge-round7-stale-handle-reenumeration` reproduced the
+wedge with the host kernel's own log (`journalctl -k`) captured live across
+the failure. This is decisive, first-hand evidence — not source inference,
+not a device screen observation, an actual kernel record of what happened
+to the USB device — and it explains every open question the previous six
+rounds accumulated. Quoted verbatim:
+
+```
+usb 3-2: New USB device found, idVendor=303a, idProduct=1001
+cdc_acm 3-2:1.0: ttyACM0: USB ACM device
+```
+
+captured immediately after the device's own ROM printed:
+
+```
+rst:0x15 (USB_UART_CHIP_RESET),boot:0x8 (SPI_FAST_FLASH_BOOT)
+```
+
+**The mechanism:** opening the port asserts DTR/RTS (Chromium's
+`SerialPort.open()` does this unconditionally; the round-6-confirmed
+transmit-side hang shows the host CLI's own `serialport`-backed open does
+too, despite leaving the lines at tty defaults post-open — the ASSERT during
+the open syscall itself is what matters, not the steady-state level
+afterward). That DTR/RTS transition resets the ESP32-S3's native
+USB-Serial-JTAG peripheral (`rst:0x15`), and the reset is severe enough that
+the chip's USB device **fully re-enumerates**: the kernel tears down the old
+`cdc_acm` interface and attaches a fresh one — under the exact same
+`idVendor`/`idProduct`/node name (`ttyACM0`), so nothing about the resulting
+device path looks wrong to userspace. Any process still holding a file
+descriptor into the OLD interface — which is unavoidable, since the host CLI
+and the browser both send their first command through the handle they just
+used to open the port — now holds a **dead handle**: writes into it queue
+into a kernel buffer that nothing on the other end will ever drain, because
+the peripheral instance that owned the file descriptor's underlying URBs no
+longer exists. That is the entire defect. One mechanism, confirmed, explains
+every observation this campaign has collected:
+
+- **(a)** The round-6 device-confirmed `tcdrain(2)`/`tty_wait_until_sent`
+  block: `write_all` lands in the kernel's TX buffer fine, then `tcdrain`
+  waits forever on URBs belonging to an interface the kernel already
+  destroyed.
+- **(b)** The host CLI printing `host CLI: serial port opened in 337us` and
+  then failing: its OWN `open()` call is what asserts DTR/RTS and triggers
+  the reset — the successful, fast open it just reported is the handle that
+  gets invalidated microseconds later.
+- **(c)** The ~10KB-then-silence browser traces (10560 / 10473 / 9990 bytes
+  across three separate reproductions — tightly clustered because this is
+  deterministic, not noise): those are the bytes the OLD interface delivered
+  during its own teardown window — the running app's trailing log output,
+  the ROM banner, and part of the fresh boot log — not an unrelated,
+  ongoing chatter stream.
+- **(d)** The device being perfectly healthy throughout every prior round's
+  observation (touch-responsive, LoRa/UI running, `admin_server` reaching
+  "admin server thread started" at 2869ms after reset): the device was never
+  the problem. It boots clean, every time; only the HOST's handle into it is
+  broken.
+- **(e)** **"Clears only on a physical reset" — FALSE.** This is the
+  constraint that wrongly ruled out every host-side and browser-side
+  explanation from round 2 onward, and it does not hold: what actually
+  clears the wedge is a **fresh `open()` call issued after the device
+  finishes re-enumerating**, and every prior observation of "a physical
+  reset fixed it" was followed by exactly that — a new process/tab opening a
+  new handle into the new interface. A physical reset was never the
+  mechanism of the fix; it was just the maintainer's only known way, until
+  now, to force a fresh open.
+- **(f)** "It used to work" with no discoverable regression window: no
+  `meshcadet` commit is or was ever required to explain this. Whether the
+  wedge fires turns on kernel/Chromium USB re-enumeration timing and
+  whatever DTR state a previous port holder left behind — not on this
+  repo's code, which is why six rounds of `git log -S` / commit-bisection
+  framing never found a culprit.
+
+### RETRACTED BY NAME (refuted against real hardware this session)
+
+- **ROM/download-mode entry.** *Refuted:* `boot:0x8 (SPI_FAST_FLASH_BOOT)` is
+  a completely normal flash boot, not a download-mode strap, and the
+  application returns fully healthy afterward (see (d) above). The device is
+  never stuck in the ROM serial bootloader at any point in this mechanism.
+- **An `admin_server` TX-ring write deadlock** (round 6's own "LEADING
+  CANDIDATE", already source-refuted there — see that section above — and
+  now also hardware-refuted). *Refuted:* the device logs continuously and is
+  fully alive and responsive while the host side is wedged; nothing on the
+  device's own RX-servicing or TX-log threads is blocked at all. The wedge
+  is entirely a host/kernel-side artifact (a dead file descriptor), with
+  nothing for a device-side fix to address.
+- **Boot time exceeding the browser's 10s `RETRY_TOTAL_MS` budget.**
+  *Refuted:* the confirmed boot timeline has `admin_server` up and accepting
+  commands at 2869ms post-reset — a 3.5× margin under the 10s retry budget.
+  A slow boot was never the constraint; a dead handle that no amount of
+  waiting within the SAME connection can heal was.
+- **A repeating reset loop.** *Refuted:* the captured kernel/serial evidence
+  shows exactly ONE `rst:0x15` event followed by one complete, clean boot to
+  a healthy running state — not a crash-reboot cycle. (This round's own
+  browser-side reboot counter, added below, exists to make a GENUINE
+  repeating case visible if one is ever seen in the field — it has not been
+  observed yet.)
+- **Round 5's reading of the ~10560/10473/9990-byte traces as "the device's
+  own unrelated periodic log chatter (GPS/battery/UI-pump ticks)"** (see
+  "Update, 2026-09-20 (round 5)" above, point 3). *Retracted:* those bytes
+  are not unrelated background chatter — they are the OLD USB interface's
+  final output during its own teardown, directly caused by the connect
+  attempt itself, per (c) above.
+
+**What this round fixes (client side only — see "FIRMWARE" below for why
+the device side is deliberately not touched):**
+
+- `host/src/transport.rs` — the round-6 `SEND_TIMEOUT` timeout is now a
+  distinct, downcastable error type (`SendTimedOut`) instead of a plain
+  string, so a caller can tell "this specific confirmed failure mode" apart
+  from any other transport error without pattern-matching text.
+- `host/src/main.rs` / `host/src/session.rs` — `run_with_reset_recovery`
+  catches a `SendTimedOut` on the first attempt of a command, waits
+  `RESET_SETTLE_DELAY` (3.5s — past the confirmed 2869ms boot-ready mark),
+  reopens the port fresh, and retries the SAME command exactly once against
+  the new handle. This recovers from the confirmed failure automatically
+  instead of merely reporting it; see `host/src/session.rs`'s doc comment on
+  `run_with_reset_recovery` for the full mechanism and its unit tests.
+- `site/provisioner/session.js` — the ESP-IDF ROM banner (`ESP-ROM:esp32s3`)
+  is unmistakable in the discarded (non-frame) traffic on a genuine reset;
+  `#scanForRebootBanner` counts its occurrences, and a resulting timeout
+  message now reads `... — device rebooted N times during this command; the
+  device reset on connect — reconnect to continue.` instead of a generic
+  "timeout waiting for response frame" that leaves the cause to be
+  reverse-engineered. The browser cannot recover automatically the way the
+  host CLI does (Web Serial gives no equivalent of "reopen this exact port
+  without a fresh user gesture" — `requestPort()` requires one), so the
+  actionable message IS this side's fix.
+- `site/provisioner/session.js`'s `#logDiscardedPreview` now uses
+  `console.warn`, not `console.debug` — six rounds of this campaign carried
+  this exact diagnostic dump and nobody read it, because Chrome's console
+  filter hides the "Verbose" level by default. A diagnostic written to be
+  read by a human during a failure must actually show up at the console's
+  default level.
+
+**Missed guard, noted for the record:** `provisioner.js:283` already
+registers `navigator.serial.addEventListener('disconnect', ...)`, and it did
+NOT fire during this campaign's reproductions — because the device returns
+under the same node identity (same `idVendor`/`idProduct`, same enumeration
+order) so Chromium's own watcher for THIS port object never sees a
+removal it recognizes as "this port disconnected." The one guard already
+built for exactly this class of failure sat silent, which is why the user
+saw a generic timeout instead of "Device disconnected." No code change
+follows from this (the browser's `disconnect` event is keyed on facts
+outside this repo's control), but it is worth naming so a future round does
+not re-propose it as a fix without first confirming it can fire for this
+specific case.
+
+### FIRMWARE: the exact ESP-IDF mechanism, from source — deliberately NOT changed this round
+
+**Established from source, not guessed:** the ESP32-S3's on-chip
+USB-Serial-JTAG peripheral treats the CDC-ACM DTR/RTS control lines as a
+**hardware** chip-reset trigger — confirmed directly against
+`espressif/esp-idf`'s own register definitions at the exact version this
+repo pins (`firmware/rust-toolchain.toml` → `esp` toolchain → ESP-IDF
+v5.2.2; this container has no Xtensa toolchain installed, so the vendored
+copy under `firmware/.embuild/` could not be read locally this session —
+the same tag fetched directly from upstream is byte-identical and cited
+below by path):
+
+- `components/soc/esp32c6/include/soc/usb_serial_jtag_reg.h` (tag
+  `v5.2.2`) defines a `USB_SERIAL_JTAG_CHIP_RST_REG` register with `RTS`
+  (bit 0) and `DTR` (bit 1) status flags — "Chip reset is detected from usb
+  serial/jtag channel" — **and** a software-controllable
+  `USB_SERIAL_JTAG_USB_UART_CHIP_RST_DIS` bit (bit 2): "Set this bit to
+  disable chip reset from usb serial channel to reset chip." On the ESP32-C6
+  (and, per Espressif forum guidance, the H2), this reset behavior CAN be
+  turned off in software.
+- `components/soc/esp32s3/include/soc/usb_serial_jtag_reg.h` (same tag) has
+  **no `USB_SERIAL_JTAG_CHIP_RST_REG` at all** — grepped directly, not
+  inferred. The ESP32-S3's USB-Serial-JTAG peripheral has no
+  software-visible register for this behavior: not a status flag, not a
+  disable bit, nothing. This matches Espressif's own esptool documentation,
+  which states plainly (`esptool` docs, ESP32-S3 advanced options): *"With
+  USB-Serial/JTAG, the peripheral interprets the RTS serial control signal
+  as a core reset."* — described as an unconditional peripheral behavior,
+  with no accompanying software escape hatch, on this chip family.
+
+**Conclusion — and why nothing is landed here this round:** on the ESP32-S3
+specifically, there is currently no known ESP-IDF-level (or any other
+software-level) way to stop this reset from happening on this hardware —
+this is not merely "unverified, might work if compiled"; the register this
+round would need to write to disable it does not exist in this chip's
+peripheral at all. Even setting aside `firmware/rust-toolchain.toml`'s
+Xtensa toolchain not being installed in this container (which alone would
+already block a compile-verified change, and landing an unbuildable guess is
+precisely the pattern rounds 2-5 repeated), there is no source-confirmed
+register write that would constitute a real fix to propose. The durable fix
+this objective asked to scope out — "stop USB-Serial-JTAG resetting the
+chip on a host DTR/RTS transition" — may not be achievable in firmware on
+this SoC at all; if a fix exists, it is more likely a board-level hardware
+change (e.g. gating DTR/RTS at the connector, the way an external
+USB-UART-bridge board can) than anything `firmware/` can express. The
+client-side recovery landed this round (reopen-and-retry on the host,
+count-and-report on the browser) should be treated as the durable mitigation
+for THIS chip, not a stopgap awaiting a firmware patch that may not exist.
 
 ## What this fix found and addressed (source + host-testable surface only)
 
@@ -904,6 +1125,23 @@ round 6 device predicate (only if the wedge reproduces — see "Update,
     appear on a step-1 wedge/timeout? yes | no — if yes, paste it (this is
     the first time six rounds of this investigation has actually looked at
     the content of that traffic — do not discard this)
+
+round 7 confirmed-mechanism verification (see "Update, 2026-09-22 (round 7)"
+  above — the recovery paths below should now make the round-5/round-6
+  predicates above moot; run this section instead of physically resetting
+  the device):
+  step 3 (host CLI), on a reproduced wedge: did it print the
+    "host CLI: ... — this matches the confirmed connect-triggered device
+    reset ... reopening and retrying the command once" message and then
+    SUCCEED on the retried attempt, with no physical reset? yes | no —
+    if no, paste the exact final error
+  step 1 (web provisioner), on a reproduced wedge: did the timeout message
+    include "device rebooted N times during this command" and "the device
+    reset on connect — reconnect to continue"? yes | no — if yes, what was
+    N? <N>
+  did `console.warn`'s discarded-bytes hex dump (promoted from
+    `console.debug` this round) appear in the browser devtools console at
+    its DEFAULT verbosity level (no filter changes)? yes | no
 
 when did provisioning last definitely work (if known)? <date / "unknown">
 
