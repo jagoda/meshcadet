@@ -455,15 +455,20 @@ async function readLoopErrorSurfacesAsRealRejectionNotSilentStall() {
   await session.disconnect();
 }
 
-// ── Scenario 1e (round 7, `meshcadet-connect-wedge-round7-stale-handle-
-//    reenumeration`, confirmed by kernel evidence): a device that keeps
-//    re-emitting the ESP32-S3 ROM boot banner on every retry attempt (a
-//    real repeated USB-Serial-JTAG chip reset, not just a slow boot) times
-//    out with a message naming the reboot count and telling the user to
-//    reconnect — not a generic "timeout waiting for response frame" that
-//    leaves the real cause to be reverse-engineered from a byte count, the
-//    way this exact scenario cost the campaign a full round (see
-//    `docs/provisioning-connect-verification-kit.md`) ─────────────────────
+// ── Scenario 1e: a device that keeps re-emitting the ESP32-S3 ROM boot
+//    banner on every retry attempt (a real repeated USB-Serial-JTAG chip
+//    reset, not just a slow boot) times out with a message naming the
+//    reboot count and the accurate recovery action — not a generic "timeout
+//    waiting for response frame" that leaves the real cause to be
+//    reverse-engineered from a byte count, the way this exact scenario cost
+//    the campaign a full round (see
+//    `docs/provisioning-connect-verification-kit.md`). Round 7 (`meshcadet-
+//    connect-wedge-round7-stale-handle-reenumeration`) first added the
+//    reboot-count reporting but told the user to "reconnect to continue" —
+//    round 8 (`meshcadet-connect-wedge-round8-host-usb-endpoint-state`,
+//    hardware evidence) RETRACTS that: a browser-side reconnect cannot force
+//    host-side re-enumeration, so this test now asserts the accurate
+//    guidance instead ─────────────────────────────────────────────────────
 
 async function repeatedRebootBannerReportsCountAndActionableTimeoutMessage() {
   const { port, push } = makeFakePort(() => {
@@ -498,8 +503,13 @@ async function repeatedRebootBannerReportsCountAndActionableTimeoutMessage() {
       );
       assert.match(
         err.message,
-        /the device reset on connect — reconnect to continue/,
-        `expected the actionable reconnect message, got: ${err.message}`
+        /Web Serial exposes no way for this page to force host-side re-enumeration/,
+        `expected the accurate (round 8) recovery guidance, got: ${err.message}`
+      );
+      assert.doesNotMatch(
+        err.message,
+        /reconnect to continue/,
+        `must not repeat round 7's retracted claim that reconnecting alone clears this, got: ${err.message}`
       );
       return true;
     }
@@ -550,6 +560,96 @@ async function rebootBannerSplitAcrossTwoReadsIsStillCounted() {
         err.message,
         /device rebooted 1 time during this command/,
         `expected the split banner to be counted exactly once, got: ${err.message}`
+      );
+      return true;
+    }
+  );
+
+  await session.disconnect();
+}
+
+// ── Scenario 1g (round 8, `meshcadet-connect-wedge-round8-host-usb-endpoint-
+//    state`): a write stall on a RETRY attempt, after the device was already
+//    observed rebooting earlier in the same command, must report the reboot
+//    count and the accurate recovery guidance too — not a bare "write
+//    stalled" with no context. This is the regression guard for the
+//    `#sendFrame`-outside-`try` defect: before the fix, a write stall always
+//    skipped `#withRebootContext` no matter what `#rebootCount` already was,
+//    because `#sendRecvWithRetry`'s catch block never saw it ─────────────
+
+function makeFakePortRebootThenStallingWrite() {
+  let controller;
+  const readable = new ReadableStream({
+    start(c) {
+      controller = c;
+    },
+  });
+  let writeCount = 0;
+  const writable = new WritableStream({
+    write() {
+      writeCount += 1;
+      if (writeCount === 1) {
+        // First attempt: the device answers with a reboot banner and no
+        // valid frame — this attempt times out and #sendRecvWithRetry
+        // retries.
+        controller.enqueue(
+          new TextEncoder().encode(
+            "ESP-ROM:esp32s3-20210327\n" +
+              "Build:Mar 27 2021\n" +
+              "rst:0x15 (USB_UART_CHIP_RESET),boot:0x8 (SPI_FAST_FLASH_BOOT)\n"
+          )
+        );
+        return Promise.resolve();
+      }
+      // The retry's write itself stalls forever.
+      return new Promise(() => {});
+    },
+  });
+  return {
+    port: {
+      readable,
+      writable,
+      async open() {},
+      async setSignals() {},
+      async close() {
+        try {
+          controller.close();
+        } catch {
+          // Already closed — fine.
+        }
+      },
+    },
+  };
+}
+
+async function writeStallAfterObservedRebootReportsRebootContext() {
+  const { port } = makeFakePortRebootThenStallingWrite();
+  installFakeGlobals(port);
+
+  // Short per-attempt/frame timeouts so the first (reboot-banner) attempt
+  // times out quickly and retries into the stalling write; the fixed
+  // UNBOUNDED_CALL_TIMEOUT_MS (2s, not test-overridable) still bounds the
+  // write stall itself, so this test genuinely waits that out.
+  const session = new ProvisionerSession({ retryAttemptMs: 20, retryTotalMs: 60_000, frameTimeoutMs: 20 });
+  await session.connect();
+
+  await assert.rejects(
+    () => session.queryStatus(),
+    (err) => {
+      assert.match(
+        err.message,
+        /write stalled/,
+        `expected the write-stall cause to still be named, got: ${err.message}`
+      );
+      assert.match(
+        err.message,
+        /device rebooted 1 time during this command/,
+        `expected the reboot observed on the earlier attempt to be reported, got: ${err.message}`
+      );
+      assert.match(
+        err.message,
+        /Web Serial exposes no way for this page to force host-side re-enumeration/,
+        `expected the accurate recovery guidance, got: ${err.message}`
       );
       return true;
     }
@@ -1530,12 +1630,16 @@ const scenarios = [
   ["connect survives a device reset at open (boot banner across a retry)", connectSurvivesResetBootBannerBeforeFirstQueryStatus],
   ["a read-loop failure surfaces as a real rejection, never a silent stall", readLoopErrorSurfacesAsRealRejectionNotSilentStall],
   [
-    "a repeating ESP32-S3 ROM boot banner reports a reboot count and an actionable reconnect message on timeout",
+    "a repeating ESP32-S3 ROM boot banner reports a reboot count and accurate (host-side) recovery guidance on timeout",
     repeatedRebootBannerReportsCountAndActionableTimeoutMessage,
   ],
   [
     "a reboot banner split across two separate reads is still counted once (carry-over boundary regression)",
     rebootBannerSplitAcrossTwoReadsIsStillCounted,
+  ],
+  [
+    "a write stall after an observed reboot reports the reboot count too, not just 'write stalled' (sendFrame-outside-try regression)",
+    writeStallAfterObservedRebootReportsRebootContext,
   ],
   ["send_recv_with_retry retries a dropped first response", retryOnDroppedFirstResponse],
   ["a retry's stale duplicate reply does not desync a later command", staleRetryDuplicateDoesNotDesyncNextCommand],
