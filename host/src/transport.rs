@@ -72,6 +72,43 @@ pub trait Transport {
 /// silently eating into `Session`'s own 10s overall retry budget.
 const SEND_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Marks a `send_bounded` timeout as distinct from any other transport
+/// error, so a caller (`host/src/main.rs`) can decide whether reset recovery
+/// (reopen the port, retry the command once) applies — via
+/// `anyhow::Error::downcast_ref::<SendTimedOut>()` — without pattern-matching
+/// an error message string.
+///
+/// CONFIRMED MECHANISM (round 7, `meshcadet-connect-wedge-round7-stale-
+/// handle-reenumeration`, kernel evidence): this is not merely a slow
+/// `tcdrain(2)` — opening the port asserts DTR/RTS, which resets the
+/// ESP32-S3's USB-Serial-JTAG chip (kernel: `rst:0x15
+/// (USB_UART_CHIP_RESET)`), and the chip then RE-ENUMERATES on USB (kernel:
+/// "New USB device found" / a fresh `cdc_acm` attach under the SAME node
+/// name). The old `cdc_acm` interface is torn down under this process's feet
+/// while it still holds a file descriptor into it — any `send` on that
+/// now-dead handle blocks in `tcdrain` against URBs belonging to a destroyed
+/// interface, which is exactly the `SEND_TIMEOUT` this type marks. See
+/// `docs/provisioning-connect-verification-kit.md` for the full evidence.
+#[derive(Debug)]
+pub struct SendTimedOut {
+    pub timeout: Duration,
+}
+
+impl std::fmt::Display for SendTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "serial send timed out after {:?} (device stopped accepting bytes on the transmit \
+             path -- likely a blocked tcdrain(2) against a stale handle left behind by a \
+             connect-triggered USB re-enumeration; see SEND_TIMEOUT's doc comment in \
+             transport.rs)",
+            self.timeout
+        )
+    }
+}
+
+impl std::error::Error for SendTimedOut {}
+
 /// Real USB-serial transport backed by `serialport`.
 ///
 /// The port is held behind `Arc<Mutex<_>>` (rather than a bare `Box`) so
@@ -170,11 +207,7 @@ where
     });
     match rx.recv_timeout(timeout) {
         Ok(result) => result,
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow::anyhow!(
-            "serial send timed out after {:?} (device stopped accepting bytes on the transmit \
-             path — likely a blocked tcdrain(2); see SEND_TIMEOUT's doc comment in transport.rs)",
-            timeout
-        )),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow::Error::new(SendTimedOut { timeout })),
         Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
             "serial send worker thread terminated without reporting a result"
         )),
