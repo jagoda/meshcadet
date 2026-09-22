@@ -175,6 +175,21 @@ const MAX_STRAY_FRAMES = 64;
 const DISCARD_PREVIEW_CAP = 512;
 
 /**
+ * ASCII prefix of the ESP32-S3 ROM's own boot banner
+ * (`ESP-ROM:esp32s3-<hash>` — the exact text confirmed in kernel evidence,
+ * round 7, `docs/provisioning-connect-verification-kit.md`, 2026-09-22).
+ * Printed only by the ROM itself immediately after a USB-Serial-JTAG chip
+ * reset (`rst:0x15 (USB_UART_CHIP_RESET)`) — a plain firmware-level reboot
+ * (watchdog, panic, `esp_restart()`) never emits it. Its presence in the
+ * discarded (non-frame) traffic is therefore an unambiguous signal that the
+ * device's USB endpoint was torn down and re-enumerated out from under this
+ * session, distinct from an ordinary slow response. `#scanForRebootBanner`
+ * counts occurrences (not just detects one) so a device that resets more
+ * than once during a single stuck command can be reported accurately.
+ */
+const REBOOT_BANNER = "ESP-ROM:esp32s3";
+
+/**
  * Thrown when the device answers a command with `RSP_ERROR`.
  * Mirrors the `anyhow::bail!("device error {}: {}", ...)` sites in
  * `host/src/session.rs`.
@@ -313,6 +328,26 @@ export class ProvisionerSession {
    * carries real bytes, not just a count.
    */
   #discardPreview = new Uint8Array(0);
+  /**
+   * Number of times `REBOOT_BANNER` has been seen in the discarded
+   * (non-frame) traffic during the CURRENT top-level command — reset
+   * alongside `#cumulativeBytesThisCommand`/`#discardPreview`, never
+   * cleared per-attempt (a device that resets on every retry must still be
+   * reported as resetting more than once). `#timeoutMessage` surfaces this
+   * as "device rebooted N times during this command" plus an actionable
+   * "reconnect to continue" once it is greater than zero, so a connect-
+   * triggered reset (round 7) reads as what it is instead of a generic
+   * frame timeout.
+   */
+  #rebootCount = 0;
+  /**
+   * Trailing `REBOOT_BANNER.length - 1` characters carried over between
+   * `#scanForRebootBanner` calls so an occurrence of the banner split across
+   * two separate discards (e.g. two separate USB reads, or
+   * `#tryExtractFrame`'s one-byte-at-a-time false-magic resync) is not
+   * missed at the boundary. Reset alongside `#rebootCount`.
+   */
+  #rebootScanCarry = "";
   #waiters = [];
   /**
    * Set by `#readLoop`'s catch when the underlying stream itself errors
@@ -344,6 +379,35 @@ export class ProvisionerSession {
    * block tearing down the connection.
    */
   #queue = Promise.resolve();
+  /**
+   * Per-attempt / overall / per-frame timeouts actually used by this
+   * instance — default to the module constants (`RETRY_ATTEMPT_MS`/
+   * `RETRY_TOTAL_MS`/`FRAME_TIMEOUT_MS`) but overridable via the
+   * constructor. Mirrors `Session::with_retry_params` (`host/src/
+   * session.rs`), which exists for exactly the same reason: a test that
+   * needs to actually reach a real timeout (e.g. proving the reboot-count
+   * message below) without a genuine multi-second wait.
+   */
+  #retryAttemptMs;
+  #retryTotalMs;
+  #frameTimeoutMs;
+
+  /**
+   * @param {{retryAttemptMs?: number, retryTotalMs?: number, frameTimeoutMs?: number}} [opts]
+   *   Overrides for this session's retry/timeout budget. Tests only —
+   *   production code (`provisioner.js`) always constructs
+   *   `new ProvisionerSession()` with no arguments and gets the real
+   *   `RETRY_ATTEMPT_MS`/`RETRY_TOTAL_MS`/`FRAME_TIMEOUT_MS` defaults.
+   */
+  constructor({
+    retryAttemptMs = RETRY_ATTEMPT_MS,
+    retryTotalMs = RETRY_TOTAL_MS,
+    frameTimeoutMs = FRAME_TIMEOUT_MS,
+  } = {}) {
+    this.#retryAttemptMs = retryAttemptMs;
+    this.#retryTotalMs = retryTotalMs;
+    this.#frameTimeoutMs = frameTimeoutMs;
+  }
 
   /** Whether this browser exposes the Web Serial API at all. */
   static isSupported() {
@@ -473,6 +537,8 @@ export class ProvisionerSession {
     this.#cumulativeBytesThisCommand = 0;
     this.#bytesArrivedThisAttempt = 0;
     this.#discardPreview = new Uint8Array(0);
+    this.#rebootCount = 0;
+    this.#rebootScanCarry = "";
     this.#fatalError = null;
     this.#readLoopPromise = this.#readLoop();
   }
@@ -540,6 +606,8 @@ export class ProvisionerSession {
     this.#cumulativeBytesThisCommand = 0;
     this.#bytesArrivedThisAttempt = 0;
     this.#discardPreview = new Uint8Array(0);
+    this.#rebootCount = 0;
+    this.#rebootScanCarry = "";
     this.#fatalError = null;
     this.#rejectAllWaiters(new Error("session disconnected"));
   }
@@ -573,7 +641,7 @@ export class ProvisionerSession {
       // Consume the trailing RSP_IDENTITY frame the firmware always sends
       // after RSP_STATUS — leaving it unread would desync the next command,
       // exactly as documented on `Session::query_status`.
-      const second = await this.#recvFrame(FRAME_TIMEOUT_MS);
+      const second = await this.#recvFrame(this.#frameTimeoutMs);
       if (second.frameType !== FRAME_RSP_IDENTITY) {
         throw new Error(
           `expected RSP_IDENTITY (0x${hex2(FRAME_RSP_IDENTITY)}) after RSP_STATUS; got 0x${hex2(second.frameType)}`
@@ -929,7 +997,7 @@ export class ProvisionerSession {
       }
       // Next streaming frame — no retry: the device is awake and streaming, so
       // a timeout here is a genuine protocol error.
-      ({ frameType, payload } = await this.#recvFrame(FRAME_TIMEOUT_MS));
+      ({ frameType, payload } = await this.#recvFrame(this.#frameTimeoutMs));
     }
     return entries;
   }
@@ -1044,7 +1112,7 @@ export class ProvisionerSession {
       } else {
         throw new Error(`unexpected frame 0x${hex2(frameType)} during ${label} enumeration`);
       }
-      ({ frameType, payload } = await this.#recvFrame(FRAME_TIMEOUT_MS));
+      ({ frameType, payload } = await this.#recvFrame(this.#frameTimeoutMs));
     }
     return entries;
   }
@@ -1115,14 +1183,16 @@ export class ProvisionerSession {
     this.#cumulativeBytesThisCommand = 0;
     this.#bytesArrivedThisAttempt = 0;
     this.#discardPreview = new Uint8Array(0);
-    const overallDeadline = Date.now() + RETRY_TOTAL_MS;
+    this.#rebootCount = 0;
+    this.#rebootScanCarry = "";
+    const overallDeadline = Date.now() + this.#retryTotalMs;
     while (true) {
       if (this.#fatalError) {
         throw this.#fatalError;
       }
       await this.#sendFrame(frameType, payload);
       try {
-        return await this.#recvUntilExpected(RETRY_ATTEMPT_MS, isExpected, label);
+        return await this.#recvUntilExpected(this.#retryAttemptMs, isExpected, label);
       } catch (err) {
         if (this.#fatalError || Date.now() >= overallDeadline) {
           throw err;
@@ -1244,10 +1314,23 @@ export class ProvisionerSession {
    * traffic, so "0 bytes this attempt" read as "the device said nothing"
    * when it could equally mean "the device said plenty, all of it discarded
    * as noise" — see `#bytesArrivedThisAttempt`'s own doc comment.
+   *
+   * Round 7 (`meshcadet-connect-wedge-round7-stale-handle-reenumeration`,
+   * confirmed by kernel evidence): if `REBOOT_BANNER` was seen anywhere in
+   * the discarded traffic this command (`#rebootCount > 0`), this is no
+   * longer a generic frame timeout — the device's USB endpoint reset and
+   * re-enumerated out from under this session, which is unrecoverable
+   * without a fresh `connect()`. Append the count and an actionable next
+   * step rather than leaving the caller to infer it from a byte count.
    */
   #timeoutMessage() {
     this.#logDiscardedPreview();
-    return `timeout waiting for response frame (${this.#bytesArrivedThisAttempt} bytes arrived this attempt, ${this.#accBuf.length} retained, ${this.#cumulativeBytesThisCommand} bytes arrived total this command)`;
+    const base = `timeout waiting for response frame (${this.#bytesArrivedThisAttempt} bytes arrived this attempt, ${this.#accBuf.length} retained, ${this.#cumulativeBytesThisCommand} bytes arrived total this command)`;
+    if (this.#rebootCount === 0) {
+      return base;
+    }
+    const times = this.#rebootCount === 1 ? "1 time" : `${this.#rebootCount} times`;
+    return `${base} — device rebooted ${times} during this command; the device reset on connect — reconnect to continue.`;
   }
 
   /**
@@ -1257,6 +1340,13 @@ export class ProvisionerSession {
    * `#timeoutMessage` so a "timeout waiting for response frame" report is
    * always accompanied by an actual look at what the device was sending,
    * instead of just a count.
+   *
+   * `console.warn`, not `console.debug`: six rounds of this connect-wedge
+   * campaign carried this exact diagnostic and nobody read it, because
+   * Chrome's console filter hides the "Verbose"/"debug" level by default —
+   * a human debugging a live wedge would have to know to go flip that
+   * filter on before it was ever visible. A diagnostic written to be read
+   * during a failure must actually show up at the console's default level.
    */
   #logDiscardedPreview() {
     if (this.#discardPreview.length === 0) {
@@ -1266,7 +1356,7 @@ export class ProvisionerSession {
     const ascii = Array.from(this.#discardPreview, (b) =>
       b >= 0x20 && b < 0x7f ? String.fromCharCode(b) : "."
     ).join("");
-    console.debug(
+    console.warn(
       `MeshCadet provisioner: first ${this.#discardPreview.length} discarded (non-frame) bytes this command —\nhex: ${hex}\nascii: ${ascii}`
     );
   }
@@ -1274,11 +1364,17 @@ export class ProvisionerSession {
   /**
    * Append `bytes` to `#discardPreview`, capped at `DISCARD_PREVIEW_CAP`
    * total — called by `#tryExtractFrame` at every point it discards bytes as
-   * non-frame noise. A no-op once the cap is reached (or if `bytes` is
-   * empty) so this stays cheap on a long, noisy session.
+   * non-frame noise. The `DISCARD_PREVIEW_CAP` truncation only bounds the
+   * human-readable dump; `#scanForRebootBanner` below always sees the full
+   * `bytes` span regardless of how much of `#discardPreview` room is left,
+   * so a reboot banner arriving after the preview cap is still counted.
    */
   #recordDiscarded(bytes) {
-    if (bytes.length === 0 || this.#discardPreview.length >= DISCARD_PREVIEW_CAP) {
+    if (bytes.length === 0) {
+      return;
+    }
+    this.#scanForRebootBanner(bytes);
+    if (this.#discardPreview.length >= DISCARD_PREVIEW_CAP) {
       return;
     }
     const room = DISCARD_PREVIEW_CAP - this.#discardPreview.length;
@@ -1287,6 +1383,31 @@ export class ProvisionerSession {
     merged.set(this.#discardPreview, 0);
     merged.set(take, this.#discardPreview.length);
     this.#discardPreview = merged;
+  }
+
+  /**
+   * Scan newly-discarded (non-frame) `bytes` for `REBOOT_BANNER`,
+   * incrementing `#rebootCount` once per occurrence found. Carries the
+   * trailing `REBOOT_BANNER.length - 1` characters across calls
+   * (`#rebootScanCarry`) so an occurrence split across two `#recordDiscarded`
+   * calls is not missed at the boundary.
+   *
+   * Latin-1 decode (`String.fromCharCode` per byte, not `TextDecoder`'s
+   * UTF-8): every byte maps to exactly one code point, so a match against
+   * the ASCII banner text is exact and lossless regardless of any non-ASCII
+   * bytes elsewhere in the noise (binary log content, partial frame
+   * remnants) that would otherwise make a UTF-8 decode throw or substitute
+   * a replacement character and shift subsequent byte offsets.
+   */
+  #scanForRebootBanner(bytes) {
+    const text = this.#rebootScanCarry + Array.from(bytes, (b) => String.fromCharCode(b)).join("");
+    let from = 0;
+    let idx;
+    while ((idx = text.indexOf(REBOOT_BANNER, from)) !== -1) {
+      this.#rebootCount += 1;
+      from = idx + REBOOT_BANNER.length;
+    }
+    this.#rebootScanCarry = text.slice(Math.max(0, text.length - (REBOOT_BANNER.length - 1)));
   }
 
   /**

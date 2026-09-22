@@ -455,6 +455,109 @@ async function readLoopErrorSurfacesAsRealRejectionNotSilentStall() {
   await session.disconnect();
 }
 
+// ── Scenario 1e (round 7, `meshcadet-connect-wedge-round7-stale-handle-
+//    reenumeration`, confirmed by kernel evidence): a device that keeps
+//    re-emitting the ESP32-S3 ROM boot banner on every retry attempt (a
+//    real repeated USB-Serial-JTAG chip reset, not just a slow boot) times
+//    out with a message naming the reboot count and telling the user to
+//    reconnect — not a generic "timeout waiting for response frame" that
+//    leaves the real cause to be reverse-engineered from a byte count, the
+//    way this exact scenario cost the campaign a full round (see
+//    `docs/provisioning-connect-verification-kit.md`) ─────────────────────
+
+async function repeatedRebootBannerReportsCountAndActionableTimeoutMessage() {
+  const { port, push } = makeFakePort(() => {
+    // Every attempt: the device is still resetting and answers with a
+    // fresh ROM boot banner, never a valid frame — #sendRecvWithRetry keeps
+    // retrying until its (deliberately shortened, for this test) overall
+    // budget elapses and the whole command times out.
+    push(
+      new TextEncoder().encode(
+        "ESP-ROM:esp32s3-20210327\n" +
+          "Build:Mar 27 2021\n" +
+          "rst:0x15 (USB_UART_CHIP_RESET),boot:0x8 (SPI_FAST_FLASH_BOOT)\n"
+      )
+    );
+  });
+  installFakeGlobals(port);
+
+  // Shortened retry budget so this test proves a real end-to-end timeout
+  // (not just the message-building logic in isolation) without an actual
+  // multi-second wait — mirrors `Session::with_retry_params`'s reason for
+  // existing (`host/src/session.rs`).
+  const session = new ProvisionerSession({ retryAttemptMs: 20, retryTotalMs: 70 });
+  await session.connect();
+
+  await assert.rejects(
+    () => session.queryStatus(),
+    (err) => {
+      assert.match(
+        err.message,
+        /device rebooted \d+ times? during this command/,
+        `expected the reboot count in the timeout message, got: ${err.message}`
+      );
+      assert.match(
+        err.message,
+        /the device reset on connect — reconnect to continue/,
+        `expected the actionable reconnect message, got: ${err.message}`
+      );
+      return true;
+    }
+  );
+
+  await session.disconnect();
+}
+
+// ── Scenario 1f: the reboot-banner scan must not miss an occurrence split
+//    across two separate reads — exactly the shape a real USB transfer can
+//    deliver (the banner arriving in more than one `reader.read()` chunk) ──
+
+async function rebootBannerSplitAcrossTwoReadsIsStillCounted() {
+  const fullBanner = "ESP-ROM:esp32s3-20210327\nBuild:Mar 27 2021\n";
+  const splitPoint = 8; // "ESP-ROM:" — splits inside the banner text itself
+  const firstHalf = fullBanner.slice(0, splitPoint);
+  const secondHalf = fullBanner.slice(splitPoint);
+
+  let writeCount = 0;
+  const { port, push } = makeFakePort(() => {
+    writeCount++;
+    if (writeCount !== 1) {
+      // Only the FIRST attempt delivers the (split) banner — later retries
+      // go silent, so the total reboot count this test asserts on stays
+      // exactly 1 regardless of how many retries the shortened budget below
+      // allows, isolating this test to the split-boundary question alone.
+      return;
+    }
+    // Deliver the SAME banner occurrence as two genuinely separate
+    // `#readLoop` reads (the `setTimeout` gap forces the first chunk all the
+    // way through `#tryExtractFrame`/`#recordDiscarded` — populating
+    // `#rebootScanCarry` — before the second chunk arrives), rather than two
+    // synchronous pushes that risk landing in `#accBuf` together before
+    // either is ever scanned, which would trivially "pass" without
+    // exercising the carry-over boundary this test targets.
+    push(new TextEncoder().encode(firstHalf));
+    setTimeout(() => push(new TextEncoder().encode(secondHalf)), 5);
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession({ retryAttemptMs: 20, retryTotalMs: 40 });
+  await session.connect();
+
+  await assert.rejects(
+    () => session.queryStatus(),
+    (err) => {
+      assert.match(
+        err.message,
+        /device rebooted 1 time during this command/,
+        `expected the split banner to be counted exactly once, got: ${err.message}`
+      );
+      return true;
+    }
+  );
+
+  await session.disconnect();
+}
+
 // ── Scenario 2: send_recv_with_retry actually retries a dropped first frame ─
 
 async function retryOnDroppedFirstResponse() {
@@ -1426,6 +1529,14 @@ const scenarios = [
   ["disconnect() does not hang when reader.cancel() stalls (unbounded-await regression)", disconnectDoesNotHangWhenReaderCancelNeverSettles],
   ["connect survives a device reset at open (boot banner across a retry)", connectSurvivesResetBootBannerBeforeFirstQueryStatus],
   ["a read-loop failure surfaces as a real rejection, never a silent stall", readLoopErrorSurfacesAsRealRejectionNotSilentStall],
+  [
+    "a repeating ESP32-S3 ROM boot banner reports a reboot count and an actionable reconnect message on timeout",
+    repeatedRebootBannerReportsCountAndActionableTimeoutMessage,
+  ],
+  [
+    "a reboot banner split across two separate reads is still counted once (carry-over boundary regression)",
+    rebootBannerSplitAcrossTwoReadsIsStillCounted,
+  ],
   ["send_recv_with_retry retries a dropped first response", retryOnDroppedFirstResponse],
   ["a retry's stale duplicate reply does not desync a later command", staleRetryDuplicateDoesNotDesyncNextCommand],
   ["disconnect() before connect() is a no-op", disconnectWithoutConnect],
