@@ -1144,132 +1144,174 @@ cannot see (real USB/DTR reset behavior on `port.open()`, a firmware code
 path missed by this read, a timing interaction only visible on real
 hardware). That is exactly what this kit is for.
 
-## Update, 2026-09-22 (round 9): regression-window commit analysis — no connect-time behavior changed in the four screen-lock commits; ranked, unconfirmed suspicion list; a no-flash artifact-split test added below
+## Update, 2026-09-22 (round 9): SUPERSEDED MID-ROUND — the screen-lock analysis below was retracted by fresh device evidence before this section could be finalized; see the correction that follows it for the current, correct scope
 
-**Scope, per this round's own mission — not a re-diagnosis.** Round 8 is
-the confirmed mechanism (host-side USB/`cdc_acm` state, survives a full
-device reset, cleared only by host-forced re-enumeration — see above; not
-revisited here). The maintainer used the web provisioner regularly without
-issue and does not know when it broke; the first report is 2026-09-16.
-Between 2026-08-01 and 2026-09-17 the entire `site/` provisioner page
-changed in exactly three commits, two of which touch the connect path's own
-files: `9e3f66e` (2026-08-01, channel-secret recoverability, not examined
-further — outside the two files that matter here), `9f0a2d2` (2026-08-22,
-screen-lock wire contract, Rust + JS), `3873c33` (2026-08-22, screen-lock
-web-provisioner surface). The matching firmware landed the next day:
-`56edde5` and `77401e5` (both 2026-08-23). This section reads all four
-diffs in full for anything touching connect-time behavior: extra
-queries/frames sent during or right after connect, changes to
-`session.js`'s `connect()`/read-loop/open sequencing, or admin_server
-boot-seed/NVS work that could delay or block the RX loop at startup.
+**This subsection is preserved for the record, not as current guidance —
+read the "Correction" subsection immediately below before acting on
+anything here.** Round 9 began scoped to the four screen-lock commits
+(`9f0a2d2`, `3873c33`, `56edde5`, `77401e5`, 2026-08-22/23) as the
+regression-window candidates, on the premise that the entire `site/`
+provisioner page changed in only three commits between 2026-08-01 and
+2026-09-17. That premise held for the client side but never accounted for
+firmware commits outside those four — and new maintainer device evidence
+(below) shows the wedge predates all four of them. The analysis this round
+originally produced (a suspicion list centered on `lock_store::load()`'s
+added boot-time NVS read, `main.rs:1296-1300`, and a proposed "old page vs.
+current firmware" localhost test) is **retracted, not merely superseded** —
+screen-lock is cleared as a suspect entirely, and the proposed localhost
+test re-answers a question that direct device testing already answered the
+other way. Kept here, struck through in spirit, so the historical record of
+what was believed and when stays intact, matching this kit's convention for
+every earlier round's retractions (see round 7/8 above).
 
-### Client side (`9f0a2d2`, `3873c33`) — no connect-time code changed
+### Correction: new device evidence retracts the screen-lock premise — the actual regression window is `v0.6.0..v0.7.0`
 
-- **`site/provisioner/session.js`'s `connect()` (lines 563-577) and its
-  supporting `#readLoop`/`#sendRecvWithRetry`/`#tryExtractFrame` machinery
-  are untouched by both commits.** `3873c33` only appends two new methods
-  after the existing ones — `setLockPin` (session.js:938-950) and
-  `setLockConfig` (session.js:957-961) — neither called from `connect()` or
-  from `provisioner.js`'s post-connect flow. Both are wired exclusively to
-  their own form-submit listeners (`provisioner.js:260-267`,
-  `lockPinForm`/`lockConfigForm`), which only fire on an explicit,
-  after-connect user click in the lock panel. **No new frame is sent during
-  or immediately after connect.**
-- **`site/provisioner/codec.js`'s additions (`9f0a2d2`) are purely
-  additive.** Four new frame constants (`FRAME_QUERY_LOCK`,
-  `FRAME_SET_LOCK_PIN`, `FRAME_SET_LOCK_CONFIG`, `FRAME_RSP_LOCK`) and their
-  own encode/decode functions were added; every existing encode/decode
-  function — including `encodeQueryStatus`'s codepath / `decodeRspStatus` —
-  is byte-for-byte unchanged. Confirmed the same on the Rust side
-  (`protocol/src/provisioning.rs`): the diff greps clean for `decode_frame`
-  (the shared dispatch entry point) — the only references added are inside
-  new tests, the function body itself is untouched. The "What this fix
-  found and addressed" section above already confirmed the two codecs agree
-  field-for-field for all 48 golden vectors including the four new frames,
-  and that this is a wire-format-additive commit — reconfirmed here from
-  the connect-timing angle specifically, not just the codec-divergence
-  angle that section already covers.
+Using the web flasher, the maintainer flashed firmware **v0.7.0** and
+**v0.6.0** and tested the web provisioner against each, no code changes:
+**v0.7.0 behaves like latest `main` (reset + wedge). v0.6.0 WORKS — no
+reset at all, status read succeeded.**
 
-### Firmware side (`56edde5`, `77401e5`) — one real boot-path addition, several non-candidates
+This is decisive on three points at once:
 
-- **The one concrete change inside the boot-to-first-`QUERY_STATUS`
-  critical path:** `firmware/src/main.rs:1296-1300` (`56edde5`) adds a
-  synchronous `lock_store::load(nvs_partition.clone())` NVS read —
-  `EspNvs::new` (opens the `mc_lock` namespace) + one `get_blob` call
-  (`firmware/src/lock_store.rs:57-75`) — inside the same synchronous
-  provisioned-boot block that already loads `ProvisionedConfig`, walks the
-  contact/channel/room lists, and loads `runtime_settings_store`
-  (`main.rs:1120-1330`). This entire block runs **before** the
-  `admin_server` thread is spawned (`main.rs:1748-1768`) — i.e. before the
-  USB-serial RX loop that answers `QUERY_STATUS` exists at all. This is the
-  only place in any of the four commits where boot-time NVS work grew on
-  that specific critical path, and it is exactly the category this round
-  was asked to look for.
-- **Why this is a weak lead, not a strong one, and is ranked accordingly:**
-  round 8's confirmed mechanism is a *persistent* host-side USB
-  endpoint-desync that survives not just one full chip reset but a
-  **second** browser connect attempt with **zero** additional device reset
-  (device uptime continuous, reboot counter 0, LoRa/NVS both still working)
-  — i.e., a mechanism that, on its own description, does not depend on how
-  long the device's boot takes. Separately, `session.js`'s own doc comment
-  (session.js:536-544) already documents that `#sendRecvWithRetry` retries
-  the first `queryStatus` for the full `RETRY_TOTAL_MS` budget
-  (session.js:109, currently `10_000`) specifically to ride out a reboot —
-  a single extra `EspNvs::new`/`get_blob` call is a sub-millisecond-to-few-
-  millisecond addition, dwarfed by that budget. Flagged because it is the
-  only candidate found, not because the arithmetic makes a strong case for
-  it.
-- **`firmware/src/admin_server.rs`'s frame-dispatch `match` gains two new
-  arms** — `FRAME_QUERY_LOCK` (admin_server.rs:730), and `FRAME_SET_LOCK_PIN`
-  (admin_server.rs:949, extended in `77401e5`) / `FRAME_SET_LOCK_CONFIG`
-  (admin_server.rs:1003) — dispatched only on their own opcodes.
-  `FRAME_QUERY_STATUS`'s own arm (admin_server.rs:397) and the surrounding
-  read loop (`admin_server.rs`'s `run()`, ~line 208 on) are unmodified apart
-  from two extra function parameters (`evt_tx`, `evt_dropped`) threaded
-  through so `SET_LOCK_CONFIG`/`SET_LOCK_PIN` can forward a `UiEvent` — no
-  change to how bytes are read or how `QUERY_STATUS` is answered. **Not a
-  suspect.**
-- **`firmware/src/ui/mod.rs`'s additions (`56edde5`, `77401e5`) run on the
-  UI thread, not `admin_server`'s thread**, and are delivered over the
-  existing `evt_tx` channel independently of and after `admin_server` has
-  already started listening. The `77401e5` per-tick lock-overlay
-  reassertion/retry (`construct_lock_screen`, called from `step()`) only
-  executes at all once `self.locked == true` — i.e., only on a device with
-  the screen lock feature both enabled and currently tripped, not the
-  default/just-provisioned state a fresh connect normally hits. **Not a
-  suspect.**
+1. **Screen-lock is eliminated.** All four commits the original round-9
+   scope named (`9f0a2d2`/`3873c33`, 2026-08-22 14:25/14:26; `56edde5`/
+   `77401e5`, 2026-08-23) land **after** the v0.7.0 release commit `c6b6b0c`
+   (2026-08-22 14:35). v0.7.0 is already broken, so nothing in screen-lock
+   can be the cause — drop that analysis entirely, not just its ranking.
+2. **The client-side artifact-split question is already answered, the
+   opposite way from what the original scope anticipated — do not build a
+   localhost kit to re-ask it.** The maintainer ran the CURRENT provisioner
+   page (served from the same deployed site as the web flasher) against OLD
+   v0.6.0 firmware, and it worked. Current page + old firmware = works ⇒
+   **the regression is firmware-side and the client/page is eliminated
+   too.** (One assumption worth stating, not re-testing: the page used was
+   the current deployed one, since the flasher and provisioner are served
+   from the same site.) Step 5 below records this instead of re-deriving it.
+3. **The DTR/RTS-triggered reset is FIRMWARE-CONTROLLED, not immutable
+   hardware behavior — this retracts a framing every prior round in this
+   kit (including round 8) carried unquestioned.** On v0.6.0, the browser's
+   unavoidable `open()` DTR/RTS assert produces **no reset whatsoever**.
+   Every earlier round in this document treated "Chromium's `open()` always
+   resets this chip" as a fixed hardware fact about the CH343/native-USB
+   wiring. It isn't fixed — something in `v0.6.0..v0.7.0` changed *whether*
+   that assert resets the chip at all, and that is the actual bug.
 
-### Ranked suspicion list — UNCONFIRMED, suspects only, not findings
+**New, tighter window: `v0.6.0..v0.7.0`** — 32 commits (13 on
+`--first-parent`, i.e. 13 merged PRs), spanning 2026-08-03 → 2026-08-22.
+Content is battery SoC filtering/indicator, GPS backup-RTC sync, DM/room
+delivery-state model + send auto-retry, clock-source provenance, raw-
+millivolt telemetry, and UI header work — nothing obviously USB- or
+console-related, which is itself notable. `firmware/src/main.rs` changed by
+~1012 lines in the range, the largest single surface.
 
-1. **(weak-moderate, sole concrete lead)** `firmware/src/main.rs:1296-1300`
-   — the added `lock_store::load()` boot-time NVS read, ahead of
-   `admin_server`'s thread spawn. Satisfies the letter of "boot-seed/NVS
-   work that could delay the RX loop," but sits in tension with round 8's
-   own finding that the wedge is a *persistent*, reset-count-independent
-   host-side state rather than a boot-timing race — see above.
-2. **(no evidence found)** `site/provisioner/session.js` /
-   `site/provisioner.js` / `site/provisioner/codec.js` — connect(), the
-   read loop, and every existing encode/decode function are unchanged
-   across both client commits; the only new code paths are user-triggered,
-   post-connect, and additive.
-3. **(no evidence found)** `firmware/src/admin_server.rs`'s `QUERY_STATUS`
-   handling and read loop, and `firmware/src/ui/mod.rs`'s screen-lock
-   additions — unmodified / wrong-thread / gated behind a feature state a
-   fresh connect doesn't reach.
+**Sharper good/bad criterion, replacing "does status succeed":** v0.6.0
+answers cleanly with **no reset at all** — watch the serial monitor for a
+boot banner immediately after clicking Connect, rather than waiting out a
+retry budget or cross-checking the host CLI. This is both faster per cycle
+and a cleaner binary signal for bisecting than step 1's original
+PASS/FAIL, which was written for a device that always resets and sometimes
+also wedges; see step 6 below.
 
-### The honest caveat this list can't resolve by itself
+### What this pass already ruled out in-container (do not re-check these)
 
-Chromium's `SerialPort.open()` asserting DTR/RTS unconditionally, and this
-board's wiring turning that into a chip reset, predate all four commits in
-this window and are untouched by them — nothing here explains *why* a
-previously-working connect flow would newly wedge, as opposed to reset (as
-it apparently always has) and recover. It is a live possibility that the
-regression is not inside this diff window at all — a host-side OS/kernel
-`cdc_acm` driver update, or a changed Chromium version, or a different
-cable/hub, none of which this source-only pass can see. That is exactly
-what the artifact-split test below is for: it tests the client-side
-variable directly, with zero speculation, before anyone reaches for a
-firmware bisect.
+- `firmware/sdkconfig.defaults` is byte-identical across `v0.6.0..v0.7.0`.
+- `firmware/Cargo.lock`'s only change for `esp-idf-hal`/`esp-idf-svc`/
+  `esp-idf-sys` is absent — the only version-string changes in the lockfile
+  are this workspace's own `firmware`/`firmware-core`/`protocol` crates
+  bumping `0.6.0` → `0.7.0`, not a dependency bump. Rules out an ESP-IDF
+  toolchain-version drift silently changing a USB-auto-reset default.
+- `usb_serial_jtag_driver_install`/`esp_vfs_usb_serial_jtag_use_driver`/the
+  RX/TX line-ending calls (`main.rs:646-689`) are present and **byte-for-
+  byte unchanged** in both tags — the driver-install call itself, and its
+  `usb_serial_jtag_driver_config_t` (only `tx_buffer_size`/`rx_buffer_size`
+  fields — no DTR/RTS-reset-arming field exists in that struct at all), are
+  not the delta.
+- **Peripheral/driver bring-up ORDER in `run()` is structurally unchanged**
+  — every numbered boot-sequence comment (`// 1.5.`, `// 2.`, `// 2.5.`,
+  `// 2.6.`, `// 4.`, `// 6.`, `// 6.5.`, `// 2.7.`, `// 7.`, `// 8.` …) sits
+  at the same relative position in both tags. Rules out "a peripheral now
+  initializes before/after USB-Serial-JTAG when it didn't before" as a
+  category outright — nothing reordered, only content *within* existing
+  steps grew.
+- Grepping the full `v0.6.0..v0.7.0` diff for `usb`/`jtag`/`dtr`/`rts`
+  (case-insensitive) across `firmware/` turns up exactly one hit, a doc-
+  comment-only change in `admin_server.rs`'s `FRAME_QUERY_ADVERT` handler
+  (wording about "USB-only, host-driven" — no code changed) and one
+  unrelated `RTS unused` comment on the GPS UART1 pin config (UART hardware
+  flow control, not USB DTR/RTS). **No firmware code anywhere in this crate
+  explicitly arms, disarms, or configures DTR/RTS-to-reset behavior** — on
+  this source-only pass, that behavior is inherited entirely from the
+  ESP32-S3 boot ROM / USB-Serial-JTAG peripheral, not from any call site
+  this codebase controls. This is the honest limit of what a no-hardware
+  pass can determine — see "What this pass cannot determine" below.
+- `firmware/src/dispatcher.rs`'s `OutstandingSends`/DM-delivery-state
+  refactor and every UI-only change (`ui/mod.rs`, `ui/screens/*.rs`,
+  `battery_indicator.slint`) grep clean for `usb`/`jtag`/`dtr`/`rts` too —
+  message-ACK tracking and rendering, no USB-adjacent code path.
+
+### Ranked suspicion list — UNCONFIRMED, suspects only, not findings; ordered for bisect priority
+
+1. **(weak-moderate, top lead)** `firmware/src/battery.rs`'s added
+   `settled_mv` NVS persistence (`load_persisted_settled_mv`,
+   `battery.rs:57-75`; call site `main.rs:1588`, `BatteryDriver::new`),
+   landed in **`2508553`** (PR #159, `meshcadet-battery-soc-filtering`,
+   chronologically the second commit after `v0.6.0`). Adds one
+   `EspNvs::new` + `get_u32` call to the same synchronous, pre-`admin_server`
+   boot block that already existed (`admin_server` thread spawns at
+   `main.rs:1748-1768`, strictly after `BatteryDriver::new` returns) —
+   structurally the same shape as every "boot-time NVS work that could
+   delay the RX loop" category this kit has flagged before. Same caveat as
+   ever: a single extra NVS open+read is a sub-millisecond-to-few-
+   millisecond addition, which is a weak mechanism for turning a
+   *non-resetting* DTR/RTS assert into a resetting one — nothing about
+   *timing* should change *whether* a reset fires. Ranked #1 only because
+   it is the most concrete, narrowly-attributable boot-path addition found,
+   not because the arithmetic makes a strong case for it.
+2. **(weak, second lead)** `firmware/src/gps.rs`'s new backup-RTC-cell
+   pre-fix clock sync (`settimeofday` now callable from an unverified,
+   pre-fix `$GPRMC`/`$GNRMC` sentence within seconds of boot, not only from
+   a verified outdoor fix — `gps.rs:1172-1200`, `set_system_clock_from_utc`
+   at `gps.rs:1282`), landed in **`f07eded`** (PR #158,
+   `meshcadet-gnss-backup-rtc-prefix-time-sync`, the FIRST firmware-
+   touching commit after `v0.6.0`). This is a genuinely new category of
+   boot-time behavior — an early, unrequested wall-clock jump via
+   `settimeofday` that is now much more likely to fire in the first few
+   seconds after boot than before. Speculative mechanism: if anything in
+   the runtime computes a deadline from wall-clock time
+   (`CLOCK_REALTIME`/`gettimeofday`) rather than a monotonic clock, an
+   abrupt jump could desync a timeout. **No call site was found** linking
+   `admin_server`'s read loop, the USB-Serial-JTAG driver, or anything on
+   that thread to wall-clock time — `grep`ing `firmware/src/*.rs` for
+   `SystemTime`/`gettimeofday` outside `gps.rs` itself turns up nothing.
+   Ranked below the battery lead because the runs entirely on the MAIN
+   thread's dispatcher loop (which only starts after `admin_server`'s own
+   thread is already spawned and listening), not on any path between boot
+   and the RX loop's readiness — its plausible blast radius, if any, is
+   runtime timeout behavior, not connect-time boot latency. Flagged because
+   it is the only OTHER genuinely new boot-adjacent behavior found in the
+   window, not because a mechanism was identified.
+3. **(no evidence found)** every other commit in the range — the DM/room
+   delivery-state model, send auto-retry, clock-source provenance
+   (`a3bb136`, layered on top of #2's mechanism but adds no new
+   `settimeofday` call site of its own), header/icon UI alignment, and the
+   `ci-fix-meshcadet-changelog-vocabulary-leak` commit (`ba7a834`, touches
+   only `.github/workflows/ci.yml` — no firmware code at all) — grep clean
+   for anything USB/JTAG/DTR/RTS-adjacent, per the ruled-out list above.
+
+### What this pass cannot determine — and why that's the honest conclusion, not a gap
+
+This is a source-only, no-hardware pass, and it hits a real limit here: no
+code in this firmware crate visibly arms or disarms DTR/RTS-triggered
+chip reset, so a diff read alone cannot explain **why** v0.6.0 doesn't
+reset while v0.7.0 does. That is exactly the question step 6's bisect below
+is built to answer mechanically, with real hardware, rather than something
+a second, deeper source read is likely to resolve — repeating the
+"diagnose from source, then discover a device-only mechanism no read could
+see" pattern this whole kit's earlier rounds (2-8) already worked through
+more than once would not be a responsible use of another in-container pass.
+See steps 5 and 6, after the original hardware-verification steps below,
+for the artifact-split answer already in hand and the mechanical bisect
+procedure this round's analysis feeds into.
 
 ## 0. Setup
 
@@ -1491,179 +1533,129 @@ cargo run -p host --example raw_add_channel_bad_key_len -- --port /dev/ttyACM0
   encode/decode path this static read and host-side tests didn't cover.
   Capture the same serial-monitor/console evidence as step 1.
 
-## 5. Regression-window artifact-split test (round 9 — no flash cycle required for this half)
+## 5. The artifact-split question — already answered, do not rebuild a kit to re-ask it
 
-**Purpose: find out, in one test with zero flashes, whether the regression
-lives in the client-side JS or the firmware.** `site/` has no build step
-(plain ES modules), and Web Serial treats `http://localhost:<port>/`
-(any port) as a secure context — so an OLD copy of the provisioner page can
-be served locally and pointed at your CURRENTLY-FLASHED, CURRENT-firmware
-device with no rebuild of anything. This does not require the container;
-it is entirely browser + a static file server, run wherever the device is
-plugged in.
+The original round-9 scope planned an "old page vs. current firmware"
+localhost test as this kit's second deliverable. **Skip it — it has already
+been run, decisively, and answered the opposite way from what that scope
+anticipated.** See the round-9 "Correction" section above, point 2: the
+maintainer ran the CURRENT provisioner page against OLD (v0.6.0) firmware
+and it worked cleanly. Current page + old firmware = works, which by itself
+eliminates the client/page as a suspect — no localhost checkout, no
+`http.server`, no second Web-Serial permission grant needed to re-derive
+that. If a future round ever needs the complementary direction (old page +
+current firmware) for some other reason, the mechanics are simple (`site/`
+is build-step-free ES modules; Web Serial accepts `localhost` as a secure
+context) but there is no open question left that direction would resolve
+right now.
 
-**Do this BEFORE reaching for step 6's bisect.** It is strictly cheaper and
-answers the client-vs-firmware question directly, per the round-9 analysis
-above.
-
-1. From your own (non-worktree) MeshCadet checkout, add a second worktree
-   pinned at the last commit before the regression window's client
-   changes:
-   ```sh
-   git worktree add /tmp/meshcadet-old-provisioner 9e3f66e
-   ```
-   (`9e3f66e` is the commit immediately before `9f0a2d2`/`3873c33` — see
-   the round-9 section above. Any commit strictly before `9f0a2d2` works
-   equally well.)
-2. Serve that old checkout's `site/` directory on a port distinct from
-   anything else you might have running:
-   ```sh
-   cd /tmp/meshcadet-old-provisioner/site
-   python3 -m http.server 8001
-   ```
-3. With your currently-flashed device connected (whatever firmware is on
-   it right now — this test intentionally does not touch firmware or
-   reflash anything), open `http://localhost:8001/provisioner.html` in a
-   Chromium-based browser, with the serial monitor from step 0 visible if
-   you have one attached.
-4. Click **Connect**, pick the device's port (Web Serial requires a fresh
-   permission grant per origin, so `localhost:8001` will prompt even if
-   you already granted the real site permission before).
-5. **Run this exactly like step 1 above** — same expected outcomes, same
-   wedge-case cross-check (immediately run step 3's host CLI `status`
-   without power-cycling if the connect attempt fails).
-
-**Read the result:**
-
-- **The OLD page connects cleanly (or hits only the "Acceptable case" —
-  reboot, self-recovers within ~10s — from step 1), with NO wedge:** the
-  regression is in the two 2026-08-22 client commits (`9f0a2d2`/`3873c33`)
-  after all, despite the round-9 analysis above finding no obvious
-  connect-time culprit in them — re-read that analysis with this positive
-  result in hand; the leading remaining candidate to dig into by hand is
-  whatever differs between the OLD and CURRENT `site/provisioner/` tree
-  beyond what this round's static read flagged. **The search is over in
-  this one test; do not proceed to step 6.**
-- **The OLD page ALSO wedges (fails to connect, or connects then the
-  host-CLI cross-check hangs until a physical reset):** the client side is
-  cleared — an old page, unable to be affected by anything landed after
-  `9e3f66e`, reproduces the exact same failure against your current
-  firmware. The regression is firmware-side (or outside this repository
-  entirely — see the caveat below). **Proceed to step 6.**
-- **Clean up either way:** `git worktree remove /tmp/meshcadet-old-provisioner`
-  when done (and `Ctrl-C` the `http.server`).
-
-**A third possible outcome, worth recording explicitly rather than
-forcing into the two boxes above:** if the OLD page ALSO wedges, this
-does not by itself prove the regression is a firmware code change *within
-the 2026-08-01..2026-09-17 window* — it only proves the client-side JS in
-that window is not the cause. It remains possible the true cause is
-outside this repository's diff history altogether (an OS/kernel `cdc_acm`
-driver update, a Chromium update, a different cable/hub/port than was used
-when the provisioner "just worked") — see the caveat at the end of the
-round-9 section above. Step 6's bisect has an explicit off-ramp for
-exactly this case; don't skip reading it.
-
-## 6. Firmware-side git-bisect procedure (fallback — only if step 5's OLD page also wedges; hardware + firmware build required, maintainer-run only)
+## 6. Firmware-side git-bisect procedure over `v0.6.0..v0.7.0` (hardware + firmware build required, maintainer-run only)
 
 The container this analysis ran in has no Xtensa toolchain — every step
 below needs your own machine.
 
-### 6a. Quick check first — revert just the two named firmware commits
+**Predicate, every cycle, identical (see the round-9 section's "Sharper
+good/bad criterion" above):** flash the candidate commit, watch the serial
+monitor, click **Connect** in the CURRENT (HEAD) web provisioner. **`good`**
+= no reboot banner appears at all. **`bad`** = a reboot banner appears (a
+wedge, per round 8, is expected to follow, but the reset itself is the
+faster, cleaner signal to bisect on — no need to wait out a retry budget or
+run the host CLI cross-check per cycle; save that for confirming the FINAL
+first-bad commit once bisect converges).
 
-Cheaper than a full bisect, and directly tests the round-9 suspicion list's
-only concrete lead plus the two named firmware commits as a pair:
+### 6a. Quick-check order — test the ranked suspicion list before a blind bisect
+
+Cheaper than a full binary search, and uses this round's own analysis
+rather than discarding it. Test these two commits directly first, in
+order, each a self-contained build+flash+test cycle:
 
 ```sh
 cd <your meshcadet checkout>
-git checkout main
-git revert --no-commit 77401e5 56edde5   # newest first, so both apply cleanly
-git status   # confirm both reverted with no conflicts
-cd firmware
-cargo run --release
+git checkout 2508553   # PR #159 — battery settled_mv NVS persistence (suspicion #1)
+cd firmware && cargo run --release
 ```
-Serve **current HEAD's** `site/` (not the old-page checkout from step 5 —
-this test isolates firmware, so hold the client side fixed at current) and
-repeat step 1's connect test against this reverted-firmware build.
+Serve `site/` from a FIXED checkout pinned at current `main` (not the
+commit you're bisecting — see 6b's note on why) and click Connect.
 
-- **PASSES (no wedge):** the firmware regression is confirmed inside this
-  window, in one or both of `56edde5`/`77401e5`. To isolate which: repeat
-  6a reverting **only** `77401e5` (keep `56edde5`), then **only**
-  `56edde5` (revert `77401e5` back out, i.e. test `56edde5` alone against
-  its own parent) — two more build+flash+test cycles, each with the same
-  PASS/FAIL predicate as step 1. Report which single commit's absence
-  clears the wedge.
-- **STILL WEDGES:** the regression predates this window, or isn't a
-  firmware code change here at all — do **not** conclude "screen-lock
-  firmware is cleared" from a revert that still fails without first ruling
-  out an unrelated cause (stale flash, wrong device state) by reflashing
-  once and retrying. If it reproduces a second time, proceed to 6b with an
-  earlier good anchor — the two named commits are not the culprit, or are
-  not the only one.
-- Clean up: `git revert --abort` if you stop mid-way, otherwise
-  `git reset --hard main` to discard the local revert commits once you're
-  done (they're a scratch test, not something to land).
+- **Resets:** suspicion #1 is confirmed as (at least) sufficient — the
+  regression is present by this commit. Move on to `f07eded` (PR #158, GPS
+  backup-RTC sync) to check whether it alone is ALSO sufficient, or whether
+  `2508553` is the actual first-bad commit; either way, report which.
+- **Does not reset:** suspicion #1 is cleared. Try `f07eded` next
+  (`git checkout f07eded`, rebuild, reflash, retest) the same way.
+  - **Resets:** suspicion #2 confirmed as (at least) sufficient.
+  - **Does not reset either:** both leads in the ranked list are cleared —
+    proceed to 6b's full bisect with no shortcut; the first-bad commit is
+    somewhere else in the 32-commit range.
 
-### 6b. Full bisect (only if 6a is inconclusive or reverting doesn't clear it)
+### 6b. Full bisect (only if 6a doesn't land on a bad commit)
 
-```sh
-git bisect start
-git bisect bad main                 # or whatever commit you've confirmed wedges
-git bisect good <your-own-anchor>   # see "choosing the good anchor" below
+**Exact anchors — the 13 first-parent (PR-merge) commits in this window,
+oldest to newest, each already a coherent, mergeable, buildable unit (this
+vehicle never squash-merges — see the vehicle's PR policy — so every commit
+on `main` already passed its own PR's CI):**
+
+```
+ba7a834  PR #157  ci-fix-meshcadet-changelog-vocabulary-leak       (.github/ only — not firmware)
+f07eded  PR #158  gnss-backup-rtc-prefix-time-sync                 (suspicion #2)
+2508553  PR #159  battery-soc-filtering                            (suspicion #1)
+e6a0019  PR #161  battery-glanceable-indicator
+aa6dbc0  PR #163  battery-level-reads-full-when-depleted
+3ce2ea2  PR #162  drop-comment-icon-from-messaging-header
+a3bb136  PR #166  clock-source-provenance-and-sync-age
+d6585ae  PR #164  header-icon-edge-alignment
+0315458  PR #165  dm-room-delivery-state-model
+d6eb9d0  PR #167  dm-room-send-auto-retry
+60abad2  PR #168  messaging-status-icon-vertical-alignment
+208f45f  PR #169  telemetry-raw-mv-over-air
+f3803c5  PR #160  release-please branches main                     (newest — this is v0.7.0)
 ```
 
-**Choosing the good anchor:** there is no commit this analysis can name as
-definitively "good" on the firmware side — round 9's window-narrowing
-applies to the *client* commits only (the objective's own three-commit
-count is a `site/` count). A reasonable default is the parent of `56edde5`
-(the last firmware commit before the screen-lock firmware landed,
-`56edde5^`), matching the same Aug-23 boundary the client side uses — but
-if you have higher confidence in an earlier date the provisioner "just
-worked," use that commit instead; an earlier anchor only costs a few extra
-bisect cycles, never a wrong answer.
+`git bisect` always walks the full commit graph — there is no built-in
+"first-parent only" mode. To bisect at PR-merge granularity (13 candidates
+instead of 32, using the coherent, already-CI-passed anchors above), skip
+`git bisect` itself and just `git checkout` each SHA from the ordered list
+directly, in the same halving order `git bisect` would use (start at the
+middle: `a3bb136`) — see "Each cycle" below. If a PR-level "bad" result
+ever needs localizing to one commit WITHIN that PR, run `git bisect` proper
+(`git bisect start`, then `git bisect bad <bad-sha-inside-PR>` and
+`git bisect good <good-sha-inside-PR>`) over that PR's own smaller commit
+range instead.
 
-**Each bisect cycle (mechanical, identical every time):**
-1. `git bisect` will have checked out a candidate commit — confirm with
-   `git log -1`.
-2. **Serve `site/` from a SEPARATE, FIXED checkout pinned at current HEAD**
-   (e.g. the `/tmp/meshcadet-old-provisioner`-style worktree from step 5,
-   but pointed at `main` instead of `9e3f66e`) for the entire bisect — this
-   isolates firmware as the only variable across cycles. Do not serve the
-   bisect-checked-out commit's own `site/` (it moves at every step,
-   confounding the result).
-3. Build and flash the bisect commit's firmware:
-   ```sh
-   cd firmware
-   cargo run --release
-   ```
-4. Run step 1's connect test (against the fixed-HEAD `site/` from #2) and
-   its wedge-case cross-check.
-5. **Good/bad criteria — identical to step 1's own PASS/FAIL:**
-   - **`good`**: no wedge — either "no reboot at all" or "reboot, connect
-     recovers within ~10s" (step 1's Best/Acceptable cases).
-   - **`bad`**: the wedge case reproduces (step 1's Wedge case, confirmed
-     by the host-CLI cross-check hanging until a physical reset — the
-     round-8-confirmed signature. A step-1 FAIL that resolves on its own
-     without a physical reset is NOT this bug; treat that build as `good`
-     for this bisect's purposes and note it separately).
-6. `git bisect good` or `git bisect bad`, then repeat from #1 until `git
-   bisect` reports the first bad commit.
-7. `git bisect reset` when done — do not leave the repo in a
-   detached-HEAD bisect state.
+**Each cycle (mechanical, identical every time):**
+1. `git checkout <candidate-sha>` from the ordered list above (start at the
+   middle: `a3bb136`).
+2. **Serve `site/` from a SEPARATE, FIXED checkout pinned at current
+   `main`** for the entire bisect (e.g. a second `git worktree add
+   /tmp/meshcadet-current-site main`) — this isolates firmware as the only
+   variable across cycles; do not serve the bisected commit's own `site/`
+   (already established client-side-clean, and it would move at every step,
+   confounding the result regardless).
+3. Build and flash: `cd firmware && cargo run --release`.
+4. Click Connect in the browser (pointed at the fixed-`main` `site/` from
+   #2), watch the serial monitor. Apply the predicate above.
+5. Move to the next candidate by binary search over the ordered list (half
+   the remaining range each cycle) until two ADJACENT commits in the list
+   disagree — that boundary is the first-bad PR merge.
+6. Confirm the boundary with `git log <good-sha>..<bad-sha> --oneline` to
+   see exactly which PR it is, then run step 1's FULL procedure (including
+   the host-CLI wedge cross-check) against that specific commit once, to
+   confirm the round-8-documented wedge shape follows the reset — not just
+   that A reset occurred.
+7. `git checkout main` (or your working branch) when done — no detached-HEAD
+   state to clean up since this uses plain `git checkout`, not `git bisect`,
+   for the PR-level search.
 
-**Off-ramp — read before you start blaming a commit:** if bisecting all
-the way back to your chosen good anchor still leaves you unable to find a
-commit where the connect genuinely never wedges even once (i.e., the
-oldest anchor you're willing to trust ALSO wedges), **stop bisecting this
-window.** That result means the regression predates the anchor you chose,
-or is not a code regression in this repository at all — see the "outside
-this repository's diff history" caveat in step 5 above. Widening the
-bisect window further without new evidence just repeats the same
-speculative-without-hardware pattern this campaign has already corrected
-for more than once (see round 8's retractions). The next right move at
-that point is a session-environment comparison (kernel version, Chromium
-version, cable/hub) against whatever setup was last known to work, not a
-deeper bisect.
+**Off-ramp — read before you start blaming a commit:** if `v0.6.0` itself
+(the chosen good anchor) ever reset on a re-test, or if every commit in the
+range resets, **stop bisecting this window** — the regression predates
+`v0.6.0`, or isn't a code regression in this repository at all (a host-side
+OS/kernel `cdc_acm` driver update, a Chromium update, a different
+cable/hub — see the round-9 section's "What this pass cannot determine"
+above). Re-test `v0.6.0` alone first if this happens; a stale flash or a
+different USB port/cable than the original v0.6.0 test is a far more
+likely explanation than the window itself being wrong, given the
+maintainer's own v0.6.0 test already showed a clean no-reset connect once.
 
 ## Result block
 
@@ -1765,22 +1757,24 @@ round 8 host-side verification (see "Update, 2026-09-22 (round 8)" above;
     devtools console at its DEFAULT verbosity level (no filter changes)?
     yes | no
 
-round 9 artifact-split test (step 5 — no-flash, client-vs-firmware split):
-  old-page commit served: <sha, e.g. 9e3f66e>
-  firmware commit currently flashed (unchanged for this test): <sha>
-  outcome: OLD page connects clean/self-recovers (no wedge) |
-    OLD page ALSO wedges (client cleared, proceed to step 6) | not run
-  (wedge case only) host-CLI cross-check immediately after, no power-cycle:
-    worked | hung until physical reset
+round 9 artifact-split (step 5 — already answered before this kit update;
+  recorded for completeness, not re-run):
+  current page + v0.6.0 firmware: worked (no reset) — maintainer-run,
+    pre-dates this kit revision — client/page eliminated as a suspect
 
-round 9 firmware bisect (step 6 — only if step 5's OLD page also wedged):
-  6a quick revert of 56edde5+77401e5 — outcome: cleared the wedge |
-    still wedges | not run
-  (if cleared) which single commit's absence cleared it, once isolated?
-    56edde5 | 77401e5 | both required | not yet isolated
+round 9 firmware bisect over v0.6.0..v0.7.0 (step 6):
+  6a quick-check order — 2508553 (PR #159, battery settled_mv NVS,
+    suspicion #1): resets | does not reset | not run
+    (if not run or cleared) f07eded (PR #158, GPS backup-RTC sync,
+    suspicion #2): resets | does not reset | not run
   6b full bisect run at all? yes | no
-  (if yes) good anchor used: <sha> — first bad commit `git bisect` reported:
-    <sha, or "off-ramp hit — see step 6's off-ramp note">
+  (if yes) first-bad PR-merge commit found (from the 13 first-parent
+    anchors listed in step 6b): <sha, e.g. f07eded/2508553/other — name it>
+  (if yes) confirmed with step 1's full procedure (reset AND the round-8
+    wedge shape, not just a reset)? yes | no
+  off-ramp hit (v0.6.0 itself reset on re-test, or the whole range
+    resets)? yes | no — if yes, do NOT report a first-bad commit; report
+    the re-test of v0.6.0 instead
 
 when did provisioning last definitely work (if known)? <date / "unknown">
 
