@@ -8,6 +8,7 @@
 //! for `MockTransport`).
 
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -72,23 +73,55 @@ pub trait Transport {
 /// silently eating into `Session`'s own 10s overall retry budget.
 const SEND_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Human-actionable recovery guidance for the confirmed HOST-side USB/
+/// cdc_acm wedge (round 8, `meshcadet-connect-wedge-round8-host-usb-
+/// endpoint-state`, 2026-09-22, hardware evidence — see
+/// `docs/provisioning-connect-verification-kit.md`). CONFIRMED: the broken
+/// state lives in the host kernel's per-device USB/cdc_acm state and
+/// SURVIVES a full device-side chip reset (the device reboots, firmware,
+/// driver and peripheral registers all reinitialize, yet host->device stays
+/// dead) — so a device-side action (power-cycle the device, hit its reset
+/// button) does NOT clear it. The only thing observed to clear it is the
+/// HOST kernel tearing down and rebuilding its per-device USB state:
+/// physically unplug and replug the USB cable, or force the same from
+/// software by deauthorizing/reauthorizing the USB device node:
+/// `echo 0 | sudo tee /sys/bus/usb/devices/<dev>/authorized` then
+/// `echo 1 | sudo tee /sys/bus/usb/devices/<dev>/authorized` (find `<dev>`
+/// via `readlink -f /sys/class/tty/<ttyname>/device/..` for the port in
+/// question). This retracts round 7's guidance to simply reopen the port —
+/// reopening the same `cdc_acm` node does not rebuild the kernel's endpoint
+/// state and cannot recover a wedged handle.
+const HOST_REENUM_GUIDANCE: &str = "unplug and replug the USB cable (or force host-side \
+     re-enumeration by deauthorizing/reauthorizing the device node: \
+     `echo 0 | sudo tee /sys/bus/usb/devices/<dev>/authorized` then `echo 1 | ...`) -- a \
+     device-side reset alone does NOT clear this; only the host kernel rebuilding its \
+     per-device USB/cdc_acm state does. Simply re-running this command will NOT help.";
+
 /// Marks a `send_bounded` timeout as distinct from any other transport
-/// error, so a caller (`host/src/main.rs`) can decide whether reset recovery
-/// (reopen the port, retry the command once) applies — via
+/// error, so a caller can recognize it — via
 /// `anyhow::Error::downcast_ref::<SendTimedOut>()` — without pattern-matching
 /// an error message string.
 ///
-/// CONFIRMED MECHANISM (round 7, `meshcadet-connect-wedge-round7-stale-
-/// handle-reenumeration`, kernel evidence): this is not merely a slow
-/// `tcdrain(2)` — opening the port asserts DTR/RTS, which resets the
-/// ESP32-S3's USB-Serial-JTAG chip (kernel: `rst:0x15
-/// (USB_UART_CHIP_RESET)`), and the chip then RE-ENUMERATES on USB (kernel:
-/// "New USB device found" / a fresh `cdc_acm` attach under the SAME node
-/// name). The old `cdc_acm` interface is torn down under this process's feet
-/// while it still holds a file descriptor into it — any `send` on that
-/// now-dead handle blocks in `tcdrain` against URBs belonging to a destroyed
-/// interface, which is exactly the `SEND_TIMEOUT` this type marks. See
-/// `docs/provisioning-connect-verification-kit.md` for the full evidence.
+/// CONFIRMED LOCALIZATION (round 8, `meshcadet-connect-wedge-round8-host-
+/// usb-endpoint-state`, hardware evidence): the broken state lives in the
+/// HOST's per-device USB/cdc_acm state, not the device — it survives a full
+/// device-side chip reset and is cleared only by the host kernel
+/// re-enumerating the device (unplug/replug, or the `/sys/.../authorized`
+/// equivalent). This REFUTES round 7's claim (retracted; see
+/// `docs/provisioning-connect-verification-kit.md`) that the device itself
+/// re-enumerates on a web connect — `journalctl -k` across a reproducing
+/// connect shows NO enumeration event at all; the USB session survives the
+/// device's self-reset unchanged from the host's point of view.
+///
+/// LABELED HYPOTHESIS, not confirmed: the leading candidate for the
+/// host-side mechanism is an OUT-endpoint data-toggle/sequence desync — the
+/// device-side reset reinitializes its endpoints (FIFOs cleared, toggle
+/// zeroed) while the host's `cdc_acm` retains its pre-reset toggle, so
+/// host->device packets are silently discarded while device->host keeps
+/// working (the device drives IN transfers). This explains the observed
+/// shape (unidirectional, survives port close/reopen and process exit, only
+/// re-enumeration clears it) but is NOT confirmed at the kernel level; do
+/// not treat it as fact.
 #[derive(Debug)]
 pub struct SendTimedOut {
     pub timeout: Duration,
@@ -98,11 +131,10 @@ impl std::fmt::Display for SendTimedOut {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "serial send timed out after {:?} (device stopped accepting bytes on the transmit \
-             path -- likely a blocked tcdrain(2) against a stale handle left behind by a \
-             connect-triggered USB re-enumeration; see SEND_TIMEOUT's doc comment in \
-             transport.rs)",
-            self.timeout
+            "serial send timed out after {:?} (confirmed HOST-side USB/cdc_acm wedge -- a \
+             device-side reset does NOT clear this, see docs/provisioning-connect-\
+             verification-kit.md for the hardware evidence; recovery: {})",
+            self.timeout, HOST_REENUM_GUIDANCE
         )
     }
 }
@@ -116,16 +148,25 @@ impl std::error::Error for SendTimedOut {}
 /// that thread with `SEND_TIMEOUT`, without requiring the port itself to be
 /// killable — POSIX gives no way to interrupt a thread blocked in
 /// `tcdrain(2)` from another thread. On a timeout, the spawned thread is
-/// simply abandoned (never joined): it keeps holding the mutex for as long
-/// as the underlying `tcdrain` stays blocked, which means any *later* call
-/// on this same `SerialTransport` (another `send`, a `recv`, `flush_input`)
-/// will itself block trying to acquire the lock. This is intentional and
-/// harmless in practice: `host/src/main.rs` is a one-shot-per-invocation CLI
-/// (see its `fn main` doc comment) — a `send` timeout error propagates
-/// straight up through `Session` and out of `main`, and the process exits
-/// before any further transport call could be attempted.
+/// simply abandoned (never joined): it keeps holding the mutex (and the
+/// underlying file descriptor) for as long as the underlying `tcdrain` stays
+/// blocked, which for the confirmed host-side USB/cdc_acm wedge (see
+/// `SendTimedOut`'s doc comment) is forever — only host-side re-enumeration
+/// clears it, and that invalidates the descriptor rather than unblocking the
+/// syscall. `poisoned` (round 8, `meshcadet-connect-wedge-round8-host-usb-
+/// endpoint-state` — FIXES the descriptor leak round 7 left unaddressed) is
+/// what stops that from stranding the port silently: once `send` times out,
+/// `poisoned` is set, and every later call on THIS `SerialTransport` (another
+/// `send`, a `recv`, `flush_input`) checks it first and fails fast instead of
+/// blocking forever on a mutex the abandoned thread will never release —
+/// without this, `recv`/`flush_input` in particular would hang with no
+/// timeout at all, silently, which defeats the entire point of `send` being
+/// "bounded" in the first place. Recovery is never in-process (see
+/// `HOST_REENUM_GUIDANCE`): the caller must re-enumerate the device at the
+/// host and open a fresh `SerialTransport`.
 pub struct SerialTransport {
     port: Arc<Mutex<Box<dyn serialport::SerialPort>>>,
+    poisoned: Arc<AtomicBool>,
 }
 
 impl SerialTransport {
@@ -166,8 +207,21 @@ impl SerialTransport {
             .map_err(|e| anyhow::anyhow!("cannot flush serial input on open: {}", e))?;
         Ok(Self {
             port: Arc::new(Mutex::new(port)),
+            poisoned: Arc::new(AtomicBool::new(false)),
         })
     }
+}
+
+/// The error every call on a `SerialTransport` returns once `poisoned` is
+/// set, instead of blocking forever on a mutex an abandoned `send_bounded`
+/// worker thread will never release. See `SerialTransport`'s doc comment.
+fn stranded_port_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "serial port already stranded by a previous timed-out send on this handle -- the \
+         abandoned worker thread is still holding it (POSIX gives no way to interrupt a \
+         blocked tcdrain(2)), so no further I/O on this handle can succeed; recovery: {}",
+        HOST_REENUM_GUIDANCE
+    )
 }
 
 /// Write `data` to `port` (`write_all` + `flush`) on a background thread,
@@ -214,16 +268,57 @@ where
     }
 }
 
+/// `send_bounded`, plus the descriptor-leak fix: check `poisoned` BEFORE
+/// touching `port` at all, and set it on a fresh timeout.
+///
+/// Round 7 abandoned the timed-out thread and left the mutex (and
+/// descriptor) held forever with nothing marking that fact — every *later*
+/// call on the same handle would spawn yet another thread and itself block
+/// on `port.lock()`, compounding the leak by one more stranded thread per
+/// call. Checking `poisoned` up front means a stranded handle fails fast
+/// (no lock attempt, no thread spawn) instead of silently piling up more
+/// abandoned threads behind the one that is actually wedged.
+///
+/// Generic over `W` for the same reason as `send_bounded` — see its doc
+/// comment; exercised directly by the tests below without a real
+/// `serialport::SerialPort`.
+fn send_bounded_guarded<W>(
+    port: &Arc<Mutex<W>>,
+    poisoned: &Arc<AtomicBool>,
+    data: &[u8],
+    timeout: Duration,
+) -> anyhow::Result<()>
+where
+    W: Write + Send + 'static,
+{
+    if poisoned.load(Ordering::SeqCst) {
+        return Err(stranded_port_error());
+    }
+    let result = send_bounded(port, data, timeout);
+    if let Err(e) = &result {
+        if e.downcast_ref::<SendTimedOut>().is_some() {
+            poisoned.store(true, Ordering::SeqCst);
+        }
+    }
+    result
+}
+
 impl Transport for SerialTransport {
     fn send(&mut self, data: &[u8]) -> anyhow::Result<()> {
         // `write_all` + `flush` (== `tcdrain(2)` on POSIX) run on a
         // background thread so this call can never block indefinitely — see
         // `SEND_TIMEOUT`'s doc comment for the device evidence that pins the
-        // hang here specifically.
-        send_bounded(&self.port, data, SEND_TIMEOUT)
+        // hang here specifically. `send_bounded_guarded` additionally marks
+        // `self.poisoned` on a timeout so later calls on this handle fail
+        // fast instead of leaking one more abandoned thread each — see
+        // `SerialTransport`'s doc comment.
+        send_bounded_guarded(&self.port, &self.poisoned, data, SEND_TIMEOUT)
     }
 
     fn recv(&mut self, buf: &mut [u8]) -> anyhow::Result<usize> {
+        if self.poisoned.load(Ordering::SeqCst) {
+            return Err(stranded_port_error());
+        }
         let mut guard = self
             .port
             .lock()
@@ -236,6 +331,9 @@ impl Transport for SerialTransport {
     }
 
     fn flush_input(&mut self) -> anyhow::Result<()> {
+        if self.poisoned.load(Ordering::SeqCst) {
+            return Err(stranded_port_error());
+        }
         let guard = self
             .port
             .lock()
@@ -327,5 +425,76 @@ mod tests {
         let result = send_bounded(&port, b"hello", Duration::from_secs(1));
         assert!(result.is_ok(), "{:?}", result);
         assert_eq!(port.lock().unwrap().written, b"hello");
+    }
+
+    /// Regression guard for the round-8 descriptor-leak fix: a `send`
+    /// timeout must not just report an error once — it must mark the handle
+    /// so every LATER call fails immediately instead of leaking one more
+    /// thread (each blocked forever on the poisoned mutex) per call.
+    #[test]
+    fn send_bounded_guarded_poisons_the_handle_on_timeout_and_later_calls_fail_fast() {
+        let written = Arc::new(AtomicUsize::new(0));
+        let port = Arc::new(Mutex::new(BlockingFlushWriter {
+            written: Arc::clone(&written),
+        }));
+        let poisoned = Arc::new(AtomicBool::new(false));
+
+        let first = send_bounded_guarded(&port, &poisoned, b"hello", Duration::from_millis(100));
+        assert!(first.is_err(), "first call must surface the timeout");
+        assert!(
+            poisoned.load(Ordering::SeqCst),
+            "a send timeout must poison the handle"
+        );
+
+        // A second call must NOT spawn another thread and block on the
+        // still-held mutex (the first thread is parked forever, holding the
+        // lock permanently) — it must fail immediately by checking
+        // `poisoned` up front. Bound this with a generous timeout the
+        // poisoned-fast-path has no business approaching; a regression back
+        // to "spawn unconditionally" would hang this test for the full
+        // duration instead.
+        let started = std::time::Instant::now();
+        let second = send_bounded_guarded(&port, &poisoned, b"world", Duration::from_secs(5));
+        let elapsed = started.elapsed();
+
+        assert!(second.is_err(), "a poisoned handle must keep failing");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "a poisoned handle must fail fast (no lock attempt, no thread spawn), took {:?}",
+            elapsed
+        );
+        let msg = second.unwrap_err().to_string();
+        assert!(
+            msg.contains("stranded"),
+            "poisoned-handle error should say the port is stranded, got: {}",
+            msg
+        );
+        // No further write reached the still-wedged writer from the second
+        // call — only the first attempt's "hello" (5 bytes) landed.
+        assert_eq!(written.load(Ordering::SeqCst), 5);
+    }
+
+    #[test]
+    fn send_bounded_guarded_does_not_poison_a_healthy_port() {
+        struct InstantWriter;
+        impl Write for InstantWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let port = Arc::new(Mutex::new(InstantWriter));
+        let poisoned = Arc::new(AtomicBool::new(false));
+
+        let result = send_bounded_guarded(&port, &poisoned, b"hello", Duration::from_secs(1));
+
+        assert!(result.is_ok(), "{:?}", result);
+        assert!(
+            !poisoned.load(Ordering::SeqCst),
+            "a successful send must not poison the handle"
+        );
     }
 }

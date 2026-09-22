@@ -41,7 +41,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::{ArgAction, Parser, Subcommand};
-use host::session::{run_with_reset_recovery, Session, RESET_SETTLE_DELAY};
+use host::session::Session;
 use host::transport::SerialTransport;
 
 // ── CLI shape ─────────────────────────────────────────────────────────────────
@@ -89,11 +89,6 @@ impl SecretBits {
     }
 }
 
-// `Clone` is required so `main`'s reset-recovery path (`run_with_reset_recovery`,
-// `host/src/session.rs`) can retry the SAME command once against a freshly
-// reopened port after a confirmed connect-triggered device reset (round 7,
-// `meshcadet-connect-wedge-round7-stale-handle-reenumeration`) without
-// consuming the original `Cli::parse()` value on the first attempt.
 #[derive(Subcommand, Debug, Clone)]
 enum Cmd {
     /// Query device provisioning status and identity.
@@ -579,31 +574,23 @@ fn main() -> anyhow::Result<()> {
         open_started.elapsed()
     );
 
-    // Round 7 (`meshcadet-connect-wedge-round7-stale-handle-reenumeration`,
-    // confirmed by kernel evidence): the `open()` above may itself have just
-    // triggered a USB-Serial-JTAG chip reset (DTR/RTS assertion) that
-    // re-enumerates the device out from under the handle just acquired. If
-    // the command below dies with the resulting `SendTimedOut`
-    // (`host/src/transport.rs`), `run_with_reset_recovery` reopens the port
-    // after the device settles and retries this exact command once more —
-    // see that function's doc comment (`host/src/session.rs`) for the full
-    // mechanism and why it stops after one retry.
-    let cmd = cli.cmd.clone();
-    run_with_reset_recovery(
-        Session::new(transport),
-        || SerialTransport::open(port, cli.baud),
-        RESET_SETTLE_DELAY,
-        move |session| run_command(session, cmd.clone()),
-    )
+    // Round 7 claimed a `SendTimedOut` here meant the `open()` above had
+    // itself triggered a USB re-enumeration, and retried by reopening the
+    // port in-process. Round 8 (`meshcadet-connect-wedge-round8-host-usb-
+    // endpoint-state`, kernel evidence: `journalctl -k` shows NO enumeration
+    // event across a web connect that reproduces this wedge) REFUTES that
+    // mechanism and retracts the reopen recovery: reopening the same
+    // `cdc_acm` node does not rebuild the kernel's per-device USB/cdc_acm
+    // state, so a same-process reopen cannot recover a wedged port — see
+    // `SendTimedOut`'s `Display` impl (`host/src/transport.rs`) for what
+    // actually clears it (host-side re-enumeration: unplug/replug, or
+    // `/sys/bus/usb/devices/<dev>/authorized`). No retry is attempted here;
+    // the error (with accurate recovery guidance) propagates straight out.
+    let mut session = Session::new(transport);
+    run_command(&mut session, cli.cmd)
 }
 
 /// Execute one already-parsed CLI subcommand against an open `session`.
-///
-/// Split out of `main` so `run_with_reset_recovery` (`host/src/session.rs`)
-/// can invoke it a second time — against a freshly reopened port — if the
-/// first attempt fails with the confirmed connect-triggered device reset;
-/// see that function's doc comment. Behaviorally identical to the inline
-/// `match` this replaced; nothing here changes for the non-reset path.
 fn run_command(session: &mut Session<SerialTransport>, cmd: Cmd) -> anyhow::Result<()> {
     match cmd {
         Cmd::Status => {

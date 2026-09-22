@@ -182,12 +182,44 @@ const DISCARD_PREVIEW_CAP = 512;
  * reset (`rst:0x15 (USB_UART_CHIP_RESET)`) — a plain firmware-level reboot
  * (watchdog, panic, `esp_restart()`) never emits it. Its presence in the
  * discarded (non-frame) traffic is therefore an unambiguous signal that the
- * device's USB endpoint was torn down and re-enumerated out from under this
- * session, distinct from an ordinary slow response. `#scanForRebootBanner`
- * counts occurrences (not just detects one) so a device that resets more
- * than once during a single stuck command can be reported accurately.
+ * DEVICE reset, distinct from an ordinary slow response.
+ * `#scanForRebootBanner` counts occurrences (not just detects one) so a
+ * device that resets more than once during a single stuck command can be
+ * reported accurately.
+ *
+ * RETRACTED (round 8, `meshcadet-connect-wedge-round8-host-usb-endpoint-
+ * state`, hardware evidence): this banner does NOT mean the device
+ * "re-enumerated out from under this session" — `journalctl -k` across a
+ * reproducing connect shows NO USB enumeration event at all; the session
+ * survives the device's self-reset unchanged from the host's point of view.
+ * What actually breaks host->device delivery, and SURVIVES this reset, is
+ * the HOST's own per-device USB/cdc_acm state — see `HOST_WEDGE_GUIDANCE`.
  */
 const REBOOT_BANNER = "ESP-ROM:esp32s3";
+
+/**
+ * Recovery guidance appended to a timeout/write-stall message once a device
+ * reset has been observed this command (`#rebootCount > 0`) — CONFIRMED
+ * (round 8, `meshcadet-connect-wedge-round8-host-usb-endpoint-state`,
+ * hardware evidence, `docs/provisioning-connect-verification-kit.md`): the
+ * broken state lives in the HOST's per-device USB/cdc_acm state and
+ * SURVIVES a full device-side chip reset, so the device rebooting is not
+ * itself the fix and does not mean the wedge is about to clear on its own.
+ *
+ * RETRACTS round 7's "reconnect to continue": a browser-side `connect()` —
+ * closing and reopening the SAME Web Serial port — does not rebuild the
+ * host kernel's endpoint state, exactly as reopening the port in the host
+ * CLI does not (see `host/src/transport.rs`'s `SerialTransport` doc
+ * comment). Web Serial exposes no primitive to force host-side
+ * re-enumeration (no equivalent of unplug/replug or
+ * `/sys/bus/usb/devices/<dev>/authorized`) — so the only thing this page
+ * can honestly tell the user is the PHYSICAL action that has been observed
+ * to work.
+ */
+const HOST_WEDGE_GUIDANCE =
+  "A device-side reset does not clear this -- the failure lives in the HOST's USB/cdc_acm " +
+  "state, and Web Serial exposes no way for this page to force host-side re-enumeration. " +
+  "Unplug and replug the USB cable, then click Connect again.";
 
 /**
  * Thrown when the device answers a command with `RSP_ERROR`.
@@ -334,10 +366,11 @@ export class ProvisionerSession {
    * alongside `#cumulativeBytesThisCommand`/`#discardPreview`, never
    * cleared per-attempt (a device that resets on every retry must still be
    * reported as resetting more than once). `#timeoutMessage` surfaces this
-   * as "device rebooted N times during this command" plus an actionable
-   * "reconnect to continue" once it is greater than zero, so a connect-
-   * triggered reset (round 7) reads as what it is instead of a generic
-   * frame timeout.
+   * as "device rebooted N times during this command" plus `HOST_WEDGE_GUIDANCE`
+   * once it is greater than zero, so a connect-triggered reset reads as what
+   * it is instead of a generic frame timeout — see `HOST_WEDGE_GUIDANCE`'s
+   * doc comment for why this is no longer "reconnect to continue" (round 7's
+   * retracted claim).
    */
   #rebootCount = 0;
   /**
@@ -1027,29 +1060,32 @@ export class ProvisionerSession {
   /**
    * Write one frame to the port. Unlike the RECEIVE side (bounded by
    * `RETRY_ATTEMPT_MS`/`RETRY_TOTAL_MS`/`FRAME_TIMEOUT_MS` throughout this
-   * class), `writer.write()` itself was, until this mission, a bare
+   * class), `writer.write()` itself was, until an earlier mission, a bare
    * `await` with no bound at all — a wedged writable stream (a dead link
    * for any reason, e.g. a reset in flight — see `connect()`'s doc comment)
    * hung here forever, with `#sendRecvWithRetry`'s loop never even reached
    * its own `#recvUntilExpected` call, let alone its retry/deadline logic.
-   * Bounding it alone would not have been enough either: `#sendRecvWithRetry`
-   * calls this OUTSIDE its `try`/`catch`
-   * (see that method's doc comment), so whatever this throws propagates
-   * immediately — a caught-and-retried write timeout would just re-enter
-   * this same stall on the next attempt, burning the retry budget one
-   * doomed write at a time for no benefit.
    *
-   * So a `writer.write()` that doesn't settle within
-   * `UNBOUNDED_CALL_TIMEOUT_MS`, or that rejects outright (the stream has
-   * errored — e.g. the device vanishing mid-write), is treated as fatal
-   * immediately: same `#fatalError` latch `#readLoop`'s catch already uses
-   * for a dead read side (see that field's doc comment), just discovered
-   * from the write side instead. Every current and future waiter is
-   * rejected with a "write stalled" cause distinct from a plain receive
-   * timeout ("no response" — see `#recvUntilExpected`/`#recvFrame`), so
-   * whichever of the two actually happened is what the caller — and the
-   * user — sees, per this mission's mandate that every failure name its
-   * own cause.
+   * A `writer.write()` that doesn't settle within `UNBOUNDED_CALL_TIMEOUT_MS`,
+   * or that rejects outright (the stream has errored — e.g. the device
+   * vanishing mid-write), is treated as fatal immediately: same
+   * `#fatalError` latch `#readLoop`'s catch already uses for a dead read
+   * side (see that field's doc comment), just discovered from the write
+   * side instead. Every current and future waiter is rejected with a
+   * "write stalled" cause distinct from a plain receive timeout ("no
+   * response" — see `#recvUntilExpected`/`#recvFrame`), so whichever of the
+   * two actually happened is what the caller — and the user — sees.
+   *
+   * `#sendRecvWithRetry` calls this INSIDE its own `try`/`catch` (round 8,
+   * `meshcadet-connect-wedge-round8-host-usb-endpoint-state` — an earlier
+   * round called it OUTSIDE the `try`, on the reasoning that a caught write
+   * stall would just be retried into the same doomed write; retrying was
+   * never actually implemented for this case, since `#fatalError` always
+   * short-circuits the retry branch either way, so the only effect of being
+   * outside `try` was that a write-stall error skipped the same
+   * reboot-count-aware enrichment (`HOST_WEDGE_GUIDANCE`) a receive timeout
+   * already gets from `#timeoutMessage()` — moving it inside closes that
+   * gap without changing the "no retry on a fatal error" behavior at all).
    */
   async #sendFrame(frameType, payload) {
     try {
@@ -1177,6 +1213,17 @@ export class ProvisionerSession {
    * (stop immediately instead of burning the rest of the 10s budget one
    * doomed attempt at a time) so the error the caller sees names the real
    * cause instead of a generic "timeout waiting for response frame".
+   *
+   * `#sendFrame` is called INSIDE the `try` below (round 8,
+   * `meshcadet-connect-wedge-round8-host-usb-endpoint-state` — see that
+   * method's own doc comment for why an earlier round had it outside): a
+   * fatal write-stall error still propagates on the FIRST catch (no retry —
+   * `this.#fatalError` is truthy the moment `#sendFrame` sets it, so the
+   * `throw err` below fires immediately, same as before), but now goes
+   * through the same reboot-count enrichment (`#withRebootContext`) a
+   * receive timeout already gets, instead of surfacing a bare "write
+   * stalled" with no context on a device that had already been observed
+   * resetting mid-command.
    */
   async #sendRecvWithRetry(frameType, payload, isExpected = () => true, label = "response") {
     this.#accBuf = new Uint8Array(0);
@@ -1190,12 +1237,12 @@ export class ProvisionerSession {
       if (this.#fatalError) {
         throw this.#fatalError;
       }
-      await this.#sendFrame(frameType, payload);
       try {
+        await this.#sendFrame(frameType, payload);
         return await this.#recvUntilExpected(this.#retryAttemptMs, isExpected, label);
       } catch (err) {
         if (this.#fatalError || Date.now() >= overallDeadline) {
-          throw err;
+          throw this.#withRebootContext(err);
         }
         // This attempt timed out but we still have overall budget — clear
         // the accumulated bytes so stale log noise from the device-side
@@ -1315,22 +1362,42 @@ export class ProvisionerSession {
    * when it could equally mean "the device said plenty, all of it discarded
    * as noise" — see `#bytesArrivedThisAttempt`'s own doc comment.
    *
-   * Round 7 (`meshcadet-connect-wedge-round7-stale-handle-reenumeration`,
-   * confirmed by kernel evidence): if `REBOOT_BANNER` was seen anywhere in
-   * the discarded traffic this command (`#rebootCount > 0`), this is no
-   * longer a generic frame timeout — the device's USB endpoint reset and
-   * re-enumerated out from under this session, which is unrecoverable
-   * without a fresh `connect()`. Append the count and an actionable next
-   * step rather than leaving the caller to infer it from a byte count.
+   * Round 7 found that if `REBOOT_BANNER` was seen anywhere in the
+   * discarded traffic this command (`#rebootCount > 0`), this is no longer
+   * a generic frame timeout — the device actually reset mid-command. Round
+   * 8 (`meshcadet-connect-wedge-round8-host-usb-endpoint-state`, hardware
+   * evidence) RETRACTS round 7's "reconnect to continue" — see
+   * `HOST_WEDGE_GUIDANCE`'s doc comment for why a browser-side reconnect
+   * cannot clear this. `#withRebootContext` applies the identical
+   * enrichment to a write-stall error, so the two share one message shape.
    */
   #timeoutMessage() {
     this.#logDiscardedPreview();
     const base = `timeout waiting for response frame (${this.#bytesArrivedThisAttempt} bytes arrived this attempt, ${this.#accBuf.length} retained, ${this.#cumulativeBytesThisCommand} bytes arrived total this command)`;
-    if (this.#rebootCount === 0) {
-      return base;
+    return this.#withRebootContext(new Error(base)).message;
+  }
+
+  /**
+   * Append `HOST_WEDGE_GUIDANCE` plus the observed reboot count to `err`'s
+   * message, returning a NEW `Error` (never mutating `err` in place — `err`
+   * may be `#fatalError` itself, which `#rejectAllWaiters` has already
+   * handed to, or will hand to, every OTHER waiter with the SAME object;
+   * mutating it here would leak this one call site's enrichment onto every
+   * other caller's error too).
+   *
+   * A no-op (returns `err` unchanged) when no reboot has been observed this
+   * command (`#rebootCount === 0` — nothing to report) or when `err`'s
+   * message already carries `HOST_WEDGE_GUIDANCE` (it came from
+   * `#timeoutMessage()`, which just applied this same enrichment itself —
+   * avoids double-appending when `#sendRecvWithRetry`'s catch wraps an
+   * error that already went through it).
+   */
+  #withRebootContext(err) {
+    if (this.#rebootCount === 0 || err.message.includes(HOST_WEDGE_GUIDANCE)) {
+      return err;
     }
     const times = this.#rebootCount === 1 ? "1 time" : `${this.#rebootCount} times`;
-    return `${base} — device rebooted ${times} during this command; the device reset on connect — reconnect to continue.`;
+    return new Error(`${err.message} — device rebooted ${times} during this command. ${HOST_WEDGE_GUIDANCE}`);
   }
 
   /**

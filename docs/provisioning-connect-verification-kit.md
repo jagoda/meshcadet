@@ -1,12 +1,21 @@
 # Provisioning connect/reboot/CLI-hang — device verification kit
 
-**ROOT CAUSE CONFIRMED, 2026-09-22 (round 7) — see "Update, 2026-09-22
-(round 7)" below before reading anything earlier in this file as current.**
-Everything above that section is the chronological record of six rounds of
+**HOST-SIDE ROOT CAUSE CONFIRMED, 2026-09-22 (round 8, the campaign's
+terminal round) — see "Update, 2026-09-22 (round 8)" below before reading
+anything earlier in this file as current.** Round 7's "the device
+re-enumerates" mechanism is REFUTED by direct kernel evidence
+(`journalctl -k` shows no enumeration event at all across a reproducing
+connect); the confirmed mechanism is that the broken state lives in the
+HOST's own per-device USB/cdc_acm state and survives a full device-side
+chip reset, cleared only by the host kernel re-enumerating the device
+(physical unplug/replug, or the `/sys/.../authorized` equivalent — never by
+reopening the same node, and never by a device-side reset alone). Round 7's
+reopen-based host recovery and its "reconnect to continue" browser message
+are both retracted as unworkable; round 8 replaces them with accurate
+recovery guidance and a fixed descriptor leak. Everything above the
+round-8 section is the chronological record of seven earlier rounds of
 diagnosis and is kept for history, but several of its findings are
-superseded and marked `RETRACTED` inline; the round-7 section is the
-current understanding, with client-side recovery landed for both the host
-CLI and the web provisioner.
+superseded and marked `RETRACTED` inline.
 
 **Maintainer-run, one sitting.** Self-contained: no external dependency, no
 queued follow-on. This kit diagnosed and fixed everything reachable from
@@ -355,7 +364,12 @@ this round is bound by:
   "Update, 2026-09-22 (round 7)" below.** The bytes are not unrelated
   chatter: they are the OLD USB interface's own final output during a
   connect-triggered teardown/re-enumeration, directly caused by this same
-  connect attempt.
+  connect attempt. **Refined, round 8:** "re-enumeration" is the wrong label
+  (see round 8's retractions) — the bytes are the device's own boot/reset
+  traffic (ROM banner etc.) from its confirmed DTR/RTS-triggered self-reset,
+  over a USB session that never actually re-enumerates. The
+  not-unrelated-chatter conclusion stands; only the re-enumeration framing
+  is retracted.
 
 **Caveat, same as round 4's fix and for the identical reason:** this
 container's `firmware/rust-toolchain.toml` pins the `esp` (Xtensa)
@@ -572,6 +586,36 @@ timeout 30 cat /dev/ttyACM0 | xxd
 
 ## Update, 2026-09-22 (round 7): ROOT CAUSE CONFIRMED by kernel evidence — the device's USB endpoint tears down and re-enumerates; every prior round diagnosed a symptom of that, not a separate defect
 
+**RETRACTED, 2026-09-22 (round 8) — see "Update, 2026-09-22 (round 8)"
+below.** This section's central claim — that the device's USB endpoint
+**re-enumerates** on a web connect, and that a fresh `open()` after it
+finishes is what clears the wedge — is REFUTED by a later, more careful
+maintainer-run test: `journalctl -k` monitored LIVE across a reproducing web
+connect shows NO enumeration event at all (no "New USB device found", no
+fresh `cdc_acm` attach) — the USB session survives the device's self-reset
+completely unchanged from the host's point of view. The `usb 3-2: New USB
+device found` / `cdc_acm 3-2:1.0` log lines quoted immediately below were
+real kernel output from this round's own session, but — per round 8's
+correction — do not correspond to a re-enumeration triggered BY the connect
+attempt that wedged the port. The enumeration line was produced by an
+**`esptool` reflash** run earlier in the same debugging session — a
+genuinely different action that also resets the ESP32-S3 and also produces
+USB kernel-log output, but does so by fully detaching and re-attaching the
+USB device, which a DTR/RTS-triggered in-place chip reset does not. Round 7
+never checked which of the two actions in its session had produced the log
+line it was looking at; it took the first enumeration event found near a
+failure and treated proximity as causation. Round 8's own decisive test
+held `journalctl -kf` across a LIVE reproduction of the specific connect
+under diagnosis, with no reflash in the same window, and found nothing.
+Kept below for the historical record, not as current fact — see round 8's
+RETRACTIONS below for the full list of what this section gets wrong and
+why. General lesson: a kernel-log event is not evidence of causation until
+you have confirmed which specific action produced it — two different
+actions in the same debugging session (a reflash and a connect attempt) can
+both reset the same chip and both produce superficially similar USB
+kernel-log output, and only reproducing the SPECIFIC action under
+diagnosis, in isolation, tells them apart.
+
 `meshcadet-connect-wedge-round7-stale-handle-reenumeration` reproduced the
 wedge with the host kernel's own log (`journalctl -k`) captured live across
 the failure. This is decisive, first-hand evidence — not source inference,
@@ -628,15 +672,25 @@ every observation this campaign has collected:
   "admin server thread started" at 2869ms after reset): the device was never
   the problem. It boots clean, every time; only the HOST's handle into it is
   broken.
-- **(e)** **"Clears only on a physical reset" — FALSE.** This is the
-  constraint that wrongly ruled out every host-side and browser-side
-  explanation from round 2 onward, and it does not hold: what actually
-  clears the wedge is a **fresh `open()` call issued after the device
-  finishes re-enumerating**, and every prior observation of "a physical
-  reset fixed it" was followed by exactly that — a new process/tab opening a
-  new handle into the new interface. A physical reset was never the
-  mechanism of the fix; it was just the maintainer's only known way, until
-  now, to force a fresh open.
+- **(e)** **"Clears only on a physical reset" — FALSE.** **RETRACTED,
+  round 8 — this point is itself wrong, and round 8 RESTORES "physical
+  reset required" as a true, load-bearing observation.** It was correct
+  from round 2 onward; this round wrongly retracted it mid-session on the
+  strength of the (also retracted) re-enumeration claim above. What round 8
+  proves is more precise than either version: a **device-side** reset
+  (power-cycle, reset button, or the chip's own DTR/RTS-triggered self-reset)
+  does NOT clear the wedge on its own — the decisive test's step 4 shows the
+  wedge surviving a full device reboot to a healthy running state. What DOES
+  clear it is forcing the **host** to physically re-enumerate the device —
+  unplug/replug the USB cable (proven directly: the T-Deck stayed on
+  battery power and never rebooted across that unplug, yet host->device was
+  restored immediately) or the software equivalent
+  (`/sys/bus/usb/devices/<dev>/authorized`, never tried live but implied by
+  the same host-side mechanism). A **fresh `open()` alone, with no physical
+  re-enumeration — round 7's actual claim here — does NOT clear it**: this
+  is exactly what round 8's reopen-recovery removal (see below) is
+  grounded in, and what the decisive test's step 3 independently confirms
+  ("a SECOND browser connect with NO reset at all... ALSO fails").
 - **(f)** "It used to work" with no discoverable regression window: no
   `meshcadet` commit is or was ever required to explain this. Whether the
   wedge fires turns on kernel/Chromium USB re-enumeration timing and
@@ -689,6 +743,16 @@ the device side is deliberately not touched):**
   the new handle. This recovers from the confirmed failure automatically
   instead of merely reporting it; see `host/src/session.rs`'s doc comment on
   `run_with_reset_recovery` for the full mechanism and its unit tests.
+  **RETRACTED, round 8 — `run_with_reset_recovery` and `RESET_SETTLE_DELAY`
+  have been REMOVED entirely, not repaired.** Reopening the same `cdc_acm`
+  node cannot rebuild the kernel's per-device endpoint state (there is no
+  re-enumeration for a reopen to "catch up to" — round 8 proves none
+  occurs), so this recovery could never have worked; worse, the abandoned
+  `send_bounded` worker thread from the ORIGINAL timeout still held the
+  port's file descriptor exclusively (`TIOCEXCL`) when the reopen ran,
+  observed directly as `cannot open /dev/ttyACM0: Device or resource busy`.
+  See "Update, 2026-09-22 (round 8)" below for the replacement (accurate
+  recovery guidance + a poisoned-handle fix for the descriptor leak).
 - `site/provisioner/session.js` — the ESP-IDF ROM banner (`ESP-ROM:esp32s3`)
   is unmistakable in the discarded (non-frame) traffic on a genuine reset;
   `#scanForRebootBanner` counts its occurrences, and a resulting timeout
@@ -699,6 +763,13 @@ the device side is deliberately not touched):**
   host CLI does (Web Serial gives no equivalent of "reopen this exact port
   without a fresh user gesture" — `requestPort()` requires one), so the
   actionable message IS this side's fix.
+  **RETRACTED, round 8 — "reconnect to continue" is wrong and has been
+  replaced.** A browser-side reconnect is exactly the same "reopen the same
+  node" action just retracted above for the host CLI, and fails for the
+  identical reason: it cannot force host-side re-enumeration. The message
+  now names the accurate recovery action and honestly states that Web
+  Serial exposes no way for the page to perform it itself — see "Update,
+  2026-09-22 (round 8)" below.
 - `site/provisioner/session.js`'s `#logDiscardedPreview` now uses
   `console.warn`, not `console.debug` — six rounds of this campaign carried
   this exact diagnostic dump and nobody read it, because Chrome's console
@@ -767,6 +838,235 @@ USB-UART-bridge board can) than anything `firmware/` can express. The
 client-side recovery landed this round (reopen-and-retry on the host,
 count-and-report on the browser) should be treated as the durable mitigation
 for THIS chip, not a stopgap awaiting a firmware patch that may not exist.
+
+**Confirmed still valid, round 8 (2026-09-22) — carried forward, not
+retracted.** This subsection's register-level finding (no
+`USB_SERIAL_JTAG_CHIP_RST_REG`/`..._CHIP_RST_DIS` bit exists in the ESP32-S3
+peripheral, unlike the ESP32-C6) is about the DEVICE side of the mechanism —
+whether the chip resetting on a DTR/RTS transition can be prevented — which
+round 8's hardware test never touched or contradicted; the device DOES
+reset on a host DTR/RTS transition, exactly as this section establishes,
+and that observation is unretracted. What round 8 retracts is a DIFFERENT,
+downstream claim: that the device's reset causes the HOST to re-enumerate
+(see "Update, 2026-09-22 (round 8)" below) — the device-side trigger this
+FIRMWARE section is about, and the host-side consequence round 7
+mis-diagnosed, are two different links in the chain. Independent
+community-sourced corroboration gathered this round (not a primary source,
+included for completeness, not as the basis of the conclusion above): an
+ESP32 forum discussion of ESP32-S3 vs. C6/H2 auto-reset notes "later
+versions of the USB-Serial-JTAG peripheral (the C6, and iirc H2) have a
+function that can [disable RTS-as-reset], but the S3 doesn't" — consistent
+with the register-level absence found directly in source above — and a
+live `espressif/esp-idf` issue (#13946) documents that the ONLY other
+control surface, the `DIS_USB_SERIAL_JTAG`/`DIS_USB_JTAG` eFuses, disables
+the peripheral **permanently and irreversibly**, and doing so on a board
+with no secondary flash/debug path (this board's situation, unconfirmed
+but likely — the T-Deck Plus exposes a single USB-C port) has been reported
+to brick the device with no recovery. Burning that eFuse is not a safe
+recommendation for this hardware and is explicitly NOT proposed here. Round
+8's own firmware scope is therefore: reconfirm this finding still holds
+(it does), make no firmware change (there remains no safe one to make), and
+stop pointing at "reopen after re-enumeration" as the workaround, since
+round 8 disproves that a reopen — of either kind — is what clears the
+wedge in the first place.
+
+## Update, 2026-09-22 (round 8, the campaign's terminal round): HOST-SIDE root cause confirmed by a decisive unplug/replug test — round 7's re-enumeration mechanism is refuted, the actual fix ships client-side, firmware stays untouched
+
+`meshcadet-connect-wedge-round8-host-usb-endpoint-state` ran a maintainer
+hardware session built around one decisive test, after round 7's kernel-log
+evidence turned out to have been mis-attributed (see the retraction inline
+in the round-7 section above). Five steps, each building on the last:
+
+1. **Clean baseline.** Power cycle, nothing else touching the port ->
+   `cargo run -- --port /dev/ttyACM0 status` SUCCEEDS, full status
+   returned, port opened in 886us. The firmware RX path, `admin_server`,
+   and the `usb_serial_jtag` driver ring are all fine — this campaign was
+   never chasing a device-side defect.
+2. **The trigger.** A web-provisioner connect -> Chromium's `open()`
+   asserts DTR/RTS, the ESP32-S3 resets itself (ROM prints `rst:0x15
+   (USB_UART_CHIP_RESET),boot:0x8 (SPI_FAST_FLASH_BOOT)`), and
+   host->device delivery is dead from that point on. Unretracted from round
+   7 — this device-side reset genuinely happens, confirmed directly, and
+   the FIRMWARE section above (carried forward from round 7) explains why
+   it cannot currently be prevented on this SoC.
+3. **The reset is a trigger, not the failure itself.** A SECOND browser
+   connect, with NO reset at all this time (reboot counter reports 0,
+   device uptime continuously 100079->102619ms, LoRa TX/RX and NVS all
+   working), ALSO fails. If the reset itself were the failure, a
+   reset-free connect attempt should succeed — it doesn't, so whatever
+   broke persists independently of any further reset.
+4. **The broken state survives a full chip reset.** The device rebooted
+   itself in step 2 and reached `admin_server`'s "admin server thread
+   started" at 2869ms — firmware, driver, ring buffer, and every peripheral
+   register all reinitialize on a chip reset — yet host->device stayed
+   dead. This rules out EVERY device-side candidate this campaign has ever
+   proposed: there is nothing left on the device for a reset to fail to
+   clear.
+5. **DECISIVE.** With the wedge active, **unplugging and replugging the
+   USB cable restores host->device immediately.** The T-Deck runs on its
+   battery (charging, 4900mV) — it never lost power and never rebooted
+   across that unplug. The only thing that changed was the **host kernel**
+   tearing down and rebuilding `cdc_acm`.
+
+### CONFIRMED CONCLUSION
+
+The failure state lives in the **HOST's** per-device USB/cdc_acm state,
+and is cleared only by kernel re-enumeration (physical unplug/replug, or
+the software equivalent, `/sys/bus/usb/devices/<dev>/authorized` toggled
+0 then 1). It is NOT the device, and it is NOT cleared by any device-side
+action (power-cycle, reset button, or the chip's own self-reset) — see the
+restored point (e) in the round-7 section above.
+
+### NOT CONFIRMED — labeled hypothesis, not fact
+
+The PRECISE host-side kernel mechanism was not directly instrumented this
+round (no `usbmon`/URB-level trace was captured — the unplug/replug test
+proves WHICH MACHINE holds the broken state, not WHICH state). The leading
+candidate: an **OUT-endpoint data-toggle/sequence desync**. The device-side
+reset reinitializes its own endpoints (FIFOs cleared, DATA0/DATA1 toggle
+zeroed), while the host's `cdc_acm` driver retains whatever toggle state it
+had before the reset — so every host->device packet the kernel sends after
+that point carries a toggle bit the device's freshly-reset endpoint no
+longer expects, and gets silently discarded (or NAK'd/ignored) forever.
+This explains every observed shape:
+- **Unidirectional** — device->host keeps working because the device
+  drives IN transfers and generates its own toggle sequence fresh each
+  time; only the HOST-driven OUT direction inherits stale host-side state.
+- **Survives port close/reopen and process exit** — the toggle state lives
+  in the kernel's `cdc_acm`/USB core per-endpoint structures, not in any
+  userspace file descriptor; closing and reopening the character device
+  node does not touch it.
+- **Only re-enumeration clears it** — tearing down and re-creating the USB
+  interface (which unplug/replug forces) is the only kernel-level operation
+  that resets the host's own recorded toggle state back to a value that
+  matches the device's freshly-zeroed one.
+
+This is a labeled hypothesis, presented as the leading candidate, not as
+confirmed fact. A future round with `usbmon`/`wireshark`-usb capture across
+a reproducing wedge would be the direct test (watch for a host OUT packet's
+toggle bit relative to the device's post-reset expectation, and/or a
+device-side NAK/stall response to it).
+
+### RETRACTIONS (against round 7's committed artifacts, all corrected this round)
+
+- **(a)** `host/src/transport.rs`'s `SEND_TIMEOUT` doc comment and
+  `SendTimedOut`'s runtime error string asserted "a stale handle left
+  behind by a connect-triggered USB re-enumeration" and called it
+  "confirmed". *Retracted and corrected* — both now state the confirmed
+  host-side localization and the labeled (unconfirmed) toggle-desync
+  hypothesis, and the error string tells the user the action that actually
+  works instead. This was the worst-placed retraction of the three source
+  artifacts: it was user-facing, printed directly to anyone who hit the
+  wedge from the CLI.
+- **(b)** The reopen-based recovery this same type advertised (`main.rs`'s
+  `run_with_reset_recovery` calling `SerialTransport::open` again after a
+  `SendTimedOut`) **could not work and has been removed, not repaired**:
+  `send_bounded` (`host/src/transport.rs`) spawns a thread holding the
+  `Arc<Mutex<port>>` and blocks it in `tcdrain` forever on a genuine wedge;
+  on timeout the main thread abandons that thread while it STILL holds the
+  mutex and the file descriptor, so `serialport`'s `TIOCEXCL` makes the
+  in-process retry open fail — observed directly as `cannot open
+  /dev/ttyACM0: Device or resource busy`. And even a successful reopen
+  would not have helped: reopening the same `cdc_acm` endpoint does not
+  rebuild the kernel's endpoint state (see the CONFIRMED CONCLUSION above).
+  Replaced with: accurate guidance (unplug/replug, or
+  `/sys/bus/usb/devices/<dev>/authorized`) in `SendTimedOut`'s message, and
+  a fix for the descriptor-leak half of this bug — a timed-out `send` now
+  poisons the `SerialTransport` (an `AtomicBool`, checked before every
+  later `send`/`recv`/`flush_input` on the same handle) so a stranded port
+  fails FAST instead of leaking one more thread — permanently blocked on
+  the same wedged mutex — per subsequent call. Regression tests:
+  `send_bounded_guarded_poisons_the_handle_on_timeout_and_later_calls_fail_fast`,
+  `send_bounded_guarded_does_not_poison_a_healthy_port`
+  (`host/src/transport.rs`).
+- **(c)** This document's own round-7 section asserted the same refuted
+  re-enumeration mechanism as fact, and its "physical reset required"
+  retraction (point (e)) was itself wrong. *Both corrected inline, in
+  place, above* — not rewritten from scratch, so the historical record of
+  what was believed and when stays intact; see the `RETRACTED, round 8`
+  annotations on the round-7 section.
+- **(d)** `site/provisioner/session.js`: `REBOOT_BANNER`'s doc comment
+  claimed the ROM banner's presence meant the device "re-enumerated out
+  from under this session", and `#timeoutMessage`'s reboot-count message
+  told the user to "reconnect to continue" — both wrong for the same
+  reason as (b)/(a): a browser-side reconnect is exactly the same "reopen
+  the same node" action, and cannot force host-side re-enumeration any
+  more than the host CLI's retracted reopen could. *Retracted and
+  corrected* — both now point at `HOST_WEDGE_GUIDANCE`: the accurate,
+  physical recovery action, with an honest statement that Web Serial
+  exposes no way for the page to perform the equivalent of
+  `/sys/.../authorized` itself (see "Web Serial limitation" below).
+
+### Also fixed this round: `#sendFrame` outside `#sendRecvWithRetry`'s `try`
+
+`site/provisioner/session.js:1193` awaited `#sendFrame` OUTSIDE the
+`try` block starting at line 1194, so a bounded-send (write-stall) timeout
+escaped `#sendRecvWithRetry` without ever reaching the same reboot-count
+enrichment a receive timeout already got from `#timeoutMessage()` — a write
+stall after an already-observed device reboot surfaced as a bare "write
+stalled" with no context, instead of naming the reboot count and the
+accurate recovery action. Fixed by moving the call inside the `try`; no
+retry behavior changes (`#fatalError` still short-circuits immediately —
+see `#sendFrame`'s and `#sendRecvWithRetry`'s doc comments for why retrying
+a write stall was never going to help regardless of which side of the
+`try` it sat on). Regression test:
+`writeStallAfterObservedRebootReportsRebootContext`
+(`site/provisioner/session.smoke.test.mjs`).
+
+### Web Serial limitation — recorded honestly, not buried
+
+Web Serial exposes **no primitive equivalent to
+`/sys/bus/usb/devices/<dev>/authorized`** or a physical unplug/replug —
+there is no API surface for a page to ask the browser (let alone the OS)
+to force host-side re-enumeration of an already-open serial device. This
+means: if a future attempt to prevent the ESP32-S3's DTR/RTS-triggered
+self-reset in firmware also fails (see the FIRMWARE section above — it
+already has, for this round), **the browser provisioner may be
+structurally unable to recover from this wedge on this board at all**,
+short of asking the user to physically unplug and replug the cable
+themselves. This is a real product limitation, not a bug this codebase can
+fix — `HOST_WEDGE_GUIDANCE` (`site/provisioner/session.js`) says exactly
+this to the user rather than implying a "Reconnect" button click will do
+it.
+
+### Acceptance criteria, walked
+
+1. **No committed artifact or error string still asserts the refuted
+   re-enumeration/stale-handle mechanism.** ✓ — `host/src/transport.rs`
+   (`SEND_TIMEOUT`/`SendTimedOut` doc comments + runtime message),
+   `site/provisioner/session.js` (`REBOOT_BANNER` doc comment,
+   `#timeoutMessage`'s reconnect claim), and this kit's round-7 section
+   (retraction markers added in place) all corrected. Grepped for
+   `re-enumerat` / `reenumerat` / `stale handle` / `reconnect to continue`
+   across `host/src`, `site/provisioner`, and `docs/` after editing — the
+   only remaining hits are inside retraction markers explicitly labeling
+   the claim as refuted, never asserting it as current fact.
+2. **The reopen recovery is removed and the `send_bounded` descriptor leak
+   is fixed, with a test.** ✓ — `run_with_reset_recovery`/
+   `RESET_SETTLE_DELAY` deleted entirely from `host/src/session.rs` and
+   `host/src/main.rs`; `SerialTransport` poisoning added to
+   `host/src/transport.rs` with two new unit tests (see retraction (b)
+   above). `cargo test -p host`: 76 (lib) + 73 (integration) + 5 (room
+   dispatch) passed.
+3. **The CLI's failure message tells the user the action that actually
+   works.** ✓ — `SendTimedOut`'s `Display` impl now embeds
+   `HOST_REENUM_GUIDANCE` (unplug/replug, or the `/sys/.../authorized`
+   equivalent; explicitly states a device-side reset alone does NOT clear
+   it and simply re-running the command will NOT help).
+4. **The kit records the confirmed host-side localization, the labeled
+   mechanism hypothesis, the restored physical-reset observation, and the
+   Web Serial limitation.** ✓ — all four are this section, above.
+5. **Any firmware change is minimal and explicitly marked
+   compile-unverified.** ✓ vacuously — no firmware change was made. The
+   FIRMWARE section (carried forward from round 7, reconfirmed above) shows
+   there is no known safe ESP-IDF-level change to make on the ESP32-S3
+   specifically; the only other control surface (`DIS_USB_SERIAL_JTAG`
+   eFuse) is a permanent, irreversible peripheral disable with documented
+   real-world bricking risk on boards with no secondary flash path, which
+   is not a responsible recommendation for this hardware. Writing an
+   unbuildable or unsafe "minimal change" just to satisfy this criterion's
+   letter would repeat exactly the pattern (landing an unverified guess)
+   this campaign has spent multiple rounds correcting for.
 
 ## What this fix found and addressed (source + host-testable surface only)
 
@@ -1126,22 +1426,43 @@ round 6 device predicate (only if the wedge reproduces — see "Update,
     the first time six rounds of this investigation has actually looked at
     the content of that traffic — do not discard this)
 
-round 7 confirmed-mechanism verification (see "Update, 2026-09-22 (round 7)"
-  above — the recovery paths below should now make the round-5/round-6
-  predicates above moot; run this section instead of physically resetting
-  the device):
-  step 3 (host CLI), on a reproduced wedge: did it print the
-    "host CLI: ... — this matches the confirmed connect-triggered device
-    reset ... reopening and retrying the command once" message and then
-    SUCCEED on the retried attempt, with no physical reset? yes | no —
-    if no, paste the exact final error
-  step 1 (web provisioner), on a reproduced wedge: did the timeout message
-    include "device rebooted N times during this command" and "the device
-    reset on connect — reconnect to continue"? yes | no — if yes, what was
-    N? <N>
-  did `console.warn`'s discarded-bytes hex dump (promoted from
-    `console.debug` this round) appear in the browser devtools console at
-    its DEFAULT verbosity level (no filter changes)? yes | no
+round 7 confirmed-mechanism verification — **SUPERSEDED, round 8: round 7's
+  reopen-and-retry mechanism was removed (see "Update, 2026-09-22 (round 8)"
+  above) because it could not work; the two predicates originally here
+  ("did it print ... reopening and retrying ... and SUCCEED" / "reconnect to
+  continue") describe behavior that no longer exists. Do not test for
+  either. Use the round 8 predicates directly below instead.**
+
+round 8 host-side verification (see "Update, 2026-09-22 (round 8)" above;
+  run WITHOUT physically resetting the device — the whole point of this
+  round is that a device-side reset does NOT clear the wedge, so a
+  physical reset here would corrupt the test):
+  step 3 (host CLI), on a reproduced wedge: does the error message name the
+    ACCURATE recovery action (unplug/replug the USB cable, or the
+    `/sys/.../authorized` equivalent) rather than claiming a re-enumeration
+    or offering to retry? yes | no — paste the exact error text either way
+  step 3 (host CLI), immediately after: does a SECOND invocation (same
+    process not required — a fresh `cargo run ... status`) ALSO fail with
+    the same error, confirming the wedge survives an in-process reopen and
+    is NOT cleared by simply re-running the command? yes | no
+  step 3 (host CLI) descriptor-leak check: after the timeout above, does
+    `lsof /dev/ttyACM0` (or `fuser`) show the ORIGINAL (now-exited) `cargo
+    run` process gone, i.e. no lingering exclusive hold once the process
+    exits? yes | no | not checked
+  step 1 (web provisioner), on a reproduced wedge: does the timeout message
+    name the reboot count AND state that Web Serial cannot force host-side
+    re-enumeration AND tell the user to unplug/replug the cable, rather than
+    "reconnect to continue"? yes | no — if yes, what was N? <N>
+  DECISIVE unplug/replug test (the actual round 8 finding — reproduce it
+    independently here): with the wedge active (host CLI failing per step 3
+    above), physically unplug and replug the USB cable, WITHOUT power-
+    cycling or resetting the device otherwise, then re-run `cargo run ...
+    status`. Does it now succeed? yes | no — this is the single strongest
+    confirmation or contradiction of this round's entire conclusion; if
+    "no", flag it loudly, everything above is wrong
+  did `console.warn`'s discarded-bytes hex dump appear in the browser
+    devtools console at its DEFAULT verbosity level (no filter changes)?
+    yes | no
 
 when did provisioning last definitely work (if known)? <date / "unknown">
 
