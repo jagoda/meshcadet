@@ -1,5 +1,19 @@
 # Provisioning connect/reboot/CLI-hang — device verification kit
 
+**ROOT CAUSE CONFIRMED, 2026-09-23 (round 11) — read "Update, 2026-09-23
+(round 11)" below before anything earlier in this file.** The campaign's
+actual defect is a device-confirmed `pthread` stack overflow in
+`admin_server` during `FRAME_QUERY_ADVERT` (an Ed25519 sign plus two NVS
+round-trips against an unmeasured, too-tight stack budget). Every earlier
+round (4 through 10) diagnosed a real but recoverable symptom that sat in
+front of this one on the connect path — the DTR/RTS reset, the host-side
+USB wedge it leaves behind, and a stale dev-flash bootloader — and clearing
+each in turn is what let a session finally survive long enough to reach
+the real crash. `rst:0x15 (USB_UART_CHIP_RESET)` and the bootloader/IDF
+skew are demoted to nuisance/build-hygiene respectively; round 8's
+unplug/replug guidance stays correct as a recovery action for a real, but
+non-root-cause, consequence.
+
 **Round 8's "terminal round" framing was premature — see "Update,
 2026-09-23 (round 10)" below.** Round 10 found and fixed a second,
 independent defect (the local dev-flash path was writing a stale,
@@ -925,6 +939,17 @@ the software equivalent, `/sys/bus/usb/devices/<dev>/authorized` toggled
 action (power-cycle, reset button, or the chip's own self-reset) — see the
 restored point (e) in the round-7 section above.
 
+**RE-SCOPED, round 11 (`admin-server-stack-overflow-fix`, 2026-09-23,
+device evidence) — this heading's "the campaign's terminal round" framing
+does not hold, but this section's own diagnosis and guidance DO.** This
+wedge is real, its localization (host, not device) is correct, and
+unplug/replug remains the right recovery action. What was wrong was
+treating it as *the reason the provisioner fails* — a session that clears
+this wedge and reaches `QUERY_STATUS` can still crash the device later, at
+`QUERY_ADVERT`, via a wholly separate, more severe defect (a firmware
+`pthread` stack overflow). See "Update, 2026-09-23 (round 11)" below for
+the actual root cause this campaign was chasing.
+
 ### NOT CONFIRMED — labeled hypothesis, not fact
 
 The PRECISE host-side kernel mechanism was not directly instrumented this
@@ -1149,6 +1174,267 @@ UNEXPLAINED — its reset reason has not yet been read — and this campaign
 has already landed refuted "confirmed" claims twice before (round 4, round
 7). Reading the mid-session reset reason is the natural next round if this
 fix lands and the wedge persists; it is explicitly out of scope here.
+
+**RE-SCOPED, round 11 — the mid-session reset above IS now explained, and
+it is a THIRD, distinct defect, not a confirmation of round 10 closing
+anything.** See "Update, 2026-09-23 (round 11)" below.
+
+## Update, 2026-09-23 (round 11): ROOT CAUSE CONFIRMED by device evidence — `admin_server`'s `pthread` stack overflows during `QUERY_ADVERT`; the reset chased since round 6 was always a recoverable nuisance one layer up from the real defect
+
+`meshcadet-connect-wedge-admin-server-stack-overflow-fix` closes this
+campaign's real defect. Every prior round (4 through 10) diagnosed a real
+but recoverable symptom that sat IN FRONT OF this one on the connect path —
+the DTR/RTS reset (round 6/7/8), the host-side USB wedge it leaves behind
+(round 8), and the stale dev-flash bootloader (round 10) — and each was
+cleared or worked around in turn, which is exactly what let a browser
+session finally survive long enough to reach the actual crash.
+
+### THE DEFECT (device-confirmed, maintainer-run HIL evidence, 2026-09-23)
+
+A web-provisioner session got through `QUERY_STATUS` successfully — the
+host-side wedge was clear, the bootloader/app were IDF-matched — and then
+**crashed the device** during `QUERY_ADVERT` (the "share my card" action;
+browser-side call chain `site/provisioner/session.js:704` `queryAdvert` ->
+`renderCardUri` -> `site/provisioner/provisioner.js:532`):
+
+```
+***ERROR*** A stack overflow in task pthread has been detected.
+Backtrace: 0x4037823a:0x3fcc3bf0 0x4037c861:0x3fcc3c10 0x4037d53e:0x3fcc3c30
+0x4037e706:0x3fcc3cb0 0x4037d670:0x3fcc3ce0 0x4037d666:0x3b4c3f83 |<-CORRUPTED
+ELF file SHA256: 7c9382079
+Rebooting...
+```
+
+followed by a reboot whose reason is `rst:0xc (RTC_SW_CPU_RST)` — **not**
+`rst:0x15 (USB_UART_CHIP_RESET)`, the reset every round from 6 onward
+chased. This is a different failure mode entirely: a firmware-internal
+stack exhaustion, not a USB-peripheral self-reset.
+
+### MECHANISM (source-confirmed)
+
+`admin_server` is spawned with `.stack_size(12288)` (`firmware/src/
+main.rs:1766`, pre-fix), and its own boot-time high-water-mark sample
+showed 7196 B peak of 12288 B — **5092 B free** (observed in the
+maintainer's boot log). The `FRAME_QUERY_ADVERT` arm
+(`firmware/src/admin_server.rs:475-501`, pre-fix) then stacks, on top of
+that already-thin baseline: an on-stack `card_buf` (134 B —
+`MAX_ADVERT_CARD_LEN`, small on its own), an NVS read
+(`advert_ts_store::load_last_advert_ts`), an **Ed25519 sign**
+(`firmware_core::advert::handle_query_advert` — `curve25519-dalek` +
+SHA-512, a large call frame), and an NVS write
+(`advert_ts_store::save_last_advert_ts`). The signing call is the real
+pressure, not `card_buf` — exceeds the 5092 B margin, overflows.
+
+**Why this was never measured:** `crate::log_thread_stack_hwm` was sampled
+in exactly two places — at boot, before the frame loop
+(`admin_server.rs:250`, pre-fix), and immediately AFTER a frame is
+successfully handled (`admin_server.rs:341`, pre-fix). A frame that
+overflows mid-handler never reaches the second sample, so the worst-case
+path was structurally invisible to the only instrument watching it. The
+spawn site's own (now-superseded) comment conceded exactly this: "12 KiB is
+now generous headroom rather than a tight fit — kept at 12 KiB rather than
+trimmed back, since no HIL measurement of the new HWM exists yet to size a
+smaller budget from."
+
+**Why ten rounds missed it:** every earlier session died at or before
+`QUERY_STATUS` — the DTR reset (round 6/7), the bootloader/IDF skew and
+host wedge (round 8/10) — so the browser never reached `queryAdvert` until
+the flash path was cleaned up enough (round 10) for a session to get that
+far.
+
+### THE FIX
+
+1. **Raised `admin_server`'s stack budget 12288 -> 24576**
+   (`firmware/src/main.rs`'s spawn-site `.stack_size(...)` call) — doubled,
+   mirroring the identical-class fix already applied to the IDF main task
+   for its own identity+crypto init path
+   (`firmware/sdkconfig.defaults`'s `CONFIG_ESP_MAIN_TASK_STACK_SIZE`
+   32768 -> 49152, +50%); doubled rather than matching that ratio because no
+   HIL measurement of the QUERY_ADVERT-path HWM exists yet to size a
+   tighter number from.
+2. **`card_buf` moved off the stack** (heap-allocated, `Box<[u8]>`) — the
+   same remedy the `boot-pthread-stack-overflow-fix` mission already
+   applied to `ProvisionedConfig` and `config_store`'s blob buffers. Belt
+   and suspenders: at 134 B it was never the dominant cost (the Ed25519
+   sign is), but it matches the established pattern for this exact hazard
+   shape everywhere else in this thread.
+3. **A third `log_thread_stack_hwm` sample added inside the
+   `FRAME_QUERY_ADVERT` arm itself**, immediately after the sign/NVS call
+   completes — this is the instrumentation gap that hid the bug for ten
+   rounds, closed as part of the fix, not as an extra. `ADMIN_SERVER_STACK_B`
+   was promoted from a `run`-local `const` to a module-level one so both
+   `run` and `handle_frame`'s arm can reference the same value.
+4. **Every other `admin_server` handler arm audited** for the same shape (a
+   large on-stack buffer plus crypto plus an NVS write). Findings:
+   `EXPORT_HISTORY`'s per-entry buffer is `MAX_RSP_HISTORY_ENTRY_PAYLOAD + 1`
+   = 74 B with no crypto in its call graph; `ADD_CONTACT`/`DEL_CONTACT`/
+   `ADD_CHANNEL`/`DEL_CHANNEL`/`ADD_ROOM`/`DEL_ROOM` all persist through
+   `persist_or_rollback`/`persist_setting` -> `config_store::
+   save_provisioned_config`, whose own blob buffer is already
+   heap-allocated (the `boot-pthread-stack-overflow-fix` mission fixed
+   this) and none of these arms call into any signing/crypto path.
+   **`FRAME_QUERY_ADVERT` is the only handler that combines a large
+   on-stack-adjacent call frame (the Ed25519 sign) with an NVS write; no
+   other arm shares this hazard shape.** No further handler-arm changes
+   are warranted by this audit.
+
+**Compile-unverified.** This container has no Xtensa toolchain; the
+firmware change above (`firmware/src/main.rs`, `firmware/src/
+admin_server.rs`) could not be built or run here. It is minimal and
+syntactically conservative by design. A maintainer will build and flash
+from this branch to verify, and the new in-arm HWM sample will report the
+actual post-fix headroom on the first `QUERY_ADVERT` of that run.
+
+### RETRACTIONS AND RE-FRAMING
+
+- **(a) `rst:0x15 (USB_UART_CHIP_RESET)` demoted from root cause to
+  nuisance.** It is a real, recoverable consequence of Chromium asserting
+  DTR/RTS at `port.open()` (unretracted mechanism, rounds 6-8) — but it is
+  not, and was never, *the defect this campaign exists to find*. It
+  recurs, is recovered from automatically or by unplug/replug, and a
+  session that clears it can still crash later via the real defect above.
+  See the "RE-SCOPED, round 11" annotations on `host/src/transport.rs`'s
+  `HOST_REENUM_GUIDANCE` doc comment and `site/provisioner/session.js`'s
+  `HOST_WEDGE_GUIDANCE` doc comment.
+- **(b) Round 8's host-side USB/cdc_acm wedge stays CORRECT as a
+  diagnosis and as guidance** — unplug/replug remains the right recovery
+  action, and a device-side reset genuinely does not clear it. What
+  changes is the FRAME: it is a *consequence of any device reset*
+  (including the DTR/RTS one), not *the reason the provisioner fails
+  overall*. Clearing the wedge and reaching `QUERY_STATUS` was necessary
+  but not sufficient — the session could still crash later, at
+  `QUERY_ADVERT`, via a wholly separate defect. Re-framed in
+  `host/src/transport.rs` and `site/provisioner/session.js`'s guidance doc
+  comments (see (a) above); the runtime error strings themselves were
+  already accurately scoped to the specific error they report and did not
+  need changing.
+- **(c) The bootloader/IDF skew is DEMOTED to build hygiene only —
+  round 10's fix is real but does not touch this campaign's actual
+  defect.** The maintainer's decisive test used the web flasher's UPGRADE
+  path (app-only write at `0x10000`, `eraseAll: false`, per
+  `site/flash.js:229-236`) for BOTH the v0.6.0 and v0.7.0 comparison, so
+  the bootloader was espflash's own v5.5.1 bundled default and the device
+  stayed provisioned in BOTH runs — and **v0.6.0 worked with that same
+  "bad" bootloader.** The bootloader/IDF mismatch is therefore not, and
+  never was, load-bearing for this campaign's failure; round 10's fix
+  (matched IDF versions, `mc_hist` actually flashed) is still correct on
+  its own terms but must not be described as fixing the connect wedge.
+- **(d) A `git bisect` of `v0.6.0..v0.7.0` is NOT recommended.** This is
+  cumulative stack creep against an unmeasured budget (see MECHANISM
+  above), not a single culprit commit. Two independent, exhaustive source
+  passes over those 32 commits (this campaign's own record; see the
+  eliminations carried forward below) found nothing that touches USB or
+  the admin_server stack directly — a bisect would only ever land on
+  whichever commit happened to tip the unmeasured budget over the edge,
+  which is not the same thing as identifying a defect to revert. The fix
+  is to size and instrument the budget correctly (done above), not to find
+  and revert the commit that happened to exhaust it.
+- **(e) The DFS (dynamic frequency scaling) elimination stands, for a
+  stronger reason than previously stated.** `feat(power): ESP-IDF dynamic
+  frequency scaling` (`f433311`, 2026-08-25 01:27 UTC) and the idle-screen
+  feature it was bundled with in the earlier evaluation
+  (`0ce0f61`, 2026-08-24 01:47 UTC) both **postdate the `v0.7.0` tag
+  entirely** (`f3803c5`, 2026-08-22 10:43:33-04:00) — they are not even IN
+  the `v0.6.0..v0.7.0` window this campaign's regression lives in, so they
+  were never a candidate to begin with, independent of the earlier
+  clock-pinning/thread-separation argument (still true, but now
+  redundant). The maintainer's own DFS-elimination test (commenting out the
+  Rust call while `CONFIG_PM_ENABLE` stayed set in sdkconfig) was
+  incomplete for the same reason this note exists: it tested a
+  post-v0.7.0 feature against a defect that predates it.
+- **(f) Flash-parameter inconsistency — documented as an accepted gap,
+  not fixed.** Round 10's bootloader fix reports 80 MHz / clock div:1 in
+  its own boot banner (an ESP-IDF default; no explicit
+  `CONFIG_ESPTOOLPY_FLASHFREQ`/`FLASHMODE` override in
+  `firmware/sdkconfig.defaults`), while `espflash flash`'s app-image write
+  (step 1 of `firmware/scripts/flash-with-partition-table.sh`) patches the
+  app header with espflash's OWN CLI defaults (previously observed as
+  40 MHz / clock div:2), independent of the project's actual config.
+  Before round 10 both bootloader and app header came from espflash's own
+  bundled defaults and so were mutually consistent (if not
+  project-intended); fixing only the bootloader sector introduces this
+  mismatch fresh. Left undisturbed rather than patched blind — this
+  container has no hardware to confirm a `--flash-freq`/`--flash-mode`
+  CLI addition actually resolves it rather than just relocating the
+  mismatch, and no functional failure has been observed to trace to it.
+  See the comment added at `firmware/scripts/flash-with-partition-table.sh`'s
+  header for the full record; a future HIL round should close this with
+  the flag/value confirmed on real hardware.
+
+### ELIMINATIONS CARRIED FORWARD FROM PR #210 (closed unmerged, superseded by this branch)
+
+`meshcadet-connect-wedge-round10-followup` (PR #210) reached a bisect/
+no-flash-test recommendation this mission's Objective retracts (see (d)
+above) — but it also independently re-derived four eliminations whose
+value survives that conclusion change. Recorded here so closing #210 loses
+nothing:
+
+- **Elimination 1 — the provisioner page is not implicated.** The artifact
+  split (site vs firmware release) was already tested on hardware: the
+  CURRENT deployed page against OLD v0.6.0 firmware worked. Current page +
+  old firmware = works, so the regression was never client-side.
+- **Elimination 2 — screen-lock is not in the window.** `9f0a2d2` and
+  `3873c33` (2026-08-22 14:25/14:26) plus `56edde5` and `77401e5`
+  (2026-08-23) all land AFTER the v0.7.0 release commit `c6b6b0c`
+  (2026-08-22 14:35), and v0.7.0 is already broken. This eliminates the
+  whole feature by date, a stronger elimination than an earlier round's
+  wire-codec-divergence refutation alone.
+- **Elimination 3 — the `v0.6.0..v0.7.0` window contains nothing that can
+  reach USB.** Verified across two independent source passes:
+  `firmware/sdkconfig.defaults` byte-identical across the tags;
+  `firmware/Cargo.lock` changes are ONLY the three workspace crates' own
+  version strings (`ESP_IDF_VERSION = "v5.2.2"` unchanged);
+  `usb_serial_jtag_driver_install` unchanged in both tags;
+  `firmware/src/serial_console.rs` unchanged since its import commit;
+  `firmware/src/admin_server.rs`, `firmware/src/advert_ts_store.rs`,
+  `firmware-core/src/advert.rs`, and `protocol/src/provisioning.rs` are all
+  comment-only in range; `firmware-core/src/dispatcher.rs` changes are
+  TX-queue tagging/retry constants only; GPIO0/trackball untouched; no
+  `esp_restart` added (the only one is `main()`'s fatal-error handler,
+  which reports `SW_CPU_RESET`, not `0x15` or `0xc`); no reference to
+  native-USB GPIO19/20 in either tag. This is the evidence base for the
+  "no bisect" ruling in (d) above.
+- **Elimination 4 — device state is not the variable.** The maintainer used
+  the web flasher's UPGRADE path (`site/flash.js:229-236`, app-only at
+  `0x10000`, `eraseAll: false`) for BOTH the v0.6.0 and v0.7.0 tests, so
+  NVS was untouched and the device stayed provisioned and radio-active in
+  both. A "factory-fresh vs provisioned" hypothesis is already controlled
+  for and should not be re-raised.
+
+### CONFIDENCE DISCIPLINE
+
+The `pthread` stack-overflow crash during `QUERY_ADVERT`, its backtrace,
+and the `rst:0xc (RTC_SW_CPU_RST)` reboot reason are **device-confirmed**
+(maintainer-run HIL evidence, 2026-09-23). The precise attribution of the
+overflow to the Ed25519 sign specifically (rather than, say, the NVS calls
+alone) is **source-inferred**, not directly measured — the new in-arm
+`log_thread_stack_hwm` sample (added this round) is what will confirm the
+actual post-fix headroom once hardware is available, and the backtrace
+above can be decoded against a locally-built ELF (`ELF file SHA256:
+7c9382079`) for a fully mechanical confirmation of the crashing frame, as a
+follow-on once hardware is available.
+
+### Acceptance criteria, walked
+
+1. **`admin_server`'s stack budget is raised and `card_buf` is off the
+   stack.** ✓ — `firmware/src/main.rs`'s spawn site (12288 -> 24576),
+   `firmware/src/admin_server.rs`'s `FRAME_QUERY_ADVERT` arm (`card_buf`
+   now `Box<[u8]>`).
+2. **HWM is sampled on the `QUERY_ADVERT` path.** ✓ — new
+   `log_thread_stack_hwm` call inside the arm, after the sign/NVS call.
+3. **Other handler arms audited with findings reported.** ✓ — see THE FIX,
+   point 4, above.
+4. **The kit and user-facing strings demote `rst:0x15` and the bootloader
+   to their true roles, keep round 8's unplug guidance as a consequence,
+   and record why no bisect is warranted.** ✓ — this section plus the
+   `RE-SCOPED, round 11` annotations in `host/src/transport.rs` and
+   `site/provisioner/session.js`.
+5. **The firmware change is labelled compile-unverified.** ✓ — stated
+   above, in the source comments at both edit sites, and in the PR
+   description.
+6. **Pushed to the existing branch, no new PR.** ✓ — landed as an
+   additional commit on PR #211 (`jagoda/meshcadet`), not a new branch or
+   pull request.
 
 ## What this fix found and addressed (source + host-testable surface only)
 

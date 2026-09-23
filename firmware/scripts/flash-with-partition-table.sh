@@ -48,6 +48,25 @@
 # (copied out of the per-build-hash OUT_DIR into the crate's target/<triple>/<profile>/ dir on
 # every build — see esp-idf-sys build/native/cargo_driver.rs `copy_binaries_to_target_folder`),
 # so they always sit right next to the ELF cargo passes us.
+#
+# ACCEPTED INCONSISTENCY (flagged, not fixed, `admin-server-stack-overflow-fix` mission,
+# 2026-09-23 — see docs/provisioning-connect-verification-kit.md's round 11 section):
+# step 1's `espflash flash` patches the APP image header's flash_mode/flash_freq bytes with
+# espflash's OWN CLI defaults (previously observed as 40 MHz / clock div:2), independent of
+# this project's actual sdkconfig — while step 3's project bootloader.bin (esp-idf-sys-built,
+# no explicit CONFIG_ESPTOOLPY_FLASHFREQ/FLASHMODE override in firmware/sdkconfig.defaults, so
+# an ESP-IDF default applies) has been observed reporting 80 MHz / clock div:1 in its own boot
+# banner. Before round 10 both bootloader AND app header came from espflash's own bundled
+# defaults, so they were internally consistent (if not project-intended); round 10 fixing only
+# the bootloader sector introduces this header/bootloader mismatch. Left undisturbed rather
+# than patched blind: this container has no hardware to verify a `--flash-freq`/`--flash-mode`
+# CLI addition to the `espflash flash` call below actually resolves it (or that guessing the
+# "right" value wouldn't just move the mismatch), and getting it wrong risks the exact
+# unverified-guess-landed-as-fact pattern this campaign has already corrected for twice
+# (rounds 4 and 7). No functional failure has been observed to trace to this — the app boots
+# and runs correctly with the mismatched header — so it is recorded here as a known, accepted
+# build-hygiene gap for a future HIL round to close with the flag/value confirmed on real
+# hardware, not guessed from documentation alone.
 set -euo pipefail
 
 ELF="${1:?usage: flash-with-partition-table.sh <path-to-elf>}"

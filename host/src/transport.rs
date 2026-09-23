@@ -91,6 +91,19 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(3);
 /// question). This retracts round 7's guidance to simply reopen the port —
 /// reopening the same `cdc_acm` node does not rebuild the kernel's endpoint
 /// state and cannot recover a wedged handle.
+///
+/// RE-SCOPED, round 11 (`admin-server-stack-overflow-fix`, 2026-09-23,
+/// device evidence): this guidance clears a REAL, RECOVERABLE nuisance —
+/// the DTR/RTS-triggered device reset itself (`rst:0x15
+/// USB_UART_CHIP_RESET`) is not a defect, and the host-side wedge it leaves
+/// behind is exactly what this constant describes. But clearing it is NOT a
+/// guarantee the rest of a provisioning session will succeed: a
+/// device-confirmed `pthread` stack overflow in `admin_server` (a wholly
+/// separate, more severe defect — `firmware/src/admin_server.rs`'s
+/// `FRAME_QUERY_ADVERT` arm, see the kit's round 11 section) can still crash
+/// the device later in the SAME session, well after any host-side wedge is
+/// cleared. Do not read a clean unplug/replug as proof the session will now
+/// complete.
 const HOST_REENUM_GUIDANCE: &str = "unplug and replug the USB cable (or force host-side \
      re-enumeration by deauthorizing/reauthorizing the device node: \
      `echo 0 | sudo tee /sys/bus/usb/devices/<dev>/authorized` then `echo 1 | ...`) -- a \

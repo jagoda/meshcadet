@@ -215,6 +215,16 @@ const REBOOT_BANNER = "ESP-ROM:esp32s3";
  * `/sys/bus/usb/devices/<dev>/authorized`) — so the only thing this page
  * can honestly tell the user is the PHYSICAL action that has been observed
  * to work.
+ *
+ * RE-SCOPED, round 11 (`admin-server-stack-overflow-fix`, 2026-09-23, device
+ * evidence): the reset this guidance recovers from is a real but RECOVERABLE
+ * nuisance, not a defect — and clearing it does not guarantee the rest of a
+ * provisioning session will succeed. A device-confirmed `pthread` stack
+ * overflow in the device's `admin_server` (a separate, more severe defect —
+ * see `docs/provisioning-connect-verification-kit.md`'s round 11 section)
+ * can still crash the device later in the SAME session, during
+ * `queryAdvert`, well after any host-side wedge is cleared and `queryStatus`
+ * has already succeeded.
  */
 const HOST_WEDGE_GUIDANCE =
   "A device-side reset does not clear this -- the failure lives in the HOST's USB/cdc_acm " +
