@@ -497,9 +497,9 @@ trace family (rounds 4-5) as ordinary device log chatter, not a receive-side
 parsing defect.** TX (device→host, what the browser/host receive and parse)
 and RX (host→device) are independent paths on the device
 (`main.rs:663`/`main.rs:676` handle them as separate VFS RX/TX line-ending
-configs, and `admin_server`'s RX loop at `admin_server.rs:257-272` reads via
-`usb_serial_jtag_read_bytes` directly, entirely separate from anything the
-device transmits). If the wedge is on the TRANSMIT path — the host's bytes
+configs, and `admin_server`'s RX loop (`pub fn run`'s `if rx_len < RX_BUF_LEN`
+block) reads via `usb_serial_jtag_read_bytes` directly, entirely separate
+from anything the device transmits). If the wedge is on the TRANSMIT path — the host's bytes
 never reaching the device, not a bad device reply — then the device's own
 periodic log/telemetry output continues completely normally on TX regardless
 of the RX-side wedge, and the browser correctly parses zero provisioning
@@ -536,11 +536,12 @@ treatment rather than rediscovering the gap from scratch.
 **LEADING CANDIDATE for the device-side half of the mechanism — explicitly
 UNVERIFIED, not landed as a root-cause claim, and now source-REFUTED (see
 below) rather than confirmed:** `admin_server` writes every reply via
-`std::io::stdout()` (`admin_server.rs:230`, `send_frame` at
-`admin_server.rs:1298-1310`) into the ESP-IDF USB-Serial-JTAG driver's
-256-byte TX ring (`tx_buffer_size: 256`, `main.rs:647`), and `send_frame` is
-called synchronously from inside the RX-servicing loop
-(`admin_server.rs:318-332`). The hypothesis: a host that stops reading
+`std::io::stdout()` (`pub fn run`'s `stdout_` binding, passed into
+`handle_frame`), through the `send_frame` fn, into the ESP-IDF
+USB-Serial-JTAG driver's 256-byte TX ring (`tx_buffer_size: 256`,
+`main.rs:647`), and `send_frame` is called synchronously from inside the
+RX-servicing loop (`handle_frame`'s call site in `run`'s frame loop). The
+hypothesis: a host that stops reading
 (closed tab, crashed process) leaves that TX ring full; if the write into it
 blocked, it would block the SAME thread that drains the RX ring, which would
 NAK the device's OUT endpoint, which would explain every host `tcdrain`
@@ -596,8 +597,8 @@ timeout 30 cat /dev/ttyACM0 | xxd
   bidirectional latch). This refutes the admin_server-shared-thread
   candidate above outright (a genuinely blocked RX-servicing thread would
   also stop producing new log output, since logging goes through the same
-  serial console lock — `send_frame`'s `crate::serial_console::lock_tx()`,
-  `admin_server.rs:1308` — as the reply frames) and points toward something
+  serial console lock — `send_frame`'s own `crate::serial_console::lock_tx()`
+  call — as the reply frames) and points toward something
   further down the USB stack: the OUT endpoint itself NAK'd or halted at
   the peripheral/driver level, independent of whether the servicing thread
   is otherwise healthy.
@@ -1194,7 +1195,7 @@ session finally survive long enough to reach the actual crash.
 A web-provisioner session got through `QUERY_STATUS` successfully — the
 host-side wedge was clear, the bootloader/app were IDF-matched — and then
 **crashed the device** during `QUERY_ADVERT` (the "share my card" action;
-browser-side call chain `site/provisioner/session.js:704` `queryAdvert` ->
+browser-side call chain `site/provisioner/session.js`'s `queryAdvert` ->
 `renderCardUri` -> `site/provisioner/provisioner.js:532`):
 
 ```
