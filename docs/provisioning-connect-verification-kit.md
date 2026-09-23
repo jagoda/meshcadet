@@ -1,5 +1,13 @@
 # Provisioning connect/reboot/CLI-hang — device verification kit
 
+**Round 8's "terminal round" framing was premature — see "Update,
+2026-09-23 (round 10)" below.** Round 10 found and fixed a second,
+independent defect (the local dev-flash path was writing a stale,
+IDF-mismatched bootloader) whose device evidence materially changed
+observed behaviour, but left a later, unexplained mid-session reset in
+place. The wedge is NOT confirmed solved; do not read round 8's language
+below as the campaign's final word.
+
 **HOST-SIDE ROOT CAUSE CONFIRMED, 2026-09-22 (round 8, the campaign's
 terminal round) — see "Update, 2026-09-22 (round 8)" below before reading
 anything earlier in this file as current.** Round 7's "the device
@@ -1067,6 +1075,80 @@ it.
    unbuildable or unsafe "minimal change" just to satisfy this criterion's
    letter would repeat exactly the pattern (landing an unverified guess)
    this campaign has spent multiple rounds correcting for.
+
+## Update, 2026-09-23 (round 10): the local dev-flash path was writing a stale, IDF-mismatched bootloader — a real build-hygiene defect, fixed, but NOT a claim that the connect wedge is solved
+
+`meshcadet-connect-wedge-round10-dev-flash-bootloader` is a different,
+independently-confirmed defect from rounds 7/8's host-side USB state
+diagnosis above — round 8's "the campaign's terminal round" framing turned
+out to be premature in a different sense than rounds 4/7 were: not a
+refuted mechanism, but an incomplete one. There was a second, unrelated bug
+sitting underneath it the whole time.
+
+**THE DEFECT.** The project pins `ESP_IDF_VERSION = "v5.2.2"`
+(`firmware/.cargo/config.toml`) and esp-idf-sys builds a matching
+`bootloader.bin` into `target/<triple>/<profile>/` next to
+`partition-table.bin` and the ELF on every build. The local dev flash
+path (`firmware/scripts/flash-with-partition-table.sh`, `cargo run`'s
+runner) used `espflash flash` to write the app and then repaired only the
+partition-table sector (0x8000) with `write-bin`; nothing ever repaired
+the bootloader sector (0x0), which `espflash flash` fills with **its own
+bundled default bootloader** — a binary that tracks espflash's release
+cadence, not this project's ESP-IDF pin. The script's own header and
+`firmware/.cargo/config.toml`'s comment both said as much, in words that
+treated it as an accepted tradeoff rather than a defect. Meanwhile the
+RELEASE path (`firmware/release-container/build.sh`'s `merge_bin` step)
+already flashes bootloader@0x0 + partition-table@0x8000 + app@0x10000
+correctly — so dev and release flashing had silently diverged, and only
+dev was wrong.
+
+**DEVICE EVIDENCE (maintainer-run, 2026-09-22/23).** A boot log from a
+device flashed via the (pre-fix) dev path showed:
+
+```
+I (27) boot: ESP-IDF v5.5.1-838-gd66ebb86d2e 2nd stage bootloader / compile time Nov 26 2025 12:27:56
+...
+I (2064) cpu_start: ESP-IDF: v5.2.2
+```
+
+A bootloader three minor versions ahead of the project's pin, produced by
+no meshcadet build, roughly ten months stale relative to the pinned app —
+paired with a `v5.2.2` app. Flashing the project's own bootloader by hand
+(`espflash write-bin 0x0 firmware/target/xtensa-esp32s3-espidf/release/bootloader.bin`)
+**materially changed device behaviour**: before it, a web-provisioner
+connect reset the device immediately and returned zero status data; after
+it, status data flows and the failure moves to a later, mid-session reset.
+
+**THE FIX (this round, build-hygiene only, no firmware source change —
+this container has no Xtensa toolchain so firmware can't be built here).**
+`flash-with-partition-table.sh` now also `write-bin`s `bootloader.bin` to
+0x0 (after the `espflash flash` step, before the 0x8000 partition-table
+repair, both at espflash's default `--after hard-reset` — an explicit
+`--after no-reset` on a `write-bin` call was previously found to fail on
+real hardware with "Communication error while flashing device", so that
+constraint was preserved, not re-litigated), gained a fail-loud
+precondition check mirroring the existing `partition-table.bin` check, and
+the two stale comments (the script's own header, and
+`firmware/.cargo/config.toml`'s runner comment) were corrected to state
+that the project's own bootloader IS now flashed and why bootloader/app
+IDF skew is a hazard rather than an accepted default. A recurrence guard
+was considered and explicitly declined, with reasoning recorded inline in
+`firmware/.cargo/config.toml` (short version: the two IDF-version inputs
+are, by construction, always produced by the same build once this repair
+step runs; skew can only recur by bypassing the repair step entirely,
+which a version-string comparison can't detect any more reliably than the
+existing missing-file precondition checks already do, and a firmware-side
+boot check is not buildable in this container).
+
+**CONFIDENCE DISCIPLINE — read before treating this as closing the
+campaign.** This is a real, independently-confirmed build-hygiene defect,
+correct on its own terms, and the device evidence above shows it changes
+device behaviour materially. **It is NOT a claim that the connect wedge is
+solved.** The mid-session reset that remains after the hand-flash test is
+UNEXPLAINED — its reset reason has not yet been read — and this campaign
+has already landed refuted "confirmed" claims twice before (round 4, round
+7). Reading the mid-session reset reason is the natural next round if this
+fix lands and the wedge persists; it is explicitly out of scope here.
 
 ## What this fix found and addressed (source + host-testable surface only)
 
