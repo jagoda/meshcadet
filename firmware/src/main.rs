@@ -1747,23 +1747,32 @@ fn run() -> anyhow::Result<()> {
         let evt_tx_for_admin = evt_tx.clone();
         std::thread::Builder::new()
             .name("admin_server".into())
-            // 12 KiB. Originally bumped from 8 KiB (see `admin_server.rs`'s
-            // stale doc comment at `run`'s definition, since corrected) on the
-            // premise that the server owning the loaded `ProvisionedConfig`
-            // plus the per-persist serialize buffer cost only ~1.6 KiB each —
-            // wrong by ~2x (`size_of::<ProvisionedConfig>()` is 3560 B, and
-            // `save_provisioned_config`'s own blob buffer is another 3544 B),
-            // which is what actually caused a boot-time `pthread`-task stack
-            // overflow (`boot-pthread-stack-overflow-fix` mission). Both are
-            // now heap-allocated instead (`Box<ProvisionedConfig>` below;
-            // `config_store`'s serialize/deserialize blob buffers) rather than
-            // resident/transient on this stack, so 12 KiB is now generous
-            // headroom rather than a tight fit — kept at 12 KiB rather than
-            // trimmed back, since no HIL measurement of the new HWM exists yet
-            // to size a smaller budget from (see `admin_server::run`'s own
-            // `log_thread_stack_hwm` calls, added this same mission, for that
-            // measurement once hardware is available).
-            .stack_size(12288)
+            // 24 KiB (raised from 12 KiB — `admin-server-stack-overflow-fix`
+            // mission). The 12 KiB budget was sized only against the boot-time
+            // HWM (a measured 7196 B peak of 12288 B, i.e. 5092 B free) sampled
+            // at exactly two points: right after setup, and right after a frame
+            // is successfully handled (`admin_server.rs`'s two
+            // `log_thread_stack_hwm` call sites). Neither sample can ever fire
+            // mid-handler, so a frame whose OWN processing overflows the stack
+            // was structurally invisible to both instruments — which is exactly
+            // what happened: maintainer-run HIL evidence 2026-09-23 device-confirmed
+            // a `pthread`-task stack overflow (`rst:0xc RTC_SW_CPU_RST`, not the
+            // earlier-suspected `rst:0x15 USB_UART_CHIP_RESET`) during
+            // `FRAME_QUERY_ADVERT`, whose handler stacks an Ed25519 sign
+            // (`firmware_core::advert::handle_query_advert` — curve25519-dalek +
+            // SHA-512, a large call frame) plus two NVS round-trips
+            // (`advert_ts_store::load_last_advert_ts`/`save_last_advert_ts`) on
+            // top of the already-thin 5092 B boot margin. 24 KiB (2x) mirrors
+            // the identical-class fix already applied to the IDF main task for
+            // its own identity+crypto init path (`firmware/sdkconfig.defaults`:
+            // `CONFIG_ESP_MAIN_TASK_STACK_SIZE` 32768 -> 49152, +50%) — doubled
+            // rather than matching that +50% ratio because no HIL measurement
+            // of the QUERY_ADVERT-path HWM exists yet (compile-unverified; see
+            // this PR's description) and the new in-arm `log_thread_stack_hwm`
+            // sample added this same round (below, at the `FRAME_QUERY_ADVERT`
+            // arm in `admin_server.rs`) is what will confirm actual headroom
+            // and drive a follow-on trim once hardware is available.
+            .stack_size(24576)
             .spawn(move || {
                 admin_server::run(
                     &HISTORY,

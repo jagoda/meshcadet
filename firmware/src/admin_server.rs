@@ -137,6 +137,17 @@ use crate::ui::UiEvent;
 /// awkwardly — a latent desync source under the host's 500 ms retry cadence.
 const RX_BUF_LEN: usize = 512;
 
+/// This thread's stack budget in bytes — must track `main.rs`'s
+/// `admin_server` spawn-site `.stack_size(...)` call exactly; see that call's
+/// doc comment for the sizing rationale (raised from 12288 to 24576,
+/// `admin-server-stack-overflow-fix` mission). Module-level (not local to
+/// [`run`]) so [`handle_frame`]'s `FRAME_QUERY_ADVERT` arm can also log an
+/// in-handler HWM sample — the exact path whose worst case (an Ed25519 sign
+/// plus two NVS round-trips) was invisible to `run`'s own two sample sites,
+/// which can only ever fire before or after a frame's own handling, never
+/// during it.
+const ADMIN_SERVER_STACK_B: u32 = 24576;
+
 /// Application error codes sent in `RspError.error_code`.  Mirrors the
 /// `provisioning_server` codes so the host sees identical errors in either state.
 mod err {
@@ -246,7 +257,8 @@ pub fn run(
     // a periodic timer, unlike `main.rs`'s 30 s sample): a stack overflow
     // reboots the task before any later tick could fire, so this is the
     // sample most likely to ever get logged if headroom regresses again.
-    const ADMIN_SERVER_STACK_B: u32 = 12288;
+    // See the module-level `ADMIN_SERVER_STACK_B` doc comment for why a THIRD
+    // sample site was needed (`FRAME_QUERY_ADVERT`'s own arm, below).
     crate::log_thread_stack_hwm("admin_server", ADMIN_SERVER_STACK_B);
 
     loop {
@@ -472,18 +484,44 @@ fn handle_frame(
         // Name: the configured device name, or (if unset) a pub_hash-derived
         // `MeshCadet-<HH>` label — an advert with an empty name is silently
         // dropped by every receiver, so this never emits one.
+        //
+        // STACK (`admin-server-stack-overflow-fix` mission): this is the arm
+        // that device-confirmed the `admin_server` `pthread` stack overflow
+        // (maintainer-run HIL evidence 2026-09-23 — `rst:0xc RTC_SW_CPU_RST`, not
+        // the earlier-suspected `rst:0x15 USB_UART_CHIP_RESET`). `card_buf` is
+        // only `MAX_ADVERT_CARD_LEN` = 134 B, small on its own — the real
+        // pressure is `handle_query_advert`'s Ed25519 sign
+        // (curve25519-dalek + SHA-512, a large call frame) stacked on top of
+        // an already-thin boot-time margin (5092 B free at a measured 7196 B
+        // / 12288 B HWM). `card_buf` is heap-allocated anyway, both as
+        // belt-and-suspenders headroom and to match the precedent this same
+        // hazard shape (a large on-stack buffer overflowing a `pthread` task)
+        // was fixed with everywhere else in this thread (`ProvisionedConfig`,
+        // `config_store`'s blob buffers — see the `boot-pthread-stack-
+        // overflow-fix` mission and this file's module doc). The primary
+        // remedy is the `main.rs` spawn site's stack_size raise (12288 ->
+        // 24576); this HWM sample is the new instrumentation that closes the
+        // gap that hid the bug for ten rounds (see this arm's own log line
+        // below and `ADMIN_SERVER_STACK_B`'s module-level doc comment).
         FRAME_QUERY_ADVERT => {
             let name_str =
                 std::str::from_utf8(&device_name[..*device_name_len as usize]).unwrap_or("");
             let nvs_last = advert_ts_store::load_last_advert_ts(nvs_partition.clone());
-            let mut card_buf = [0u8; MAX_ADVERT_CARD_LEN];
-            match firmware_core::advert::handle_query_advert(
+            let mut card_buf = vec![0u8; MAX_ADVERT_CARD_LEN].into_boxed_slice();
+            let result = firmware_core::advert::handle_query_advert(
                 identity,
                 payload,
                 nvs_last,
                 name_str,
                 &mut card_buf,
-            ) {
+            );
+            // Sampled here, inside the handler, not only at `run`'s two
+            // existing sites (before the frame loop / after a frame is
+            // successfully handled) — a frame that overflows mid-handler
+            // never reaches either of those, which is exactly what made this
+            // arm's worst-case path structurally invisible for ten rounds.
+            crate::log_thread_stack_hwm("admin_server", ADMIN_SERVER_STACK_B);
+            match result {
                 Ok((n, new_ts)) => {
                     // Persist BEFORE replying (see doc comment above).
                     advert_ts_store::save_last_advert_ts(nvs_partition.clone(), new_ts);
