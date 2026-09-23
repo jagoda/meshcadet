@@ -10,8 +10,7 @@
 # That's enough to pin down the one thing round 10 changed without a device:
 # the script's own CALL SEQUENCE and its fail-loud preconditions. It cannot
 # and does not assert anything about what espflash actually does on the
-# wire — that's the Commander's device-side job, per the mission's
-# constraints.
+# wire — that's a maintainer's device-side job, done on real hardware.
 #
 # Run directly (`firmware/scripts/flash-with-partition-table.test.sh`).
 set -euo pipefail

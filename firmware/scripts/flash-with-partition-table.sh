@@ -55,17 +55,20 @@ BIN_DIR="$(dirname "$ELF")"
 PARTITION_TABLE_BIN="$BIN_DIR/partition-table.bin"
 BOOTLOADER_BIN="$BIN_DIR/bootloader.bin"
 
-if [[ ! -f "$PARTITION_TABLE_BIN" ]]; then
-  echo "flash-with-partition-table.sh: $PARTITION_TABLE_BIN not found (expected next to the" >&2
-  echo "ELF — esp-idf-sys's build.rs copies it there on every build; did the build succeed?)" >&2
-  exit 1
-fi
-
-if [[ ! -f "$BOOTLOADER_BIN" ]]; then
-  echo "flash-with-partition-table.sh: $BOOTLOADER_BIN not found (expected next to the" >&2
-  echo "ELF — esp-idf-sys's build.rs copies it there on every build; did the build succeed?)" >&2
-  exit 1
-fi
+# Both artifacts are esp-idf-sys build outputs copied next to the ELF on every
+# build (see the header comment above) — a missing one means the build didn't
+# succeed (or didn't run), and flashing anyway would silently write a stale or
+# absent bootloader/partition table. Fail loud instead.
+require_bin() {
+  local bin_path="$1"
+  if [[ ! -f "$bin_path" ]]; then
+    echo "flash-with-partition-table.sh: $bin_path not found (expected next to the" >&2
+    echo "ELF — esp-idf-sys's build.rs copies it there on every build; did the build succeed?)" >&2
+    exit 1
+  fi
+}
+require_bin "$PARTITION_TABLE_BIN"
+require_bin "$BOOTLOADER_BIN"
 
 # --no-skip: the stale-flash fix this runner already carried — always write the
 #   freshly-linked app, never checksum-skip.
