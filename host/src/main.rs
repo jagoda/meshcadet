@@ -581,11 +581,12 @@ fn main() -> anyhow::Result<()> {
     // event across a web connect that reproduces this wedge) REFUTES that
     // mechanism and retracts the reopen recovery: reopening the same
     // `cdc_acm` node does not rebuild the kernel's per-device USB/cdc_acm
-    // state, so a same-process reopen cannot recover a wedged port — see
-    // `SendTimedOut`'s `Display` impl (`host/src/transport.rs`) for what
-    // actually clears it (host-side re-enumeration: unplug/replug, or
-    // `/sys/bus/usb/devices/<dev>/authorized`). No retry is attempted here;
-    // the error (with accurate recovery guidance) propagates straight out.
+    // state, so a same-process reopen cannot recover a wedged port. No
+    // reliable in-process OR out-of-process recovery is currently known —
+    // see `SendTimedOut`'s `Display` impl (`host/src/transport.rs`) for what
+    // is and is not established. No retry is attempted here; the error
+    // (stating what is actually known, without prescribing an unproven
+    // remedy) propagates straight out.
     let mut session = Session::new(transport);
     run_command(&mut session, cli.cmd)
 }

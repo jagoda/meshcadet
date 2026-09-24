@@ -70,10 +70,10 @@ import { ProvisionerSession, DeviceError } from "./session.js";
  * scripted device responses and to assert what was sent); the returned
  * `push(bytes)` enqueues bytes as if the device sent them; `signalsCalls`
  * records every `setSignals()` invocation IN ORDER (used to assert
- * `connect()` clears RTS then DTR as two separate calls, never one combined
- * call — see session.js's `connect()` doc comment for why the order is the
- * entire fix); `error(err)` makes the readable stream error out, as if the
- * device vanished mid-read (e.g. a USB re-enumeration from a hard reset).
+ * `connect()` makes NO such calls at all — see session.js's `connect()`
+ * doc comment for why); `error(err)` makes the readable stream error out,
+ * as if the device vanished mid-read (e.g. a USB re-enumeration from a hard
+ * reset).
  */
 function makeFakePort(onWrite) {
   let controller;
@@ -260,35 +260,35 @@ async function happyPathWithLogNoiseResync() {
   assert.equal(session.isConnected, false);
 }
 
-// ── Scenario 1b: connect() clears RTS, then DTR, as two separate calls ───
+// ── Scenario 1b: connect() calls open() and nothing else — no setSignals ──
 //
-// Regression guard for THREE successive rounds on the same line, in order:
+// Regression guard for FOUR successive rounds on the same line, in order:
 // (a) PR #197 fixed the host CLI (`host/src/transport.rs`) to leave DTR/RTS
 // untouched. (b) The browser client never got the equivalent treatment, so
 // PR #200 added a post-open `setSignals({dataTerminalReady: false,
 // requestToSend: false})` de-assert as ONE combined call — hardware
 // evidence showed this left the device unreachable by the host CLI until a
-// PHYSICAL RESET, very likely because a single combined call lets Chromium
-// choose the internal order of the two line changes, and if it clears DTR
-// before RTS the transition lands on the ESP32-S3's confirmed core-reset
-// trigger, DTR=0/RTS=1. PR #201 then removed signal handling from
-// `connect()` altogether. (c) This mission (round 12, external
-// corroboration — `vinceneil666/MeshcoreChatter#3`) confirms the trigger
-// precisely and fixes it: clear RTS BEFORE DTR, as two SEPARATE awaited
-// `setSignals()` calls, so the DTR=0/RTS=1 state is never visited. The
-// ORDER is the entire fix — collapsing this back into one combined call
-// (#200's mistake) would silently reintroduce the wedge, so this asserts
-// the exact call SEQUENCE, not merely that `setSignals()` was called at
-// all. See `connect()`'s doc comment for the full history and mechanism.
+// PHYSICAL RESET. (c) PR #201 removed signal handling from `connect()`
+// altogether. (d) 86746ca re-added it, split into two separate awaited
+// calls — RTS then DTR — on the theory that ordering, not the presence of
+// the calls, was the problem; tested on hardware, it did NOT clear the
+// connect wedge. This mission reverts 86746ca: a systematic comparison
+// against every Web Serial client independently known to work against this
+// hardware class (meshcore-dev's `config.meshcore.io`, `meshtastic/js`,
+// this repo's own host CLI) found that NONE of them call `setSignals` at
+// all — the working pattern is `open()` alone. This asserts the fake
+// port's `signalsCalls` log is EMPTY, not merely that some particular
+// sequence was used — any `setSignals()` call at all is a regression. See
+// `connect()`'s doc comment for the full history.
 
-async function connectClearsRtsBeforeDtr() {
+async function connectMakesNoSetSignalsCalls() {
   const { port } = makeFakePort(() => {});
   installFakeGlobals(port);
 
   const session = new ProvisionerSession();
   await session.connect();
 
-  assert.deepEqual(port.signalsCalls, [{ requestToSend: false }, { dataTerminalReady: false }]);
+  assert.deepEqual(port.signalsCalls, []);
 
   await session.disconnect();
 }
@@ -427,10 +427,10 @@ async function connectSurvivesResetBootBannerBeforeFirstQueryStatus() {
 
   const session = new ProvisionerSession();
   await session.connect();
-  // connect() clears RTS then DTR (see its doc comment) — the boot banner
-  // this scenario drives is `open()`'s own unavoidable, known-survivable
-  // reset, not a symptom of the post-open setSignals() sequence.
-  assert.deepEqual(port.signalsCalls, [{ requestToSend: false }, { dataTerminalReady: false }]);
+  // connect() makes no setSignals() calls at all (see its doc comment) —
+  // the boot banner this scenario drives is `open()`'s own unavoidable,
+  // known-survivable reset, not a symptom of any post-open signal handling.
+  assert.deepEqual(port.signalsCalls, []);
 
   const { status, identity } = await session.queryStatus();
   assertStatusAndIdentity(status, identity);
@@ -752,6 +752,55 @@ async function staleRetryDuplicateDoesNotDesyncNextCommand() {
 
   const channels = await session.listChannels();
   assert.deepEqual(channels, []);
+
+  await session.disconnect();
+}
+
+// ── Scenario 2c: a reply split across a retry boundary is still parsed,
+//    not silently lost (TASK 2 regression guard) ─────────────────────────
+//
+// Before this mission, `#sendRecvWithRetry` cleared `#accBuf` both on entry
+// AND after every failed attempt, on the theory that stale bytes left by an
+// abandoned attempt would otherwise confuse the next attempt's
+// `#recvFrame` call. No other client this protocol was compared against
+// discards received bytes mid-command, and `#tryExtractFrame`'s own
+// `find_magic_start`/`plen` resync already exists to recover from stale
+// bytes — the per-retry clear was pure loss with no corresponding gain.
+// This drives exactly the failure mode that loss caused: the device
+// answers the FIRST attempt with its one and only reply, but delivers it
+// split into two USB reads that straddle the (deliberately short)
+// per-attempt deadline — the first four bytes (an incomplete frame header)
+// land comfortably inside the attempt's window, the remaining three land
+// just after it elapses. The retried (second) send is never answered at
+// all. Pre-fix, the first attempt's timeout cleared the four already-
+// received bytes, and the later three (now headerless) were shredded as
+// noise by the resync guard — this command could only ever finish by
+// re-sending into the retry's own unanswered void, so it would exhaust the
+// whole retry budget and time out. Post-fix, the four bytes stay in
+// `#accBuf` across the retry boundary, the trailing three complete the
+// frame once they land, and the command resolves from the FIRST attempt's
+// reply alone, with the retry's own send going unanswered.
+
+async function replySplitAcrossRetryBoundaryIsStillParsed() {
+  let writeCount = 0;
+  const { port, push } = makeFakePort(() => {
+    writeCount++;
+    if (writeCount === 1) {
+      const okFrame = encodeFrame(FRAME_RSP_OK); // 7 bytes total, no payload
+      push(okFrame.subarray(0, 4)); // header, incomplete — arrives promptly
+      setTimeout(() => push(okFrame.subarray(4)), 60); // completes it, late
+    }
+    // writeCount === 2 (the retry): deliberately left unanswered — this
+    // command must resolve from the first attempt's split reply alone.
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession({ retryAttemptMs: 50, retryTotalMs: 1000 });
+  await session.connect();
+
+  await session.commit(); // must resolve — throws "timeout waiting for response frame" pre-fix
+
+  assert.equal(writeCount, 2, "expected exactly one retry send, whose own (absent) reply must not be needed");
 
   await session.disconnect();
 }
@@ -1626,8 +1675,8 @@ async function delRoomSendsCorrectFrame() {
 const scenarios = [
   ["happy path: two-frame handshake + magic-resync past log noise", happyPathWithLogNoiseResync],
   [
-    "connect() clears RTS then DTR as two separate calls, in that order (DTR=0/RTS=1 core-reset regression — see connect()'s doc comment)",
-    connectClearsRtsBeforeDtr,
+    "connect() calls open() and nothing else — no setSignals() calls (setSignals-revert regression — see connect()'s doc comment)",
+    connectMakesNoSetSignalsCalls,
   ],
   ["a stalled writer.write() surfaces a distinct 'write stalled' error within bounded time (unbounded-await regression)", writeStallSurfacesDistinctErrorWithinBoundedTime],
   ["disconnect() does not hang when reader.cancel() stalls (unbounded-await regression)", disconnectDoesNotHangWhenReaderCancelNeverSettles],
@@ -1647,6 +1696,10 @@ const scenarios = [
   ],
   ["send_recv_with_retry retries a dropped first response", retryOnDroppedFirstResponse],
   ["a retry's stale duplicate reply does not desync a later command", staleRetryDuplicateDoesNotDesyncNextCommand],
+  [
+    "a reply split across a retry boundary is still parsed, not silently lost (retry-boundary #accBuf-retention regression)",
+    replySplitAcrossRetryBoundaryIsStillParsed,
+  ],
   ["disconnect() before connect() is a no-op", disconnectWithoutConnect],
   ["device RSP_ERROR on QUERY_STATUS surfaces as DeviceError", deviceErrorOnQueryStatus],
   ["unexpected frame after RSP_STATUS surfaces a desync error", unexpectedFrameAfterStatus],

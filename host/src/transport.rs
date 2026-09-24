@@ -105,21 +105,20 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(3);
 /// cleared. Do not read a clean unplug/replug as proof the session will now
 /// complete.
 ///
-/// NARROWED, round 12 (`docs/provisioning-connect-verification-kit.md`'s
-/// "CASE CLOSED" section, external corroboration): the specific reset this
-/// guidance was written against — the browser's own post-open DTR/RTS
-/// transition — is now actively AVOIDED by `site/provisioner/session.js`'s
-/// `connect()` (clears RTS then DTR, never the DTR=0/RTS=1 core-reset
-/// trigger), not merely tolerated. This guidance remains correct and
-/// necessary for whatever reset still occurs (`port.open()`'s own
-/// unavoidable line assert, or any other cause) and for the host-side wedge
-/// that can follow one — it is not retracted, only no longer the first
-/// line of defense against a connect failure.
-const HOST_REENUM_GUIDANCE: &str = "unplug and replug the USB cable (or force host-side \
-     re-enumeration by deauthorizing/reauthorizing the device node: \
-     `echo 0 | sudo tee /sys/bus/usb/devices/<dev>/authorized` then `echo 1 | ...`) -- a \
-     device-side reset alone does NOT clear this; only the host kernel rebuilding its \
-     per-device USB/cdc_acm state does. Simply re-running this command will NOT help.";
+/// REVISED, round 13 (`meshcadet-provisioner-revert-setsignals-and-loose-
+/// ends`): a round-12 attempt to have the browser client avoid the
+/// DTR=0/RTS=1 transition that can trigger this reset was tested on
+/// hardware and did NOT clear the connect wedge, and has been reverted
+/// (see `site/provisioner/session.js`'s `connect()` doc comment). Separately,
+/// the specific recovery action this guidance used to prescribe — unplug and
+/// replug the USB cable — has since been tried, more than once, against a
+/// live instance of this wedge and did not reliably clear it either. The
+/// text below no longer instructs that action as a remedy; it states only
+/// what is actually known (the failure lives in the host kernel's
+/// per-device USB/cdc_acm state, confirmed by round 8's kernel-log
+/// evidence) without asserting that any particular recovery action works.
+const HOST_WEDGE_GUIDANCE: &str = "no recovery action is currently known to reliably clear \
+     it; simply re-running this command will NOT help.";
 
 /// Marks a `send_bounded` timeout as distinct from any other transport
 /// error, so a caller can recognize it — via
@@ -157,8 +156,8 @@ impl std::fmt::Display for SendTimedOut {
             f,
             "serial send timed out after {:?} (confirmed HOST-side USB/cdc_acm wedge -- a \
              device-side reset does NOT clear this, see docs/provisioning-connect-\
-             verification-kit.md for the hardware evidence; recovery: {})",
-            self.timeout, HOST_REENUM_GUIDANCE
+             verification-kit.md for the hardware evidence; {})",
+            self.timeout, HOST_WEDGE_GUIDANCE
         )
     }
 }
@@ -186,7 +185,7 @@ impl std::error::Error for SendTimedOut {}
 /// without this, `recv`/`flush_input` in particular would hang with no
 /// timeout at all, silently, which defeats the entire point of `send` being
 /// "bounded" in the first place. Recovery is never in-process (see
-/// `HOST_REENUM_GUIDANCE`): the caller must re-enumerate the device at the
+/// `HOST_WEDGE_GUIDANCE`): the caller must re-enumerate the device at the
 /// host and open a fresh `SerialTransport`.
 pub struct SerialTransport {
     port: Arc<Mutex<Box<dyn serialport::SerialPort>>>,
@@ -212,12 +211,20 @@ impl SerialTransport {
     /// The EN+IO0 reset circuit on ESP32 boards is triggered by the DTR/RTS
     /// *pair* toggling together (the esptool programming sequence); leaving
     /// both lines at their tty-open defaults also avoids inadvertent resets.
-    /// CONFIRMED, round 12 (`docs/provisioning-connect-verification-kit.md`,
-    /// `site/provisioner/session.js`'s `connect()` doc comment): on this
-    /// board's ESP32-S3, the precise trigger is the control-line state
-    /// passing through DTR=0/RTS=1 — never asserting or clearing either
-    /// line at all, as this method does, structurally cannot produce that
-    /// (or any other) transition.
+    /// On this board's ESP32-S3, external corroboration (an unrelated
+    /// project hitting the identical symptom on the same chip family — see
+    /// `site/provisioner/session.js`'s `connect()` doc comment) points to
+    /// the precise trigger being the control-line state passing through
+    /// DTR=0/RTS=1 specifically — never asserting or clearing either line
+    /// at all, as this method does, structurally cannot produce that (or
+    /// any other) transition. This method has never needed to change on
+    /// that basis: it already avoided DTR/RTS entirely before that
+    /// corroboration existed, and still does. (A later round attempted to
+    /// have the BROWSER client explicitly avoid the same transition
+    /// post-open; tested on hardware, it did not clear the connect wedge
+    /// and was reverted — see `site/provisioner/session.js`'s `connect()`
+    /// doc comment for the current state. That result does not change
+    /// anything about this method.)
     ///
     /// NOTE (round 6): this `open()`/`clear()` call is bounded by the OS —
     /// device evidence shows a genuine connect-wedge hang lives in `send`'s
@@ -249,8 +256,8 @@ fn stranded_port_error() -> anyhow::Error {
     anyhow::anyhow!(
         "serial port already stranded by a previous timed-out send on this handle -- the \
          abandoned worker thread is still holding it (POSIX gives no way to interrupt a \
-         blocked tcdrain(2)), so no further I/O on this handle can succeed; recovery: {}",
-        HOST_REENUM_GUIDANCE
+         blocked tcdrain(2)), so no further I/O on this handle can succeed; {}",
+        HOST_WEDGE_GUIDANCE
     )
 }
 

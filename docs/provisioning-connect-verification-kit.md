@@ -1,10 +1,53 @@
 # Provisioning connect/reboot/CLI-hang — device verification kit
 
-**CASE CLOSED, 2026-09-24 (round 12) — the DTR/RTS reset round 11 demoted to
-"nuisance" is now PREVENTED, not just tolerated, and the two remaining
-over-broad conclusions in this kit are retracted. Read "Update, 2026-09-24
-(round 12)" below before anything earlier in this file; round 11's own
-findings (below) are otherwise unchanged and still current.**
+**CASE REOPENED, 2026-09-24 (round 13) — round 12's "CASE CLOSED" was
+premature: its fix was tested on hardware and did NOT clear the connect
+wedge. Read "Update, 2026-09-24 (round 13)" below before anything earlier in
+this file, including the "CASE CLOSED" banner immediately below, which this
+round retracts.**
+
+Round 12 (below) re-added `setSignals()` handling to
+`site/provisioner/session.js`'s `connect()` — RTS cleared before DTR, as two
+separate calls — on the theory that the ESP32-S3's confirmed DTR=0/RTS=1
+core-reset trigger was the mechanism to defeat and that getting the ordering
+right (unlike PR #200's single combined call) would do it. **Tested on real
+hardware, it did not clear the connect wedge.** This mission
+(`meshcadet-provisioner-revert-setsignals-and-loose-ends`) reverts it:
+`connect()` is back to bare `await port.open({ baudRate: BAUD_RATE })` with
+NO signal manipulation of any kind, matching a systematic comparison against
+every Web Serial client independently known to work against this hardware
+class (`meshcore-dev/config.meshcore.io`, `meshtastic/js`'s
+`transport-web-serial`, and this repo's own host CLI) — none of them touch
+`setSignals` at all. See `site/provisioner/session.js`'s `connect()` doc
+comment for the full current history.
+
+**What this does NOT retract:** the DTR=0/RTS=1 core-reset trigger itself
+(external corroboration, `vinceneil666/MeshcoreChatter#3`) is a real,
+independently-observed hardware fact about this chip family, and is not
+in question. What is now unproven is the INFERENCE this kit drew from it —
+that a client avoiding that one transition would be sufficient to clear the
+wedge. It was not. **No new theory is substituted here.** The connect-time
+`rst:0x15 (USB_UART_CHIP_RESET)` reset and the host-side wedge that can
+follow it remain, as of this round, UNEXPLAINED as a complete causal chain.
+
+**Current status, honestly stated:** three real, independently-fixed defects
+were found and fixed on this connect/provisioning path this campaign — the
+dev-flash bootloader/IDF skew (round 10, build hygiene), the `admin_server`
+`pthread` stack overflow on `QUERY_ADVERT` (round 11, device-confirmed), and
+retained-byte loss across a `#sendRecvWithRetry` retry boundary (this round,
+Task 2, host-testable). The connect-time `rst:0x15` reset is real and
+recoverable (the retry/resync machinery already tolerates it) but its root
+cause is NOT established. See "Update, 2026-09-24 (round 13)" below for the
+full accounting, including what this round eliminates from the "confirmed"
+column back to "eliminated hypothesis".
+
+**CASE CLOSED, 2026-09-24 (round 12) — RETRACTED by round 13 above. The
+banner below is preserved as history; do not treat it as current.** ~~the
+DTR/RTS reset round 11 demoted to "nuisance" is now PREVENTED, not just
+tolerated, and the two remaining over-broad conclusions in this kit are
+retracted.~~ Read "Update, 2026-09-24 (round 12)" below before anything
+earlier in this file; round 11's own findings (below) are otherwise
+unchanged and still current.
 
 The ESP32-S3's native USB-Serial-JTAG peripheral treats a control-line
 transition through **DTR=0, RTS=1** specifically (not any DTR/RTS change in
@@ -903,6 +946,21 @@ change and not a stopgap. The client-side recovery landed round 8
 correct and necessary for whatever reset still occurs at `open()` time
 (see round 12's mechanism), just no longer the only mitigation available.
 
+**PARTIALLY RE-RETRACTED, round 13 (this mission, 2026-09-24): round 12's
+client-side fix was tested on hardware and did NOT clear the connect
+wedge, and has been reverted.** "Cannot be disabled" still does not
+logically imply "cannot be avoided" — that inference stands. What is now
+unproven is the STRONGER claim this paragraph drew from it: that THIS
+specific avoidance (a client that never emits DTR=0/RTS=1 post-open) IS a
+durable fix. It is not, empirically. `port.open()` itself still asserts
+DTR/RTS unconditionally before any application code runs, so a
+post-open-only avoidance was never a guarantee against a reset triggered
+at `open()` time in the first place — round 12 apparently did not close
+that gap even though its own doc comment named it. No new firmware-level
+mechanism is proposed here to close it either; this SoC's register-level
+absence (above) is unretracted and this section's "deliberately NOT
+changed this round" scope stands, now for a third round running.
+
 **Confirmed still valid, round 8 (2026-09-22) — carried forward, not
 retracted.** This subsection's register-level finding (no
 `USB_SERIAL_JTAG_CHIP_RST_REG`/`..._CHIP_RST_DIS` bit exists in the ESP32-S3
@@ -1114,6 +1172,18 @@ DTR=0/RTS=1 trigger in the first place (`site/provisioner/session.js`'s
 has no API to force host-side re-enumeration if a wedge does happen —
 remains true and is why `HOST_WEDGE_GUIDANCE` still exists; it was never,
 and is not now, a claim that connecting is unrecoverable in general.
+
+**NARROWED FURTHER, round 13 (this mission, 2026-09-24):** round 12's
+specific claim — that THIS provisioner's connect wedge was fully explained
+by, and fixed by avoiding, its own post-open DTR/RTS transition — did not
+hold up on hardware; that fix is reverted (see the "CASE REOPENED" banner
+at the top of this file). The external corroboration itself (a different
+project's client connecting successfully once correctly ordered) is not
+retracted — it is still evidence that a Web Serial client CAN connect to
+this chip family without incident, so "structurally unworkable" remains
+the wrong conclusion. What is retracted is the belief that this
+provisioner had already found the specific working configuration; it had
+not, as of round 12, and this round does not claim to have found it either.
 
 ### Acceptance criteria, walked
 
@@ -1602,13 +1672,160 @@ fix (round 8). None of these were touched or questioned by this round.
 
 ### Case status: CLOSED
 
-Three independent, real defects on this connect path have now each been
+~~Three independent, real defects on this connect path have now each been
 found and fixed: the dev-flash bootloader/IDF skew (round 10, build
 hygiene), the `admin_server` `pthread` stack overflow on `QUERY_ADVERT`
 (round 11, device-confirmed), and the client-side DTR=0/RTS=1 core-reset
 emission (round 12, externally corroborated). No open hypothesis remains
 in this kit. A *new* symptom, not a recurrence of any of the three
-described here, is what would justify reopening it.
+described here, is what would justify reopening it.~~
+
+**RETRACTED, round 13 (`meshcadet-provisioner-revert-setsignals-and-loose-
+ends`, 2026-09-24): this "case closed" status was premature.** The fix this
+section describes (RTS-then-DTR, two separate calls) was tested on real
+hardware and did NOT clear the connect wedge. It has been reverted — see
+"Update, 2026-09-24 (round 13)" below, and the "CASE REOPENED" banner at the
+top of this file. The THE MECHANISM / WHY THIS CAMPAIGN'S OWN DIAGNOSTICS
+NEVER REPRODUCED IT / RETRACTIONS AND RE-FRAMING sections above are
+preserved as history (the underlying DTR=0/RTS=1 hardware-trigger fact is
+not in question) but THE FIX and this Case status section are superseded.
+
+## Update, 2026-09-24 (round 13): round 12's fix did NOT clear the wedge on hardware — reverted, no new theory substituted, plus two real defects closed along the way
+
+This round is a code comparison and cleanup pass, not a new hardware
+diagnosis. NO NEW THEORY IS ATTACHED TO THIS ROUND. It removes a change
+that did not work and fixes two real defects found by comparing this
+client's code against every other Web Serial client independently known to
+work against this hardware class.
+
+### THE REVERT
+
+A systematic comparison against `meshcore-dev/config.meshcore.io`'s
+`lib/serial-cli.js`, `meshtastic/js`'s
+`packages/transport-web-serial/src/transport.ts`, and this repo's own host
+CLI (`host/src/transport.rs`) found ONE universal rule across every client
+confirmed to work against this hardware class: **`port.open({ baudRate })`
+and nothing else.** None of them call `setSignals()` at all — not even
+`meshtastic/js`, despite handling the same reset-prone family of boards.
+The only client examined that touches `setSignals` is `esptool-js`, which
+*wants* the reset to enter its own bootloader — not a model for a
+provisioning client. Round 12 violated this rule (re-adding a post-open
+`setSignals()` pair) on 2026-09-24 and, per the mission that landed it, the
+fix WAS tested on hardware and did NOT fix the connect wedge.
+`site/provisioner/session.js`'s `connect()` is reverted to
+`await port.open({ baudRate: BAUD_RATE })` with no signal manipulation
+whatsoever, matching the reference implementations. See that method's own
+doc comment for the full three-round history (PR #200's combined call, PR
+#201's removal, 86746ca's split-call reorder, this round's revert).
+
+**What this does NOT retract:** the DTR=0/RTS=1 core-reset trigger
+(external corroboration, `vinceneil666/MeshcoreChatter#3`) remains a real,
+independently-observed fact about this chip family — `port.open()` itself
+still asserts DTR/RTS unconditionally before any application code runs, and
+Chromium gives no way to open a port without touching those lines. What
+this round retracts is the INFERENCE that a client avoiding one specific
+POST-open transition would be sufficient to prevent the connect wedge. It
+was not sufficient, tested on hardware. Also worth carrying forward: this
+round's comparison surfaced that de-asserting DTR post-open is
+independently suspect on this chip family regardless of ordering —
+`meshcore_py` issue #105 documents that native-USB CDC stacks (which is
+what this SoC's USB-Serial-JTAG peripheral is) can treat DTR low as "no
+host connected" and stop replying, the opposite of what a discrete
+bridge-chip board needs a DTR toggle for.
+
+**Also ruled out, by the same comparison, and must NOT be "fixed"
+speculatively:** the host CLI writes immediately after `open()` AND
+retransmits on the identical 500ms/10s retry schedule as the browser
+client, and it works — so "immediate first write" and "retry storm" are
+both eliminated as explanations for the browser-specific failure, not
+merely untested.
+
+### TWO REAL DEFECTS FOUND AND FIXED, SEPARATE FROM THE REVERT
+
+1. **Retained-byte loss across a retry boundary.**
+   `#sendRecvWithRetry` (`site/provisioner/session.js`) cleared `#accBuf`
+   both on entry to a top-level command AND after every failed retry
+   attempt. No other client compared discards received bytes mid-command,
+   and `#tryExtractFrame`'s own `find_magic_start`/`plen` resync already
+   exists to recover from stale bytes — the per-retry clear was pure loss.
+   A reply that straddled a retry boundary (some bytes landing just before
+   the per-attempt deadline, the rest just after) was silently lost: the
+   pre-deadline partial frame was discarded by the clear, and the
+   post-deadline remainder — now headerless — was shredded as noise by the
+   resync guard. Fixed by no longer clearing `#accBuf` on a retry boundary
+   (the whole-command entry clear and the cross-command residue guard are
+   untouched — this is scoped to *within* one command's retries only).
+   Host-testable regression test: `replySplitAcrossRetryBoundaryIsStillParsed`
+   in `session.smoke.test.mjs`, which drives a reply split across exactly
+   this boundary and asserts it is still parsed from the retry's own
+   (never-answered) attempt.
+2. **64-byte-multiple USB-packet hazard (firmware, latent — NOT the current
+   failure).** This project's own firmware tracker documents this class:
+   `OffbandMesh/meshcore-firmware#1093` — a USB full-speed bulk transfer
+   whose length is an exact multiple of the 64-byte max packet size needs a
+   short/zero-length packet to terminate, or the host can wait rather than
+   treat the transfer as complete. `RSP_STATUS` (68 bytes, fixed) is safe,
+   which is why this was not the reported failure — but an audit of every
+   reply frame builder in `protocol::provisioning`/`history`/`advert`
+   found SIX reachable exact-multiple cases: `RSP_IDENTITY` at a
+   23-character device name (64B), `RSP_CONTACT` at a 22-character contact
+   name (64B), `RSP_ROOM` at a 17-character room name with no learned route
+   (64B) or a full-length learned route plus a 17-character name (128B),
+   `RSP_ERROR` at a 55-byte message (64B), `RSP_HISTORY_ENTRY` at a
+   48-byte text (64B), and `RSP_ADVERT`'s self-advert card at an
+   18-character device name (128B). `RSP_CHANNEL` cannot reach 64B at any
+   valid name length (max 44B) and needed no change. Closed once, generically,
+   in `admin_server::send_frame` and `provisioning_server::send_frame`
+   (mirrored, byte-for-byte, as those two already are): when the encoded
+   frame's total length is an exact 64-byte multiple, the final byte is
+   written and flushed as its own separate call, so the last USB packet a
+   frame produces is never itself a bare multiple. The boundary predicate
+   (`protocol::provisioning::frame_needs_usb_packet_split`) and all six
+   reachable cases are pinned as host-testable unit tests in
+   `protocol/src/provisioning.rs`'s `usb_packet_boundary` test module —
+   `cargo test -p protocol usb_packet_boundary`. **NOT device-verified**:
+   this container has no Xtensa toolchain, so the two `firmware/` edits are
+   compile-unverified. Kept deliberately minimal and syntactically
+   conservative (a single `if`/`else` branch mirroring the existing
+   write+flush shape) for exactly that reason.
+
+### CLEANUP: user-facing text that outlived its own evidence
+
+Two user-facing strings still told the operator to "unplug and replug the
+USB cable" as a remedy for a serial-send timeout/wedge — advice the
+operator has since disproven twice on real hardware. Neither now
+instructs an action known not to work: `site/provisioner/session.js`'s
+timeout guidance and `host/src/transport.rs`'s `SendTimedOut` message
+(`HOST_WEDGE_GUIDANCE`, renamed from `HOST_REENUM_GUIDANCE` to stop
+implying the remedy it used to name) now state only what is actually
+known — the failure lives in the host kernel's per-device USB/cdc_acm
+state (round 8, kernel-log evidence, unretracted) — without asserting that
+any particular recovery action reliably works.
+
+### Case status, honestly restated
+
+Three real, independently-fixed defects on this connect/provisioning path
+across the whole campaign: the dev-flash bootloader/IDF skew (round 10,
+build hygiene), the `admin_server` `pthread` stack overflow on
+`QUERY_ADVERT` (round 11, device-confirmed), and retained-byte loss across
+a retry boundary (this round, host-testable). The 64-byte-multiple USB
+hazard above is a fourth, real, but LATENT defect (closed, not
+device-verified, not the reported failure). The connect-time
+`rst:0x15 (USB_UART_CHIP_RESET)` reset and the host-side wedge that can
+follow it are real, recoverable (the retry/resync machinery tolerates the
+reset; nothing here changes that), but their root cause is **unexplained**.
+
+**Eliminated hypotheses (do not re-propose without new evidence):**
+round 7's device-re-enumeration mechanism (refuted by round 8 kernel
+evidence); "Web Serial exposes no way for this page to recover" / the
+browser path being structurally unworkable (refuted by external
+corroboration that a correctly-ordered client connects fine); a firmware
+regression between `v0.6.0` and `v0.7.0` (refuted by round 11's commit-by-
+commit elimination — no bisect warranted); "immediate first write" and
+"retry storm" as explanations (refuted, this round, by the host CLI doing
+both and working); and, as of this round, client-side post-open
+`setSignals()` handling of any ordering as a sufficient fix for the
+connect wedge (tested on hardware, round 12's fix did not work).
 
 ## What this fix found and addressed (source + host-testable surface only)
 
