@@ -226,20 +226,26 @@ const REBOOT_BANNER = "ESP-ROM:esp32s3";
  * `queryAdvert`, well after any host-side wedge is cleared and `queryStatus`
  * has already succeeded.
  *
- * NARROWED, round 12 (this mission, external corroboration — see
- * `connect()`'s doc comment): the specific `open()`-triggered reset this
- * guidance was written against is now actively AVOIDED, not merely
- * tolerated — `connect()` clears RTS then DTR immediately post-open so the
- * confirmed DTR=0/RTS=1 core-reset trigger is never emitted by this
- * client. This guidance remains correct and necessary for whatever reset
- * still occurs (`open()`'s own unavoidable line assert, or any other
- * cause) and for the host-side wedge that can follow one — it is not
- * retracted, only no longer the FIRST line of defense.
+ * REVERTED, round 13 (this mission,
+ * `meshcadet-provisioner-revert-setsignals-and-loose-ends`): round 12's
+ * client-side fix (clearing RTS then DTR immediately post-open, on the
+ * theory that ordering was what mattered) was tested on hardware and did
+ * NOT clear the connect wedge. It has been reverted — `connect()` is back
+ * to bare `open()` with no signal manipulation at all, matching every
+ * independently known-working Web Serial client against this hardware
+ * class (see `connect()`'s doc comment). The connect-time reset this
+ * guidance recovers from remains unexplained; no theory about its cause is
+ * asserted here. The message text below no longer tells the user to
+ * unplug and replug the cable as a remedy: that specific action has since
+ * been tried, more than once, against a live instance of this wedge and
+ * did not reliably clear it — this states only what is actually known
+ * about the failure, not an action known not to work.
  */
 const HOST_WEDGE_GUIDANCE =
   "A device-side reset does not clear this -- the failure lives in the HOST's USB/cdc_acm " +
   "state, and Web Serial exposes no way for this page to force host-side re-enumeration. " +
-  "Unplug and replug the USB cable, then click Connect again.";
+  "No recovery action is currently known to reliably clear it; the underlying cause of the " +
+  "connect-time reset itself is not yet established.";
 
 /**
  * Thrown when the device answers a command with `RSP_ERROR`.
@@ -266,18 +272,11 @@ function hex2(n) {
  * — sub-100ms on a healthy link — so 2s is generous headroom, while still
  * bounded well under `RETRY_TOTAL_MS` (10s) so a stalled call surfaces its
  * own distinct cause quickly instead of hanging forever with no diagnosis
- * at all (part of the defect this mission fixes: `writer.write()` was never
- * guarded by `RETRY_TOTAL_MS`/`RETRY_ATTEMPT_MS`/`FRAME_TIMEOUT_MS` — those
- * three only ever wrapped the RECEIVE side). `connect()`'s two post-open
- * `port.setSignals()` calls (see that method's doc comment for the confirmed
- * DTR/RTS mechanism they exist to avoid) are deliberately NOT routed through
- * this helper: the exact two-call, two-line sequence the fix depends on is
- * simple and immediate, and racing it against a timeout would only add risk
- * to the one thing that must not change — the ORDER — for no corresponding
- * benefit; an unresponsive `setSignals()` is not a failure mode this round
- * has any evidence for, unlike `writer.write()`/`reader.cancel()`/
- * `port.close()`, each added to this helper only after a real hang was
- * observed.
+ * at all (part of the defect an earlier mission fixed: `writer.write()` was
+ * never guarded by `RETRY_TOTAL_MS`/`RETRY_ATTEMPT_MS`/`FRAME_TIMEOUT_MS` —
+ * those three only ever wrapped the RECEIVE side). `connect()` makes no
+ * `setSignals()` calls at all (see that method's doc comment) — there is no
+ * such call left for this helper to route or exclude.
  */
 const UNBOUNDED_CALL_TIMEOUT_MS = 2_000;
 
@@ -333,26 +332,29 @@ export class ProvisionerSession {
   #accBuf = new Uint8Array(0);
   /**
    * Total bytes received from the device since the start of the CURRENT
-   * top-level command (`#sendRecvWithRetry`'s entry) — unlike `#accBuf`,
-   * this is never cleared between retry attempts within that command, only
-   * once per command. Exists so a "timeout waiting for response frame"
-   * error can report a genuine whole-command total alongside `#accBuf`'s
-   * per-attempt count: `#accBuf` alone made a timeout's "accumulated N
-   * bytes" read as "the device sent nothing, ever" when N=0, but
-   * `#sendRecvWithRetry` clears `#accBuf` on entry AND after every failed
-   * attempt, so N=0 there only ever means "silent in the final
-   * ~`RETRY_ATTEMPT_MS` window" — an early boot banner from an earlier,
-   * already-cleared retry is invisible to that count and this is the
-   * over-reading it invites — an "accumulated 0 bytes" report against a
-   * real device was misread exactly this way before this field existed.
+   * top-level command (`#sendRecvWithRetry`'s entry) — unlike
+   * `#bytesArrivedThisAttempt`, this is never reset between retry attempts
+   * within that command, only once per command. Exists so a "timeout
+   * waiting for response frame" error can report a genuine whole-command
+   * total alongside the per-attempt count: `#bytesArrivedThisAttempt` alone
+   * made a timeout's "N bytes this attempt" read as "the device has been
+   * silent all along" when N=0, even though it may have answered fully on
+   * an earlier, already-timed-out attempt whose bytes this field still
+   * remembers — an "accumulated 0 bytes" report against a real device was
+   * misread exactly this way before this field existed.
    */
   #cumulativeBytesThisCommand = 0;
   /**
    * Raw bytes ARRIVED from the device during the CURRENT retry attempt only
-   * — reset every time `#accBuf` is (`#sendRecvWithRetry`'s initial reset
-   * and its per-retry clear), incremented by `#readLoop` alongside
-   * `#cumulativeBytesThisCommand`, and — unlike `#accBuf.length` — never
-   * reduced by `#tryExtractFrame`'s magic-resync discard.
+   * — reset once per attempt by `#sendRecvWithRetry`'s entry and its
+   * per-retry `catch` block (see that method's RETRY-BOUNDARY BYTE
+   * RETENTION doc comment: unlike this field, `#accBuf` itself is NOT
+   * cleared on a retry boundary, so the two no longer track the same
+   * lifecycle — this field answers "how much arrived in JUST this
+   * attempt's window", `#accBuf.length` answers "how much is retained right
+   * now, across however many attempts"), incremented by `#readLoop`
+   * alongside `#cumulativeBytesThisCommand`, and — unlike `#accBuf.length`
+   * — never reduced by `#tryExtractFrame`'s magic-resync discard.
    *
    * WHY THIS EXISTS (round 6, `meshcadet-connect-wedge-round6-transmit-
    * side`): `#timeoutMessage` used to report `#accBuf.length` as "bytes this
@@ -360,12 +362,15 @@ export class ProvisionerSession {
    * every resync — `findMagicStart` returns `buf.length` (i.e. "discard
    * everything") whenever no `PROV_MAGIC` candidate is found, and
    * `#tryExtractFrame` immediately slices that whole span out of `#accBuf`.
-   * So `#accBuf.length` at timeout time reports what's RETAINED (usually a
-   * trailing partial-frame remnant, often 0), not what ARRIVED — "0 bytes
-   * this attempt" was indistinguishable between "the device said nothing at
-   * all" and "the device said plenty, all of it non-frame noise that got
-   * discarded." `#bytesArrivedThisAttempt` is the ARRIVED count `#timeoutMessage`
-   * needed instead; `#accBuf.length` is still reported alongside it (labeled
+   * So `#accBuf.length` at timeout time reports what's RETAINED (a trailing
+   * partial-frame remnant from this attempt, PLUS — since a retry no longer
+   * clears it, see `#sendRecvWithRetry`'s RETRY-BOUNDARY BYTE RETENTION doc
+   * comment — anything still-unconsumed from an earlier attempt of this same
+   * command; often 0 either way), not what ARRIVED — "0 bytes this attempt"
+   * was indistinguishable between "the device said nothing at all" and "the
+   * device said plenty, all of it non-frame noise that got discarded."
+   * `#bytesArrivedThisAttempt` is the ARRIVED count `#timeoutMessage` needed
+   * instead; `#accBuf.length` is still reported alongside it (labeled
    * "retained") since the two together are what actually distinguish the two
    * scenarios above.
    */
@@ -495,98 +500,62 @@ export class ProvisionerSession {
    * dismisses the picker without choosing a device — callers should treat
    * that as a silent cancel, not an error to surface.
    *
-   * ── CONFIRMED MECHANISM (round 12, this mission, external corroboration —
-   * mirrors `host/src/transport.rs`'s `SerialTransport::open` doc comment,
-   * read that one too) ──
+   * ── `open()` and nothing else — reverted, round 13 (this mission) ──
    *
-   * The ESP32-S3's NATIVE USB-Serial-JTAG peripheral (this SoC exposes
-   * USB-CDC directly — there is no external CH34x/CP210x-style UART bridge
-   * chip on this signal path) treats a DTR/RTS transition as a hardware
-   * chip-reset trigger. The confirmed trigger is not "DTR and RTS both
-   * change" in general — it is the control-line state passing through
-   * **DTR=0, RTS=1** specifically. The ESP32-S3 has no register to disable
-   * this (later peripherals — C6, H2 — do; see this repo's verification kit,
-   * `docs/provisioning-connect-verification-kit.md`, FIRMWARE section, for
-   * the register-level citation): it cannot be switched off in firmware, so
-   * the only fix is for this client to never emit that transition.
+   * `connect()` is exactly `await port.open({ baudRate: BAUD_RATE })`, with
+   * NO signal manipulation of any kind afterward. This matches every Web
+   * Serial client independently confirmed to work against this hardware
+   * class: `meshcore-dev/config.meshcore.io`'s `lib/serial-cli.js`
+   * (`requestPort(); open({baudRate}); getReader(); getWriter();
+   * startReading()`, no `setSignals` anywhere), `meshtastic/js`'s
+   * `packages/transport-web-serial/src/transport.ts` (`port.open({ baudRate:
+   * baudRate || 115200 })` then pipes streams, no `setSignals`, no
+   * preamble), and this repo's own host CLI (`host/src/transport.rs`, which
+   * deliberately never writes DTR/RTS at all). The only client examined that
+   * touches `setSignals` is `esptool-js`, which *wants* the reset to enter
+   * its own bootloader for flashing — not a model for this method.
    *
-   * Independent corroboration, same symptom, same chip family: an unrelated
-   * project (`vinceneil666/MeshcoreChatter` PR #3, "Fix serial connect on
-   * ESP32 nodes: drop RTS before DTR") reports MeshCore nodes visibly
-   * resetting when ITS client connected, while a different, correctly
-   * ordered client could connect fine to the same port — diagnoses the same
-   * DTR=0/RTS=1 transit, and fixes it the same way this method now does:
-   * clear RTS before DTR. That project measured 0/3 -> 6/6 successful
-   * connections on an ESP32-S3 after the reorder. See also
-   * https://www.esp32.com/viewtopic.php?t=37208 and esptool's `--before
-   * no-reset-no-sync` option, which exists precisely to skip the DTR/RTS
-   * assignment esptool would otherwise perform.
+   * ── History: three rounds on this exact line ──
+   *
+   * PR #200 called `setSignals({ dataTerminalReady: false, requestToSend:
+   * false })` as a single combined call immediately after `open()`,
+   * reasoning that de-asserting fast might "beat" `open()`'s own forced
+   * DTR/RTS assert — explicitly flagged in that PR's own commit message as
+   * unverified on real hardware. Tested, it made things worse: the device
+   * was left unreachable by the host CLI until a physical reset. PR #201
+   * removed signal handling from `connect()` entirely. A later round
+   * (86746ca, "drop RTS before DTR to stop ESP32-S3 DTR=0/RTS=1 core-reset
+   * on connect") re-added it, split into two separate awaited calls — RTS
+   * first, then DTR — on the theory that a single combined call let
+   * Chromium choose the internal line order and could land on the
+   * ESP32-S3's confirmed DTR=0/RTS=1 core-reset trigger, while clearing RTS
+   * first would never visit that state. **That fix was tested on hardware
+   * and did not clear the connect wedge.** It is reverted here, all the way
+   * back to `open()` and nothing else, because a systematic comparison
+   * against every Web Serial client independently known to work against
+   * this hardware class found that none of them touch these lines at all —
+   * the working pattern is `open()` alone, not any particular ordering of
+   * post-open signal calls.
+   *
+   * This is not a re-endorsement of PR #200's or #201's own reasoning,
+   * just a return to the same code #201 already landed. Also worth noting:
+   * de-asserting DTR post-open is independently suspect on this chip
+   * family regardless of ordering — `meshcore_py` issue #105 documents that
+   * native-USB CDC stacks (which is what the ESP32-S3's USB-Serial-JTAG
+   * peripheral is) can treat DTR low as "no host connected" and stop
+   * replying, the opposite of what a bridge-chip board needs a DTR toggle
+   * for.
    *
    * `port.open()` itself still asserts DTR and RTS unconditionally before
    * any application code runs — Chromium gives no "open without touching
-   * the lines" call, so that one transition is not this method's to avoid.
-   * Field evidence already shows it is a **known-survivable** reset (visible
-   * reboot, tolerated by the retry/resync machinery below, never a state
-   * requiring physical intervention on its own). What IS this method's to
-   * avoid is the transition it makes ITSELF immediately after open — and
-   * getting that wrong is exactly what PR #200 did (see history below).
+   * the lines" call, so that one transition is not something this method
+   * can avoid regardless of what it does afterward. Field evidence already
+   * shows the resulting reset (`rst:0x15 USB_UART_CHIP_RESET`) is
+   * known-survivable (tolerated by the retry/resync machinery below) even
+   * though its CAUSE is not established — no theory about it is asserted
+   * here; see `HOST_WEDGE_GUIDANCE`'s doc comment for what is and is not
+   * known about what follows it.
    *
-   * ── THE FIX: clear RTS, then DTR, as two SEPARATE awaited calls ──
-   *
-   * `await port.setSignals({ requestToSend: false })`, THEN
-   * `await port.setSignals({ dataTerminalReady: false })`. The separation is
-   * the entire point and must NOT be collapsed into one combined
-   * `setSignals({ dataTerminalReady: false, requestToSend: false })` call: a
-   * single call lets Chromium choose the internal order of the two line
-   * changes, and if it clears DTR before RTS the transition lands exactly on
-   * DTR=0/RTS=1 — the trigger. Clearing RTS first instead means the
-   * transition goes RTS=1,DTR=1 -> RTS=0,DTR=1 -> RTS=0,DTR=0: the
-   * DTR=0/RTS=1 state is never visited.
-   *
-   * ── History: PR #200's single combined call very likely wedged the
-   * device; PR #201 removed signal handling entirely; this is #200 with
-   * the ordering it got wrong, not a re-litigation of #200's premise ──
-   *
-   * PR #200 called `setSignals({ dataTerminalReady: false, requestToSend:
-   * false })` immediately after `open()`, reasoning that de-asserting as
-   * fast as possible might "beat" the EN/IO0 reset pulse `open()`'s own
-   * forced assert triggers — explicitly flagged in that PR's own commit
-   * message as unverified on real hardware ("developed without a browser or
-   * a physical device available"). A failed web-provisioner connect against
-   * that code left the device **unreachable by the host CLI across a full
-   * process boundary, until a physical reset** — not a timeout, a genuine
-   * hang. `host/src/transport.rs` never writes DTR/RTS at all, so this was
-   * not residual browser-side signal state; something on the device itself
-   * had latched. This is very likely explained by the mechanism above:
-   * `setSignals()`'s two line changes inside one combined call are not
-   * guaranteed to land in a particular order below the JS call, and if
-   * Chromium happened to clear DTR before RTS, the transition landed
-   * squarely on DTR=0/RTS=1. PR #201 then removed signal handling from
-   * `connect()` altogether. Both were reasonable responses to real field
-   * evidence at the time; the ordering bug identified this round is why
-   * de-asserting post-open was never actually unsafe, only unordered.
-   *
-   * ── Why our own diagnostics never reproduced this ──
-   *
-   * A stdlib probe script driving the port directly from a POSIX tty was
-   * run in three modes (plain open; an explicit DTR/RTS clear-then-assert
-   * within one open; three rapid open/close cycles) and NONE reset the
-   * device, nor poisoned host state (213-1278 bytes of normal log traffic
-   * each time; the host CLI succeeded immediately after every run). The
-   * reason is mechanical: setting both modem bits in ONE ioctl
-   * (`TIOCMBIS`/`TIOCMBIC` with `DTR|RTS` together) cannot produce an
-   * intermediate single-line state, and the kernel's tty-open raises both
-   * lines together the same way — a POSIX probe structurally cannot emit
-   * the DTR=0/RTS=1 transition, however it tries. Chromium, by contrast,
-   * sets the two lines in SEPARATE operations, so its `open()` and (pre-fix)
-   * its `setSignals()` calls could transit through it. This explains the
-   * entire observation set: the host CLI works (`host/src/transport.rs`
-   * leaves the lines at tty-open defaults), `cat`/`screen` work for the same
-   * reason, `esptool-js` "works" because it drives the reset deliberately,
-   * the MeshCore web app works because it orders the signals correctly, and
-   * only this provisioner — pre-fix — reset the board.
-   *
-   * A reset `open()`'s own forced assert triggers must still not be fatal.
    * `#readLoop`'s magic-header resync (`#tryExtractFrame`, gotcha #9)
    * already tolerates an ESP-IDF boot banner landing ahead of any real
    * frame, and `#sendRecvWithRetry` already retries the first command
@@ -595,9 +564,9 @@ export class ProvisionerSession {
    * out a reboot if one happens. No separate "wait for boot" step is added
    * here: `#sendRecvWithRetry` clears `#accBuf` before its first send, so
    * stale bytes accumulated during `port.open()` are already discarded
-   * before the first attempt, and every retry re-clears it again — that IS
-   * the "settle, drain the banner, retry" sequence, already in place for
-   * any caller, not something `connect()` needs to duplicate.
+   * before the first attempt — that IS the "settle, drain the banner,
+   * retry" sequence, already in place for any caller, not something
+   * `connect()` needs to duplicate.
    *
    * What this does NOT handle: if a reset is severe enough to make the
    * ESP32-S3's native USB peripheral fully re-enumerate (as opposed to a
@@ -609,32 +578,14 @@ export class ProvisionerSession {
    * something this method can paper over. If a device reset ever DOES leave
    * the host CLI wedged afterward, that is a real, separate, HOST-side
    * USB/cdc_acm consequence — see `HOST_WEDGE_GUIDANCE`'s doc comment — not
-   * evidence that this fix failed to prevent the reset in the first place.
-   * And a session that survives connect entirely can still hit the
-   * unrelated, separate `admin_server` stack-overflow defect on
-   * `queryAdvert` — see `HOST_WEDGE_GUIDANCE`'s round-11 annotation.
-   *
-   * `esptool-js` itself must NOT be changed to match this — it deliberately
-   * *wants* the EN/IO0 reset to enter its own bootloader for flashing; see
-   * the gotcha doc's "Occurrences" note.
+   * something this method can prevent. And a session that survives connect
+   * entirely can still hit the unrelated, separate `admin_server`
+   * stack-overflow defect on `queryAdvert` — see `HOST_WEDGE_GUIDANCE`'s
+   * round-11 annotation.
    */
   async connect() {
     const port = await navigator.serial.requestPort();
     await port.open({ baudRate: BAUD_RATE });
-    // Clear RTS, then DTR — two SEPARATE awaited calls, in this exact
-    // order. Never collapse this into one setSignals() call: see this
-    // method's doc comment above for the confirmed DTR=0/RTS=1 core-reset
-    // mechanism and why a single combined call (PR #200's mistake) risks
-    // landing on exactly that trigger. Deliberately BEFORE `this.#port` is
-    // set (matching every other fallible step below, `getWriter()`/
-    // `getReader()` included): if either call rejects, this instance's
-    // state stays entirely unset (`isConnected` false) rather than
-    // partially populated with e.g. `#port` set but `#reader` still null —
-    // `disconnect()` unconditionally dereferences `#reader`/`#writer` once
-    // `#port` is truthy, so a partial `connect()` failure must never leave
-    // it set on its own.
-    await port.setSignals({ requestToSend: false });
-    await port.setSignals({ dataTerminalReady: false });
     this.#port = port;
     this.#writer = port.writable.getWriter();
     this.#reader = port.readable.getReader();
@@ -1231,10 +1182,35 @@ export class ProvisionerSession {
    * `RETRY_TOTAL_MS` has elapsed. Mirrors `Session::send_recv_with_retry`.
    *
    * Unlike the Rust version, there is no `flush_input()` step between
-   * retries: Web Serial exposes no OS-buffer-clear primitive, but since
-   * `#readLoop` continuously drains the port into `#accBuf` there is no
-   * separate kernel buffer accumulating behind the scenes to flush — clearing
-   * `#accBuf` itself (below) is the JS-side equivalent.
+   * retries: Web Serial exposes no OS-buffer-clear primitive, and — unlike
+   * `Session::flush_input`'s deliberate discard of whatever is sitting in
+   * the OS buffer — this method does NOT clear `#accBuf` between retry
+   * attempts either (see RETRY-BOUNDARY BYTE RETENTION below). `#readLoop`
+   * continuously drains the port into `#accBuf` regardless of which attempt
+   * is "current", so there is no separate kernel buffer accumulating behind
+   * the scenes that would need a JS-side equivalent of a flush in the first
+   * place.
+   *
+   * RETRY-BOUNDARY BYTE RETENTION: an earlier version of this method cleared
+   * `#accBuf` at the top of the `catch` block below, on the theory that
+   * stale bytes left over from a timed-out attempt would otherwise confuse
+   * the next attempt's `#recvFrame` call. No other client this protocol was
+   * compared against (the host CLI included) discards received bytes
+   * mid-command, and the theory doesn't hold up: `#tryExtractFrame`'s own
+   * `find_magic_start`/`plen` resync already exists to recover from stale or
+   * malformed bytes at the front of `#accBuf`, so clearing it here was pure
+   * loss with no corresponding gain. The real cost showed up whenever the
+   * device's one and only reply to an attempt straddled the retry boundary
+   * — some of its bytes arriving just before the per-attempt deadline, the
+   * rest just after: the pre-deadline partial frame was thrown away by the
+   * clear, and the post-deadline remainder then had no header to resync
+   * against and was shredded as noise, silently losing a reply the device
+   * never sends twice. `#accBuf` is now left untouched across a retry
+   * boundary — only the whole-command entry reset above and the
+   * cross-command residue guard below ever clear it — so a reply that
+   * completes a moment after `#sendRecvWithRetry` has already moved on to
+   * the next attempt is still sitting there, still resyncable, the next
+   * time `#recvFrame` looks.
    *
    * CROSS-COMMAND RESIDUE GUARD: every top-level command (`queryStatus`,
    * `listContacts`, ...) enters here exactly once as its first frame I/O.
@@ -1316,15 +1292,16 @@ export class ProvisionerSession {
         if (this.#fatalError || Date.now() >= overallDeadline) {
           throw this.#withRebootContext(err);
         }
-        // This attempt timed out but we still have overall budget — clear
-        // the accumulated bytes so stale log noise from the device-side
-        // processing delay doesn't confuse the next recvFrame call, then
-        // loop → send again. `#bytesArrivedThisAttempt` is per-attempt too
-        // (unlike `#cumulativeBytesThisCommand`/`#discardPreview`, which are
-        // whole-command) — clear it here as well so the NEXT attempt's
-        // "arrived" figure isn't inflated by bytes this now-abandoned
-        // attempt already accounted for.
-        this.#accBuf = new Uint8Array(0);
+        // This attempt timed out but we still have overall budget — loop
+        // and send again. `#accBuf` is deliberately NOT cleared here (see
+        // RETRY-BOUNDARY BYTE RETENTION above): whatever this attempt
+        // accumulated, complete or partial, stays in place for the next
+        // attempt's `#recvFrame` to keep resyncing against.
+        // `#bytesArrivedThisAttempt` IS reset here — unlike `#accBuf`, it is
+        // purely a per-attempt "how many bytes arrived during JUST this
+        // attempt's window" counter (see its own doc comment), independent
+        // of what `#accBuf` currently retains, so the NEXT attempt's
+        // "arrived" figure must start back at zero regardless.
         this.#bytesArrivedThisAttempt = 0;
       }
     }
