@@ -91,6 +91,30 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(3);
 /// question). This retracts round 7's guidance to simply reopen the port —
 /// reopening the same `cdc_acm` node does not rebuild the kernel's endpoint
 /// state and cannot recover a wedged handle.
+///
+/// RE-SCOPED, round 11 (`admin-server-stack-overflow-fix`, 2026-09-23,
+/// device evidence): this guidance clears a REAL, RECOVERABLE nuisance —
+/// the DTR/RTS-triggered device reset itself (`rst:0x15
+/// USB_UART_CHIP_RESET`) is not a defect, and the host-side wedge it leaves
+/// behind is exactly what this constant describes. But clearing it is NOT a
+/// guarantee the rest of a provisioning session will succeed: a
+/// device-confirmed `pthread` stack overflow in `admin_server` (a wholly
+/// separate, more severe defect — `firmware/src/admin_server.rs`'s
+/// `FRAME_QUERY_ADVERT` arm, see the kit's round 11 section) can still crash
+/// the device later in the SAME session, well after any host-side wedge is
+/// cleared. Do not read a clean unplug/replug as proof the session will now
+/// complete.
+///
+/// NARROWED, round 12 (`docs/provisioning-connect-verification-kit.md`'s
+/// "CASE CLOSED" section, external corroboration): the specific reset this
+/// guidance was written against — the browser's own post-open DTR/RTS
+/// transition — is now actively AVOIDED by `site/provisioner/session.js`'s
+/// `connect()` (clears RTS then DTR, never the DTR=0/RTS=1 core-reset
+/// trigger), not merely tolerated. This guidance remains correct and
+/// necessary for whatever reset still occurs (`port.open()`'s own
+/// unavoidable line assert, or any other cause) and for the host-side wedge
+/// that can follow one — it is not retracted, only no longer the first
+/// line of defense against a connect failure.
 const HOST_REENUM_GUIDANCE: &str = "unplug and replug the USB cable (or force host-side \
      re-enumeration by deauthorizing/reauthorizing the device node: \
      `echo 0 | sudo tee /sys/bus/usb/devices/<dev>/authorized` then `echo 1 | ...`) -- a \
@@ -188,6 +212,12 @@ impl SerialTransport {
     /// The EN+IO0 reset circuit on ESP32 boards is triggered by the DTR/RTS
     /// *pair* toggling together (the esptool programming sequence); leaving
     /// both lines at their tty-open defaults also avoids inadvertent resets.
+    /// CONFIRMED, round 12 (`docs/provisioning-connect-verification-kit.md`,
+    /// `site/provisioner/session.js`'s `connect()` doc comment): on this
+    /// board's ESP32-S3, the precise trigger is the control-line state
+    /// passing through DTR=0/RTS=1 — never asserting or clearing either
+    /// line at all, as this method does, structurally cannot produce that
+    /// (or any other) transition.
     ///
     /// NOTE (round 6): this `open()`/`clear()` call is bounded by the OS —
     /// device evidence shows a genuine connect-wedge hang lives in `send`'s

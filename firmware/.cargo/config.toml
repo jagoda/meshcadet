@@ -9,9 +9,10 @@ linker = "ldproxy"
 #   scripts/flash-with-partition-table.sh <target/.../debug/meshcadet-firmware>
 # That script's own header comment explains the full sequence; in short, it wraps
 # `espflash flash --no-skip --after no-reset <ELF>` followed by `espflash write-bin
-# 0x8000 <partition-table.bin>` and `espflash monitor`, replicating what a plain
-# `espflash flash --no-skip --monitor <ELF>` used to do, plus landing our custom
-# partition table on the device (see "Custom partition table" comment below).
+# 0x0 <bootloader.bin>`, `espflash write-bin 0x8000 <partition-table.bin>`, and
+# `espflash monitor`, replicating what a plain `espflash flash --no-skip --monitor
+# <ELF>` used to do, plus landing our own bootloader and custom partition table on
+# the device (see "Custom partition table" and "Bootloader repair" comments below).
 #
 # `--no-skip` is the fix for a stale-flash defect: by default espflash computes the
 # MD5 of each flash part and SKIPS any whose checksum matches — an optimisation
@@ -19,11 +20,14 @@ linker = "ldproxy"
 # so the device keeps booting the previous image and only `cargo clean && cargo
 # run` reliably lands the latest.  Diagnosis established that the incremental
 # BUILD is already correct (an app-source edit relinks a fresh ELF in a fraction
-# of full-clean time), and that espflash flashes THIS ELF (it ignores the
-# esp-idf-sys-generated bootloader/partition-table bins — no espflash.toml /
-# [package.metadata.espflash] is present, so espflash uses its bundled defaults
-# plus the ELF).  The only removable flash-side staleness variable is the
-# checksum-skip; `--no-skip` forces the just-built app to be written every
+# of full-clean time), and that plain `espflash flash` writes THIS ELF alongside
+# espflash's OWN bundled bootloader and default partition table (no espflash.toml /
+# [package.metadata.espflash] is present) — which is exactly why the wrapper script
+# below repairs both the partition table AND the bootloader sector after that call;
+# see "Bootloader repair" below for why leaving espflash's bundled bootloader in
+# place is a real ESP-IDF-version-skew hazard, confirmed on hardware, not a benign
+# default.  The only removable flash-side staleness variable `--no-skip` itself
+# addresses is the checksum-skip; it forces the just-built app to be written every
 # invocation, restoring the invariant "cargo run flashes the latest build"
 # WITHOUT forcing a clean (builds stay incremental).
 #
@@ -37,6 +41,32 @@ linker = "ldproxy"
 # two-step-flash workaround). scripts/flash-with-partition-table.sh implements that
 # workaround and is confirmed, on real T-Deck Plus hardware, to flash + land `mc_hist` +
 # boot cleanly.
+#
+# Bootloader repair (round 10, 2026-09-23): plain `espflash flash` also writes espflash's
+# OWN bundled bootloader at 0x0, which tracks espflash's release cadence, not this crate's
+# ESP_IDF_VERSION pin above. Left alone, that bootloader silently drifts out of sync with
+# the app's pinned ESP-IDF version — confirmed on hardware: a device flashed without this
+# repair booted an ESP-IDF v5.5.1 bootloader (ten months newer, produced by no meshcadet
+# build) paired with a v5.2.2 app. scripts/flash-with-partition-table.sh now also
+# `write-bin`s esp-idf-sys's own bootloader.bin to 0x0 after the `espflash flash` step, the
+# same repair pattern used for the partition table above and the one
+# firmware/release-container/build.sh's merge_bin already applied on the release path.
+# Flashing the project's own bootloader by hand was observed to materially change device
+# behaviour, but did NOT eliminate a later, still-unexplained mid-session reset — see
+# docs/provisioning-connect-verification-kit.md ("round 10") for the evidence; this is a
+# partial, unconfirmed improvement, not a resolution of the connect wedge.
+#
+# No build- or flash-time skew guard is implemented here: the only two IDF-version inputs
+# (this pinned ESP_IDF_VERSION and whatever bootloader.bin esp-idf-sys built) are, by
+# construction, always produced by the SAME build once this repair step runs — esp-idf-sys
+# regenerates bootloader.bin from the pinned version on every build, so skew can only
+# recur by skipping this repair step entirely (e.g. hand-editing the runner back out, or a
+# flash tool bypassing it), which a version-string comparison at flash time cannot detect
+# any more reliably than the precondition checks below already do (missing file ==
+# skipped/broken build). A firmware-side boot-time check was considered and rejected: this
+# container has no Xtensa toolchain, so firmware cannot be compile-verified here, and the
+# mechanism the check would guard against is a dev-tooling regression, not a device-side
+# fault.
 runner = "scripts/flash-with-partition-table.sh"
 rustflags = ["--cfg", "espidf_time64"]
 

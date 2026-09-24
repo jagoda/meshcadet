@@ -262,6 +262,28 @@ jobs:
       - name: Self-test scripts/sync-cargo-lock-versions.sh
         run: scripts/sync-cargo-lock-versions.test.sh
 
+  flash-runner-guard:
+    name: flash-with-partition-table.sh self-test
+    runs-on: ubuntu-latest
+    # firmware/scripts/flash-with-partition-table.sh is the `cargo run`
+    # runner (firmware/.cargo/config.toml) that repairs the bootloader
+    # (0x0) and custom partition table (0x8000) espflash's own bundled
+    # defaults would otherwise leave in place — see the script's own header
+    # comment and docs/provisioning-connect-verification-kit.md ("round
+    # 10") for why leaving either unrepaired is a real hazard, confirmed on
+    # hardware. This container has no Xtensa toolchain and no device (see
+    # the `firmware` job below), so nothing here can flash real hardware;
+    # firmware/scripts/flash-with-partition-table.test.sh instead stubs
+    # `espflash` on PATH and pins down the script's call sequence and
+    # fail-loud preconditions, the same shape as cargo-lock-sync-guard
+    # above. Self-contained (its own tmpdir fixture + fake espflash), so it
+    # needs no path-filter gating either.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Self-test firmware/scripts/flash-with-partition-table.sh
+        run: firmware/scripts/flash-with-partition-table.test.sh
+
   vocabulary-hygiene:
     name: no internal-ops vocabulary leaks in public docs
     runs-on: ubuntu-latest

@@ -17,41 +17,91 @@
 # WORKAROUND (verified end-to-end on real T-Deck Plus hardware, on-device boot-log
 # transcript on file):
 #   1. `espflash flash` WITHOUT `--partition-table` never touches our CSV/bin at all, so it
-#      can't hit the panic. It writes the bootloader + app image using espflash's OWN bundled
-#      default single-app table, which — on every ESP-IDF target — places nvs/phy_init/factory
-#      at the SAME fixed offsets (0x9000 / 0xf000 / 0x10000) our custom table also uses, so the
-#      app bytes land exactly where our real table's `factory` partition expects them.
+#      can't hit the panic. It writes espflash's OWN bundled default bootloader + our app
+#      image using espflash's OWN bundled default single-app table, which — on every
+#      ESP-IDF target — places nvs/phy_init/factory at the SAME fixed offsets (0x9000 /
+#      0xf000 / 0x10000) our custom table also uses, so the app bytes land exactly where our
+#      real table's `factory` partition expects them.
 #   2. `espflash write-bin <addr> <file>` is a raw address-write with NO partition-table
 #      parsing whatsoever, so it can safely overwrite just the partition-table sector
 #      (0x8000, one 4 KB sector) with our real, esp-idf-sys-built `partition-table.bin`
 #      (which DOES declare `mc_hist`) — landing the correct table without ever exercising
 #      espflash's broken decoder.
-#   3. Reset (already triggered by write-bin's default `--after hard-reset`) boots the app
-#      with the corrected table in place; `espflash monitor` (no `--no-reset`) then does
-#      its OWN before/after reset too to load its flash stub and attach — see that step's
-#      own comment for why suppressing monitor's reset (as this script used to) hangs.
+#   3. The same `write-bin` mechanism also repairs the bootloader sector (0x0 on ESP32-S3 —
+#      NOT 0x1000, that's original ESP32; see firmware/release-container/build.sh, which
+#      flashes the same offset for the release image) with esp-idf-sys's own bootloader.bin,
+#      the one actually built against this project's pinned ESP_IDF_VERSION
+#      (firmware/.cargo/config.toml). Step 1's bootloader is espflash's bundled default —
+#      it tracks espflash's OWN release cadence, not this project's ESP-IDF pin, so leaving
+#      it in place is a real skew hazard, not a theoretical one: a device flashed by step 1
+#      alone was confirmed on hardware to boot an ESP-IDF v5.5.1 bootloader (ten months
+#      newer than the app, and produced by no meshcadet build) paired with a v5.2.2 app, and
+#      flashing the project's own bootloader by hand materially changed device behaviour —
+#      see docs/provisioning-connect-verification-kit.md ("round 10") for the evidence and
+#      for why this is a partial fix, not a confirmed resolution of the connect wedge.
+#   4. Reset (already triggered by write-bin's default `--after hard-reset`) boots the app
+#      with the corrected bootloader + table in place; `espflash monitor` (no `--no-reset`)
+#      then does its OWN before/after reset too to load its flash stub and attach — see that
+#      step's own comment for why suppressing monitor's reset (as this script used to) hangs.
 #
-# `partition-table.bin` is esp-idf-sys's stable, always-fresh copy (copied out of the
-# per-build-hash OUT_DIR into the crate's target/<triple>/<profile>/ dir on every build —
-# see esp-idf-sys build/native/cargo_driver.rs `copy_binaries_to_target_folder`), so it
-# always sits right next to the ELF cargo passes us.
+# `partition-table.bin` and `bootloader.bin` are esp-idf-sys's stable, always-fresh copies
+# (copied out of the per-build-hash OUT_DIR into the crate's target/<triple>/<profile>/ dir on
+# every build — see esp-idf-sys build/native/cargo_driver.rs `copy_binaries_to_target_folder`),
+# so they always sit right next to the ELF cargo passes us.
+#
+# ACCEPTED INCONSISTENCY (flagged, not fixed, `admin-server-stack-overflow-fix` mission,
+# 2026-09-23 — see docs/provisioning-connect-verification-kit.md's round 11 section):
+# step 1's `espflash flash` patches the APP image header's flash_mode/flash_freq bytes with
+# espflash's OWN CLI defaults (previously observed as 40 MHz / clock div:2), independent of
+# this project's actual sdkconfig — while step 3's project bootloader.bin (esp-idf-sys-built,
+# no explicit CONFIG_ESPTOOLPY_FLASHFREQ/FLASHMODE override in firmware/sdkconfig.defaults, so
+# an ESP-IDF default applies) has been observed reporting 80 MHz / clock div:1 in its own boot
+# banner. Before round 10 both bootloader AND app header came from espflash's own bundled
+# defaults, so they were internally consistent (if not project-intended); round 10 fixing only
+# the bootloader sector introduces this header/bootloader mismatch. Left undisturbed rather
+# than patched blind: this container has no hardware to verify a `--flash-freq`/`--flash-mode`
+# CLI addition to the `espflash flash` call below actually resolves it (or that guessing the
+# "right" value wouldn't just move the mismatch), and getting it wrong risks the exact
+# unverified-guess-landed-as-fact pattern this campaign has already corrected for twice
+# (rounds 4 and 7). No functional failure has been observed to trace to this — the app boots
+# and runs correctly with the mismatched header — so it is recorded here as a known, accepted
+# build-hygiene gap for a future HIL round to close with the flag/value confirmed on real
+# hardware, not guessed from documentation alone.
 set -euo pipefail
 
 ELF="${1:?usage: flash-with-partition-table.sh <path-to-elf>}"
 BIN_DIR="$(dirname "$ELF")"
 PARTITION_TABLE_BIN="$BIN_DIR/partition-table.bin"
+BOOTLOADER_BIN="$BIN_DIR/bootloader.bin"
 
-if [[ ! -f "$PARTITION_TABLE_BIN" ]]; then
-  echo "flash-with-partition-table.sh: $PARTITION_TABLE_BIN not found (expected next to the" >&2
-  echo "ELF — esp-idf-sys's build.rs copies it there on every build; did the build succeed?)" >&2
-  exit 1
-fi
+# Both artifacts are esp-idf-sys build outputs copied next to the ELF on every
+# build (see the header comment above) — a missing one means the build didn't
+# succeed (or didn't run), and flashing anyway would silently write a stale or
+# absent bootloader/partition table. Fail loud instead.
+require_bin() {
+  local bin_path="$1"
+  if [[ ! -f "$bin_path" ]]; then
+    echo "flash-with-partition-table.sh: $bin_path not found (expected next to the" >&2
+    echo "ELF — esp-idf-sys's build.rs copies it there on every build; did the build succeed?)" >&2
+    exit 1
+  fi
+}
+require_bin "$PARTITION_TABLE_BIN"
+require_bin "$BOOTLOADER_BIN"
 
 # --no-skip: the stale-flash fix this runner already carried — always write the
 #   freshly-linked app, never checksum-skip.
 # --after no-reset: don't let the app boot yet — it would briefly run with espflash's
-#   default (wrong, no mc_hist) table still in the partition-table sector.
+#   own bundled bootloader and (wrong, no mc_hist) table still on the device.
 espflash flash --no-skip --after no-reset "$ELF"
+
+# Overwrite the bootloader sector (0x0) with the project's own, ESP_IDF_VERSION-matched
+# bootloader.bin — repairs the skew left by step 1's espflash-bundled bootloader (see the
+# header comment above for the confirmed-on-hardware hazard this closes). Default --after
+# is hard-reset; left at default for the same reason the partition-table write below is:
+# see that step's comment for the "Communication error" failure an explicit
+# `--after no-reset` produced on real hardware.
+espflash write-bin 0x0 "$BOOTLOADER_BIN"
 
 # Overwrite just the partition-table sector with our real table. Default --after is
 # hard-reset, so this is also what boots the device into its corrected state. (An
