@@ -69,11 +69,11 @@ import { ProvisionerSession, DeviceError } from "./session.js";
  * is called synchronously for every frame the session writes (used to drive
  * scripted device responses and to assert what was sent); the returned
  * `push(bytes)` enqueues bytes as if the device sent them; `signalsCalls`
- * records every `setSignals()` invocation in order (used to assert
- * `connect()` never calls it at all — see session.js's `connect()` doc
- * comment for why); `error(err)` makes the readable stream error out, as if
- * the device vanished mid-read (e.g. a USB re-enumeration from a hard
- * reset).
+ * records every `setSignals()` invocation IN ORDER (used to assert
+ * `connect()` clears RTS then DTR as two separate calls, never one combined
+ * call — see session.js's `connect()` doc comment for why the order is the
+ * entire fix); `error(err)` makes the readable stream error out, as if the
+ * device vanished mid-read (e.g. a USB re-enumeration from a hard reset).
  */
 function makeFakePort(onWrite) {
   let controller;
@@ -260,34 +260,35 @@ async function happyPathWithLogNoiseResync() {
   assert.equal(session.isConnected, false);
 }
 
-// ── Scenario 1b: connect() never touches setSignals() at all ─────────────
+// ── Scenario 1b: connect() clears RTS, then DTR, as two separate calls ───
 //
-// Regression guard for TWO successive defects on the same line, in order:
+// Regression guard for THREE successive rounds on the same line, in order:
 // (a) PR #197 fixed the host CLI (`host/src/transport.rs`) to leave DTR/RTS
-// untouched; the browser client never got the equivalent treatment, so PR
-// #200 added a post-open `setSignals({dataTerminalReady: false,
-// requestToSend: false})` de-assert, reasoning it might "beat" the reset
-// pulse `open()`'s own forced assert triggers on this board's CH343
-// auto-program wiring (EN/IO0). (b) `meshcadet-provisioner-connect-
-// unbounded-awaits-hang` (this mission) got the first real hardware
-// evidence against that de-assert and found it left the device unreachable
-// by the host CLI until a PHYSICAL RESET — `setSignals()`'s two line
-// changes are not guaranteed atomic below the JS call, and a staggered
-// transition on this wiring is indistinguishable from `site/flash.js`'s
-// vendored `esptool-js`'s deliberate bootloader-entry dance. The fix:
-// `connect()` must not call `setSignals()` at all — see its doc comment for
-// the full history and why relying on `open()`'s own (already
-// field-proven-survivable, pre-#200) forced assert is the smallest correct
-// fix.
+// untouched. (b) The browser client never got the equivalent treatment, so
+// PR #200 added a post-open `setSignals({dataTerminalReady: false,
+// requestToSend: false})` de-assert as ONE combined call — hardware
+// evidence showed this left the device unreachable by the host CLI until a
+// PHYSICAL RESET, very likely because a single combined call lets Chromium
+// choose the internal order of the two line changes, and if it clears DTR
+// before RTS the transition lands on the ESP32-S3's confirmed core-reset
+// trigger, DTR=0/RTS=1. PR #201 then removed signal handling from
+// `connect()` altogether. (c) This mission (round 12, external
+// corroboration — `vinceneil666/MeshcoreChatter#3`) confirms the trigger
+// precisely and fixes it: clear RTS BEFORE DTR, as two SEPARATE awaited
+// `setSignals()` calls, so the DTR=0/RTS=1 state is never visited. The
+// ORDER is the entire fix — collapsing this back into one combined call
+// (#200's mistake) would silently reintroduce the wedge, so this asserts
+// the exact call SEQUENCE, not merely that `setSignals()` was called at
+// all. See `connect()`'s doc comment for the full history and mechanism.
 
-async function connectNeverCallsSetSignals() {
+async function connectClearsRtsBeforeDtr() {
   const { port } = makeFakePort(() => {});
   installFakeGlobals(port);
 
   const session = new ProvisionerSession();
   await session.connect();
 
-  assert.deepEqual(port.signalsCalls, []);
+  assert.deepEqual(port.signalsCalls, [{ requestToSend: false }, { dataTerminalReady: false }]);
 
   await session.disconnect();
 }
@@ -426,7 +427,10 @@ async function connectSurvivesResetBootBannerBeforeFirstQueryStatus() {
 
   const session = new ProvisionerSession();
   await session.connect();
-  assert.deepEqual(port.signalsCalls, []); // connect() no longer touches setSignals() — see its doc comment
+  // connect() clears RTS then DTR (see its doc comment) — the boot banner
+  // this scenario drives is `open()`'s own unavoidable, known-survivable
+  // reset, not a symptom of the post-open setSignals() sequence.
+  assert.deepEqual(port.signalsCalls, [{ requestToSend: false }, { dataTerminalReady: false }]);
 
   const { status, identity } = await session.queryStatus();
   assertStatusAndIdentity(status, identity);
@@ -1622,8 +1626,8 @@ async function delRoomSendsCorrectFrame() {
 const scenarios = [
   ["happy path: two-frame handshake + magic-resync past log noise", happyPathWithLogNoiseResync],
   [
-    "connect() never calls setSignals() (device-wedge regression — see connect()'s doc comment)",
-    connectNeverCallsSetSignals,
+    "connect() clears RTS then DTR as two separate calls, in that order (DTR=0/RTS=1 core-reset regression — see connect()'s doc comment)",
+    connectClearsRtsBeforeDtr,
   ],
   ["a stalled writer.write() surfaces a distinct 'write stalled' error within bounded time (unbounded-await regression)", writeStallSurfacesDistinctErrorWithinBoundedTime],
   ["disconnect() does not hang when reader.cancel() stalls (unbounded-await regression)", disconnectDoesNotHangWhenReaderCancelNeverSettles],

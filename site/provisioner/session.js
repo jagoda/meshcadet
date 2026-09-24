@@ -225,6 +225,16 @@ const REBOOT_BANNER = "ESP-ROM:esp32s3";
  * can still crash the device later in the SAME session, during
  * `queryAdvert`, well after any host-side wedge is cleared and `queryStatus`
  * has already succeeded.
+ *
+ * NARROWED, round 12 (this mission, external corroboration — see
+ * `connect()`'s doc comment): the specific `open()`-triggered reset this
+ * guidance was written against is now actively AVOIDED, not merely
+ * tolerated — `connect()` clears RTS then DTR immediately post-open so the
+ * confirmed DTR=0/RTS=1 core-reset trigger is never emitted by this
+ * client. This guidance remains correct and necessary for whatever reset
+ * still occurs (`open()`'s own unavoidable line assert, or any other
+ * cause) and for the host-side wedge that can follow one — it is not
+ * retracted, only no longer the FIRST line of defense.
  */
 const HOST_WEDGE_GUIDANCE =
   "A device-side reset does not clear this -- the failure lives in the HOST's USB/cdc_acm " +
@@ -258,11 +268,16 @@ function hex2(n) {
  * own distinct cause quickly instead of hanging forever with no diagnosis
  * at all (part of the defect this mission fixes: `writer.write()` was never
  * guarded by `RETRY_TOTAL_MS`/`RETRY_ATTEMPT_MS`/`FRAME_TIMEOUT_MS` — those
- * three only ever wrapped the RECEIVE side). `connect()` no longer calls
- * `port.setSignals()` at all — see that method's doc comment for why — so
- * it is not a caller of this helper, even though an earlier pass of this
- * fix bounded that call too before the underlying call was removed
- * entirely.
+ * three only ever wrapped the RECEIVE side). `connect()`'s two post-open
+ * `port.setSignals()` calls (see that method's doc comment for the confirmed
+ * DTR/RTS mechanism they exist to avoid) are deliberately NOT routed through
+ * this helper: the exact two-call, two-line sequence the fix depends on is
+ * simple and immediate, and racing it against a timeout would only add risk
+ * to the one thing that must not change — the ORDER — for no corresponding
+ * benefit; an unresponsive `setSignals()` is not a failure mode this round
+ * has any evidence for, unlike `writer.write()`/`reader.cancel()`/
+ * `port.close()`, each added to this helper only after a real hang was
+ * observed.
  */
 const UNBOUNDED_CALL_TIMEOUT_MS = 2_000;
 
@@ -480,65 +495,96 @@ export class ProvisionerSession {
    * dismisses the picker without choosing a device — callers should treat
    * that as a silent cancel, not an error to surface.
    *
-   * ── DTR/RTS on this board (mirrors `host/src/transport.rs`'s
-   * `SerialTransport::open` doc comment — read that one too) ──
+   * ── CONFIRMED MECHANISM (round 12, this mission, external corroboration —
+   * mirrors `host/src/transport.rs`'s `SerialTransport::open` doc comment,
+   * read that one too) ──
    *
-   * The T-Deck Plus wires DTR/RTS to EN/IO0 — the CH343's standard
-   * auto-program circuit. Asserting DTR resets the chip; it is never "ready to
-   * receive" on this silicon. The host CLI avoids this by never touching
-   * the lines at all (`serialport` leaves them at tty-open defaults,
-   * `88b0456`). Web Serial gives no equivalent "open without touching the
-   * lines" call: Chromium's `SerialPort.open()` asserts both DTR and RTS
-   * unconditionally as part of opening the port, before any application
-   * code runs, and this method does not (and, per the history below, must
-   * not) do anything further to them after that.
+   * The ESP32-S3's NATIVE USB-Serial-JTAG peripheral (this SoC exposes
+   * USB-CDC directly — there is no external CH34x/CP210x-style UART bridge
+   * chip on this signal path) treats a DTR/RTS transition as a hardware
+   * chip-reset trigger. The confirmed trigger is not "DTR and RTS both
+   * change" in general — it is the control-line state passing through
+   * **DTR=0, RTS=1** specifically. The ESP32-S3 has no register to disable
+   * this (later peripherals — C6, H2 — do; see this repo's verification kit,
+   * `docs/provisioning-connect-verification-kit.md`, FIRMWARE section, for
+   * the register-level citation): it cannot be switched off in firmware, so
+   * the only fix is for this client to never emit that transition.
    *
-   * ── History: PR #200 added a post-open de-assert; hardware evidence
-   * showed it wedges the device until a physical reset. Removed. ──
+   * Independent corroboration, same symptom, same chip family: an unrelated
+   * project (`vinceneil666/MeshcoreChatter` PR #3, "Fix serial connect on
+   * ESP32 nodes: drop RTS before DTR") reports MeshCore nodes visibly
+   * resetting when ITS client connected, while a different, correctly
+   * ordered client could connect fine to the same port — diagnoses the same
+   * DTR=0/RTS=1 transit, and fixes it the same way this method now does:
+   * clear RTS before DTR. That project measured 0/3 -> 6/6 successful
+   * connections on an ESP32-S3 after the reorder. See also
+   * https://www.esp32.com/viewtopic.php?t=37208 and esptool's `--before
+   * no-reset-no-sync` option, which exists precisely to skip the DTR/RTS
+   * assignment esptool would otherwise perform.
+   *
+   * `port.open()` itself still asserts DTR and RTS unconditionally before
+   * any application code runs — Chromium gives no "open without touching
+   * the lines" call, so that one transition is not this method's to avoid.
+   * Field evidence already shows it is a **known-survivable** reset (visible
+   * reboot, tolerated by the retry/resync machinery below, never a state
+   * requiring physical intervention on its own). What IS this method's to
+   * avoid is the transition it makes ITSELF immediately after open — and
+   * getting that wrong is exactly what PR #200 did (see history below).
+   *
+   * ── THE FIX: clear RTS, then DTR, as two SEPARATE awaited calls ──
+   *
+   * `await port.setSignals({ requestToSend: false })`, THEN
+   * `await port.setSignals({ dataTerminalReady: false })`. The separation is
+   * the entire point and must NOT be collapsed into one combined
+   * `setSignals({ dataTerminalReady: false, requestToSend: false })` call: a
+   * single call lets Chromium choose the internal order of the two line
+   * changes, and if it clears DTR before RTS the transition lands exactly on
+   * DTR=0/RTS=1 — the trigger. Clearing RTS first instead means the
+   * transition goes RTS=1,DTR=1 -> RTS=0,DTR=1 -> RTS=0,DTR=0: the
+   * DTR=0/RTS=1 state is never visited.
+   *
+   * ── History: PR #200's single combined call very likely wedged the
+   * device; PR #201 removed signal handling entirely; this is #200 with
+   * the ordering it got wrong, not a re-litigation of #200's premise ──
    *
    * PR #200 called `setSignals({ dataTerminalReady: false, requestToSend:
    * false })` immediately after `open()`, reasoning that de-asserting as
    * fast as possible might "beat" the EN/IO0 reset pulse `open()`'s own
    * forced assert triggers — explicitly flagged in that PR's own commit
    * message as unverified on real hardware ("developed without a browser or
-   * a physical device available").
+   * a physical device available"). A failed web-provisioner connect against
+   * that code left the device **unreachable by the host CLI across a full
+   * process boundary, until a physical reset** — not a timeout, a genuine
+   * hang. `host/src/transport.rs` never writes DTR/RTS at all, so this was
+   * not residual browser-side signal state; something on the device itself
+   * had latched. This is very likely explained by the mechanism above:
+   * `setSignals()`'s two line changes inside one combined call are not
+   * guaranteed to land in a particular order below the JS call, and if
+   * Chromium happened to clear DTR before RTS, the transition landed
+   * squarely on DTR=0/RTS=1. PR #201 then removed signal handling from
+   * `connect()` altogether. Both were reasonable responses to real field
+   * evidence at the time; the ordering bug identified this round is why
+   * de-asserting post-open was never actually unsafe, only unordered.
    *
-   * `meshcadet-provisioner-connect-unbounded-awaits-hang` (this mission)
-   * got the first real hardware run against it and found something worse
-   * than the reboot #200 was trying to avoid: a failed web-provisioner
-   * connect left the device **unreachable by the host CLI across a full
-   * process boundary, until a physical reset** — not a timeout, not a
-   * retriable error, a genuine hang that persisted after the browser tab
-   * closed and the port released. `host/src/transport.rs` never writes
-   * DTR/RTS at all, so this could not be residual browser-side signal
-   * state; something on the device itself had latched.
+   * ── Why our own diagnostics never reproduced this ──
    *
-   * The leading mechanism: `setSignals()`'s two line changes are not
-   * guaranteed atomic at the OS/driver layer below the single JS call — on
-   * this board's CH343 auto-program wiring, a *staggered* DTR-then-RTS (or
-   * RTS-then-DTR) transition is indistinguishable from the deliberate
-   * bootloader-entry toggle sequence `site/flash.js`'s vendored
-   * `esptool-js` (`ClassicReset`/`UsbJtagSerialReset`) implements on
-   * purpose to force entry into the ROM serial bootloader — which runs no
-   * application, answers no provisioning frames, and persists until reset.
-   * PR #200 appears to have accidentally reimplemented the flasher's
-   * enter-download-mode dance inside the provisioner's own connect path.
-   *
-   * The fix: stop touching the lines after `open()`, full stop — no
-   * de-assert, no restore/re-assert. Re-asserting would just reintroduce
-   * the plain reset PR #197/#200 were trying to avoid: DTR/RTS on this
-   * board select reset/bootloader mode, not CDC flow control (see the DTR/
-   * RTS section above), so "keep it asserted to keep RX open" is exactly
-   * the incorrect UART-flow-control analogy `host/src/transport.rs`'s own
-   * fix already retired on the host CLI side. Whatever `open()`'s own
-   * forced assert does to the chip is the one DTR/RTS
-   * transition this method cannot avoid — and it is a **known-survivable**
-   * one: pre-#200, with no `setSignals()` call anywhere in this file, the
-   * device reliably reset and came back up (visible reboot, failed first
-   * connect attempt, working retry) — never a state requiring physical
-   * intervention. Removing the post-open call returns to exactly that
-   * already-field-proven path. This is deliberately the smallest change
-   * that closes the wedge, not a rewrite of the signal-handling story.
+   * A stdlib probe script driving the port directly from a POSIX tty was
+   * run in three modes (plain open; an explicit DTR/RTS clear-then-assert
+   * within one open; three rapid open/close cycles) and NONE reset the
+   * device, nor poisoned host state (213-1278 bytes of normal log traffic
+   * each time; the host CLI succeeded immediately after every run). The
+   * reason is mechanical: setting both modem bits in ONE ioctl
+   * (`TIOCMBIS`/`TIOCMBIC` with `DTR|RTS` together) cannot produce an
+   * intermediate single-line state, and the kernel's tty-open raises both
+   * lines together the same way — a POSIX probe structurally cannot emit
+   * the DTR=0/RTS=1 transition, however it tries. Chromium, by contrast,
+   * sets the two lines in SEPARATE operations, so its `open()` and (pre-fix)
+   * its `setSignals()` calls could transit through it. This explains the
+   * entire observation set: the host CLI works (`host/src/transport.rs`
+   * leaves the lines at tty-open defaults), `cat`/`screen` work for the same
+   * reason, `esptool-js` "works" because it drives the reset deliberately,
+   * the MeshCore web app works because it orders the signals correctly, and
+   * only this provisioner — pre-fix — reset the board.
    *
    * A reset `open()`'s own forced assert triggers must still not be fatal.
    * `#readLoop`'s magic-header resync (`#tryExtractFrame`, gotcha #9)
@@ -553,18 +599,20 @@ export class ProvisionerSession {
    * the "settle, drain the banner, retry" sequence, already in place for
    * any caller, not something `connect()` needs to duplicate.
    *
-   * What this does NOT handle: if the EN reset is severe enough to make the
+   * What this does NOT handle: if a reset is severe enough to make the
    * ESP32-S3's native USB peripheral fully re-enumerate (as opposed to a
    * soft reboot that keeps the same USB session alive), the already-open
    * `port.readable`/`port.writable` streams may error out from under
    * `#readLoop` rather than just going quiet for a while. That surfaces as
    * a real rejection (`#readLoop`'s catch rejects every waiter — never a
    * silent hang), but recovering from it means the user reconnecting, not
-   * something this method can paper over. Device-confirm this — see
-   * `docs/provisioning-connect-verification-kit.md`, whose step 1 now also
-   * checks the specific wedge this history section describes: a failed web
-   * connect must leave the device reachable by the host CLI without a
-   * physical reset.
+   * something this method can paper over. If a device reset ever DOES leave
+   * the host CLI wedged afterward, that is a real, separate, HOST-side
+   * USB/cdc_acm consequence — see `HOST_WEDGE_GUIDANCE`'s doc comment — not
+   * evidence that this fix failed to prevent the reset in the first place.
+   * And a session that survives connect entirely can still hit the
+   * unrelated, separate `admin_server` stack-overflow defect on
+   * `queryAdvert` — see `HOST_WEDGE_GUIDANCE`'s round-11 annotation.
    *
    * `esptool-js` itself must NOT be changed to match this — it deliberately
    * *wants* the EN/IO0 reset to enter its own bootloader for flashing; see
@@ -573,6 +621,20 @@ export class ProvisionerSession {
   async connect() {
     const port = await navigator.serial.requestPort();
     await port.open({ baudRate: BAUD_RATE });
+    // Clear RTS, then DTR — two SEPARATE awaited calls, in this exact
+    // order. Never collapse this into one setSignals() call: see this
+    // method's doc comment above for the confirmed DTR=0/RTS=1 core-reset
+    // mechanism and why a single combined call (PR #200's mistake) risks
+    // landing on exactly that trigger. Deliberately BEFORE `this.#port` is
+    // set (matching every other fallible step below, `getWriter()`/
+    // `getReader()` included): if either call rejects, this instance's
+    // state stays entirely unset (`isConnected` false) rather than
+    // partially populated with e.g. `#port` set but `#reader` still null —
+    // `disconnect()` unconditionally dereferences `#reader`/`#writer` once
+    // `#port` is truthy, so a partial `connect()` failure must never leave
+    // it set on its own.
+    await port.setSignals({ requestToSend: false });
+    await port.setSignals({ dataTerminalReady: false });
     this.#port = port;
     this.#writer = port.writable.getWriter();
     this.#reader = port.readable.getReader();

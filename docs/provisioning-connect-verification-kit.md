@@ -1,5 +1,38 @@
 # Provisioning connect/reboot/CLI-hang — device verification kit
 
+**CASE CLOSED, 2026-09-24 (round 12) — the DTR/RTS reset round 11 demoted to
+"nuisance" is now PREVENTED, not just tolerated, and the two remaining
+over-broad conclusions in this kit are retracted. Read "Update, 2026-09-24
+(round 12)" below before anything earlier in this file; round 11's own
+findings (below) are otherwise unchanged and still current.**
+
+The ESP32-S3's native USB-Serial-JTAG peripheral treats a control-line
+transition through **DTR=0, RTS=1** specifically (not any DTR/RTS change in
+general) as a hardware core-reset trigger, confirmed against an independent
+project hitting the identical symptom on the same chip
+([`vinceneil666/MeshcoreChatter#3`](https://github.com/vinceneil666/MeshcoreChatter/pull/3)).
+`site/provisioner/session.js`'s `connect()` now clears RTS then DTR as two
+separate awaited calls, immediately post-open, so this client never emits
+that transition — see "Update, 2026-09-24 (round 12)" below for the full
+mechanism, the fix, and why this campaign's own diagnostics could never
+reproduce it. Two round 7/8-era conclusions this newly confirms wrong are
+retracted in place: (a) "Web Serial exposes no way for this page to
+recover" / "the browser provisioner may be structurally unable to recover
+from this wedge" (the "Web Serial limitation" section, round 8), and (b)
+"there is no safe ESP-IDF knob, only a bricking-risk eFuse, therefore this
+is unfixable" (the FIRMWARE section's concluding paragraph, round 7/8) —
+in both cases the underlying fact stands (Web Serial has no host-side
+re-enumeration primitive; the S3 cannot disable the reset in firmware) but
+the "therefore unfixable" conclusion drawn from it does not.
+
+Round 11's own root-cause finding (the `admin_server` `pthread` stack
+overflow on `QUERY_ADVERT`) and its retractions/re-framing (rst:0x15 as
+nuisance not root cause, the host-side wedge as consequence not
+explanation, no `v0.6.0..v0.7.0` bisect warranted) are UNCHANGED by this
+round — they were correct then and remain correct now. This round adds a
+THIRD, independent, now also-fixed defect to the two rounds 10/11 already
+closed; it does not reopen or contradict either.
+
 **ROOT CAUSE CONFIRMED, 2026-09-23 (round 11) — read "Update, 2026-09-23
 (round 11)" below before anything earlier in this file.** The campaign's
 actual defect is a device-confirmed `pthread` stack overflow in
@@ -852,15 +885,23 @@ peripheral at all. Even setting aside `firmware/rust-toolchain.toml`'s
 Xtensa toolchain not being installed in this container (which alone would
 already block a compile-verified change, and landing an unbuildable guess is
 precisely the pattern rounds 2-5 repeated), there is no source-confirmed
-register write that would constitute a real fix to propose. The durable fix
-this objective asked to scope out — "stop USB-Serial-JTAG resetting the
-chip on a host DTR/RTS transition" — may not be achievable in firmware on
-this SoC at all; if a fix exists, it is more likely a board-level hardware
-change (e.g. gating DTR/RTS at the connector, the way an external
-USB-UART-bridge board can) than anything `firmware/` can express. The
-client-side recovery landed this round (reopen-and-retry on the host,
-count-and-report on the browser) should be treated as the durable mitigation
-for THIS chip, not a stopgap awaiting a firmware patch that may not exist.
+register write that would constitute a real fix to propose. Stopping
+USB-Serial-JTAG from resetting the chip on ANY DTR/RTS transition is not
+achievable in firmware on this SoC — that half of this conclusion is
+unretracted and stands.
+**RETRACTED, round 12 (see the CASE CLOSED section at the top of this
+file) — the OTHER half of this conclusion, "therefore unfixable"/no
+durable fix exists, does not follow and is wrong.** "Cannot be disabled"
+is not the same claim as "cannot be avoided": the trigger is not any
+DTR/RTS change, it is one SPECIFIC, precisely identified transition
+(DTR=0, RTS=1) that a client controls entirely on its own side, with no
+firmware or hardware change needed. The durable fix is a client
+(`site/provisioner/session.js`'s `connect()`) that structurally never
+emits that transition — landed round 12, not a board-level hardware
+change and not a stopgap. The client-side recovery landed round 8
+(reopen-and-retry on the host, count-and-report on the browser) remains
+correct and necessary for whatever reset still occurs at `open()` time
+(see round 12's mechanism), just no longer the only mitigation available.
 
 **Confirmed still valid, round 8 (2026-09-22) — carried forward, not
 retracted.** This subsection's register-level finding (no
@@ -1052,16 +1093,27 @@ a write stall was never going to help regardless of which side of the
 Web Serial exposes **no primitive equivalent to
 `/sys/bus/usb/devices/<dev>/authorized`** or a physical unplug/replug —
 there is no API surface for a page to ask the browser (let alone the OS)
-to force host-side re-enumeration of an already-open serial device. This
-means: if a future attempt to prevent the ESP32-S3's DTR/RTS-triggered
-self-reset in firmware also fails (see the FIRMWARE section above — it
-already has, for this round), **the browser provisioner may be
-structurally unable to recover from this wedge on this board at all**,
-short of asking the user to physically unplug and replug the cable
-themselves. This is a real product limitation, not a bug this codebase can
-fix — `HOST_WEDGE_GUIDANCE` (`site/provisioner/session.js`) says exactly
-this to the user rather than implying a "Reconnect" button click will do
-it.
+to force host-side re-enumeration of an already-open serial device. If the
+HOST-side USB/cdc_acm wedge this section is about ever occurs, the page
+genuinely cannot clear it itself; `HOST_WEDGE_GUIDANCE`
+(`site/provisioner/session.js`) says exactly that to the user rather than
+implying a "Reconnect" button click will do it, and that recovery guidance
+is correct and unretracted.
+
+**RETRACTED, round 12 (see the CASE CLOSED section at the top of this
+file) — the broader claim drawn from this limitation, "the browser
+provisioner may be structurally unable to recover from this wedge on this
+board at all" (i.e., the connect path itself may be unfixable), is wrong.**
+That conclusion depended on "no firmware fix exists" meaning "no fix of any
+kind exists" — refuted: a correctly-ordered Web Serial client connects to
+this exact chip without incident (external corroboration,
+`vinceneil666/MeshcoreChatter#3`), because the fix was never a firmware or
+host-recovery problem — it was this browser client not emitting the
+DTR=0/RTS=1 trigger in the first place (`site/provisioner/session.js`'s
+`connect()`, round 12). This section's actual, narrower scope — Web Serial
+has no API to force host-side re-enumeration if a wedge does happen —
+remains true and is why `HOST_WEDGE_GUIDANCE` still exists; it was never,
+and is not now, a claim that connecting is unrecoverable in general.
 
 ### Acceptance criteria, walked
 
@@ -1437,6 +1489,127 @@ follow-on once hardware is available.
    additional commit on PR #211 (`jagoda/meshcadet`), not a new branch or
    pull request.
 
+## Update, 2026-09-24 (round 12): the DTR/RTS reset round 11 demoted to "nuisance" is CONFIRMED and PREVENTED — external corroboration, client-side fix, case closed
+
+This mission picks up exactly where round 11 left the `rst:0x15
+(USB_UART_CHIP_RESET)` reset: real, recoverable, demoted to nuisance —
+but never itself prevented. This round confirms the PRECISE trigger and
+prevents it from ever being emitted by this client, closing the last open
+thread in this kit.
+
+### THE MECHANISM (confirmed, external corroboration)
+
+The ESP32-S3's native USB-Serial-JTAG peripheral (no external UART bridge
+chip is involved — this SoC exposes USB-CDC directly) treats a
+control-line transition through **DTR=0, RTS=1** — this specific ordered
+pair, not "DTR and RTS both change" in general — as a hardware core-reset
+trigger. The FIRMWARE section (rounds 7/8, reconfirmed below) already
+established the S3 has no register to disable this; what this round adds
+is the precise trigger condition and the fact that avoiding it requires no
+firmware change at all.
+
+**Independent corroboration:** an unrelated project hit the identical
+symptom on the same chip —
+[`vinceneil666/MeshcoreChatter#3`](https://github.com/vinceneil666/MeshcoreChatter/pull/3)
+("Fix serial connect on ESP32 nodes: drop RTS before DTR") reports MeshCore
+nodes visibly resetting when its client connected, while "the MeshCore web
+app could connect fine to the same port" — diagnoses the DTR=0/RTS=1
+transit precisely, and fixes it by clearing RTS BEFORE DTR, measuring
+0/3 -> 6/6 successful connections on an ESP32-S3. Background:
+<https://www.esp32.com/viewtopic.php?t=37208>, and esptool's `--before
+no-reset-no-sync` option, which exists precisely to skip the DTR/RTS
+assignment esptool would otherwise perform.
+
+### WHY THIS CAMPAIGN'S OWN DIAGNOSTICS NEVER REPRODUCED IT
+
+A stdlib probe script driving the port directly from a POSIX tty was run
+in three modes — plain open, an explicit DTR/RTS clear-then-assert within
+one open, and three rapid open/close cycles — and NONE reset the device
+(213-1278 bytes of normal log traffic each time), nor did any poison host
+state (the host CLI succeeded immediately after every run). The reason is
+mechanical: setting both modem bits in ONE ioctl (`TIOCMBIS`/`TIOCMBIC`
+with `DTR|RTS` together) cannot produce an intermediate single-line state,
+and the kernel's tty-open raises both together the same way — a POSIX
+probe structurally cannot emit the DTR=0/RTS=1 transition, however it
+tries. Chromium, by contrast, sets the two lines in SEPARATE operations,
+so its `open()` and (pre-fix) its `setSignals()` calls could transit
+through it. This explains the entire observation set at last: the host CLI
+works (`host/src/transport.rs` leaves the lines at tty-open defaults),
+`cat`/`screen` work for the same reason, `esptool-js` "works" because it
+drives the reset deliberately, the MeshCore web app works because it
+orders the signals correctly, and only this provisioner — pre-fix — reset
+the board.
+
+### THE FIX
+
+`site/provisioner/session.js`'s `connect()`, immediately after
+`await port.open({ baudRate: BAUD_RATE })`, now clears the lines in the
+safe order as TWO SEPARATE AWAITED CALLS:
+`await port.setSignals({ requestToSend: false });` THEN
+`await port.setSignals({ dataTerminalReady: false });`. The separation is
+the entire point and must never be collapsed into one combined call: PR
+#200 called `setSignals({ dataTerminalReady: false, requestToSend: false
+})` as a SINGLE call, which lets Chromium choose the internal order, and if
+it clears DTR before RTS the state lands exactly on DTR=0/RTS=1 — very
+likely why #200 made things WORSE (it wedged the device until a physical
+reset) and why #201 then removed signal handling altogether. **This is not
+a re-litigation of #200 — it is #200 with the ordering it got wrong.**
+
+Regression-protected by `session.smoke.test.mjs`'s "connect() clears RTS
+then DTR as two separate calls, in that order" scenario, which asserts the
+exact call SEQUENCE — not merely that `setSignals()` was called at all — so
+an order regression here fails CI instead of re-breaking the device
+silently.
+
+**Not device-verified this round** (no hardware in this container): the
+JS fix needs no reflash to verify — a browser reload of the deployed page
+suffices, since it is page-side only and firmware is untouched.
+
+### RETRACTIONS AND RE-FRAMING, this round
+
+- **(a)** "Web Serial exposes no way for this page to recover" / "the
+  browser provisioner may be structurally unable to recover from this
+  wedge on this board at all" (the "Web Serial limitation" section, round
+  8) — **retracted.** A correctly-ordered Web Serial client connects to
+  this exact chip without incident (the external corroboration above);
+  see that section, corrected in place.
+- **(b)** "There is no safe ESP-IDF knob, only a bricking-risk eFuse,
+  [therefore] the durable fix... may not be achievable in firmware on this
+  SoC at all" (the FIRMWARE section's concluding paragraph, round 7/8) —
+  **partially retracted.** The ESP32-S3 genuinely has no firmware-level way
+  to disable the reset (unretracted), and burning the `DIS_USB_SERIAL_JTAG`
+  eFuse remains an irresponsible, bricking-risk recommendation for this
+  hardware (still not proposed). What was wrong was the CONCLUSION: "cannot
+  be disabled" does not mean "cannot be avoided" — the fix is a client that
+  never emits the one transition that triggers it, not a firmware or
+  hardware change at all. See that section, corrected in place.
+- **(c)/(d)** Round 11 already correctly demoted the host-side USB/cdc_acm
+  wedge to a consequence (not the root cause of a connect failure) and
+  already retracted any `v0.6.0`/`v0.7.0` firmware-regression framing (no
+  bisect warranted) — both stand unchanged by this round; nothing new to
+  retract on either point. This round's own contribution is narrower: it
+  confirms the PRECISE DTR/RTS trigger and prevents it, which is
+  additive to, not a re-litigation of, round 11's findings.
+
+### What stays, unchanged and correct
+
+Round 10's dev-flash bootloader fix (build hygiene — matched IDF versions,
+`mc_hist` actually flashed), round 11's `admin_server` stack-overflow fix
+(device-confirmed crash on the `QUERY_ADVERT` path), the reboot counter and
+discard-dump instrumentation (`#scanForRebootBanner`/`#logDiscardedPreview`
+in `session.js`), and the `#sendFrame`-outside-`#sendRecvWithRetry`'s-`try`
+fix (round 8). None of these were touched or questioned by this round.
+
+### Case status: CLOSED
+
+Three independent, real defects on this connect path have now each been
+found and fixed: the dev-flash bootloader/IDF skew (round 10, build
+hygiene), the `admin_server` `pthread` stack overflow on `QUERY_ADVERT`
+(round 11, device-confirmed), and the client-side DTR=0/RTS=1 core-reset
+emission (round 12, externally corroborated). No open hypothesis remains
+in this kit. A *new* symptom, not a recurrence of any of the three
+described here, is what would justify reopening it.
+
 ## What this fix found and addressed (source + host-testable surface only)
 
 - **Refuted:** a Rust/JS wire-codec divergence from the recent screen-lock
@@ -1548,24 +1721,30 @@ hardware). That is exactly what this kit is for.
   the serial monitor from step 0 visible.
 - Click **Connect** and select the T-Deck Plus's port in the browser's
   device picker.
-- **Best case — Expect:** the page shows device status (pubkey, "0 contacts,
-  0 channels") within a couple of seconds. The serial monitor shows normal
-  `prov_server: QUERY_STATUS` log lines — **no panic, no reboot banner, no
-  gap where the monitor goes silent and a fresh boot banner appears.** This
-  means `open()`'s own forced DTR/RTS assert (the one `connect()` can no
-  longer avoid or mitigate — see its doc comment for why it no longer tries)
-  did not trigger a visible reset on this run — the ideal outcome, but not
-  the one the fix depends on (see next bullet).
+- **Best case — Expect, and now the round-12 EXPECTED outcome:** the page
+  shows device status (pubkey, "0 contacts, 0 channels") within a couple of
+  seconds. The serial monitor shows normal `prov_server: QUERY_STATUS` log
+  lines — **no panic, no reboot banner, no gap where the monitor goes
+  silent and a fresh boot banner appears.** `connect()` now clears RTS then
+  DTR immediately post-open specifically so this is the outcome, not merely
+  a lucky one — see its doc comment for the confirmed DTR=0/RTS=1
+  mechanism this prevents. `port.open()`'s own initial forced DTR+RTS
+  assert (both lines together, not staggered) is a separate transition this
+  method still cannot avoid, but field/external evidence indicates it does
+  not itself reach the DTR=0/RTS=1 trigger.
 - **Acceptable case — the device still reboots, but the page recovers on
   its own within ~10 seconds** (no manual reconnect needed), and the serial
   monitor shows a full, ordinary boot banner (no panic) before
-  `prov_server:` logging resumes and status appears in the browser. This is
-  the **expected steady-state outcome** now that `connect()` relies purely
-  on `#sendRecvWithRetry`'s reset-tolerant retry path (boot-noise resync +
-  the 10 s budget) rather than trying to prevent the reset — matches the
-  pre-#200, field-proven-survivable behavior. **This counts as a PASS for
-  step 1** — record which of the two outcomes above actually happened in the
-  result block.
+  `prov_server:` logging resumes and status appears in the browser. This
+  remains a PASS — `#sendRecvWithRetry`'s reset-tolerant retry path
+  (boot-noise resync + the 10 s budget) still exists as a fallback for
+  `open()`'s own unavoidable line assert, or any other reset cause — but it
+  is no longer the outcome round 12's fix is betting on; if this outcome is
+  now the COMMON one rather than the rare one, that is itself worth
+  reporting back, since it would mean something beyond the confirmed
+  DTR=0/RTS=1 mechanism is still triggering a reset. **This counts as a
+  PASS for step 1** — record which of the two outcomes above actually
+  happened in the result block.
 - **RX-BUFFER-STARVATION CHECK (new — `meshcadet-web-provisioner-
   read-timeout-after-reset`): watch for the guard actually firing, not just
   for a clean connect.** The `admin_server` RX-buffer-full flush guard is
@@ -1602,8 +1781,9 @@ hardware). That is exactly what this kit is for.
   this command)` — reworded, round 6, from the earlier `accumulated N bytes
   this attempt, M bytes total this command` phrasing; see `session.js`'s
   `#timeoutMessage` doc comment for why "arrived" vs. "retained" matters —
-  or, less likely now that `connect()` no longer calls `setSignals()`, a
-  `write stalled — …` message) **rather than hanging with no error at all.**
+  or, less likely now that `connect()` clears RTS/DTR correctly (round 12),
+  a `write stalled — …` message) **rather than hanging with no error at
+  all.**
   **Round 6 also added a console hex/ASCII dump** (`console.debug`, browser
   devtools) of the first ~512 bytes discarded as non-frame noise, printed
   automatically alongside this same timeout — check it if `K` (bytes

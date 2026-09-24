@@ -104,6 +104,17 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(3);
 /// the device later in the SAME session, well after any host-side wedge is
 /// cleared. Do not read a clean unplug/replug as proof the session will now
 /// complete.
+///
+/// NARROWED, round 12 (`docs/provisioning-connect-verification-kit.md`'s
+/// "CASE CLOSED" section, external corroboration): the specific reset this
+/// guidance was written against — the browser's own post-open DTR/RTS
+/// transition — is now actively AVOIDED by `site/provisioner/session.js`'s
+/// `connect()` (clears RTS then DTR, never the DTR=0/RTS=1 core-reset
+/// trigger), not merely tolerated. This guidance remains correct and
+/// necessary for whatever reset still occurs (`port.open()`'s own
+/// unavoidable line assert, or any other cause) and for the host-side wedge
+/// that can follow one — it is not retracted, only no longer the first
+/// line of defense against a connect failure.
 const HOST_REENUM_GUIDANCE: &str = "unplug and replug the USB cable (or force host-side \
      re-enumeration by deauthorizing/reauthorizing the device node: \
      `echo 0 | sudo tee /sys/bus/usb/devices/<dev>/authorized` then `echo 1 | ...`) -- a \
@@ -201,6 +212,12 @@ impl SerialTransport {
     /// The EN+IO0 reset circuit on ESP32 boards is triggered by the DTR/RTS
     /// *pair* toggling together (the esptool programming sequence); leaving
     /// both lines at their tty-open defaults also avoids inadvertent resets.
+    /// CONFIRMED, round 12 (`docs/provisioning-connect-verification-kit.md`,
+    /// `site/provisioner/session.js`'s `connect()` doc comment): on this
+    /// board's ESP32-S3, the precise trigger is the control-line state
+    /// passing through DTR=0/RTS=1 — never asserting or clearing either
+    /// line at all, as this method does, structurally cannot produce that
+    /// (or any other) transition.
     ///
     /// NOTE (round 6): this `open()`/`clear()` call is bounded by the OS —
     /// device evidence shows a genuine connect-wedge hang lives in `send`'s
