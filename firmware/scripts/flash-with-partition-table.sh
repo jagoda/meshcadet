@@ -50,7 +50,7 @@
 # so they always sit right next to the ELF cargo passes us.
 #
 # ACCEPTED INCONSISTENCY (flagged, not fixed, `admin-server-stack-overflow-fix` mission,
-# 2026-09-23 — see docs/provisioning-connect-verification-kit.md's round 11 section):
+# 2026-09-23 — see docs/provisioning-connect-verification-kit.md, "Real defects found and fixed" item 1):
 # step 1's `espflash flash` patches the APP image header's flash_mode/flash_freq bytes with
 # espflash's OWN CLI defaults (previously observed as 40 MHz / clock div:2), independent of
 # this project's actual sdkconfig — while step 3's project bootloader.bin (esp-idf-sys-built,

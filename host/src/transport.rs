@@ -62,10 +62,9 @@ pub trait Transport {
 /// them — this is a genuine, unbounded-at-the-syscall-level hang, not merely
 /// a slow one.
 ///
-/// This refutes round 5's finding that `SerialTransport::open()` was "the
-/// one call in the host CLI's entire path with no deadline" — see that
-/// method's own doc comment, retracted below, and
-/// `docs/provisioning-connect-verification-kit.md`'s finding 1 retraction.
+/// This refutes an earlier round's finding that `SerialTransport::open()`
+/// was "the one call in the host CLI's entire path with no deadline" — see
+/// that method's own doc comment below.
 ///
 /// 3 seconds is chosen to be comfortably above any legitimate `tcdrain`
 /// latency on a healthy link (a 512-byte frame drains in microseconds to
@@ -73,50 +72,32 @@ pub trait Transport {
 /// silently eating into `Session`'s own 10s overall retry budget.
 const SEND_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Human-actionable recovery guidance for the confirmed HOST-side USB/
-/// cdc_acm wedge (round 8, `meshcadet-connect-wedge-round8-host-usb-
-/// endpoint-state`, 2026-09-22, hardware evidence — see
-/// `docs/provisioning-connect-verification-kit.md`). CONFIRMED: the broken
-/// state lives in the host kernel's per-device USB/cdc_acm state and
-/// SURVIVES a full device-side chip reset (the device reboots, firmware,
-/// driver and peripheral registers all reinitialize, yet host->device stays
-/// dead) — so a device-side action (power-cycle the device, hit its reset
-/// button) does NOT clear it. The only thing observed to clear it is the
-/// HOST kernel tearing down and rebuilding its per-device USB state:
-/// physically unplug and replug the USB cable, or force the same from
-/// software by deauthorizing/reauthorizing the USB device node:
-/// `echo 0 | sudo tee /sys/bus/usb/devices/<dev>/authorized` then
-/// `echo 1 | sudo tee /sys/bus/usb/devices/<dev>/authorized` (find `<dev>`
-/// via `readlink -f /sys/class/tty/<ttyname>/device/..` for the port in
-/// question). This retracts round 7's guidance to simply reopen the port —
-/// reopening the same `cdc_acm` node does not rebuild the kernel's endpoint
-/// state and cannot recover a wedged handle.
+/// Human-actionable recovery guidance for a HOST-side USB/cdc_acm wedge
+/// observed once, on hardware, with kernel-log evidence (2026-09-22): a
+/// device reset left the host kernel's per-device USB/cdc_acm state broken
+/// while `journalctl -k` showed no re-enumeration event at all, and the
+/// broken state SURVIVED a full device-side chip reset (the device
+/// reboots, firmware, driver and peripheral registers all reinitialize, yet
+/// host->device stays dead) — so a device-side action (power-cycle the
+/// device, hit its reset button) does not clear it.
 ///
-/// RE-SCOPED, round 11 (`admin-server-stack-overflow-fix`, 2026-09-23,
-/// device evidence): this guidance clears a REAL, RECOVERABLE nuisance —
-/// the DTR/RTS-triggered device reset itself (`rst:0x15
-/// USB_UART_CHIP_RESET`) is not a defect, and the host-side wedge it leaves
-/// behind is exactly what this constant describes. But clearing it is NOT a
-/// guarantee the rest of a provisioning session will succeed: a
-/// device-confirmed `pthread` stack overflow in `admin_server` (a wholly
-/// separate, more severe defect — `firmware/src/admin_server.rs`'s
-/// `FRAME_QUERY_ADVERT` arm, see the kit's round 11 section) can still crash
-/// the device later in the SAME session, well after any host-side wedge is
-/// cleared. Do not read a clean unplug/replug as proof the session will now
-/// complete.
+/// This is kept as a real, recoverable-in-principle *consequence* of a
+/// device reset, not as an explanation for why the device resets or why a
+/// connect attempt fails in the first place — see
+/// `docs/provisioning-connect-verification-kit.md`'s "host-side USB/cdc_acm
+/// wedge" section. It is also NOT a guarantee that clearing it is
+/// sufficient: a session that clears this wedge and reaches `QUERY_STATUS`
+/// can still crash later via a separate, unrelated defect (the
+/// `admin_server` `pthread` stack overflow on `QUERY_ADVERT`, fixed — see
+/// the kit's "Real defects found and fixed" section).
 ///
-/// REVISED, round 13 (`meshcadet-provisioner-revert-setsignals-and-loose-
-/// ends`): a round-12 attempt to have the browser client avoid the
-/// DTR=0/RTS=1 transition that can trigger this reset was tested on
-/// hardware and did NOT clear the connect wedge, and has been reverted
-/// (see `site/provisioner/session.js`'s `connect()` doc comment). Separately,
-/// the specific recovery action this guidance used to prescribe — unplug and
-/// replug the USB cable — has since been tried, more than once, against a
-/// live instance of this wedge and did not reliably clear it either. The
-/// text below no longer instructs that action as a remedy; it states only
-/// what is actually known (the failure lives in the host kernel's
-/// per-device USB/cdc_acm state, confirmed by round 8's kernel-log
-/// evidence) without asserting that any particular recovery action works.
+/// What recovers it, if anything reliably does, is **not established**:
+/// the specific action once thought to clear it (physically unplugging and
+/// replugging the USB cable, or the software equivalent,
+/// `/sys/bus/usb/devices/<dev>/authorized` toggled 0 then 1) has since been
+/// tried, more than once, against a live instance of this wedge and did NOT
+/// reliably clear it. The text below states only what is actually known —
+/// it does not prescribe an action that has not been verified to work.
 const HOST_WEDGE_GUIDANCE: &str = "no recovery action is currently known to reliably clear \
      it; simply re-running this command will NOT help.";
 
@@ -125,26 +106,25 @@ const HOST_WEDGE_GUIDANCE: &str = "no recovery action is currently known to reli
 /// `anyhow::Error::downcast_ref::<SendTimedOut>()` — without pattern-matching
 /// an error message string.
 ///
-/// CONFIRMED LOCALIZATION (round 8, `meshcadet-connect-wedge-round8-host-
-/// usb-endpoint-state`, hardware evidence): the broken state lives in the
-/// HOST's per-device USB/cdc_acm state, not the device — it survives a full
-/// device-side chip reset and is cleared only by the host kernel
-/// re-enumerating the device (unplug/replug, or the `/sys/.../authorized`
-/// equivalent). This REFUTES round 7's claim (retracted; see
-/// `docs/provisioning-connect-verification-kit.md`) that the device itself
-/// re-enumerates on a web connect — `journalctl -k` across a reproducing
-/// connect shows NO enumeration event at all; the USB session survives the
-/// device's self-reset unchanged from the host's point of view.
+/// One reproduction, with kernel-log evidence (2026-09-22), localized a
+/// send timeout like this to the HOST's per-device USB/cdc_acm state, not
+/// the device: `journalctl -k` across the reproducing connect showed no
+/// re-enumeration event at all, yet the broken state survived a full
+/// device-side chip reset. That reproduction does not establish this as the
+/// explanation for every send timeout, and no root cause for the connect
+/// failures this campaign investigated is asserted here — see
+/// `docs/provisioning-connect-verification-kit.md`'s "Verified conclusion"
+/// and "Eliminated hypotheses" sections.
 ///
 /// LABELED HYPOTHESIS, not confirmed: the leading candidate for the
-/// host-side mechanism is an OUT-endpoint data-toggle/sequence desync — the
-/// device-side reset reinitializes its endpoints (FIFOs cleared, toggle
-/// zeroed) while the host's `cdc_acm` retains its pre-reset toggle, so
-/// host->device packets are silently discarded while device->host keeps
-/// working (the device drives IN transfers). This explains the observed
-/// shape (unidirectional, survives port close/reopen and process exit, only
-/// re-enumeration clears it) but is NOT confirmed at the kernel level; do
-/// not treat it as fact.
+/// host-side mechanism observed in that one reproduction is an OUT-endpoint
+/// data-toggle/sequence desync — the device-side reset reinitializes its
+/// endpoints (FIFOs cleared, toggle zeroed) while the host's `cdc_acm`
+/// retains its pre-reset toggle, so host->device packets are silently
+/// discarded while device->host keeps working (the device drives IN
+/// transfers). This explains the observed shape (unidirectional, survives
+/// port close/reopen and process exit) but is NOT confirmed at the kernel
+/// level; do not treat it as fact.
 #[derive(Debug)]
 pub struct SendTimedOut {
     pub timeout: Duration,
@@ -154,9 +134,10 @@ impl std::fmt::Display for SendTimedOut {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "serial send timed out after {:?} (confirmed HOST-side USB/cdc_acm wedge -- a \
-             device-side reset does NOT clear this, see docs/provisioning-connect-\
-             verification-kit.md for the hardware evidence; {})",
+            "serial send timed out after {:?} (a send timeout like this has previously \
+             coincided with a host-side USB/cdc_acm state that a device-side reset does not \
+             clear; the underlying cause is not established -- see docs/provisioning-connect-\
+             verification-kit.md; {})",
             self.timeout, HOST_WEDGE_GUIDANCE
         )
     }
@@ -173,20 +154,21 @@ impl std::error::Error for SendTimedOut {}
 /// `tcdrain(2)` from another thread. On a timeout, the spawned thread is
 /// simply abandoned (never joined): it keeps holding the mutex (and the
 /// underlying file descriptor) for as long as the underlying `tcdrain` stays
-/// blocked, which for the confirmed host-side USB/cdc_acm wedge (see
-/// `SendTimedOut`'s doc comment) is forever — only host-side re-enumeration
-/// clears it, and that invalidates the descriptor rather than unblocking the
-/// syscall. `poisoned` (round 8, `meshcadet-connect-wedge-round8-host-usb-
-/// endpoint-state` — FIXES the descriptor leak round 7 left unaddressed) is
-/// what stops that from stranding the port silently: once `send` times out,
-/// `poisoned` is set, and every later call on THIS `SerialTransport` (another
-/// `send`, a `recv`, `flush_input`) checks it first and fails fast instead of
+/// blocked, which for the host-side USB/cdc_acm wedge observed once on
+/// hardware (see `SendTimedOut`'s doc comment) was, in that reproduction,
+/// forever. `poisoned` (added to fix a descriptor leak an earlier
+/// implementation of this recovery path left behind) is what stops that
+/// from stranding the port silently: once `send` times out, `poisoned` is
+/// set, and every later call on THIS `SerialTransport` (another `send`, a
+/// `recv`, `flush_input`) checks it first and fails fast instead of
 /// blocking forever on a mutex the abandoned thread will never release —
 /// without this, `recv`/`flush_input` in particular would hang with no
 /// timeout at all, silently, which defeats the entire point of `send` being
 /// "bounded" in the first place. Recovery is never in-process (see
-/// `HOST_WEDGE_GUIDANCE`): the caller must re-enumerate the device at the
-/// host and open a fresh `SerialTransport`.
+/// `HOST_WEDGE_GUIDANCE`): no recovery action is currently known to
+/// reliably clear this wedge; a caller that hits it must open a fresh
+/// `SerialTransport` and cannot assume any particular host-side action will
+/// make that succeed.
 pub struct SerialTransport {
     port: Arc<Mutex<Box<dyn serialport::SerialPort>>>,
     poisoned: Arc<AtomicBool>,
