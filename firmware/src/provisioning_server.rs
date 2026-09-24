@@ -46,6 +46,7 @@ use protocol::provisioning::{
     decode_set_device_name, decode_set_notif_defaults, decode_set_pin,
     encode_rsp_status, encode_rsp_identity, encode_rsp_error,
     encode_rsp_contact, encode_rsp_channel,
+    frame_needs_usb_packet_split,
     RspStatusPayload,
 };
 use protocol::channel_hash_var;
@@ -704,6 +705,16 @@ fn send_error(out: &mut impl Write, code: u8, msg: &[u8]) -> anyhow::Result<bool
     Ok(false)
 }
 
+/// 64-BYTE-MULTIPLE USB-PACKET HAZARD (audited, this mission — see
+/// `protocol::provisioning::frame_needs_usb_packet_split`'s doc comment and
+/// test module for the full audit and the reachable frame types/inputs that
+/// hit it; not the current connect-wedge defect, and NOT device-verified —
+/// this crate is xtensa-only and this container has no Xtensa toolchain).
+/// Mirrors `admin_server::send_frame`'s identical split: if the encoded
+/// frame's total length lands on an exact multiple of the USB full-speed
+/// max packet size (64 bytes), the final byte is written (and flushed) as
+/// its own separate call so the last USB packet the frame produces is
+/// always short.
 fn send_frame(out: &mut impl Write, frame_type: u8, payload: &[u8]) -> anyhow::Result<()> {
     let mut frame_buf = [0u8; 512];
     let n = encode_frame(frame_type, payload, &mut frame_buf);
@@ -714,8 +725,15 @@ fn send_frame(out: &mut impl Write, frame_type: u8, payload: &[u8]) -> anyhow::R
     // admin_server defect. The C logger takes the same lock via the
     // serial_console vprintf hook. No logging inside this section → no nesting.
     let _tx = crate::serial_console::lock_tx();
-    out.write_all(&frame_buf[..n]).map_err(|e| anyhow!("stdout write: {}", e))?;
-    out.flush().map_err(|e| anyhow!("stdout flush: {}", e))?;
+    if frame_needs_usb_packet_split(n) {
+        out.write_all(&frame_buf[..n - 1]).map_err(|e| anyhow!("stdout write: {}", e))?;
+        out.flush().map_err(|e| anyhow!("stdout flush: {}", e))?;
+        out.write_all(&frame_buf[n - 1..n]).map_err(|e| anyhow!("stdout write: {}", e))?;
+        out.flush().map_err(|e| anyhow!("stdout flush: {}", e))?;
+    } else {
+        out.write_all(&frame_buf[..n]).map_err(|e| anyhow!("stdout write: {}", e))?;
+        out.flush().map_err(|e| anyhow!("stdout flush: {}", e))?;
+    }
     Ok(())
 }
 

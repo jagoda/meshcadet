@@ -659,6 +659,40 @@ pub fn encode_frame(frame_type: u8, payload: &[u8], out: &mut [u8]) -> usize {
     FRAME_OVERHEAD + plen
 }
 
+/// USB full-speed bulk endpoints (this device's USB-Serial-JTAG peripheral
+/// included) use a 64-byte max packet size.
+const USB_FS_MAX_PACKET_SIZE: usize = 64;
+
+/// Whether a `total_len`-byte frame (i.e. `FRAME_OVERHEAD + payload.len()`,
+/// [`encode_frame`]'s return value) lands on an EXACT multiple of the USB
+/// full-speed max packet size (64 bytes) and therefore needs its final byte
+/// written as a separate transfer to guarantee the last USB packet is short.
+///
+/// 64-BYTE-MULTIPLE FRAME HAZARD (audited across this protocol's reply
+/// frame builders; not the current connect-wedge defect — see
+/// `docs/provisioning-connect-verification-kit.md`): a USB bulk transfer
+/// whose total length is an exact multiple of the endpoint's max packet
+/// size needs a following short (or zero-length) packet to signal
+/// completion; without one, the host can wait for more data rather than
+/// treating the transfer as done. MeshCore's own firmware tracker documents
+/// exactly this class delaying/timing out a device-info reply on first
+/// connect (`OffbandMesh/meshcore-firmware#1093`). Several reply frame
+/// builders in this protocol can reach an exact 64- or 128-byte total for a
+/// reachable input — `RSP_STATUS` (68 bytes, fixed) is NOT one of them, but
+/// e.g. `RSP_IDENTITY` at a 23-character device name, or `RSP_ADVERT` at an
+/// 18-character device name, are (see this function's test module for the
+/// full audited list, pinned as regression tests).
+///
+/// This is a pure, host-testable predicate deliberately factored out of
+/// `send_frame` (`firmware/src/admin_server.rs` /
+/// `firmware/src/provisioning_server.rs`, both xtensa-only and therefore
+/// compile-unverified in this container — see those files' own doc
+/// comments) so the boundary condition itself can be exercised and pinned
+/// on host, even though the actual split-write fix that consumes it cannot.
+pub fn frame_needs_usb_packet_split(total_len: usize) -> bool {
+    total_len > 0 && total_len.is_multiple_of(USB_FS_MAX_PACKET_SIZE)
+}
+
 /// Decode a provisioning frame from `buf`.
 ///
 /// On success, returns `(frame_type, payload_slice)` where `payload_slice` is a
@@ -2525,5 +2559,200 @@ mod tests {
         let (ft, payload) = decode_frame(&buf[..n]).unwrap();
         assert_eq!(ft, FRAME_QUERY_LOCK);
         assert!(payload.is_empty());
+    }
+
+    // ── 64-byte-multiple USB-packet hazard audit (this mission, Task 3) ─────
+    //
+    // Host-testable pin of `frame_needs_usb_packet_split`'s boundary itself,
+    // PLUS every reply frame builder in this protocol that can reach an
+    // exact 64- or 128-byte total frame length for a REACHABLE input (i.e.
+    // one a real client can actually cause, not merely a value the wire
+    // format could theoretically carry). `send_frame`
+    // (`firmware/src/admin_server.rs` / `firmware/src/provisioning_server.rs`)
+    // is what actually consumes `frame_needs_usb_packet_split` to split the
+    // write — that half is xtensa-only and compile-unverified in this
+    // container (see those files' own doc comments); this half is the
+    // audit trail proving the predicate actually fires for every builder
+    // it needs to, on host, without hardware.
+
+    mod usb_packet_boundary {
+        use super::*;
+        use crate::advert::{build_self_advert_card, MAX_ADVERT_CARD_LEN};
+        use crate::history::{HistoryEntry, HistoryMsgType};
+        use crate::identity::Identity;
+
+        #[test]
+        fn boundary_predicate_flags_exact_multiples_only() {
+            assert!(!frame_needs_usb_packet_split(0));
+            assert!(!frame_needs_usb_packet_split(1));
+            assert!(!frame_needs_usb_packet_split(63));
+            assert!(frame_needs_usb_packet_split(64));
+            assert!(!frame_needs_usb_packet_split(65));
+            assert!(!frame_needs_usb_packet_split(127));
+            assert!(frame_needs_usb_packet_split(128));
+            assert!(!frame_needs_usb_packet_split(129));
+        }
+
+        #[test]
+        fn rsp_status_is_68_bytes_and_never_flagged() {
+            // Fixed-size payload (61 bytes) — no reachable input varies it.
+            // 7 (FRAME_OVERHEAD) + 61 = 68, safely clear of 64/128.
+            let payload = RspStatusPayload {
+                provisioned: true,
+                pubkey: [0u8; 32],
+                contact_count: 0,
+                channel_count: 0,
+                gps_has_fix: false,
+                gps_lat_e7: 0,
+                gps_lon_e7: 0,
+                gps_fix_age_secs: 0,
+                gps_clock_synced: false,
+                gps_clock_sync_age_secs: 0,
+                battery_percent: 0,
+                battery_charging: false,
+                battery_raw_mv: 0,
+                battery_held_raw_mv: 0,
+                battery_level: 0,
+                battery_confirmed: false,
+            };
+            let mut buf = [0u8; 128];
+            let plen = encode_rsp_status(&payload, &mut buf);
+            assert_eq!(FRAME_OVERHEAD + plen, 68);
+            assert!(!frame_needs_usb_packet_split(FRAME_OVERHEAD + plen));
+        }
+
+        #[test]
+        fn rsp_identity_hits_exactly_64_bytes_at_a_23_char_name() {
+            // plen = 34 + name_len; total = 41 + name_len. name_len=23 -> 64.
+            let pubkey = [0xABu8; 32];
+            let name = "a".repeat(23);
+            assert_eq!(name.len(), 23);
+            let mut buf = [0u8; 128];
+            let plen = encode_rsp_identity(&pubkey, name.as_bytes(), &mut buf);
+            let total = FRAME_OVERHEAD + plen;
+            assert_eq!(
+                total, 64,
+                "a 23-character device name must land exactly on 64 bytes"
+            );
+            assert!(frame_needs_usb_packet_split(total));
+            // One character short must NOT be flagged — pins the boundary
+            // precisely rather than a range.
+            let short_name = "a".repeat(22);
+            let plen_short = encode_rsp_identity(&pubkey, short_name.as_bytes(), &mut buf);
+            assert!(!frame_needs_usb_packet_split(FRAME_OVERHEAD + plen_short));
+        }
+
+        #[test]
+        fn rsp_contact_hits_exactly_64_bytes_at_a_22_char_name() {
+            // plen = 35 + name_len; total = 42 + name_len. name_len=22 -> 64.
+            let pubkey = [0xCDu8; 32];
+            let name = "a".repeat(22);
+            let mut buf = [0u8; 128];
+            let plen = encode_rsp_contact(0, &pubkey, true, name.as_bytes(), &mut buf);
+            let total = FRAME_OVERHEAD + plen;
+            assert_eq!(
+                total, 64,
+                "a 22-character contact name must land exactly on 64 bytes"
+            );
+            assert!(frame_needs_usb_packet_split(total));
+        }
+
+        #[test]
+        fn rsp_channel_max_length_never_reaches_64() {
+            // plen = 5 + name_len (name_len <= MAX_NAME_LEN=32); total max =
+            // 12 + 32 = 44, structurally clear of 64 — no reachable hazard.
+            let name = "a".repeat(MAX_NAME_LEN);
+            let mut buf = [0u8; 64];
+            let plen = encode_rsp_channel(0, 0, 32, true, name.as_bytes(), &mut buf);
+            let total = FRAME_OVERHEAD + plen;
+            assert_eq!(total, 44);
+            assert!(!frame_needs_usb_packet_split(total));
+        }
+
+        #[test]
+        fn rsp_room_hits_exactly_64_bytes_at_a_17_char_name_and_no_path() {
+            // plen = 40 + out_path_len + name_len; total = 47 + out_path_len
+            // + name_len. out_path_len=0, name_len=17 -> 64.
+            let pubkey = [0xEFu8; 32];
+            let name = "a".repeat(17);
+            let mut buf = [0u8; 256];
+            let plen = encode_rsp_room(0, &pubkey, 0, 0, &[], name.as_bytes(), &mut buf);
+            let total = FRAME_OVERHEAD + plen;
+            assert_eq!(
+                total, 64,
+                "a 17-character room name with no out_path must land exactly on 64 bytes"
+            );
+            assert!(frame_needs_usb_packet_split(total));
+        }
+
+        #[test]
+        fn rsp_room_hits_exactly_128_bytes_at_a_learned_out_path_plus_name() {
+            // total = 47 + out_path_len + name_len. out_path_len=64 (max,
+            // MAX_ROOM_PATH_LEN), name_len=17 -> 128.
+            let pubkey = [0x12u8; 32];
+            let out_path = [0xAAu8; MAX_ROOM_PATH_LEN];
+            let name = "a".repeat(17);
+            let mut buf = [0u8; 256];
+            let plen = encode_rsp_room(0, &pubkey, 0, 0, &out_path, name.as_bytes(), &mut buf);
+            let total = FRAME_OVERHEAD + plen;
+            assert_eq!(total, 128, "a full-length learned route path plus a 17-character name must land exactly on 128 bytes");
+            assert!(frame_needs_usb_packet_split(total));
+        }
+
+        #[test]
+        fn rsp_error_hits_exactly_64_bytes_at_a_55_byte_message() {
+            // plen = 2 + msg_len; total = 9 + msg_len. msg_len=55 -> 64.
+            let msg = "a".repeat(55);
+            assert!(msg.len() <= MAX_ERR_MSG_LEN);
+            let mut buf = [0u8; 128];
+            let plen = encode_rsp_error(1, msg.as_bytes(), &mut buf);
+            let total = FRAME_OVERHEAD + plen;
+            assert_eq!(
+                total, 64,
+                "a 55-byte error message must land exactly on 64 bytes"
+            );
+            assert!(frame_needs_usb_packet_split(total));
+        }
+
+        #[test]
+        fn rsp_history_entry_hits_exactly_64_bytes_at_a_48_byte_text() {
+            // plen = 9 + text_len; total = 16 + text_len. text_len=48 -> 64.
+            let text_len = 48u8;
+            let mut text = [0u8; crate::history::MAX_HISTORY_TEXT_LEN];
+            text[..text_len as usize].fill(b'a');
+            let entry = HistoryEntry {
+                sender_hash: 0,
+                msg_type: HistoryMsgType::Dm,
+                timestamp: 0,
+                text,
+                text_len,
+            };
+            let mut buf = [0u8; 128];
+            let plen = crate::history::encode_rsp_history_entry(0, &entry, false, &mut buf);
+            let total = FRAME_OVERHEAD + plen;
+            assert_eq!(
+                total, 64,
+                "a 48-byte history entry text must land exactly on 64 bytes"
+            );
+            assert!(frame_needs_usb_packet_split(total));
+        }
+
+        #[test]
+        fn rsp_advert_hits_exactly_128_bytes_at_an_18_char_device_name() {
+            // Card length = 102 + 1 (flags) + name_len; total = FRAME_OVERHEAD
+            // + card_len = 110 + name_len. name_len=18 -> 128. The card IS
+            // the whole RSP_ADVERT payload (no extra envelope) — see
+            // `build_self_advert_card`'s module doc comment.
+            let identity = Identity::from_seed([0x77u8; 32]);
+            let name = "a".repeat(18);
+            let mut card = [0u8; MAX_ADVERT_CARD_LEN];
+            let card_len = build_self_advert_card(&identity, 0, &name, &mut card);
+            let total = FRAME_OVERHEAD + card_len;
+            assert_eq!(
+                total, 128,
+                "an 18-character device name's self-advert card must land exactly on 128 bytes"
+            );
+            assert!(frame_needs_usb_packet_split(total));
+        }
     }
 }

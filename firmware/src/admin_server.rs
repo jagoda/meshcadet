@@ -111,7 +111,7 @@ use protocol::provisioning::{
     decode_set_device_name, decode_set_lock_config, decode_set_lock_pin, decode_set_notif_defaults,
     decode_set_pin,
     encode_frame, encode_rsp_channel, encode_rsp_contact, encode_rsp_error, encode_rsp_identity,
-    encode_rsp_lock, encode_rsp_status,
+    encode_rsp_lock, encode_rsp_status, frame_needs_usb_packet_split,
 };
 use protocol::{encode_rsp_history_entry, Identity, MAX_ADVERT_CARD_LEN, MAX_RSP_HISTORY_ENTRY_PAYLOAD};
 
@@ -1333,6 +1333,17 @@ fn persist_setting(
 /// tests (in-memory transport, no LineWriter, no USB-JTAG) never caught it.
 /// Flushing per frame makes the streamed enumeration use the identical, proven
 /// delivery discipline as the single-frame replies.
+///
+/// 64-BYTE-MULTIPLE USB-PACKET HAZARD (audited, this mission — see
+/// `protocol::provisioning::frame_needs_usb_packet_split`'s doc comment and
+/// test module for the full audit and the reachable frame types/inputs that
+/// hit it; not the current connect-wedge defect, and NOT device-verified —
+/// this crate is xtensa-only and this container has no Xtensa toolchain).
+/// If the encoded frame's total length lands on an exact multiple of the
+/// USB full-speed max packet size (64 bytes), the final byte is written (and
+/// flushed) as its own separate call so the last USB packet the frame
+/// produces is always short, never a bare multiple that leaves the host
+/// waiting for a terminating short/zero-length packet that never comes.
 fn send_frame(out: &mut impl Write, frame_type: u8, payload: &[u8]) -> anyhow::Result<()> {
     let mut frame_buf = [0u8; 512];
     let n = encode_frame(frame_type, payload, &mut frame_buf);
@@ -1344,8 +1355,15 @@ fn send_frame(out: &mut impl Write, frame_type: u8, payload: &[u8]) -> anyhow::R
     // list-channels "no channels configured" corruption fix. No logging happens
     // inside this critical section, so the lock never nests.
     let _tx = crate::serial_console::lock_tx();
-    out.write_all(&frame_buf[..n]).map_err(|e| anyhow!("stdout write: {}", e))?;
-    out.flush().map_err(|e| anyhow!("stdout flush: {}", e))?;
+    if frame_needs_usb_packet_split(n) {
+        out.write_all(&frame_buf[..n - 1]).map_err(|e| anyhow!("stdout write: {}", e))?;
+        out.flush().map_err(|e| anyhow!("stdout flush: {}", e))?;
+        out.write_all(&frame_buf[n - 1..n]).map_err(|e| anyhow!("stdout write: {}", e))?;
+        out.flush().map_err(|e| anyhow!("stdout flush: {}", e))?;
+    } else {
+        out.write_all(&frame_buf[..n]).map_err(|e| anyhow!("stdout write: {}", e))?;
+        out.flush().map_err(|e| anyhow!("stdout flush: {}", e))?;
+    }
     Ok(())
 }
 
