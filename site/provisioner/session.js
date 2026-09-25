@@ -177,9 +177,9 @@ const DISCARD_PREVIEW_CAP = 512;
 /**
  * ASCII prefix of the ESP32-S3 ROM's own boot banner
  * (`ESP-ROM:esp32s3-<hash>` — the exact text confirmed in kernel evidence,
- * round 7, `docs/provisioning-connect-verification-kit.md`, 2026-09-22).
- * Printed only by the ROM itself immediately after a USB-Serial-JTAG chip
- * reset (`rst:0x15 (USB_UART_CHIP_RESET)`) — a plain firmware-level reboot
+ * 2026-09-22, `docs/provisioning-connect-verification-kit.md`). Printed
+ * only by the ROM itself immediately after a USB-Serial-JTAG chip reset
+ * (`rst:0x15 (USB_UART_CHIP_RESET)`) — a plain firmware-level reboot
  * (watchdog, panic, `esp_restart()`) never emits it. Its presence in the
  * discarded (non-frame) traffic is therefore an unambiguous signal that the
  * DEVICE reset, distinct from an ordinary slow response.
@@ -187,65 +187,52 @@ const DISCARD_PREVIEW_CAP = 512;
  * device that resets more than once during a single stuck command can be
  * reported accurately.
  *
- * RETRACTED (round 8, `meshcadet-connect-wedge-round8-host-usb-endpoint-
- * state`, hardware evidence): this banner does NOT mean the device
- * "re-enumerated out from under this session" — `journalctl -k` across a
- * reproducing connect shows NO USB enumeration event at all; the session
- * survives the device's self-reset unchanged from the host's point of view.
- * What actually breaks host->device delivery, and SURVIVES this reset, is
- * the HOST's own per-device USB/cdc_acm state — see `HOST_WEDGE_GUIDANCE`.
+ * This banner's presence does NOT mean the device "re-enumerated out from
+ * under this session" — kernel-log evidence (`journalctl -k`) across a
+ * reproducing connect showed no USB enumeration event at all in that
+ * reproduction; the session survived the device's self-reset unchanged
+ * from the host's point of view. One reproduction instead found the HOST's
+ * own per-device USB/cdc_acm state broken afterward — see
+ * `HOST_WEDGE_GUIDANCE` for what that is and is not established to mean.
  */
 const REBOOT_BANNER = "ESP-ROM:esp32s3";
 
 /**
  * Recovery guidance appended to a timeout/write-stall message once a device
- * reset has been observed this command (`#rebootCount > 0`) — CONFIRMED
- * (round 8, `meshcadet-connect-wedge-round8-host-usb-endpoint-state`,
- * hardware evidence, `docs/provisioning-connect-verification-kit.md`): the
- * broken state lives in the HOST's per-device USB/cdc_acm state and
- * SURVIVES a full device-side chip reset, so the device rebooting is not
- * itself the fix and does not mean the wedge is about to clear on its own.
+ * reset has been observed this command (`#rebootCount > 0`).
  *
- * RETRACTS round 7's "reconnect to continue": a browser-side `connect()` —
- * closing and reopening the SAME Web Serial port — does not rebuild the
- * host kernel's endpoint state, exactly as reopening the port in the host
- * CLI does not (see `host/src/transport.rs`'s `SerialTransport` doc
- * comment). Web Serial exposes no primitive to force host-side
- * re-enumeration (no equivalent of unplug/replug or
- * `/sys/bus/usb/devices/<dev>/authorized`) — so the only thing this page
- * can honestly tell the user is the PHYSICAL action that has been observed
- * to work.
+ * One reproduction, with hardware/kernel-log evidence (2026-09-22), found
+ * the broken state living in the HOST's per-device USB/cdc_acm state and
+ * surviving a full device-side chip reset — so the device rebooting is not
+ * itself a fix and does not mean the wedge is about to clear on its own. A
+ * browser-side `connect()` — closing and reopening the SAME Web Serial
+ * port — does not rebuild the host kernel's endpoint state, exactly as
+ * reopening the port in the host CLI does not (see
+ * `host/src/transport.rs`'s `SerialTransport` doc comment); Web Serial
+ * exposes no primitive to force host-side re-enumeration (no equivalent of
+ * unplug/replug or `/sys/bus/usb/devices/<dev>/authorized`).
  *
- * RE-SCOPED, round 11 (`admin-server-stack-overflow-fix`, 2026-09-23, device
- * evidence): the reset this guidance recovers from is a real but RECOVERABLE
- * nuisance, not a defect — and clearing it does not guarantee the rest of a
- * provisioning session will succeed. A device-confirmed `pthread` stack
- * overflow in the device's `admin_server` (a separate, more severe defect —
- * see `docs/provisioning-connect-verification-kit.md`'s round 11 section)
- * can still crash the device later in the SAME session, during
- * `queryAdvert`, well after any host-side wedge is cleared and `queryStatus`
- * has already succeeded.
+ * This is kept as a real, recoverable-in-principle *consequence* of a
+ * device reset, not as the explanation for the connect wedge overall — see
+ * `docs/provisioning-connect-verification-kit.md`'s "host-side USB/cdc_acm
+ * wedge" section. Clearing it is also not a guarantee the rest of a
+ * provisioning session will succeed: a device-confirmed `pthread` stack
+ * overflow in the device's `admin_server` (a separate, fixed defect — see
+ * the kit's "Real defects found and fixed" section) can still crash the
+ * device later in the SAME session, during `queryAdvert`, well after any
+ * host-side wedge is cleared and `queryStatus` has already succeeded.
  *
- * REVERTED, round 13 (this mission,
- * `meshcadet-provisioner-revert-setsignals-and-loose-ends`): round 12's
- * client-side fix (clearing RTS then DTR immediately post-open, on the
- * theory that ordering was what mattered) was tested on hardware and did
- * NOT clear the connect wedge. It has been reverted — `connect()` is back
- * to bare `open()` with no signal manipulation at all, matching every
- * independently known-working Web Serial client against this hardware
- * class (see `connect()`'s doc comment). The connect-time reset this
- * guidance recovers from remains unexplained; no theory about its cause is
- * asserted here. The message text below no longer tells the user to
- * unplug and replug the cable as a remedy: that specific action has since
- * been tried, more than once, against a live instance of this wedge and
- * did not reliably clear it — this states only what is actually known
- * about the failure, not an action known not to work.
+ * The message text below does not tell the user to unplug and replug the
+ * cable as a remedy: that specific action has since been tried, more than
+ * once, against a live instance of this wedge and did not reliably clear
+ * it — this states only what is actually known about the failure, not an
+ * action known not to work.
  */
 const HOST_WEDGE_GUIDANCE =
-  "A device-side reset does not clear this -- the failure lives in the HOST's USB/cdc_acm " +
-  "state, and Web Serial exposes no way for this page to force host-side re-enumeration. " +
-  "No recovery action is currently known to reliably clear it; the underlying cause of the " +
-  "connect-time reset itself is not yet established.";
+  "A device-side reset does not clear this -- one reproduction traced it to the HOST's " +
+  "USB/cdc_acm state, and Web Serial exposes no way for this page to force host-side " +
+  "re-enumeration. No recovery action is currently known to reliably clear it; the " +
+  "underlying cause of the connect-time reset itself is not established.";
 
 /**
  * Thrown when the device answers a command with `RSP_ERROR`.
@@ -580,8 +567,21 @@ export class ProvisionerSession {
    * USB/cdc_acm consequence — see `HOST_WEDGE_GUIDANCE`'s doc comment — not
    * something this method can prevent. And a session that survives connect
    * entirely can still hit the unrelated, separate `admin_server`
-   * stack-overflow defect on `queryAdvert` — see `HOST_WEDGE_GUIDANCE`'s
-   * round-11 annotation.
+   * stack-overflow defect on `queryAdvert` — see `HOST_WEDGE_GUIDANCE`'s doc
+   * comment.
+   *
+   * ── Case closed, 2026-09-24: this connect path is not the defect ──
+   *
+   * The identical deployed page, against the identical device and firmware,
+   * connects and reads status correctly from a different host (a Chromebook
+   * running native Chrome). The connect failures this campaign chased are
+   * specific to one host (Pop!_OS running Flatpak Chromium, where the
+   * native host CLI works fine against the same device but the
+   * Flatpak-sandboxed browser does not) — root cause on that host is not
+   * identified, and this method is not changed further to chase it. See
+   * `docs/provisioning-connect-verification-kit.md` for the full account,
+   * what this campaign fixed, what it eliminated, and the one open next
+   * step (native Chromium `.deb` vs. Flatpak Chromium on the same host).
    */
   async connect() {
     const port = await navigator.serial.requestPort();

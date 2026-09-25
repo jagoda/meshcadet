@@ -683,6 +683,19 @@ const USB_FS_MAX_PACKET_SIZE: usize = 64;
 /// 18-character device name, are (see this function's test module for the
 /// full audited list, pinned as regression tests).
 ///
+/// UPSTREAM CAVEAT, carried forward, not resolved: MeshCore's own fix for
+/// this class is on hold — `OffbandMesh/meshcore-firmware#1093` reports it
+/// "on hold after review found a regression" — so it has not shipped
+/// upstream. This port's fix (`send_frame`'s split write+flush at the
+/// boundary, in `firmware/src/admin_server.rs` and
+/// `firmware/src/provisioning_server.rs`) is a different implementation and
+/// is not known to share that regression, but it has not been proven not to
+/// either: this crate is xtensa-only and no Xtensa toolchain is available to
+/// device-verify it in every environment this fix has been developed in.
+/// Watch for a regression in this class (a reply that arrives truncated, or
+/// the host waiting past a seemingly-complete reply) if similar symptoms
+/// appear post-deploy.
+///
 /// This is a pure, host-testable predicate deliberately factored out of
 /// `send_frame` (`firmware/src/admin_server.rs` /
 /// `firmware/src/provisioning_server.rs`, both xtensa-only and therefore
