@@ -127,7 +127,8 @@ pub use codec::{
     channel_hash, channel_hash_var, compute_ack_hash, decode_dm_payload, decode_grp_txt,
     decode_grp_txt_var, decode_path_return, decode_txt_msg_plaintext, encode_dm_payload,
     encode_grp_txt, encode_grp_txt_var, encode_txt_msg_plaintext, format_channel_text,
-    parse_channel_text, CodecError, GrpTxtFields, PathExtra, ReturnPath, CHANNEL_NAME_DELIM,
+    parse_channel_text, CodecError, GrpTxtFields, PathExtra, ReturnPath, TxtType,
+    CHANNEL_NAME_DELIM,
 };
 pub use crypto::{
     aes128_ecb_decrypt, aes128_ecb_encrypt, ceil_16, encrypt_then_mac, encrypt_then_mac_var,
@@ -156,7 +157,7 @@ pub use room::{
     room_push_ack_hash, KeepAliveAck, LoginResponse, RoomCodecError, RoomPermission, RoomPush,
     RoomServerDouble, MAX_LOGIN_PASSWORD_LEN, MAX_POST_TEXT_LEN, MAX_ROOM_CLIENTS,
     MAX_UNSYNCED_POSTS, PERM_ACL_ROLE_MASK, REQ_TYPE_KEEP_ALIVE, RESP_SERVER_LOGIN_OK,
-    TXT_TYPE_CLI_DATA, TXT_TYPE_PLAIN, TXT_TYPE_SIGNED_PLAIN,
+    TXT_TYPE_CLI_COMMAND, TXT_TYPE_CLI_DATA, TXT_TYPE_PLAIN, TXT_TYPE_SIGNED_PLAIN,
 };
 pub use telemetry::{
     decode_telemetry_response,

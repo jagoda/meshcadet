@@ -129,7 +129,7 @@ fn dm_frame_on_air_contract() {
         rx_ts, timestamp,
         "timestamp survives the full frame round-trip"
     );
-    assert_eq!(rx_type, 0, "txt_type survives");
+    assert_eq!(rx_type, protocol::TxtType::Plain, "txt_type survives");
     assert_eq!(
         &text_region[..end],
         text,
