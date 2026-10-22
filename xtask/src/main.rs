@@ -91,6 +91,13 @@
 //! short-circuiting on the first — a full pass (manual or CI) should
 //! surface everything in one go.
 //!
+//! One maintenance command is also NOT part of the default battery:
+//!
+//! - **regen-wire-vectors** — regenerates the checked-in upstream conformance
+//!   fixtures from a read-only MeshCore checkout (never the network). See
+//!   `xtask::wire_vectors` and `docs/upstream-conformance.md`. Run with:
+//!   `cargo run -p xtask --bin xtask -- regen-wire-vectors --upstream <path> --tag <tag>`.
+//!
 //! One check is deliberately NOT part of that default battery and is NOT a
 //! `cargo test`, because it needs the `esp` cross-toolchain and takes
 //! minutes rather than milliseconds — it must be named explicitly:
@@ -105,6 +112,50 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let repo_root = xtask::repo_root_from_manifest_dir();
+    let args: Vec<String> = std::env::args().collect();
+
+    // `regen-wire-vectors` is a maintenance command, not a guard: it reads an
+    // upstream MeshCore checkout the caller supplies (never the network) and
+    // rewrites the checked-in conformance fixtures. Dispatch it alone so a
+    // plain `cargo run -p xtask --bin xtask` still runs the full guard
+    // battery, and so a missing/mistyped upstream path fails with a usage
+    // error instead of a page of static-guard output.
+    if let Some(pos) = args.iter().position(|a| a == "regen-wire-vectors") {
+        let mut upstream = None;
+        let mut tag = None;
+        let mut rest = args[pos + 1..].iter();
+        while let Some(arg) = rest.next() {
+            match arg.as_str() {
+                "--upstream" => upstream = rest.next().cloned(),
+                "--tag" => tag = rest.next().cloned(),
+                other => {
+                    eprintln!("xtask regen-wire-vectors: unexpected argument {other:?}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        let (Some(upstream), Some(tag)) = (upstream, tag) else {
+            eprintln!(
+                "usage: cargo run -p xtask --bin xtask -- regen-wire-vectors \
+                 --upstream <MeshCore-checkout> --tag <companion-vX.Y.Z>"
+            );
+            return ExitCode::FAILURE;
+        };
+        return match xtask::wire_vectors::regen(&repo_root, std::path::Path::new(&upstream), &tag) {
+            Ok(path) => {
+                println!(
+                    "xtask regen-wire-vectors: OK — wrote {} from {} ({tag})",
+                    path.display(),
+                    upstream
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("xtask regen-wire-vectors: FAILED — {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     // `verify-partition-budget` requires the `esp` cross-toolchain and a
     // multi-minute release build (see xtask::partition_budget's module doc

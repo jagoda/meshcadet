@@ -115,6 +115,8 @@ pub mod room_session_erase;
 pub mod room_watermark_persist;
 pub mod slint_thread_affinity;
 pub mod ui_event_parity;
+/// Upstream wire-conformance vector generator (issue #214) — see the module doc.
+pub mod wire_vectors;
 
 /// One known, already-documented, deliberately-deferred gap — see
 /// `firmware/gen_emoji_font.c`'s `EMOJI_SIZES` doc comment ("KNOWN, DEFERRED

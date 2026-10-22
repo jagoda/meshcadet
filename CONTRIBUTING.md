@@ -126,6 +126,26 @@ undetected, before an entire campaign had budgeted every phase-5/6 decision
 against it — see `xtask/src/partition_budget.rs`'s module doc for the full
 incident.
 
+### Upstream wire conformance
+
+`protocol/tests/upstream_conformance.rs` pins whole on-air frames against the
+target MeshCore companion release, including one older-tag byte-identical case
+and an exhaustive payload-type/route-bit inventory check. The expected frames
+live in `protocol/tests/fixtures/wire/` and are generated — never hand edited —
+from a read-only upstream checkout:
+
+```sh
+git clone --depth 1 --branch companion-v1.18.0 \
+  https://github.com/meshcore-dev/MeshCore /tmp/mc118
+cargo run -p xtask --bin xtask -- regen-wire-vectors \
+  --upstream /tmp/mc118 --tag companion-v1.18.0
+```
+
+See [`docs/upstream-conformance.md`](docs/upstream-conformance.md) for the
+vector provenance table, deliberate compatibility notes, and the checklist to
+follow when upstream tags a new release. `cargo test --workspace --locked` runs
+these tests in the existing CI lane; no separate job is needed.
+
 ### Testing UI changes without hardware
 
 `ui_sim/` is a host-native render rig that exercises the real Slint markup

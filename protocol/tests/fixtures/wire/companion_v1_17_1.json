@@ -1,0 +1,150 @@
+{
+  "generated_by": "cargo run -p xtask --bin xtask -- regen-wire-vectors --upstream <upstream-checkout> --tag companion-v1.17.1",
+  "inventory": {
+    "constants": {
+      "CIPHER_BLOCK_SIZE": 16,
+      "CIPHER_KEY_SIZE": 16,
+      "CIPHER_MAC_SIZE": 2,
+      "MAX_ADVERT_DATA_SIZE": 32,
+      "MAX_PACKET_PAYLOAD": 184,
+      "MAX_PATH_SIZE": 64,
+      "PATH_HASH_SIZE": 1,
+      "PUB_KEY_SIZE": 32,
+      "SIGNATURE_SIZE": 64
+    },
+    "payload_types": [
+      {
+        "name": "PAYLOAD_TYPE_REQ",
+        "value": 0
+      },
+      {
+        "name": "PAYLOAD_TYPE_RESPONSE",
+        "value": 1
+      },
+      {
+        "name": "PAYLOAD_TYPE_TXT_MSG",
+        "value": 2
+      },
+      {
+        "name": "PAYLOAD_TYPE_ACK",
+        "value": 3
+      },
+      {
+        "name": "PAYLOAD_TYPE_ADVERT",
+        "value": 4
+      },
+      {
+        "name": "PAYLOAD_TYPE_GRP_TXT",
+        "value": 5
+      },
+      {
+        "name": "PAYLOAD_TYPE_GRP_DATA",
+        "value": 6
+      },
+      {
+        "name": "PAYLOAD_TYPE_ANON_REQ",
+        "value": 7
+      },
+      {
+        "name": "PAYLOAD_TYPE_PATH",
+        "value": 8
+      },
+      {
+        "name": "PAYLOAD_TYPE_TRACE",
+        "value": 9
+      },
+      {
+        "name": "PAYLOAD_TYPE_MULTIPART",
+        "value": 10
+      },
+      {
+        "name": "PAYLOAD_TYPE_CONTROL",
+        "value": 11
+      },
+      {
+        "name": "PAYLOAD_TYPE_RAW_CUSTOM",
+        "value": 15
+      }
+    ],
+    "route_types": [
+      {
+        "name": "ROUTE_TYPE_TRANSPORT_FLOOD",
+        "value": 0
+      },
+      {
+        "name": "ROUTE_TYPE_FLOOD",
+        "value": 1
+      },
+      {
+        "name": "ROUTE_TYPE_DIRECT",
+        "value": 2
+      },
+      {
+        "name": "ROUTE_TYPE_TRANSPORT_DIRECT",
+        "value": 3
+      }
+    ]
+  },
+  "schema": 1,
+  "upstream_commit": "d92964352441e53b93e8667b802e04f6e072b39e",
+  "upstream_reference": "https://github.com/meshcore-dev/MeshCore",
+  "upstream_tag": "companion-v1.17.1",
+  "vectors": [
+    {
+      "byte_identical_to": "advert_v118",
+      "derivation": "Mesh.cpp createAdvert builds [pubkey(32)][timestamp_le(4)][signature(64)][appdata(1..32)] with appdata = flags(0x81) || name; sendFlood sets header 0x11 (ADVERT|FLOOD) and path_len 0x00 (one-byte hash, zero hops). MeshCadet's build_self_advert_card emits the identical card.",
+      "derivation_note": "The upstream advert payload block is byte-identical between companion-v1.18.0 and companion-v1.17.1 (verified with diff over Mesh.cpp:404-438); this vector proves the v1.17.1 target still produces the same on-air frame.",
+      "direction": "encode",
+      "frame": {
+        "frame_hex": "11008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c040302010347c27580f4c231cc6d8185c4af41aadc5c19ef5bd8194aade123f7a90c9260aee5631ef6792d32e6daf711df44379bfa7a5984b0e771e3ef426cdcd2b94b0e814361646574",
+        "header": 17,
+        "path_hex": "",
+        "path_len": 0,
+        "payload_hex": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c040302010347c27580f4c231cc6d8185c4af41aadc5c19ef5bd8194aade123f7a90c9260aee5631ef6792d32e6daf711df44379bfa7a5984b0e771e3ef426cdcd2b94b0e814361646574"
+      },
+      "id": "advert_v1171",
+      "inputs": {
+        "identity_seed_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+        "name": "Cadet",
+        "timestamp": 16909060
+      },
+      "kind": "advert",
+      "provenance": [
+        {
+          "file": "src/Mesh.cpp",
+          "line": 404,
+          "note": "payload layout: pubkey || timestamp_le || signature || appdata",
+          "snippet": "Packet* Mesh::createAdvert(const LocalIdentity& id"
+        },
+        {
+          "file": "src/Mesh.cpp",
+          "line": 413,
+          "note": "header carries ADVERT; sendFlood later ORs in ROUTE_TYPE_FLOOD",
+          "snippet": "packet->header = (PAYLOAD_TYPE_ADVERT << PH_TYPE_SHIFT);"
+        },
+        {
+          "file": "src/Mesh.cpp",
+          "line": 434,
+          "note": "Ed25519 signs pubkey || timestamp_le || appdata (header/path_len excluded)",
+          "snippet": "id.sign(signature, message, msg_len);"
+        },
+        {
+          "file": "src/Mesh.cpp",
+          "line": 637,
+          "note": "default path_hash_size = 1, zero hops -> path_len 0x00",
+          "snippet": "void Mesh::sendFlood(Packet* packet, uint32_t delay_millis, uint8_t path_hash_size)"
+        },
+        {
+          "file": "src/Mesh.cpp",
+          "line": 649,
+          "note": "path_len = ((1 - 1) << 6) | 0 = 0x00",
+          "snippet": "packet->setPathHashSizeAndCount(path_hash_size, 0);"
+        }
+      ],
+      "upstream": {
+        "commit": "d92964352441e53b93e8667b802e04f6e072b39e",
+        "tag": "companion-v1.17.1"
+      }
+    }
+  ]
+}
