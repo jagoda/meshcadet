@@ -5,14 +5,26 @@
 //! format: packet framing, header/route/payload-type fields, 2-byte path-hash
 //! encoding, the crypto/identity primitives (Ed25519 → X25519 ECDH, AES-128-ECB,
 //! 2-byte HMAC-SHA256 MAC), the DM + ACK codec, and symmetric channel encryption.
-//! It is also prefix-compatible with v1.16/v1.17, the current protocol target
-//! (the ACK codec accepts and prefix-matches v1.16's widened 6-byte ACK; see
-//! [`codec::compute_ack_hash`]). v1.17.1 was verified wire-unchanged from
-//! v1.16.0 (`FIRMWARE_VER_CODE` still 13; every `src/MeshCore.h` constant
-//! identical) — no codec change was needed for the v1.17 bump.
+//! It also interoperates with the current protocol target, MeshCore v1.18.0
+//! (released 2026-10-15), and with every release in between: framing, header,
+//! `MAX_PACKET_PAYLOAD` 184, `MAX_ADVERT_DATA_SIZE` 32, `MAX_PATH_SIZE` 64,
+//! `PATH_HASH_SIZE`, the `CIPHER_*` sizes, every `PayloadType`/`RouteType`
+//! value, the advert format and signature scope, and the ACK hash contract are
+//! byte-identical between v1.17.1 and v1.18.0. v1.18.0 adds one on-air text
+//! subtype, `TXT_TYPE_CLI_COMMAND` = 3 (and re-documents `TXT_TYPE_CLI_DATA` =
+//! 1 as "CLI command or reply"), which reuses the existing TXT_MSG frame
+//! encoding; no frame-format change was needed for the v1.18.0 bump. The ACK
+//! codec likewise still accepts and prefix-matches v1.16's widened 6-byte ACK
+//! (see [`codec::compute_ack_hash`]).
 //!
-//! The authoritative spec is the upstream MeshCore v1.15.0 firmware source
-//! (`dee3e26a`) this crate is ported from.
+//! `FIRMWARE_VER_CODE` is not used as a currency signal: it versions the
+//! companion host-link frames a MeshCore node sends to an attached app over
+//! USB/BLE (14 in v1.18.0, 13 in v1.17.x), not the on-air protocol this crate
+//! implements and MeshCadet speaks.
+//!
+//! The authoritative spec for the port remains the upstream MeshCore v1.15.0
+//! firmware source (`dee3e26a`); currency is re-checked against the
+//! `companion-v1.18.0` tag.
 //! Interop is a HARD requirement — every byte on the air must match the deployed
 //! mesh. See `docs/adr/0001-charter.md`.
 //!
