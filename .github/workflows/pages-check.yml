@@ -21,6 +21,9 @@ on:
       # See docs/adr/0007-provisioner-codec.md.
       - "protocol/src/provisioning.rs"
       - "protocol/src/history.rs"
+      # Region-name validation/key derivation is mirrored in codec.js +
+      # validation.js; a change there must re-run the conformance guard too.
+      - "protocol/src/region.rs"
       - "xtask/src/golden.rs"
       - "xtask/src/bin/gen_prov_golden_vectors.rs"
       - "xtask/Cargo.toml"

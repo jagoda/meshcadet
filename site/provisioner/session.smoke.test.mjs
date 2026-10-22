@@ -26,18 +26,21 @@ import {
   encodeSetPin,
   encodeSetLockPin,
   encodeSetLockConfig,
+  encodeSetRegion,
   LOCK_SCREEN_ENABLE,
   FRAME_QUERY_STATUS,
   FRAME_QUERY_CONTACTS,
   FRAME_QUERY_CHANNELS,
   FRAME_QUERY_ADVERT,
   FRAME_QUERY_ROOMS,
+  FRAME_QUERY_REGION,
   FRAME_ADD_CONTACT,
   FRAME_ADD_ROOM,
   FRAME_DEL_ROOM,
   FRAME_SET_PIN,
   FRAME_SET_LOCK_PIN,
   FRAME_SET_LOCK_CONFIG,
+  FRAME_SET_REGION,
   FRAME_EXPORT_HISTORY,
   FRAME_CLEAR_HISTORY,
   FRAME_RSP_STATUS,
@@ -54,6 +57,7 @@ import {
   FRAME_RSP_HISTORY_DONE,
   FRAME_RSP_ADVERT,
   FRAME_RSP_LOCK,
+  FRAME_RSP_REGION,
   MAX_RSP_HISTORY_ENTRY_PAYLOAD,
   HISTORY_MSG_TYPE_DM,
   HISTORY_MSG_TYPE_GRP_TXT,
@@ -1147,6 +1151,56 @@ async function setLockConfigSendsCorrectFrame() {
   await session.disconnect();
 }
 
+// ── Scenario 12d: queryRegion / setRegion / clearRegion round-trip ─────────
+
+async function regionQuerySetClearRoundTrip() {
+  const written = [];
+  // Device-side region state: empty until a SET_REGION arrives.
+  let deviceRegion = new Uint8Array([0]);
+  const { port, push } = makeFakePort((chunk) => {
+    written.push(chunk);
+    const sent = decodeFrame(chunk);
+    if (sent.frameType === FRAME_SET_REGION) {
+      deviceRegion = sent.payload;
+      setTimeout(() => push(encodeFrame(FRAME_RSP_OK)), 5);
+    } else if (sent.frameType === FRAME_QUERY_REGION) {
+      setTimeout(() => push(encodeFrame(FRAME_RSP_REGION, deviceRegion)), 5);
+    }
+  });
+  installFakeGlobals(port);
+
+  const session = new ProvisionerSession();
+  await session.connect();
+
+  const initial = await session.queryRegion();
+  assert.equal(initial.name, "");
+  assert.equal(initial.name_len, 0);
+
+  await session.setRegion("seattle");
+  assert.equal(decodeFrame(written[1]).frameType, FRAME_SET_REGION);
+  assert.deepEqual(
+    Array.from(decodeFrame(written[1]).payload),
+    Array.from(encodeSetRegion("seattle"))
+  );
+
+  const set = await session.queryRegion();
+  assert.equal(set.name, "seattle");
+  assert.equal(set.name_len, 7);
+  // The read-back is a QUERY_REGION, not a SET.
+  assert.equal(decodeFrame(written[2]).frameType, FRAME_QUERY_REGION);
+
+  // Clear path: empty payload, then read-back shows no region (unscoped).
+  await session.clearRegion();
+  const clearFrame = decodeFrame(written[3]);
+  assert.equal(clearFrame.frameType, FRAME_SET_REGION);
+  assert.deepEqual(Array.from(clearFrame.payload), [0]);
+  const cleared = await session.queryRegion();
+  assert.equal(cleared.name, "");
+  assert.equal(cleared.name_len, 0);
+
+  await session.disconnect();
+}
+
 // ── Scenario 13: exportHistory streams RSP_HISTORY_ENTRY*N -> RSP_HISTORY_DONE ─
 
 /** Wire layout: index(1) | sender_hash(1) | msg_type(1) | timestamp(4 LE) | text_len(1) | is_ours(1) | text(text_len). */
@@ -1712,6 +1766,7 @@ const scenarios = [
   ["setPin sends FRAME_SET_PIN with the encoded PIN payload", setPinSendsCorrectFrame],
   ["setLockPin sends FRAME_SET_LOCK_PIN with the encoded lock-PIN payload", setLockPinSendsCorrectFrame],
   ["setLockConfig sends FRAME_SET_LOCK_CONFIG with lock_flags + lock_timeout_s", setLockConfigSendsCorrectFrame],
+  ["queryRegion/setRegion/clearRegion round-trip (including the clear path)", regionQuerySetClearRoundTrip],
   ["exportHistory streams RSP_HISTORY_ENTRY*N -> RSP_HISTORY_DONE (oldest-first)", exportHistoryStreamsToDone],
   ["exportHistory tolerates a bounded stray reply before the stream", exportHistoryToleratesStrayFrame],
   ["exportHistory surfaces a device RSP_ERROR as DeviceError", exportHistoryDeviceError],

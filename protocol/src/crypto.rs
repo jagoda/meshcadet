@@ -82,6 +82,21 @@ pub fn hmac_sha256_2(key: &[u8], data: &[u8]) -> [u8; 2] {
     [result[0], result[1]]
 }
 
+/// 2-byte truncated HMAC-SHA256 over two logically concatenated slices:
+/// `HMAC-SHA256(key, part_a || part_b)[0:2]`, without allocating.
+///
+/// Used by region scoping, whose upstream MAC covers
+/// `payload_type_byte || payload` (`TransportKeyStore.cpp`
+/// `calcTransportCode`) — the type byte is a separate stack value on both
+/// sides, never part of the payload buffer.
+pub fn hmac_sha256_2_parts(key: &[u8], part_a: &[u8], part_b: &[u8]) -> [u8; 2] {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key size");
+    mac.update(part_a);
+    mac.update(part_b);
+    let result = mac.finalize().into_bytes();
+    [result[0], result[1]]
+}
+
 // ── SHA-256 ──────────────────────────────────────────────────────────────────
 
 /// SHA-256 hash of `data`.
@@ -211,6 +226,17 @@ mod tests {
         assert_ne!(h, [0u8; 32]);
         // SHA-256("abc") and SHA-256("") must differ
         assert_ne!(h, sha256(b""));
+    }
+
+    #[test]
+    fn hmac_sha256_2_parts_equals_single_concat() {
+        let key = b"0123456789abcdef";
+        let a = [0x02u8];
+        let b = b"hello";
+        let mut joined = Vec::new();
+        joined.extend_from_slice(&a);
+        joined.extend_from_slice(b);
+        assert_eq!(hmac_sha256_2_parts(key, &a, b), hmac_sha256_2(key, &joined));
     }
 
     #[test]

@@ -16,6 +16,8 @@
 //! meshcadet --port /dev/ttyUSB0 add-room --pubkey <HEX64> --name "Lobby" --password-stdin
 //! meshcadet --port /dev/ttyUSB0 list-rooms
 //! meshcadet --port /dev/ttyUSB0 set-notif-defaults --visual --audible
+//! meshcadet --port /dev/ttyUSB0 set-region --name seattle
+//! meshcadet --port /dev/ttyUSB0 set-region --clear
 //! meshcadet --port /dev/ttyUSB0 set-pin --pin 1234
 //! meshcadet --port /dev/ttyUSB0 commit
 //! meshcadet --port /dev/ttyUSB0 reset-pin --pin 5678
@@ -341,6 +343,30 @@ enum Cmd {
         audible: bool,
     },
 
+    /// Set or clear the device's MeshCore region scope.
+    ///
+    /// Region scoping is configured only from this CLI and the web
+    /// provisioner — there is deliberately no on-device control (ADR-0015).
+    /// A configured region makes outbound flood traffic carry upstream
+    /// transport codes derived from the name. **A region on a mesh that is
+    /// not region-managed causes total silence: traffic is dropped at the
+    /// first hop.** Use `--clear` to return to plain unscoped flood
+    /// emission. Names are 1-31 bytes of upstream region characters
+    /// (`-`, `#`, digits, `A` and above); a leading `$` (private region) is
+    /// rejected because upstream has no private keystore implementation.
+    SetRegion {
+        /// Region name. A leading '#' is kept; a bare name is treated as
+        /// the public hashtag region '#' + name when deriving the key.
+        /// Mutually exclusive with `--clear`.
+        #[arg(long, conflicts_with = "clear")]
+        name: Option<String>,
+
+        /// Clear the configured region, returning the device to plain
+        /// unscoped flood emission. Mutually exclusive with `--name`.
+        #[arg(long, action = ArgAction::SetTrue, conflicts_with = "name")]
+        clear: bool,
+    },
+
     /// Set the admin PIN (used to access the on-device admin menu).
     ///
     /// The PIN crosses the USB link in the clear — correct and intentional,
@@ -601,6 +627,19 @@ fn run_command(session: &mut Session<SerialTransport>, cmd: Cmd) -> anyhow::Resu
             println!("pub_hash    : 0x{:02X}", s.pubkey[0]);
             println!("contacts    : {}", s.contact_count);
             println!("channels    : {}", s.channel_count);
+            // Region is a separate query/response pair (not a status-payload
+            // trailing field) so it can evolve independently. A device that
+            // predates FRAME_QUERY_REGION answers RSP_ERROR/unknown; surface
+            // that as an explicit status line rather than failing the whole
+            // readout.
+            match session.query_region() {
+                Ok(r) if r.name_len == 0 => println!("region      : (none — unscoped flood)"),
+                Ok(r) => println!(
+                    "region      : {}",
+                    String::from_utf8_lossy(&r.name[..r.name_len as usize])
+                ),
+                Err(e) => println!("region      : (query failed: {e})"),
+            }
             // Mirrors the on-device admin-menu GPS status view: fix state,
             // coordinates + age, and clock-sync state + age. Status/display
             // only — there is no GPS control surface on either side.
@@ -1002,6 +1041,25 @@ fn run_command(session: &mut Session<SerialTransport>, cmd: Cmd) -> anyhow::Resu
                 "notification defaults set: visual={}, audible={}",
                 visual, audible
             );
+        }
+
+        Cmd::SetRegion { name, clear } => {
+            if clear {
+                session.set_region(b"")?;
+                println!("region cleared — device will emit plain unscoped flood frames");
+            } else {
+                let name = name.context("specify --name <region> or --clear")?;
+                if let Err(err) = protocol::region::validate_region_name(name.as_bytes()) {
+                    anyhow::bail!(
+                        "invalid region name {:?}: {:?} (1-{} bytes; allowed: '-', '$', '#', digits, 'A' and above; leading '$' private regions are unsupported)",
+                        name,
+                        err,
+                        protocol::region::REGION_NAME_MAX
+                    );
+                }
+                session.set_region(name.as_bytes())?;
+                println!("region set: {:?} — commit provisioning to persist it", name);
+            }
         }
 
         Cmd::SetPin {
@@ -2625,5 +2683,71 @@ mod tests {
         let cli = Cli::try_parse_from(["meshcadet", "--port", "/dev/ttyUSB0", "lock-status"])
             .expect("lock-status must parse");
         assert!(matches!(cli.cmd, Cmd::LockStatus));
+    }
+
+    // ── CLI parsing — set-region shape ──────────────────────────────────────
+
+    #[test]
+    fn cli_parses_set_region_name() {
+        let cli = Cli::try_parse_from([
+            "meshcadet",
+            "--port",
+            "/dev/ttyUSB0",
+            "set-region",
+            "--name",
+            "seattle",
+        ])
+        .expect("set-region --name must parse");
+        match cli.cmd {
+            Cmd::SetRegion { name, clear } => {
+                assert_eq!(name.as_deref(), Some("seattle"));
+                assert!(!clear);
+            }
+            other => panic!("expected Cmd::SetRegion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_set_region_clear() {
+        let cli = Cli::try_parse_from([
+            "meshcadet",
+            "--port",
+            "/dev/ttyUSB0",
+            "set-region",
+            "--clear",
+        ])
+        .expect("set-region --clear must parse");
+        match cli.cmd {
+            Cmd::SetRegion { name, clear } => {
+                assert!(clear);
+                assert!(name.is_none());
+            }
+            other => panic!("expected Cmd::SetRegion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_set_region_name_and_clear_together() {
+        let result = Cli::try_parse_from([
+            "meshcadet",
+            "--port",
+            "/dev/ttyUSB0",
+            "set-region",
+            "--name",
+            "seattle",
+            "--clear",
+        ]);
+        assert!(
+            result.is_err(),
+            "--name and --clear must be mutually exclusive at the arg-parsing layer"
+        );
+    }
+
+    #[test]
+    fn region_name_validation_accepts_public_names_and_rejects_private() {
+        assert!(protocol::region::validate_region_name(b"seattle").is_ok());
+        assert!(protocol::region::validate_region_name(b"#seattle").is_ok());
+        assert!(protocol::region::validate_region_name(b"$private").is_err());
+        assert!(protocol::region::validate_region_name(b"bad name").is_err());
     }
 }

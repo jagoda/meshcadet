@@ -20,6 +20,7 @@ import {
   MAX_NAME_LEN,
   MAX_PIN_LEN,
   MAX_ROOM_PASSWORD_LEN,
+  REGION_NAME_MAX,
   LOCK_PIN_LEN,
   LOCK_TIMEOUT_MIN_S,
   LOCK_TIMEOUT_MAX_S,
@@ -96,6 +97,49 @@ export function validateDeviceName(input) {
   const byteLen = new TextEncoder().encode(name).length;
   if (byteLen > MAX_NAME_LEN) {
     return { ok: false, error: `device name must be at most ${MAX_NAME_LEN} bytes (UTF-8); got ${byteLen} bytes` };
+  }
+  return { ok: true, name };
+}
+
+/**
+ * Validate a MeshCore region name.
+ * Mirrors upstream `RegionMap::is_name_char` and the 31-byte
+ * `RegionEntry::name` ceiling, plus the v1 private-region rejection: the
+ * leading `$` form is refused because upstream's private keystore is
+ * unimplemented, so such a name could never derive a key. Whitespace padding
+ * is trimmed; every remaining byte must be `-`, `$`, `#`, an ASCII digit, or
+ * `>= 'A'` (which includes lowercase and UTF-8 bytes >= 0x80).
+ *
+ * Empty is rejected here — clearing is an explicit action (the UI's Clear
+ * region button / `set-region --clear`), so a blank save cannot silently
+ * remove a region the operator forgot was configured.
+ *
+ * Returns `{ ok: true, name }` or `{ ok: false, error }`.
+ */
+export function validateRegionName(input) {
+  const name = (input ?? "").trim();
+  if (name.length === 0) {
+    return { ok: false, error: "region name is required (use Clear region to remove it)" };
+  }
+  const bytes = new TextEncoder().encode(name);
+  if (bytes.length > REGION_NAME_MAX) {
+    return { ok: false, error: `region name must be at most ${REGION_NAME_MAX} bytes; got ${bytes.length}` };
+  }
+  if (bytes[0] === 0x24) {
+    return {
+      ok: false,
+      error: "private regions ('$') are not supported by MeshCore yet; use a public region name",
+    };
+  }
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i];
+    const allowed = b === 0x2d || b === 0x24 || b === 0x23 || (b >= 0x30 && b <= 0x39) || b >= 0x41;
+    if (!allowed) {
+      return {
+        ok: false,
+        error: `region name has an invalid character at byte ${i}; allowed: '-', '$', '#', digits, and 'A' or above`,
+      };
+    }
   }
   return { ok: true, name };
 }

@@ -16,6 +16,7 @@
 | [0012](0012-dispatcher-ui-task-split.md) | Dispatcher/UI Task Split: Radio on Core 0, UI on Core 1, Message Queues Across the Boundary | Accepted (2026-08-02) |
 | [0013](0013-screen-lock-policy-layer.md) | Screen Lock: Policy/UI Layer, No Wire-Protocol Change | Accepted (2026-08-23) |
 | [0014](0014-power-policy.md) | Power Policy: Invariants, Estimate Labelling, and the Light-Sleep/RX-Integrity Contract | Accepted (2026-08-23) |
+| [0015](0015-region-scoping.md) | Region Scoping: Outbound-Only Transport-Code Scope, Provisioner/CLI-Only Config | Accepted (2026-10-22) |
 
 ADR-0001 is the project's founding charter: the design decisions made before
 any code was written. Subsequent ADRs (UI toolkit choice, provisioning wire
