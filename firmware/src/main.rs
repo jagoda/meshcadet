@@ -2827,9 +2827,18 @@ fn run() -> anyhow::Result<()> {
                     // right below is about to drop — a dedup'd duplicate from a
                     // repeater still proves it is audible right now (decision 6
                     // in the ADR), so this MUST run before that drop, not after.
-                    // `frame_buf[1]` is the `path_len` byte (`n >= 2` guards the
-                    // index — a frame this short is truncated garbage the rest
-                    // of this match arm would reject anyway). `hop_count == 0`
+                    // `path_len` is NOT always `frame_buf[1]`: a
+                    // TRANSPORT_FLOOD/TRANSPORT_DIRECT frame carries 4
+                    // transport-code bytes first, so its `path_len` sits at
+                    // offset 5 (`Packet::readFrom`, mirrored by
+                    // `protocol::frame::parse_rx_frame_header`). Reading byte 1
+                    // unconditionally read `transport_codes[0]` as the
+                    // path_len byte for those frames and reported a garbage
+                    // hop count; `firmware_core::rx_frame::frame_path_len`
+                    // returns the byte from the correct offset (and `None` when
+                    // the frame is too short to hold one at all — a frame this
+                    // short is truncated garbage the rest of this match arm
+                    // would reject anyway). `hop_count == 0`
                     // (a zero-hop, direct-from-origin packet) is filtered out
                     // here explicitly, mirroring the ADR's "hop >= 1" gate —
                     // `SignalTracker::record` would also no-op on it internally,
@@ -2838,8 +2847,9 @@ fn run() -> anyhow::Result<()> {
                     // already decoded above; `now` is this dispatcher-loop
                     // iteration's real monotonic `esp_timer_get_time`-backed
                     // clock (`uptime_ms()`), never a loop-iteration counter.
-                    if n >= 2 {
-                        let hop_count = PathLen(frame_buf[1]).hop_count();
+                    if let Some(path_len) = firmware_core::rx_frame::frame_path_len(&frame_buf[..n])
+                    {
+                        let hop_count = path_len.hop_count();
                         if hop_count >= 1 {
                             signal_tracker.record(rssi_dbm as i16, snr_db as i8, hop_count, now);
                             rx_diag!(

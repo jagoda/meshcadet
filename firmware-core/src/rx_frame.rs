@@ -14,7 +14,7 @@
 //! reference. This module keeps `firmware_core::rx_frame::*` as a stable
 //! import path for `firmware/src/main.rs`, which is unchanged.
 
-pub use protocol::frame::{parse_rx_frame_header, RxFrameError, RxFrameHeader};
+pub use protocol::frame::{frame_path_len, parse_rx_frame_header, RxFrameError, RxFrameHeader};
 
 #[cfg(test)]
 mod tests {

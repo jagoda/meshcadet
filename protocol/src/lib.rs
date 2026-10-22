@@ -135,7 +135,7 @@ pub use crypto::{
     hmac_sha256_2, mac_then_decrypt, mac_then_decrypt_var, sha256, sha256_2, MacError,
 };
 pub use dedup::{packet_dedup_key, packet_payload_view};
-pub use frame::{parse_rx_frame_header, RxFrameError, RxFrameHeader};
+pub use frame::{frame_path_len, parse_rx_frame_header, RxFrameError, RxFrameHeader};
 pub use header::{Header, PathLen};
 pub use history::{
     decode_entry_blob, decode_rsp_history_entry, encode_entry_blob, encode_rsp_history_entry,
