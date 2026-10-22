@@ -35,6 +35,8 @@
 //! | `FRAME_CLEAR_HISTORY`   | host→device | erase ALL persisted conversation history (every DM + channel, both directions), reply `RSP_OK` / `RSP_ERROR` — flash effect immediate, UI in-memory state needs a reboot to reflect it (see handler doc comment) |
 //! | `FRAME_QUERY_ADVERT`    | host→device | build + sign this device's self-advert card, reply `RSP_ADVERT` with the raw card bytes — written straight to this serial reply, **never** enqueued onto `txq`/the radio dispatcher (see handler doc comment) |
 //! | `FRAME_QUERY_LOCK`      | host→device | reply `RSP_LOCK` with the CURRENT `lock_flags`/`lock_timeout_s` (read fresh from `mc_rts` every call — the on-device admin menu can change them without going through this thread) and whether a screen-lock PIN is stored (`mc_lock`) |
+//! | `FRAME_QUERY_REGION`    | host→device | reply `RSP_REGION` with the region name read fresh from the dedicated `mc_region` store (`name_len == 0` ⇒ no region configured), or `RSP_ERROR(REGION_INVALID)` if the stored name cannot be keyed |
+//! | `FRAME_SET_REGION`      | host→device | set/clear the MeshCore region name in the dedicated `mc_region` store (immediate persist, `name_len == 0` clears), reply `RSP_OK` / `RSP_ERROR` — takes effect on air at the NEXT BOOT (the emission scope is a boot-time snapshot) |
 //! | `FRAME_SET_LOCK_PIN`    | host→device | set/reset the screen-lock PIN (distinct from the admin PIN above), persist to the dedicated `mc_lock` NVS store, forward `UiEvent::LockPinChanged` to the UI thread so it takes effect live rather than only at next boot, reply `RSP_OK` / `RSP_ERROR` |
 //! | `FRAME_SET_LOCK_CONFIG` | host→device | forward the new enable-flags/timeout to the UI thread as `UiEvent::LockConfigChanged` over the cloned `evt_tx` — **not** persisted by this thread (the `mc_rts` single-writer invariant, see this file's own module doc below); `RSP_OK` means "accepted and forwarded," not "persisted" |
 //!
@@ -101,12 +103,13 @@ use protocol::provisioning::{
     FRAME_ADD_CHANNEL, FRAME_ADD_CONTACT, FRAME_ADD_ROOM, FRAME_CLEAR_HISTORY,
     FRAME_COMMIT_PROVISIONING, FRAME_DEL_CHANNEL, FRAME_DEL_CONTACT, FRAME_DEL_ROOM,
     FRAME_EXPORT_HISTORY, FRAME_QUERY_ADVERT, FRAME_QUERY_CHANNELS, FRAME_QUERY_CONTACTS,
-    FRAME_QUERY_LOCK, FRAME_QUERY_ROOMS, FRAME_QUERY_STATUS, FRAME_RSP_ADVERT, FRAME_RSP_CHANNEL,
-    FRAME_RSP_CHANNELS_DONE, FRAME_RSP_CONTACT, FRAME_RSP_CONTACTS_DONE, FRAME_RSP_ERROR,
-    FRAME_RSP_HISTORY_DONE, FRAME_RSP_HISTORY_ENTRY, FRAME_RSP_IDENTITY, FRAME_RSP_LOCK,
-    FRAME_RSP_OK, FRAME_RSP_STATUS, FRAME_SET_DEVICE_NAME, FRAME_SET_LOCK_CONFIG,
-    FRAME_SET_LOCK_PIN, FRAME_SET_NOTIF_DEFAULTS, FRAME_SET_PIN, FRAME_OVERHEAD, LOCK_PIN_LEN,
-    MAX_NAME_LEN, PROV_MAGIC, ProvError, RspLockPayload, RspStatusPayload,
+    FRAME_QUERY_LOCK, FRAME_QUERY_REGION, FRAME_QUERY_ROOMS, FRAME_QUERY_STATUS,
+    FRAME_RSP_ADVERT, FRAME_RSP_CHANNEL, FRAME_RSP_CHANNELS_DONE, FRAME_RSP_CONTACT,
+    FRAME_RSP_CONTACTS_DONE, FRAME_RSP_ERROR, FRAME_RSP_HISTORY_DONE, FRAME_RSP_HISTORY_ENTRY,
+    FRAME_RSP_IDENTITY, FRAME_RSP_LOCK, FRAME_RSP_OK, FRAME_RSP_REGION, FRAME_RSP_STATUS,
+    FRAME_SET_DEVICE_NAME, FRAME_SET_LOCK_CONFIG, FRAME_SET_LOCK_PIN, FRAME_SET_NOTIF_DEFAULTS,
+    FRAME_SET_PIN, FRAME_SET_REGION, FRAME_OVERHEAD, LOCK_PIN_LEN, MAX_NAME_LEN,
+    MAX_REGION_NAME_LEN, PROV_MAGIC, ProvError, RspLockPayload, RspStatusPayload,
     decode_add_channel, decode_add_contact, decode_del_channel, decode_del_contact, decode_frame,
     decode_set_device_name, decode_set_lock_config, decode_set_lock_pin, decode_set_notif_defaults,
     decode_set_pin,
@@ -115,6 +118,7 @@ use protocol::provisioning::{
 };
 use protocol::{encode_rsp_history_entry, Identity, MAX_ADVERT_CARD_LEN, MAX_RSP_HISTORY_ENTRY_PAYLOAD};
 
+use firmware_core::region_admin::{self, QueryRegionOutcome, SetRegionOutcome};
 use firmware_core::room_admin::{self, AddRoomOutcome, DelRoomOutcome};
 use firmware_core::ui::ui_task_boundary::send_or_count;
 
@@ -164,6 +168,13 @@ mod err {
     /// to preserve (`RSP_OK` must mean "accepted and forwarded," never a
     /// silently swallowed forward failure).
     pub const FORWARD_ERROR: u8     = 0x07;
+    /// `FRAME_SET_REGION` carried a name the device will not key (over 31
+    /// bytes, a byte outside upstream's set, or a leading `$` private
+    /// region), or `FRAME_QUERY_REGION` found a stored name that cannot be
+    /// keyed — the fail-closed state ADR-0015 D4 requires be *visible* rather
+    /// than silently degraded to unscoped emission. Same code as
+    /// `provisioning_server`'s, so the host sees one error either way.
+    pub const REGION_INVALID: u8    = 0x08;
 }
 
 /// Entry point for the admin server thread.
@@ -790,6 +801,52 @@ fn handle_frame(
             let plen = encode_rsp_lock(&rsp, &mut pbuf);
             send_frame(out, FRAME_RSP_LOCK, &pbuf[..plen])?;
         }
+        // ── QUERY_REGION ─────────────────────────────────────────────────────
+        // ADR-0015 D2/D5: `meshcadet status` and the web provisioner's status
+        // panel read the region back through this dedicated pair rather than a
+        // trailing `RSP_STATUS` field. Before this arm existed the frame fell
+        // through to the unknown-frame arm below, which sends NO reply at all,
+        // so the host hung until its retry deadline expired.
+        //
+        // The name is read FRESH from the store on every call (no boot-time
+        // copy in this thread): `SET_REGION` below persists immediately, so
+        // flash is the single source of truth, and a second cached copy could
+        // only go stale. Same "read the owning store live" posture as
+        // `FRAME_QUERY_LOCK` above — and, like it, this is a READ, so the
+        // `mc_rts` single-writer invariant this file documents is untouched
+        // (this store is `admin_server`'s own).
+        FRAME_QUERY_REGION => {
+            let (name, name_len) = match crate::region_store::load_name(nvs_partition.clone()) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::error!("admin_server: QUERY_REGION — region_store::load_name failed: {:?}", e);
+                    return send_error(out, err::STORAGE_ERROR, b"region store read failed");
+                }
+            };
+            let mut pbuf = [0u8; 1 + MAX_REGION_NAME_LEN];
+            match region_admin::handle_query_region(&name[..name_len as usize], &mut pbuf) {
+                QueryRegionOutcome::Encoded(plen) => {
+                    log::info!("admin_server: QUERY_REGION — name_len={}", name_len);
+                    send_frame(out, FRAME_RSP_REGION, &pbuf[..plen])?;
+                }
+                QueryRegionOutcome::StoredNameUnusable(e) => {
+                    // Fail-closed surfacing (ADR-0015 D4): the device is
+                    // emitting nothing at all right now, and the status surface
+                    // must say so instead of printing a name that cannot be
+                    // keyed.
+                    log::error!(
+                        "admin_server: QUERY_REGION — stored region name unusable: {:?} — \
+                         flood emission is disabled until it is cleared or re-set",
+                        e,
+                    );
+                    return send_error(
+                        out,
+                        err::REGION_INVALID,
+                        b"stored region name is invalid; set-region --clear or set-region --name <name>",
+                    );
+                }
+            }
+        }
         // ── ADD_ROOM ─────────────────────────────────────────────────────────
         // Upsert a room-server contact keyed on its pubkey: `room_admin::handle_add_room`
         // (firmware-core, host-tested — see the M1 gap-fix doc there) decodes
@@ -1099,6 +1156,75 @@ fn handle_frame(
                 Err(e) => {
                     log::warn!("admin_server: SET_DEVICE_NAME decode: {:?}", e);
                     return send_error(out, err::DECODE_ERROR, b"set_device_name decode error");
+                }
+            }
+        }
+        // ── SET_REGION ───────────────────────────────────────────────────────
+        // The host CLI's `set-region --name/--clear` and the web provisioner's
+        // region field. Persists straight to the dedicated `mc_region` store —
+        // like `SET_DEVICE_NAME` above, not like the `ProvisionedConfig`-backed
+        // arms: the region is a node-level on-air setting, deliberately NOT
+        // part of the provisioning blob (ADR-0015 D2; `region_store`'s module
+        // doc has the full reasoning: folding it in would cost a `CFG_VERSION`
+        // bump and drag both host-side blob decoders along).
+        //
+        // WHEN IT TAKES EFFECT: immediately on flash (`RSP_OK` follows a
+        // completed NVS write, same ack semantics as `SET_DEVICE_NAME`), but on
+        // air only at the NEXT BOOT. The emission scope is derived exactly once
+        // at boot and held by the radio loop (`firmware_core::region_scope`),
+        // and it must stay that way: a live switch would apply a new transport
+        // code to a payload already in the TX queue, and a frame's `code0` has
+        // to remain byte-identical across its retries. This mirrors every other
+        // boot-snapshotted setting in this firmware (channels, contacts, radio
+        // preset) and `FRAME_DEL_ROOM`'s own reboot-required posture.
+        //
+        // NO live UI forward: there is deliberately no on-device region control
+        // (ADR-0015 D2), so unlike `SET_LOCK_PIN`/`SET_LOCK_CONFIG` there is no
+        // live consumer to notify.
+        //
+        // Validation, the `$`-private rejection, over-length refusal (never
+        // truncation), and "empty name = clear" are decided in `region_admin`
+        // (firmware-core, host-tested); this arm owns the NVS write + ack only.
+        FRAME_SET_REGION => {
+            match region_admin::handle_set_region(payload) {
+                SetRegionOutcome::Apply(v) => {
+                    match crate::region_store::save(nvs_partition.clone(), &v.name, v.name_len) {
+                        Ok(()) => {
+                            log::info!(
+                                "admin_server: SET_REGION len={} — stored (takes effect on air \
+                                 at the next boot)",
+                                v.name_len,
+                            );
+                            send_ok(out)?;
+                        }
+                        Err(e) => {
+                            log::error!("admin_server: SET_REGION — region_store::save failed: {:?}", e);
+                            return send_error(out, err::STORAGE_ERROR, b"NVS save failed");
+                        }
+                    }
+                }
+                SetRegionOutcome::PrivateUnsupported => {
+                    log::warn!(
+                        "admin_server: SET_REGION — private ($) region refused (no upstream \
+                         private keystore)",
+                    );
+                    return send_error(
+                        out,
+                        err::REGION_INVALID,
+                        b"private ($) regions are unsupported; use a public region name",
+                    );
+                }
+                SetRegionOutcome::InvalidName(e) => {
+                    log::warn!("admin_server: SET_REGION — invalid region name: {:?}", e);
+                    return send_error(
+                        out,
+                        err::REGION_INVALID,
+                        b"invalid region name (1-31 chars: '-', '#', digits, 'A' and above)",
+                    );
+                }
+                SetRegionOutcome::DecodeError => {
+                    log::warn!("admin_server: SET_REGION decode error");
+                    return send_error(out, err::DECODE_ERROR, b"set_region decode error");
                 }
             }
         }

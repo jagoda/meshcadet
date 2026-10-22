@@ -89,23 +89,34 @@ impl From<RoomCodecError> for RoomSessionError {
 
 // ── Login: encode ────────────────────────────────────────────────────────────
 
-/// Generous capacity for [`encode_room_login_frame`]'s output: 2-byte outer
+/// Generous capacity for [`encode_room_login_frame`]'s output: `2`-byte outer
 /// header/path_len + `1(dest_hash) + 32(sender_pubkey) + 2(HMAC) + 32(AES-ECB
 /// ciphertext, comfortably above the `ceil_16(8 + 15 + 1)` = 32-byte worst
-/// case)`.
-pub const MAX_LOGIN_FRAME_LEN: usize = 2 + 1 + 32 + 2 + 32;
+/// case)` + the four transport-code bytes a region-scoped frame inserts
+/// between the header and `path_len` (`firmware_core::region_scope`). Sized for
+/// the scoped (worst) case so one buffer works for both.
+pub const MAX_LOGIN_FRAME_LEN: usize =
+    2 + crate::region_scope::TRANSPORT_CODE_BYTES + 1 + 32 + 2 + 32;
 
-/// Encode the full outbound frame for a room login: `[header][path_len =
-/// 0 hops][ANON_REQ payload]`. Always flood-routed (`RouteType::Flood`) — a
+/// Encode the full outbound frame for a room login: `[header][(transport
+/// codes)][path_len = 0 hops][ANON_REQ payload]`. Always flood-routed — a
 /// room contact has no learned mesh route on first contact (`out_path`
 /// starts empty), and this module does not implement re-login over a learned
 /// route (that belongs to milestone 2's keep-alive scheduler).
+///
+/// `scope` is the boot-time region scope's transport key
+/// (`firmware_core::region_scope::RegionScope::emission`): `None` emits the
+/// plain `ROUTE_TYPE_FLOOD` frame MeshCadet has always emitted, `Some(key)`
+/// emits the region-scoped `TRANSPORT_FLOOD` frame (ADR-0015). The caller owns
+/// the fail-closed decision — a region that is configured but cannot be keyed
+/// must never reach this function as `None`; it must not be sent at all.
 ///
 /// `sync_since` should be the room's persisted watermark (`RoomExtra::sync_since`)
 /// so a resumed session does not re-drain posts the server already delivered.
 ///
 /// Returns the number of bytes written to `out` (`out` must be at least
 /// [`MAX_LOGIN_FRAME_LEN`] bytes).
+#[allow(clippy::too_many_arguments)]
 pub fn encode_room_login_frame(
     shared_secret: &[u8; 32],
     dest_hash: u8,
@@ -113,11 +124,11 @@ pub fn encode_room_login_frame(
     timestamp: u32,
     sync_since: u32,
     password: &[u8],
+    scope: Option<&[u8; 16]>,
     out: &mut [u8],
 ) -> usize {
-    out[0] = Header::new(RouteType::Flood, PayloadType::AnonReq).0;
-    out[1] = PathLen::new(2, 0).map(|p| p.0).unwrap_or(0x40);
-    let n = protocol::room::encode_anon_req_login(
+    let path_len = PathLen::new(2, 0).expect("(hash_size 2, 0 hops) is always a valid path_len");
+    let payload_len = protocol::room::encode_anon_req_login(
         shared_secret,
         dest_hash,
         sender_pubkey,
@@ -126,7 +137,13 @@ pub fn encode_room_login_frame(
         password,
         &mut out[2..],
     );
-    2 + n
+    crate::region_scope::assemble_flood_frame(
+        scope,
+        out,
+        PayloadType::AnonReq,
+        path_len,
+        payload_len,
+    )
 }
 
 // ── Login: decode ────────────────────────────────────────────────────────────
@@ -1188,16 +1205,27 @@ pub enum RoomPostError {
 }
 
 /// Generous upper bound on [`encode_room_post_checked`]'s output: outer
-/// `[header(1)][path_len(1)]` + `encode_room_post`'s own DM-envelope worst
-/// case (`2(dest/src hash) + 2(HMAC) + ceil_16(6 + MAX_POST_TEXT_LEN + 1)`).
-pub const MAX_POST_FRAME_LEN: usize = 2 + 2 + 2 + (((6 + MAX_POST_TEXT_LEN + 1) / 16) + 1) * 16;
+/// `[header(1)][(transport codes(4))][path_len(1)]` + `encode_room_post`'s own
+/// DM-envelope worst case (`2(dest/src hash) + 2(HMAC) +
+/// ceil_16(6 + MAX_POST_TEXT_LEN + 1)`). Sized for the region-scoped (worst)
+/// case so one buffer serves both.
+pub const MAX_POST_FRAME_LEN: usize = 2
+    + crate::region_scope::TRANSPORT_CODE_BYTES
+    + 2
+    + (((6 + MAX_POST_TEXT_LEN + 1) / 16) + 1) * 16;
 
 /// Checked, wire-ready encode of a room post (Phase A "post semantics"):
-/// `[header=Flood/TxtMsg][path_len=0-hop][DM envelope]` — the same "flood,
-/// addressed by dest_hash" shape [`encode_room_login_frame`] already uses,
-/// since a room contact worth posting to has necessarily already reached
-/// the server once (over flood or a learned direct route) and flood
-/// addressing reaches it either way.
+/// `[header=Flood|TransportFlood/TxtMsg][(codes)][path_len=0-hop][DM envelope]`
+/// — the same "flood, addressed by dest_hash" shape
+/// [`encode_room_login_frame`] already uses, since a room contact worth
+/// posting to has necessarily already reached the server once (over flood or a
+/// learned direct route) and flood addressing reaches it either way.
+///
+/// `scope` works exactly as in [`encode_room_login_frame`]: `None` = plain
+/// `ROUTE_TYPE_FLOOD` (today's bytes), `Some(key)` = region-scoped
+/// `TRANSPORT_FLOOD` (ADR-0015). It changes ONLY the outer framing — the ACK
+/// hash and the DM envelope are identical either way, because both derive from
+/// the plaintext, not from the header.
 ///
 /// Refuses to encode (returns `Err`, writes nothing) unless `candidate_ts`
 /// is STRICTLY greater than `last_room_ts` — see [`RoomPostError`]'s doc.
@@ -1221,14 +1249,13 @@ pub fn encode_room_post_checked(
     last_room_ts: u32,
     text: &[u8],
     client_pubkey: &[u8; 32],
+    scope: Option<&[u8; 16]>,
     out: &mut [u8],
 ) -> Result<(usize, [u8; 4]), RoomPostError> {
     if candidate_ts <= last_room_ts {
         return Err(RoomPostError::NonMonotonicTimestamp);
     }
-    out[0] = Header::new(RouteType::Flood, PayloadType::TxtMsg).0;
-    out[1] = PathLen::new(2, 0).map(|p| p.0).unwrap_or(0x40);
-    let n = encode_room_post(
+    let payload_len = encode_room_post(
         shared_secret,
         dest_hash,
         src_hash,
@@ -1239,7 +1266,15 @@ pub fn encode_room_post_checked(
     );
     let text_len = text.len().min(MAX_POST_TEXT_LEN);
     let ack = room_post_ack_hash(candidate_ts, 0, &text[..text_len], client_pubkey);
-    Ok((2 + n, ack))
+    let path_len = PathLen::new(2, 0).expect("(hash_size 2, 0 hops) is always a valid path_len");
+    let n = crate::region_scope::assemble_flood_frame(
+        scope,
+        out,
+        PayloadType::TxtMsg,
+        path_len,
+        payload_len,
+    );
+    Ok((n, ack))
 }
 
 // ── Keep-alive: Phase C "keep-alive scheduler" ──────────────────────────────
@@ -2104,6 +2139,7 @@ mod tests {
             1000,
             42,
             b"guest-pw",
+            None,
             &mut out,
         );
         assert_eq!(
@@ -2121,6 +2157,131 @@ mod tests {
             n > 2 + 33,
             "payload must carry the inline pubkey + HMAC + ciphertext"
         );
+    }
+
+    /// Byte-exact layout of a REGION-SCOPED room login (ADR-0015): the header
+    /// becomes `TRANSPORT_FLOOD` and four transport-code bytes sit between it
+    /// and `path_len`. The ANON_REQ payload itself must be identical to the
+    /// unscoped form — only the outer framing changes.
+    #[test]
+    fn encode_room_login_frame_scoped_layout_is_byte_exact() {
+        let (client, server) = make_pair();
+        let shared = client.ecdh_shared_secret(&server.pubkey);
+        let key = protocol::region::region_key(b"seattle").unwrap();
+
+        let mut unscoped = [0u8; MAX_LOGIN_FRAME_LEN];
+        let n_unscoped = encode_room_login_frame(
+            &shared,
+            server.pub_hash(),
+            &client.pubkey,
+            1000,
+            42,
+            b"guest-pw",
+            None,
+            &mut unscoped,
+        );
+        let mut scoped = [0u8; MAX_LOGIN_FRAME_LEN];
+        let n_scoped = encode_room_login_frame(
+            &shared,
+            server.pub_hash(),
+            &client.pubkey,
+            1000,
+            42,
+            b"guest-pw",
+            Some(&key),
+            &mut scoped,
+        );
+
+        let payload = &unscoped[2..n_unscoped];
+        assert_eq!(
+            n_scoped,
+            n_unscoped + 4,
+            "exactly the four code bytes are added"
+        );
+        assert_eq!(
+            scoped[0],
+            Header::new(RouteType::TransportFlood, PayloadType::AnonReq).0,
+            "scoped login must be TRANSPORT_FLOOD, not FLOOD"
+        );
+        assert_eq!(
+            &scoped[1..5],
+            &protocol::region::scoped_transport_codes(&key, PayloadType::AnonReq as u8, payload),
+            "[code0 lo, code0 hi, 0, 0] immediately after the header"
+        );
+        assert_ne!(
+            scoped[1] | scoped[2],
+            0,
+            "code0 must never be the forbidden zero code"
+        );
+        assert_eq!(
+            scoped[5],
+            PathLen::new(2, 0).unwrap().0,
+            "0-hop path_len after the codes"
+        );
+        assert_eq!(
+            &scoped[6..n_scoped],
+            payload,
+            "ANON_REQ payload byte-identical"
+        );
+        assert_eq!(
+            scoped[6],
+            server.pub_hash(),
+            "dest_hash still leads the payload"
+        );
+    }
+
+    /// The region scope must NOT change a room post's ACK hash or DM envelope
+    /// (both derive from the plaintext); only the outer framing moves.
+    #[test]
+    fn encode_room_post_scoped_layout_keeps_ack_and_envelope() {
+        let (client, server) = make_pair();
+        let shared = client.ecdh_shared_secret(&server.pubkey);
+        let key = protocol::region::region_key(b"bay-area").unwrap();
+
+        let mut unscoped = [0u8; MAX_POST_FRAME_LEN];
+        let (n_unscoped, ack_unscoped) = encode_room_post_checked(
+            &shared,
+            server.pub_hash(),
+            client.pub_hash(),
+            2000,
+            1000,
+            b"scoped post body",
+            &client.pubkey,
+            None,
+            &mut unscoped,
+        )
+        .expect("unscoped post encodes");
+
+        let mut scoped = [0u8; MAX_POST_FRAME_LEN];
+        let (n_scoped, ack_scoped) = encode_room_post_checked(
+            &shared,
+            server.pub_hash(),
+            client.pub_hash(),
+            2000,
+            1000,
+            b"scoped post body",
+            &client.pubkey,
+            Some(&key),
+            &mut scoped,
+        )
+        .expect("scoped post encodes");
+
+        assert_eq!(
+            ack_unscoped, ack_scoped,
+            "the ACK hash is over the plaintext"
+        );
+        assert_eq!(n_scoped, n_unscoped + 4);
+        let payload = &unscoped[2..n_unscoped];
+        assert_eq!(
+            scoped[0],
+            Header::new(RouteType::TransportFlood, PayloadType::TxtMsg).0
+        );
+        assert_eq!(
+            &scoped[1..5],
+            &protocol::region::scoped_transport_codes(&key, PayloadType::TxtMsg as u8, payload)
+        );
+        assert_eq!(scoped[5], PathLen::new(2, 0).unwrap().0);
+        assert_eq!(&scoped[6..n_scoped], payload, "DM envelope byte-identical");
     }
 
     // ── Login: decode both reply forms ──────────────────────────────────────
@@ -3404,6 +3565,7 @@ mod tests {
             state.last_room_ts,
             b"hello, unsynced",
             &client.pubkey,
+            None,
             &mut out,
         )
         .expect("a post must succeed with clock_synced == false");
@@ -3631,6 +3793,7 @@ mod tests {
                 1000, // equal: the "silently discarded as a retry" trap
                 b"hi",
                 &client.pubkey,
+                None,
                 &mut out,
             ),
             Err(RoomPostError::NonMonotonicTimestamp)
@@ -3644,6 +3807,7 @@ mod tests {
                 1000, // lesser: outright replay
                 b"hi",
                 &client.pubkey,
+                None,
                 &mut out,
             ),
             Err(RoomPostError::NonMonotonicTimestamp)
@@ -3666,6 +3830,7 @@ mod tests {
             1000,
             b"a genuinely new post",
             &client.pubkey,
+            None,
             &mut out,
         )
         .expect("candidate_ts > last_room_ts must encode");
