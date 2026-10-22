@@ -4207,8 +4207,38 @@ fn handle_dm(
 
             let ts        = u32::from_le_bytes([dec_buf[0], dec_buf[1], dec_buf[2], dec_buf[3]]);
             let type_byte = dec_buf[4];
+            let txt_type  = protocol::TxtType::from_byte(type_byte >> 2);
             let text_region = &dec_buf[5..pt_len.min(dec_buf.len())];
             let text = c_str(text_region);
+
+            // ── Text-subtype gate (MeshCore v1.18.0 conformance) ──────────────
+            // The flags byte's upper 6 bits are the TXT_MSG text subtype
+            // (`TxtDataHelpers.h` @ `companion-v1.18.0`): 0 PLAIN, 1 CLI_DATA,
+            // 2 SIGNED_PLAIN, 3 CLI_COMMAND (new in v1.18.0), 4..=63 reserved.
+            // Upstream `BaseChatMesh::onPeerDataRecv` (`BaseChatMesh.cpp:239-300`)
+            // only reaches a message callback — and only computes/queues an ACK
+            // — for PLAIN and SIGNED_PLAIN; the CLI subtypes go to their own
+            // callbacks with "no ack expected", and unmatched flags are dropped.
+            // This gate sits AHEAD of the replay gate, history, UI event,
+            // telemetry-request check and ACK below, so dropping here means
+            // none of those side effects — and no replay-ring slot or
+            // `last_ts` advance — happens for non-chat traffic.
+            //
+            // The decision itself is a pure function in `firmware_core`
+            // (host-testable; this file's tests cannot run in CI), and
+            // `ignore_reason()` is `Some` for every non-accepted disposition.
+            if let Some(reason) =
+                firmware_core::inbound_dm::classify_inbound_dm(txt_type).ignore_reason()
+            {
+                log::info!(
+                    "RX DM from 0x{:02x} ts={}: {} (txt_type={}) — no ACK, no history, no UI",
+                    raw_src,
+                    ts,
+                    reason,
+                    txt_type.as_byte(),
+                );
+                return;
+            }
 
             let text_str = core::str::from_utf8(text).unwrap_or("<invalid utf8>");
             log::info!("RX DM from 0x{:02x} ts={}: \"{}\"", raw_src, ts, text_str);
