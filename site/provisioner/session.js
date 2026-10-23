@@ -48,6 +48,7 @@ import {
   decodeRspContact,
   decodeRspChannel,
   decodeRspRoom,
+  decodeRspRegion,
   decodeRspHistoryEntry,
   decodeRspAdvert,
   encodeAddContact,
@@ -61,6 +62,7 @@ import {
   encodeSetPin,
   encodeSetLockPin,
   encodeSetLockConfig,
+  encodeSetRegion,
   encodeQueryAdvert,
   ProvError,
   FRAME_QUERY_STATUS,
@@ -68,6 +70,7 @@ import {
   FRAME_QUERY_CHANNELS,
   FRAME_QUERY_ADVERT,
   FRAME_QUERY_ROOMS,
+  FRAME_QUERY_REGION,
   FRAME_ADD_CONTACT,
   FRAME_DEL_CONTACT,
   FRAME_ADD_CHANNEL,
@@ -78,6 +81,7 @@ import {
   FRAME_SET_PIN,
   FRAME_SET_LOCK_PIN,
   FRAME_SET_LOCK_CONFIG,
+  FRAME_SET_REGION,
   FRAME_SET_DEVICE_NAME,
   FRAME_COMMIT_PROVISIONING,
   FRAME_EXPORT_HISTORY,
@@ -96,6 +100,7 @@ import {
   FRAME_RSP_HISTORY_DONE,
   FRAME_RSP_ADVERT,
   FRAME_RSP_LOCK,
+  FRAME_RSP_REGION,
   MAX_RSP_HISTORY_ENTRY_PAYLOAD,
   MAX_ADVERT_CARD_LEN,
 } from "./codec.js";
@@ -155,6 +160,7 @@ const ALL_RSP_FRAME_TYPES = new Set([
   FRAME_RSP_ROOMS_DONE,
   FRAME_RSP_ADVERT,
   FRAME_RSP_LOCK,
+  FRAME_RSP_REGION,
 ]);
 
 /**
@@ -888,6 +894,53 @@ export class ProvisionerSession {
    */
   async setDeviceName(name) {
     await this.#exclusive(() => this.#sendAndExpectOk(FRAME_SET_DEVICE_NAME, encodeSetDeviceName(name)));
+  }
+
+  /**
+   * Query the device's configured MeshCore region name. Sends
+   * `FRAME_QUERY_REGION` and expects a single `FRAME_RSP_REGION` back —
+   * `name_len === 0` means no region configured (plain unscoped flood).
+   * Mirrors `Session::query_region` (`host/src/session.rs`).
+   */
+  async queryRegion() {
+    return this.#exclusive(async () => {
+      const { frameType, payload } = await this.#sendRecvWithRetry(
+        FRAME_QUERY_REGION,
+        new Uint8Array(0),
+        (ft) => ft === FRAME_RSP_REGION,
+        "QUERY_REGION's RSP_REGION"
+      );
+      if (frameType === FRAME_RSP_REGION) {
+        return decodeRspRegion(payload);
+      }
+      if (frameType === FRAME_RSP_ERROR) {
+        throw deviceErrorFrom(payload);
+      }
+      throw new Error(
+        `unexpected response 0x${hex2(frameType)} to QUERY_REGION (expected RSP_REGION 0x${hex2(FRAME_RSP_REGION)})`
+      );
+    });
+  }
+
+  /**
+   * Set the device's MeshCore region name. `name` is validated by
+   * `encodeSetRegion` (31-byte ceiling, upstream character rules, no `$`
+   * private regions) — validate it upstream with `validateRegionName` to
+   * render an inline error instead of catching an encode throw. Mirrors
+   * `Session::set_region`.
+   *
+   * WARNING (also rendered prominently in the UI): a region on a mesh that
+   * is not region-managed causes total silence — there is no fallback, and
+   * the traffic is dropped at the first hop. `RSP_OK` means accepted into
+   * the staging config; `commit()` still persists it.
+   */
+  async setRegion(name) {
+    await this.#exclusive(() => this.#sendAndExpectOk(FRAME_SET_REGION, encodeSetRegion(name)));
+  }
+
+  /** Clear the configured region, returning to plain unscoped flood emission. */
+  async clearRegion() {
+    await this.setRegion("");
   }
 
   /**

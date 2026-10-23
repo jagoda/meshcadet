@@ -63,6 +63,12 @@ pub const MAX_ROOM_PASSWORD_LEN: usize = MAX_LOGIN_PASSWORD_LEN;
 /// again to keep a single source of truth.
 pub const MAX_ROOM_PATH_LEN: usize = MAX_PATH_SIZE;
 
+/// Maximum region-name length carried in a region frame (bytes). Reuses
+/// [`crate::region::REGION_NAME_MAX`], the upstream `RegionEntry::name[31]`
+/// ceiling, so the provisioning wire format and the on-air region codec can
+/// never drift on this number.
+pub const MAX_REGION_NAME_LEN: usize = crate::region::REGION_NAME_MAX;
+
 // ── Screen-lock constants (docs/adr/0013-screen-lock-policy-layer.md, D1/D2/D6) ─
 //
 // These are the wire-level pieces of the screen-lock policy layer: frame
@@ -150,6 +156,14 @@ pub const FRAME_QUERY_ROOMS: u8 = 0x05;
 /// comment for why it stays frozen.
 pub const FRAME_QUERY_LOCK: u8 = 0x06;
 
+/// Query the device's configured MeshCore region name. Payload: empty. The
+/// device replies [`FRAME_RSP_REGION`] (empty name = no region configured).
+/// Deliberately a dedicated query/response pair rather than a new field on
+/// the frozen [`RspStatusPayload`] / a trailing-field bump of it — mirrors
+/// [`FRAME_QUERY_LOCK`]'s shape and keeps the region contract independently
+/// versionable.
+pub const FRAME_QUERY_REGION: u8 = 0x07;
+
 /// Add a contact entry.
 pub const FRAME_ADD_CONTACT: u8 = 0x10;
 /// Delete a contact entry by pubkey.
@@ -206,6 +220,15 @@ pub const FRAME_SET_LOCK_PIN: u8 = 0x52;
 /// screen-lock plan's D2). `RSP_OK` for this frame means "accepted and
 /// forwarded", not "persisted" — persistence completes asynchronously.
 pub const FRAME_SET_LOCK_CONFIG: u8 = 0x53;
+
+/// Set (or clear) the device's MeshCore region name. Payload:
+/// [`SetRegionPayload`] — a length-prefixed name, at most
+/// [`MAX_REGION_NAME_LEN`] bytes; an empty name clears the region. The name
+/// is validated at the decode path against upstream `RegionMap`'s character
+/// rules and the v1 private-region rejection (leading `$`). Region scoping is
+/// configured **only** via the host CLI and web provisioner — there is no
+/// on-device UI control by design (ADR-0015).
+pub const FRAME_SET_REGION: u8 = 0x54;
 
 /// Commit: mark provisioning complete and persist config to flash.
 /// Payload: empty.  Device reboots after responding RspOk.
@@ -274,6 +297,13 @@ pub const FRAME_RSP_ROOMS_DONE: u8 = 0x8C;
 /// currently set.
 pub const FRAME_RSP_LOCK: u8 = 0x8D;
 
+/// Response: answer to [`FRAME_QUERY_REGION`]. Payload:
+/// [`RspRegionPayload`] — the configured name, or an empty name when no
+/// region is configured. Never echoes a derived key: the name is the only
+/// provisioning-time value, and both host and browser derive the key with
+/// [`crate::region::region_key`].
+pub const FRAME_RSP_REGION: u8 = 0x8E;
+
 // ── Error type ────────────────────────────────────────────────────────────────
 
 /// Errors from provisioning frame encode/decode operations.
@@ -298,6 +328,12 @@ pub enum ProvError {
     /// A `SET_LOCK_PIN` payload is not exactly `LOCK_PIN_LEN` bytes, or
     /// contains a byte that is not an ASCII digit (`b'0'..=b'9'`).
     LockPinInvalid,
+    /// A region name is empty where one is required, too long, contains a
+    /// byte outside upstream `RegionMap::is_name_char`, or starts with `$`
+    /// (an upstream private region, whose keystore is unimplemented — v1
+    /// deliberately rejects it rather than provisioning a name that can
+    /// never derive a key).
+    RegionNameInvalid,
     /// An `ADD_CHANNEL` payload's `key_len` byte is neither 16 nor 32 — the
     /// only two channel-secret widths this protocol supports. Rejected at
     /// decode rather than trusted downstream: every consumer indexes the
@@ -443,6 +479,30 @@ pub struct RspLockPayload {
     /// `true` if a lock PIN is currently stored on the device. The PIN
     /// itself is never echoed back (see `FRAME_RSP_LOCK`'s doc comment).
     pub pin_set: bool,
+}
+
+/// Payload for `FRAME_SET_REGION`.
+///
+/// Wire layout: `name_len(1) | name(name_len)`. `name_len == 0` clears the
+/// configured region. The same shape as `FRAME_SET_DEVICE_NAME` but with a
+/// 31-byte ceiling and decode-path character/private-region validation,
+/// because an invalid region silently changes on-air reach rather than just
+/// a display label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetRegionPayload {
+    /// UTF-8 region name, zero-padded to [`MAX_REGION_NAME_LEN`].
+    pub name: [u8; MAX_REGION_NAME_LEN],
+    /// Actual byte length of `name` (0 ⇒ clear the configured region).
+    pub name_len: u8,
+}
+
+/// Payload for `FRAME_RSP_REGION` (response to `FRAME_QUERY_REGION`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RspRegionPayload {
+    /// UTF-8 region name, zero-padded to [`MAX_REGION_NAME_LEN`].
+    pub name: [u8; MAX_REGION_NAME_LEN],
+    /// Actual byte length of `name` (0 ⇒ no region configured).
+    pub name_len: u8,
 }
 
 /// Payload for `FRAME_RSP_STATUS` (response to `FRAME_QUERY_STATUS`).
@@ -890,6 +950,34 @@ pub fn encode_rsp_lock(payload: &RspLockPayload, out: &mut [u8]) -> usize {
     4
 }
 
+/// Encode a `SetRegion` payload.  Returns bytes written.
+///
+/// Wire layout: `name_len(1) | name(name_len)`. An empty `name` is the
+/// explicit clear command and is accepted; any non-empty name is validated
+/// with [`crate::region::validate_region_name`] (fail closed rather than
+/// sending a name the device will reject or a private region it cannot key).
+pub fn encode_set_region(name: &[u8], out: &mut [u8]) -> Result<usize, ProvError> {
+    if !name.is_empty() {
+        crate::region::validate_region_name(name).map_err(|_| ProvError::RegionNameInvalid)?;
+    }
+    out[0] = name.len() as u8;
+    out[1..1 + name.len()].copy_from_slice(name);
+    Ok(1 + name.len())
+}
+
+/// Encode an `RspRegion` payload.  Returns bytes written.
+///
+/// Wire layout: `name_len(1) | name(name_len)`. An empty name is valid (no
+/// region configured).
+pub fn encode_rsp_region(name: &[u8], out: &mut [u8]) -> Result<usize, ProvError> {
+    if !name.is_empty() {
+        crate::region::validate_region_name(name).map_err(|_| ProvError::RegionNameInvalid)?;
+    }
+    out[0] = name.len() as u8;
+    out[1..1 + name.len()].copy_from_slice(name);
+    Ok(1 + name.len())
+}
+
 /// Encode an `RspStatus` payload.  Returns bytes written (always 59).
 ///
 /// Wire layout: `provisioned(1) | pubkey(32) | contact_count(1) | channel_count(1) |
@@ -1236,6 +1324,64 @@ pub fn decode_rsp_lock(payload: &[u8]) -> Result<RspLockPayload, ProvError> {
         lock_flags: payload[0],
         lock_timeout_s: u16::from_le_bytes(payload[1..3].try_into().unwrap()),
         pin_set: payload[3] != 0,
+    })
+}
+
+/// Decode a `SetRegion` payload.
+///
+/// Empty is valid and means "clear". A non-empty name is validated with the
+/// same upstream rules as the encoder; an over-length, malformed, or
+/// `$`-private name is rejected with [`ProvError::RegionNameInvalid`] rather
+/// than accepted into config.
+pub fn decode_set_region(payload: &[u8]) -> Result<SetRegionPayload, ProvError> {
+    if payload.is_empty() {
+        return Err(ProvError::TruncatedPayload);
+    }
+    let name_len = payload[0] as usize;
+    if name_len > MAX_REGION_NAME_LEN {
+        return Err(ProvError::RegionNameInvalid);
+    }
+    if payload.len() < 1 + name_len {
+        return Err(ProvError::TruncatedPayload);
+    }
+    let name_bytes = &payload[1..1 + name_len];
+    if !name_bytes.is_empty() {
+        crate::region::validate_region_name(name_bytes)
+            .map_err(|_| ProvError::RegionNameInvalid)?;
+    }
+    let mut name = [0u8; MAX_REGION_NAME_LEN];
+    name[..name_len].copy_from_slice(name_bytes);
+    Ok(SetRegionPayload {
+        name,
+        name_len: name_len as u8,
+    })
+}
+
+/// Decode an `RspRegion` payload.
+///
+/// Empty is valid and means "no region configured". A non-empty name must
+/// pass the same validation as [`decode_set_region`].
+pub fn decode_rsp_region(payload: &[u8]) -> Result<RspRegionPayload, ProvError> {
+    if payload.is_empty() {
+        return Err(ProvError::TruncatedPayload);
+    }
+    let name_len = payload[0] as usize;
+    if name_len > MAX_REGION_NAME_LEN {
+        return Err(ProvError::RegionNameInvalid);
+    }
+    if payload.len() < 1 + name_len {
+        return Err(ProvError::TruncatedPayload);
+    }
+    let name_bytes = &payload[1..1 + name_len];
+    if !name_bytes.is_empty() {
+        crate::region::validate_region_name(name_bytes)
+            .map_err(|_| ProvError::RegionNameInvalid)?;
+    }
+    let mut name = [0u8; MAX_REGION_NAME_LEN];
+    name[..name_len].copy_from_slice(name_bytes);
+    Ok(RspRegionPayload {
+        name,
+        name_len: name_len as u8,
     })
 }
 
@@ -2301,6 +2447,104 @@ mod tests {
         assert_ne!(FRAME_QUERY_ADVERT, FRAME_QUERY_CONTACTS);
         assert_ne!(FRAME_QUERY_ADVERT, FRAME_QUERY_CHANNELS);
         assert_ne!(FRAME_RSP_ADVERT, FRAME_RSP_CHANNELS_DONE);
+    }
+
+    // ── Region frames ────────────────────────────────────────────────────────
+
+    #[test]
+    fn set_region_roundtrip_bare_and_hash_names() {
+        for name in [&b"seattle"[..], b"#seattle"] {
+            let mut buf = [0u8; 40];
+            let plen = encode_set_region(name, &mut buf).unwrap();
+            assert_eq!(plen, 1 + name.len());
+            assert_eq!(buf[0], name.len() as u8);
+            assert_eq!(&buf[1..plen], name);
+            let d = decode_set_region(&buf[..plen]).unwrap();
+            assert_eq!(d.name_len as usize, name.len());
+            assert_eq!(&d.name[..d.name_len as usize], name);
+        }
+    }
+
+    #[test]
+    fn set_region_empty_payload_is_the_clear_command() {
+        let mut buf = [0u8; 4];
+        let plen = encode_set_region(b"", &mut buf).unwrap();
+        assert_eq!(plen, 1);
+        assert_eq!(buf[0], 0);
+        let d = decode_set_region(&buf[..plen]).unwrap();
+        assert_eq!(d.name_len, 0);
+        assert_eq!(d.name, [0u8; MAX_REGION_NAME_LEN]);
+    }
+
+    #[test]
+    fn set_region_rejects_invalid_names_at_both_codec_ends() {
+        for bad in [&b"$secret"[..], b"bad name", b"caf\xc3\xa9 ok"] {
+            let mut buf = [0u8; 64];
+            assert_eq!(
+                encode_set_region(bad, &mut buf),
+                Err(ProvError::RegionNameInvalid),
+                "encode must reject {bad:?}"
+            );
+            // Build a wire-legal payload by hand so the DECODE path is
+            // exercised independently of the encoder's own guard.
+            let mut payload = vec![bad.len() as u8];
+            payload.extend_from_slice(bad);
+            assert_eq!(
+                decode_set_region(&payload),
+                Err(ProvError::RegionNameInvalid),
+                "decode must reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_region_rejects_overlength_name_bytes() {
+        let mut payload = vec![(MAX_REGION_NAME_LEN + 1) as u8];
+        payload.extend_from_slice(&[b'A'; MAX_REGION_NAME_LEN + 1]);
+        assert_eq!(
+            decode_set_region(&payload),
+            Err(ProvError::RegionNameInvalid)
+        );
+        assert_eq!(
+            encode_set_region(&[b'A'; MAX_REGION_NAME_LEN + 1], &mut [0u8; 64]),
+            Err(ProvError::RegionNameInvalid)
+        );
+    }
+
+    #[test]
+    fn rsp_region_roundtrips_name_and_empty() {
+        for name in [&b"bay-area"[..], b""] {
+            let mut buf = [0u8; 40];
+            let plen = encode_rsp_region(name, &mut buf).unwrap();
+            let d = decode_rsp_region(&buf[..plen]).unwrap();
+            assert_eq!(d.name_len as usize, name.len());
+            assert_eq!(&d.name[..d.name_len as usize], name);
+        }
+    }
+
+    #[test]
+    fn rsp_region_rejects_truncated_and_private_names() {
+        assert_eq!(decode_rsp_region(&[]), Err(ProvError::TruncatedPayload));
+        assert_eq!(
+            decode_rsp_region(&[5, b'a', b'b']),
+            Err(ProvError::TruncatedPayload)
+        );
+        let mut private = vec![7];
+        private.extend_from_slice(b"$secret");
+        assert_eq!(
+            decode_rsp_region(&private),
+            Err(ProvError::RegionNameInvalid)
+        );
+    }
+
+    #[test]
+    fn region_frame_ids_are_new_and_distinct() {
+        assert_eq!(FRAME_QUERY_REGION, 0x07);
+        assert_eq!(FRAME_SET_REGION, 0x54);
+        assert_eq!(FRAME_RSP_REGION, 0x8E);
+        // 0x30 and 0x60 are retired and must not be reused (ADR-0002 §3).
+        assert_ne!(FRAME_SET_REGION, 0x30);
+        assert_ne!(FRAME_SET_REGION, 0x60);
     }
 
     // ── CRC-16 sanity ────────────────────────────────────────────────────────

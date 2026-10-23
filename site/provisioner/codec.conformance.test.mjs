@@ -190,6 +190,45 @@ check("decodeRspLock rejects a payload shorter than the 4-byte floor", () => {
   );
 });
 
+check("decodeRspRegion rejects an over-length name_len byte", () => {
+  const payload = new Uint8Array(2);
+  payload[0] = codec.REGION_NAME_MAX + 1;
+  assert.throws(
+    () => codec.decodeRspRegion(payload),
+    (err) => err instanceof codec.ProvError && err.kind === "RegionNameInvalid",
+  );
+});
+
+check("decodeRspRegion rejects a private ('$') or malformed name from the wire", () => {
+  for (const bytes of [[0x24, 0x73], [0x62, 0x61, 0x64, 0x20, 0x6e]]) {
+    const payload = new Uint8Array(1 + bytes.length);
+    payload[0] = bytes.length;
+    payload.set(bytes, 1);
+    assert.throws(
+      () => codec.decodeRspRegion(payload),
+      (err) => err instanceof codec.ProvError && err.kind === "RegionNameInvalid",
+    );
+  }
+});
+
+check("decodeRspRegion accepts an empty name (no region configured)", () => {
+  assert.deepEqual(codec.decodeRspRegion(new Uint8Array([0])), { name: "", name_len: 0 });
+});
+
+check("encodeSetRegion rejects invalid, over-length, and private names (empty is clear)", () => {
+  assert.throws(() => codec.encodeSetRegion("bad name"), /invalid region-name byte/);
+  assert.throws(() => codec.encodeSetRegion("A".repeat(codec.REGION_NAME_MAX + 1)), /at most 31 bytes/);
+  assert.throws(() => codec.encodeSetRegion("$private"), /private/);
+  assert.equal(codec.bytesToHex(codec.encodeSetRegion("")), "00");
+});
+
+check("encodeSetRegion accepts a public name and preserves a leading '#'", () => {
+  assert.equal(codec.bytesToHex(codec.encodeSetRegion("seattle")), "0773656174746c65");
+  assert.equal(codec.bytesToHex(codec.encodeSetRegion("#bay-area")), "09236261792d61726561");
+  // Empty is the explicit clear command at the codec layer.
+  assert.equal(codec.bytesToHex(codec.encodeSetRegion("")), "00");
+});
+
 check("encodeSetLockPin rejects a pin that isn't exactly LOCK_PIN_LEN ASCII digits", () => {
   assert.throws(() => codec.encodeSetLockPin("123"), /exactly 4 ASCII digits/);
   assert.throws(() => codec.encodeSetLockPin("12345"), /exactly 4 ASCII digits/);
@@ -248,6 +287,8 @@ const ENCODE_OPS = {
   query_rooms: () => new Uint8Array(0),
   query_advert: (p) => codec.encodeQueryAdvert(p.host_unix_time),
   query_lock: () => new Uint8Array(0),
+  query_region: () => new Uint8Array(0),
+  set_region: (p) => codec.encodeSetRegion(p.name),
   set_lock_pin: (p) => codec.encodeSetLockPin(p.pin),
   set_lock_config: (p) => codec.encodeSetLockConfig(p.lock_flags, p.lock_timeout_s),
   commit_provisioning: () => new Uint8Array(0),
@@ -274,6 +315,7 @@ const DECODE_OPS = {
   rsp_history_entry: codec.decodeRspHistoryEntry,
   rsp_advert: codec.decodeRspAdvert,
   rsp_lock: codec.decodeRspLock,
+  rsp_region: codec.decodeRspRegion,
 };
 
 // Fields that are raw byte arrays (`Uint8Array`) in codec.js's decoded

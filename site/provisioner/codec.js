@@ -26,6 +26,8 @@
 export const PROV_MAGIC = new Uint8Array([0x4d, 0x43]); // "MC"
 export const FRAME_OVERHEAD = 7; // magic(2) + type(1) + len(2) + crc(2)
 export const MAX_NAME_LEN = 32;
+/** Maximum region-name length (bytes), mirroring `REGION_NAME_MAX` (upstream `RegionEntry::name[31]`). */
+export const REGION_NAME_MAX = 31;
 export const MAX_PIN_LEN = 16;
 export const MAX_ERR_MSG_LEN = 64;
 // From protocol::history — shared by FRAME_RSP_HISTORY_ENTRY's payload.
@@ -60,6 +62,14 @@ export const FRAME_QUERY_ROOMS = 0x05;
  * `FRAME_QUERY_STATUS`/`decodeRspStatus` — that payload stays frozen.
  */
 export const FRAME_QUERY_LOCK = 0x06;
+
+/**
+ * Query the device's configured MeshCore region name. Payload: empty. The
+ * device replies `FRAME_RSP_REGION` (empty name = no region configured).
+ * Dedicated pair rather than a field on `RSP_STATUS`, mirroring
+ * `FRAME_QUERY_LOCK`.
+ */
+export const FRAME_QUERY_REGION = 0x07;
 
 export const FRAME_ADD_CONTACT = 0x10;
 export const FRAME_DEL_CONTACT = 0x11;
@@ -102,6 +112,15 @@ export const FRAME_SET_LOCK_PIN = 0x52;
  */
 export const FRAME_SET_LOCK_CONFIG = 0x53;
 
+/**
+ * Set (or clear) the device's MeshCore region name. Payload:
+ * `name_len(1) | name(name_len)`; empty clears. The name is validated against
+ * upstream `RegionMap`'s character rules; a leading `$` (private region) is
+ * rejected because upstream has no private-keystore implementation. Region
+ * scoping is provisioner/CLI-only by design — no on-device control.
+ */
+export const FRAME_SET_REGION = 0x54;
+
 export const FRAME_COMMIT_PROVISIONING = 0x70;
 export const FRAME_EXPORT_HISTORY = 0x71;
 export const FRAME_CLEAR_HISTORY = 0x72;
@@ -141,6 +160,13 @@ export const FRAME_RSP_ROOMS_DONE = 0x8c;
  */
 export const FRAME_RSP_LOCK = 0x8d;
 
+/**
+ * Response: answer to `FRAME_QUERY_REGION`. Payload:
+ * `name_len(1) | name(name_len)`; empty means no region configured. Never
+ * echoes a derived key.
+ */
+export const FRAME_RSP_REGION = 0x8e;
+
 // ── Screen-lock constants (mirrors provisioning.rs's "Screen-lock
 //    constants") ────────────────────────────────────────────────────────────
 
@@ -177,7 +203,7 @@ export const HISTORY_MSG_TYPE_GRP_TXT = 1;
  * Mirrors `protocol::provisioning::ProvError`'s variants (as `.kind`):
  * `TruncatedFrame`, `BadMagic`, `CrcMismatch`, `TruncatedPayload`,
  * `NameTooLong`, `PinTooLong`, `PasswordTooLong`, `PathTooLong`,
- * `LockPinInvalid`.
+ * `LockPinInvalid`, `RegionNameInvalid`.
  */
 export class ProvError extends Error {
   constructor(kind) {
@@ -463,6 +489,50 @@ export function encodeSetLockConfig(lockFlags, lockTimeoutS) {
   return out;
 }
 
+/**
+ * `true` if `byte` is accepted by upstream `RegionMap::is_name_char`.
+ * Byte-for-byte mirror: `-`, `$`, `#`, ASCII digits, or any byte `>= 'A'`
+ * (which deliberately admits lowercase and UTF-8 bytes >= 0x80).
+ */
+export function isRegionNameByte(byte) {
+  return byte === 0x2d || byte === 0x24 || byte === 0x23 || (byte >= 0x30 && byte <= 0x39) || byte >= 0x41;
+}
+
+function assertValidRegionName(nameBytes) {
+  if (nameBytes.length === 0) {
+    throw new Error("encodeSetRegion: region name must not be empty (use clearRegion to clear)");
+  }
+  if (nameBytes.length > REGION_NAME_MAX) {
+    throw new Error(`encodeSetRegion: region name must be at most ${REGION_NAME_MAX} bytes; got ${nameBytes.length}`);
+  }
+  if (nameBytes[0] === 0x24) {
+    throw new Error("encodeSetRegion: private ('$') regions are not supported");
+  }
+  for (let i = 0; i < nameBytes.length; i++) {
+    if (!isRegionNameByte(nameBytes[i])) {
+      throw new Error(`encodeSetRegion: invalid region-name byte 0x${nameBytes[i].toString(16)} at index ${i}`);
+    }
+  }
+}
+
+/**
+ * Encode a `SetRegion` payload. Wire layout: `name_len(1) | name(name_len)`.
+ * An empty name is the explicit clear command and is accepted. Unlike
+ * `encodeSetDeviceName` (which silently truncates), a non-empty name is
+ * validated and throws rather than truncating: a silently shortened region
+ * name would scope traffic to the wrong region.
+ */
+export function encodeSetRegion(name) {
+  const nameBytes = encodeUtf8(name);
+  if (nameBytes.length > 0) {
+    assertValidRegionName(nameBytes);
+  }
+  const out = new Uint8Array(1 + nameBytes.length);
+  out[0] = nameBytes.length;
+  out.set(nameBytes, 1);
+  return out;
+}
+
 // ── Payload decode functions (device -> host responses) ─────────────────────
 //
 // Mirrors provisioning.rs's "Payload decode functions" byte-for-byte,
@@ -486,6 +556,32 @@ export function decodeRspLock(payload) {
     lock_flags: payload[0],
     lock_timeout_s: view.getUint16(1, true),
     pin_set: payload[3] !== 0,
+  };
+}
+
+/**
+ * Decode an `RspRegion` payload. Wire layout:
+ * `name_len(1) | name(name_len)`. An empty name is valid and means no region
+ * is configured. A non-empty name must pass `assertValidRegionName`.
+ */
+export function decodeRspRegion(payload) {
+  requireLen(payload, 1);
+  const nameLen = payload[0];
+  if (nameLen > REGION_NAME_MAX) {
+    throw new ProvError("RegionNameInvalid");
+  }
+  requireLen(payload, 1 + nameLen);
+  const nameBytes = payload.subarray(1, 1 + nameLen);
+  if (nameLen > 0) {
+    try {
+      assertValidRegionName(nameBytes);
+    } catch {
+      throw new ProvError("RegionNameInvalid");
+    }
+  }
+  return {
+    name: decodeUtf8(nameBytes),
+    name_len: nameLen,
   };
 }
 

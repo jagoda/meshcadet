@@ -112,6 +112,9 @@
             <dt>Channels</dt>
             <dd id="stat-channels">—</dd>
 
+            <dt>Region</dt>
+            <dd id="stat-region">—</dd>
+
             <dt>Battery</dt>
             <dd id="stat-battery">—</dd>
 
@@ -171,7 +174,7 @@
           <h2>4. Contacts</h2>
           <p>
             Lists the device's in-progress (pre-commit) staging set — pair
-            with add/remove below and <strong>Commit</strong> (section 8) to
+            with add/remove below and <strong>Commit</strong> (section 9) to
             verify the configured list before persisting it.
           </p>
           <table class="data-table">
@@ -344,8 +347,42 @@
           </form>
         </div>
 
+        <div class="flash-panel" id="region-panel" hidden>
+          <h2>8. Region scoping</h2>
+          <p>
+            Restrict this device's outbound flood traffic to a MeshCore region
+            by name. Region scoping is configured <strong>only</strong> here and
+            from the host CLI — there are deliberately no on-device controls.
+          </p>
+          <div class="warn-box">
+            <p>
+              <strong>Warning:</strong> a region on a mesh that is not
+              region-managed causes <strong>total silence</strong> — traffic is
+              dropped at the first hop. Leave this unconfigured (or choose
+              <em>Clear region</em>) unless every node on the mesh understands
+              the same region.
+            </p>
+          </div>
+          <p>Current region: <strong id="region-current">—</strong></p>
+          <form id="region-form" class="inline-form">
+            <label class="version-label" for="region-input">Region name (1–31 bytes; leading # optional)</label>
+            <div class="cta-row">
+              <input
+                id="region-input"
+                class="text-input mono"
+                type="text"
+                placeholder="seattle"
+                maxlength="64"
+              />
+              <button id="region-save-button" class="btn btn-primary" type="submit">Save region</button>
+              <button id="region-clear-button" class="btn btn-ghost" type="button">Clear region</button>
+            </div>
+            <p id="region-status" class="muted form-status" role="status"></p>
+          </form>
+        </div>
+
         <div class="flash-panel" id="commit-panel" hidden>
-          <h2>8. Commit provisioning</h2>
+          <h2>9. Commit provisioning</h2>
           <p>
             Persist all of the above to flash. Run this after configuring
             contacts, channels, and notification defaults.
@@ -363,7 +400,7 @@
         </div>
 
         <div class="flash-panel" id="pin-panel" hidden>
-          <h2>9. Admin PIN</h2>
+          <h2>10. Admin PIN</h2>
           <p>
             Set (or reset) the PIN that unlocks the on-device admin menu.
             Physical USB possession is the authentication factor — resetting
@@ -386,7 +423,7 @@
         </div>
 
         <div class="flash-panel" id="lock-panel" hidden>
-          <h2>10. Screen lock</h2>
+          <h2>11. Screen lock</h2>
           <p>
             A 4-digit lock PIN, distinct from the admin PIN above — unlocking
             the screen never opens the admin menu, and the admin PIN never
@@ -442,7 +479,7 @@
         </div>
 
         <div class="flash-panel" id="history-panel" hidden>
-          <h2>11. Export conversation history</h2>
+          <h2>12. Export conversation history</h2>
           <p>
             Read every stored message (DMs and channels), oldest-first, and
             save it as a local text file.
@@ -462,7 +499,7 @@
         </div>
 
         <div class="flash-panel" id="clear-history-panel" hidden>
-          <h2>12. Clear conversation history</h2>
+          <h2>13. Clear conversation history</h2>
           <p>
             Permanently erase <strong>all</strong> stored messages — every DM
             and channel conversation — from the device's flash.

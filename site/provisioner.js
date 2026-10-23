@@ -46,6 +46,7 @@ import {
   validateRoomPassword,
   validateLockPin,
   validateLockTimeout,
+  validateRegionName,
 } from "./provisioner/validation.js";
 import { formatHistoryTranscript } from "./provisioner/history-format.js";
 import QRCode from "./vendor/qrcode.js";
@@ -70,6 +71,7 @@ const fields = {
   pubkey: document.getElementById("stat-pubkey"),
   contacts: document.getElementById("stat-contacts"),
   channels: document.getElementById("stat-channels"),
+  region: document.getElementById("stat-region"),
   battery: document.getElementById("stat-battery"),
   gpsFix: document.getElementById("stat-gps-fix"),
   gpsCoords: document.getElementById("stat-gps-coords"),
@@ -142,6 +144,14 @@ const notifAudible = document.getElementById("notif-audible");
 const notifSaveButton = document.getElementById("notif-save-button");
 const notifStatus = document.getElementById("notif-status");
 
+const regionPanel = document.getElementById("region-panel");
+const regionForm = document.getElementById("region-form");
+const regionInput = document.getElementById("region-input");
+const regionSaveButton = document.getElementById("region-save-button");
+const regionClearButton = document.getElementById("region-clear-button");
+const regionCurrent = document.getElementById("region-current");
+const regionStatus = document.getElementById("region-status");
+
 const commitPanel = document.getElementById("commit-panel");
 const commitButton = document.getElementById("commit-button");
 const commitStatus = document.getElementById("commit-status");
@@ -181,6 +191,7 @@ const writePanels = [
   channelsPanel,
   roomsPanel,
   notifPanel,
+  regionPanel,
   commitPanel,
   pinPanel,
   lockPanel,
@@ -250,6 +261,11 @@ if (!ProvisionerSession.isSupported() || !ProvisionerSession.isSecureContext()) 
     event.preventDefault();
     handleSetNotifDefaults();
   });
+  regionForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    handleSetRegion();
+  });
+  regionClearButton.addEventListener("click", handleClearRegion);
   commitButton.addEventListener("click", handleCommit);
 
   setPinForm.addEventListener("submit", (event) => {
@@ -364,6 +380,9 @@ function clearFormStatuses() {
   delChannelStatus.textContent = "";
   addRoomStatus.textContent = "";
   notifStatus.textContent = "";
+  regionStatus.textContent = "";
+  regionInput.value = "";
+  regionCurrent.textContent = "—";
   commitStatus.textContent = "";
   setPinStatus.textContent = "";
   lockPinStatus.textContent = "";
@@ -401,6 +420,7 @@ async function queryAndRender() {
   try {
     const { status, identity } = await session.queryStatus();
     renderStatus(status, identity);
+    await renderRegion();
     await renderQr(identity);
     await renderCardUri();
     await refreshLists();
@@ -471,6 +491,7 @@ function renderStatus(status, identity) {
   fields.pubkey.textContent = bytesToHex(identity.pubkey);
   fields.contacts.textContent = String(status.contact_count);
   fields.channels.textContent = String(status.channel_count);
+  fields.region.textContent = "—"; // filled by renderRegion() from its own query
   fields.battery.textContent = status.battery_charging
     ? `${status.battery_percent}% (charging)`
     : `${status.battery_percent}%`;
@@ -927,6 +948,64 @@ async function handleDelRoom(pubkey, removeButton) {
       await refreshLists();
     } catch (err) {
       reportWriteError(addRoomStatus, "remove room", err);
+    }
+  });
+}
+
+// ── Region scoping (set-region / query-region) ────────────────────────────
+//
+// Region scoping is provisioner/CLI-only by design (no on-device control).
+// The warning in provisioner.html is not decoration: a region on a mesh that
+// is not region-managed drops every scoped frame at the first hop, and there
+// is no fallback to unscoped emission while a region is configured.
+
+function renderRegionFields(region) {
+  const label = region.name_len === 0 ? "(none — unscoped flood)" : region.name;
+  fields.region.textContent = label;
+  regionCurrent.textContent = label;
+}
+
+async function renderRegion() {
+  try {
+    renderRegionFields(await session.queryRegion());
+    regionStatus.textContent = "";
+  } catch (err) {
+    console.error("MeshCadet provisioner: query_region failed", err);
+    fields.region.textContent = "(unavailable)";
+    regionCurrent.textContent = "(unavailable)";
+    regionStatus.textContent = `Couldn't read the region: ${err.message || err}`;
+  }
+}
+
+async function handleSetRegion() {
+  const validated = validateRegionName(regionInput.value);
+  if (!validated.ok) {
+    regionStatus.textContent = validated.error;
+    return;
+  }
+  await withButtonDisabled(regionSaveButton, async () => {
+    regionStatus.textContent = "Saving…";
+    try {
+      await session.setRegion(validated.name);
+      await renderRegion();
+      regionStatus.textContent = `Region set: ${validated.name}. Commit provisioning to persist it.`;
+    } catch (err) {
+      reportWriteError(regionStatus, "set region", err);
+    }
+  });
+}
+
+async function handleClearRegion() {
+  await withButtonDisabled(regionClearButton, async () => {
+    regionStatus.textContent = "Clearing…";
+    try {
+      await session.clearRegion();
+      regionInput.value = "";
+      await renderRegion();
+      regionStatus.textContent =
+        "Region cleared — the device will emit plain unscoped flood frames. Commit provisioning to persist it.";
+    } catch (err) {
+      reportWriteError(regionStatus, "clear region", err);
     }
   });
 }

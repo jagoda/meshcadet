@@ -125,6 +125,7 @@ pub mod identity;
 pub mod mention;
 pub mod policy;
 pub mod provisioning;
+pub mod region;
 pub mod room;
 pub mod staging;
 pub mod telemetry;

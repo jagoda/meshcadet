@@ -19,6 +19,7 @@ use protocol::provisioning::{
     decode_rsp_error,
     decode_rsp_identity,
     decode_rsp_lock,
+    decode_rsp_region,
     decode_rsp_room,
     decode_rsp_status,
     // encode helpers
@@ -35,10 +36,12 @@ use protocol::provisioning::{
     encode_set_lock_pin,
     encode_set_notif_defaults,
     encode_set_pin,
+    encode_set_region,
     ProvError,
     RspChannelPayload,
     RspContactPayload,
     RspLockPayload,
+    RspRegionPayload,
     RspRoomPayload,
     RspStatusPayload,
     // frame-type constants
@@ -55,6 +58,7 @@ use protocol::provisioning::{
     FRAME_QUERY_CHANNELS,
     FRAME_QUERY_CONTACTS,
     FRAME_QUERY_LOCK,
+    FRAME_QUERY_REGION,
     FRAME_QUERY_ROOMS,
     FRAME_QUERY_STATUS,
     FRAME_RSP_ADVERT,
@@ -68,6 +72,7 @@ use protocol::provisioning::{
     FRAME_RSP_IDENTITY,
     FRAME_RSP_LOCK,
     FRAME_RSP_OK,
+    FRAME_RSP_REGION,
     FRAME_RSP_ROOM,
     FRAME_RSP_ROOMS_DONE,
     FRAME_RSP_STATUS,
@@ -76,7 +81,9 @@ use protocol::provisioning::{
     FRAME_SET_LOCK_PIN,
     FRAME_SET_NOTIF_DEFAULTS,
     FRAME_SET_PIN,
+    FRAME_SET_REGION,
     LOCK_PIN_LEN,
+    MAX_REGION_NAME_LEN,
     // frame synchronisation
     PROV_MAGIC,
 };
@@ -705,6 +712,48 @@ impl<T: Transport> Session<T> {
                 FRAME_RSP_LOCK,
             ),
         }
+    }
+
+    /// Query the device's configured MeshCore region name.
+    ///
+    /// Sends `FRAME_QUERY_REGION` (empty payload) and expects a single
+    /// `FRAME_RSP_REGION` back. `name_len == 0` means no region is
+    /// configured (the device emits unscoped `ROUTE_TYPE_FLOOD`).
+    pub fn query_region(&mut self) -> anyhow::Result<RspRegionPayload> {
+        let (ft, payload) = self.send_recv_with_retry(FRAME_QUERY_REGION, &[])?;
+        match ft {
+            FRAME_RSP_REGION => decode_rsp_region(&payload)
+                .map_err(|e| anyhow::anyhow!("decode RSP_REGION payload: {:?}", e)),
+            FRAME_RSP_ERROR => {
+                let e = decode_rsp_error(&payload)
+                    .map_err(|de| anyhow::anyhow!("decode RSP_ERROR payload: {:?}", de))?;
+                let msg =
+                    std::str::from_utf8(&e.msg[..e.msg_len as usize]).unwrap_or("<invalid utf-8>");
+                anyhow::bail!("device error {}: {}", e.error_code, msg)
+            }
+            _ => anyhow::bail!(
+                "unexpected response 0x{:02X} to QUERY_REGION (expected RSP_REGION 0x{:02X})",
+                ft,
+                FRAME_RSP_REGION,
+            ),
+        }
+    }
+
+    /// Set (or clear, with an empty slice) the device's MeshCore region.
+    ///
+    /// `name` must pass `protocol::region::validate_region_name`; an invalid
+    /// or `$`-private name is refused here rather than sent (fail closed —
+    /// the device's decoder rejects it too). Empty means "no region", and
+    /// the device must emit plain unscoped flood frames in that state.
+    pub fn set_region(&mut self, name: &[u8]) -> anyhow::Result<()> {
+        let mut buf = [0u8; 1 + MAX_REGION_NAME_LEN];
+        let plen = encode_set_region(name, &mut buf).map_err(|_| {
+            anyhow::anyhow!(
+                "invalid region name: must be 1-{} bytes of upstream region characters, and must not start with '$' (private regions are unsupported)",
+                MAX_REGION_NAME_LEN
+            )
+        })?;
+        self.send_and_expect_ok(FRAME_SET_REGION, &buf[..plen])
     }
 
     /// Set (or clear, with an empty slice) the device display name.

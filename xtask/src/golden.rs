@@ -401,6 +401,21 @@ fn rsp_lock_vector(
     decode_vector(name, "rsp_lock", FRAME_RSP_LOCK, &buf[..plen], expect)
 }
 
+fn rsp_region_vector(name: &'static str, region_name: &[u8]) -> Vector {
+    let mut buf = [0u8; 32];
+    let plen =
+        encode_rsp_region(region_name, &mut buf).expect("golden generator: rsp_region encode");
+    let d = decode_rsp_region(&buf[..plen]).expect("golden generator: rsp_region self-decode");
+    let expect = Json::Obj(vec![
+        (
+            "name",
+            s(std::str::from_utf8(&d.name[..d.name_len as usize]).unwrap()),
+        ),
+        ("name_len", n(d.name_len as i64)),
+    ]);
+    decode_vector(name, "rsp_region", FRAME_RSP_REGION, &buf[..plen], expect)
+}
+
 fn rsp_error_vector(name: &'static str, error_code: u8, msg: &[u8]) -> Vector {
     let mut buf = [0u8; 128];
     let plen = encode_rsp_error(error_code, msg, &mut buf);
@@ -754,6 +769,48 @@ fn build_vectors() -> Vec<Vector> {
         &[],
         Json::Obj(vec![]),
     ));
+    v.push(encode_vector(
+        "query_region",
+        "query_region",
+        FRAME_QUERY_REGION,
+        &[],
+        Json::Obj(vec![]),
+    ));
+    {
+        let name = b"seattle";
+        let mut buf = [0u8; 32];
+        let plen = encode_set_region(name, &mut buf).expect("golden generator: set_region encode");
+        v.push(encode_vector(
+            "set_region",
+            "set_region",
+            FRAME_SET_REGION,
+            &buf[..plen],
+            Json::Obj(vec![("name", s(std::str::from_utf8(name).unwrap()))]),
+        ));
+    }
+    {
+        let name = b"#bay-area";
+        let mut buf = [0u8; 32];
+        let plen = encode_set_region(name, &mut buf).expect("golden generator: set_region encode");
+        v.push(encode_vector(
+            "set_region_hash_prefix",
+            "set_region",
+            FRAME_SET_REGION,
+            &buf[..plen],
+            Json::Obj(vec![("name", s(std::str::from_utf8(name).unwrap()))]),
+        ));
+    }
+    {
+        let mut buf = [0u8; 32];
+        let plen = encode_set_region(b"", &mut buf).expect("golden generator: set_region clear");
+        v.push(encode_vector(
+            "set_region_empty_clears",
+            "set_region",
+            FRAME_SET_REGION,
+            &buf[..plen],
+            Json::Obj(vec![("name", s(""))]),
+        ));
+    }
     {
         let pin = *b"1234";
         let mut buf = [0u8; 8];
@@ -1007,6 +1064,9 @@ fn build_vectors() -> Vec<Vector> {
         LOCK_TIMEOUT_DEFAULT_S,
         false,
     ));
+
+    v.push(rsp_region_vector("rsp_region_configured", b"seattle"));
+    v.push(rsp_region_vector("rsp_region_unconfigured", b""));
 
     v.push(rsp_history_entry_vector(
         "rsp_history_entry_received_dm",
