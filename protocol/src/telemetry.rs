@@ -371,6 +371,30 @@ const LPP_PRESENCE: u8 = 102;
 /// charge percentage.
 const LPP_PERCENTAGE: u8 = 120;
 
+/// Cayenne LPP data-type byte for a signed 0.1 °C temperature reading
+/// (`LPP_TEMPERATURE`, "2 bytes, 0.1°C signed").
+///
+/// This is what a *stock* MeshCore node actually puts in a base telemetry
+/// reply: `onContactRequest` writes the battery voltage and then — when the
+/// board has a built-in MCU sensor — the MCU temperature, both on
+/// [`TELEM_CHANNEL_SELF`] (`examples/companion_radio/MyMesh.cpp`, companion
+/// v1.18.0, ~lines 668-674 for the `CMD_SEND_TELEMETRY_REQ` self reply and
+/// ~lines 1701-1711 for the on-air `REQ_TYPE_GET_TELEMETRY_DATA` reply).
+/// MeshCadet never emits it (it sends its own battery detail on
+/// `LPP_GENERIC_SENSOR`/`LPP_LUMINOSITY`), but it MUST decode it, or a stock
+/// peer's reply loses every field after the voltage entry.
+const LPP_TEMPERATURE: u8 = 103;
+
+/// Cayenne LPP data-type byte for a 0.01 V/LSB unsigned voltage reading
+/// (`LPP_VOLTAGE`, "2 bytes 0.01V unsigned").
+///
+/// The **first** entry in every stock MeshCore base telemetry reply
+/// (`addVoltage(TELEM_CHANNEL_SELF, batt_mV / 1000.0f)` — see
+/// [`LPP_TEMPERATURE`]'s doc for the exact call sites), which makes it the
+/// single most load-bearing unknown-type byte in the protocol: a decoder that
+/// aborts on it discards the entire remainder of the reply.
+const LPP_VOLTAGE: u8 = 116;
+
 /// Cayenne LPP data-type byte for a digital-input / boolean reading
 /// (`LPP_DIGITAL_INPUT`, "1 byte"). Reused here — distinct from
 /// [`LPP_PRESENCE`], which already means "no GPS fix" in this protocol — for
@@ -431,6 +455,54 @@ const LPP_U16_ENTRY_LEN: usize = 4;
 /// Bytes of one 4-byte-payload LPP entry (the raw-millivolt generic-sensor
 /// entry): channel(1) + type(1) + data(4) = 6.
 const LPP_U32_ENTRY_LEN: usize = 6;
+
+/// Cayenne LPP entry length in bytes — channel byte + type byte + the payload
+/// length implied by the type — for a data-type id.
+///
+/// Only used to **skip** an entry: every type this decoder actually extracts a
+/// value from is matched explicitly in [`decode_telemetry_response_lpp`], so the
+/// `LPP_*_ENTRY_LEN` constants above stay the single statement of each known
+/// entry's size.
+///
+/// Cayenne LPP has no per-entry length field on the wire; the payload length is
+/// implied by the type byte, so tolerance for an unknown type requires a table
+/// like this one. The sizes below are the Cayenne LPP 1.6.1 `LPP_*_SIZE` macros
+/// (`src/CayenneLPP.h:56-82`) — the library MeshCore's telemetry writer links
+/// against (`platformio.ini` `lib_deps`: `electroniccats/CayenneLPP @ 1.6.1`) —
+/// and they agree with MeshCore's own `LPPData::getDataSize`
+/// (`src/helpers/sensors/LPPDataHelpers.h:63-106`) except for
+/// `LPP_RELATIVE_HUMIDITY`, where upstream's table claims a 2-byte payload while
+/// upstream's own writer *and* reader use 1 ("1 byte, 0.5% unsigned",
+/// `LPPDataHelpers.h:15`); 1 is the on-wire size, so 1 is what is used here.
+fn lpp_entry_len(entry_type: u8) -> usize {
+    match entry_type {
+        // DIGITAL_INPUT, DIGITAL_OUTPUT, PRESENCE, RELATIVE_HUMIDITY,
+        // PERCENTAGE, SWITCH.
+        0 | 1 | 102 | 104 | 120 | 142 => LPP_BYTE_ENTRY_LEN,
+        // ANALOG_INPUT, ANALOG_OUTPUT, LUMINOSITY, TEMPERATURE,
+        // BAROMETRIC_PRESSURE, VOLTAGE, CURRENT, ALTITUDE, CONCENTRATION,
+        // POWER, DIRECTION — all carry 2 payload bytes.
+        2 | 3 | 101 | 103 | 115 | 116 | 117 | 121 | 125 | 128 | 132 => LPP_U16_ENTRY_LEN,
+        // COLOUR: one payload byte per RGB channel.
+        135 => 5,
+        // GENERIC_SENSOR, FREQUENCY, DISTANCE, ENERGY, UNIXTIME.
+        100 | 118 | 130 | 131 | 133 => LPP_U32_ENTRY_LEN,
+        // ACCELEROMETER, GYROMETER: 2 payload bytes per axis.
+        113 | 134 => 8,
+        // GPS: 3B lat + 3B lon + 3B altitude.
+        136 => LPP_GPS_ENTRY_LEN,
+        // POLYLINE: upstream calls an 8-byte payload the minimum.
+        240 => 10,
+        // Same default as upstream's `LPPData::getDataSize`
+        // (`LPPDataHelpers.h:105`): a type it does not know is assumed to carry
+        // ONE payload byte, i.e. a 3-byte entry. That keeps the scan alive
+        // (MeshCore's own reader does the same — `skipData(type)` in its
+        // `default:` arm, `examples/companion_radio/ui-new/UITask.cpp:497`) at
+        // the cost of possibly desynchronising for a genuinely multi-byte
+        // foreign type — far better than discarding the rest of a peer's reply.
+        _ => LPP_BYTE_ENTRY_LEN,
+    }
+}
 
 /// Maximum RESPONSE plaintext length: tag(4) + one LPP GPS entry(11) + one
 /// battery-percentage entry(3) + one charging-state entry(3) + one
@@ -624,15 +696,42 @@ pub struct TelemetryResponseLpp {
     /// the `LPP_DIGITAL_OUTPUT`-repurposed entry was present. Added
     /// alongside `battery_held_raw_mv`, same mission.
     pub battery_level: Option<u8>,
+    /// Battery voltage in millivolts from a stock `LPP_VOLTAGE` entry on
+    /// [`TELEM_CHANNEL_SELF`] (Cayenne resolution 0.01 V/LSB, so the wire
+    /// value is scaled by 10 here). This is the battery reading every
+    /// MeshCore v1.18 companion/repeater emits first in a base telemetry
+    /// reply; MeshCadet's own encoder never emits it (see [`LPP_VOLTAGE`]'s
+    /// doc), so a `Some(_)` here means the reply came from a stock peer.
+    pub battery_voltage_mv: Option<u32>,
+    /// MCU temperature in tenths of a degree Celsius from a stock
+    /// `LPP_TEMPERATURE` entry on [`TELEM_CHANNEL_SELF`] (Cayenne resolution
+    /// 0.1 °C/LSB, signed) — the same `raw` the wire carried, left unscaled so
+    /// no precision is invented. `None` when the peer board has no built-in
+    /// temperature sensor (upstream skips the entry when it reads `NaN`).
+    pub temperature_c_x10: Option<i16>,
 }
 
 /// Parse a `PAYLOAD_TYPE_RESPONSE` plaintext produced by
-/// [`encode_telemetry_response_lpp`]. Returns `None` if it is too short to
-/// hold a tag. Scans every LPP entry in the body (GPS, presence, percentage,
+/// [`encode_telemetry_response_lpp`] — or by a stock MeshCore node.
+///
+/// Returns `None` if it is too short to hold a tag. Scans **every** LPP entry
+/// in the body (GPS, stock voltage/temperature, presence, percentage,
 /// digital-input, generic-sensor raw-mv, luminosity-repurposed held-raw-mv,
-/// digital-output-repurposed level); unrecognised entry types stop the scan
-/// (defensive against a foreign/corrupt RESPONSE rather than misreading past
-/// it).
+/// digital-output-repurposed level).
+///
+/// Entries whose type this decoder does not extract a value from are **skipped
+/// by their Cayenne-implied entry length** ([`lpp_entry_len`]) and the scan
+/// continues — they are never rendered as a value, and they never end the
+/// scan. This matches upstream's own reader, which forwards over what it does
+/// not display (`default: r.skipData(type)`, `examples/companion_radio/
+/// ui-new/UITask.cpp:497`, companion v1.18.0), so a peer running extended or
+/// future telemetry does not silently truncate the rest of the reply. The
+/// previous abort-on-first-unknown behaviour was not upstream-compatible: a
+/// stock v1.18 base reply *leads* with `LPP_VOLTAGE`, so it decoded to an
+/// all-`None` struct.
+///
+/// A truncated trailing entry (fewer bytes left than its type declares) ends
+/// the scan without reading past the buffer.
 pub fn decode_telemetry_response_lpp(plaintext: &[u8]) -> Option<TelemetryResponseLpp> {
     if plaintext.len() < 4 {
         return None;
@@ -644,43 +743,63 @@ pub fn decode_telemetry_response_lpp(plaintext: &[u8]) -> Option<TelemetryRespon
     let mut raw_mv: Option<u32> = None;
     let mut held_raw_mv: Option<u32> = None;
     let mut level: Option<u8> = None;
+    let mut voltage_mv: Option<u32> = None;
+    let mut temperature_c_x10: Option<i16> = None;
     let mut body = &plaintext[4..];
 
     while body.len() >= 2 {
+        let channel = body[0];
         let entry_type = body[1];
+        // Channel byte + type byte + the payload length implied by the type.
+        let entry_len = lpp_entry_len(entry_type);
+        if body.len() < entry_len {
+            break; // truncated trailing entry — never read past the buffer.
+        }
         match entry_type {
-            LPP_GPS if body.len() >= LPP_GPS_ENTRY_LEN => {
+            LPP_GPS => {
                 let lat_e4 = read_i24_be(&body[2..5]);
                 let lon_e4 = read_i24_be(&body[5..8]);
                 gps_e4 = Some((lat_e4, lon_e4));
-                body = &body[LPP_GPS_ENTRY_LEN..];
             }
-            LPP_PERCENTAGE if body.len() >= LPP_BYTE_ENTRY_LEN => {
+            // Stock MeshCore base telemetry. Gated on the self channel because
+            // upstream also emits VOLTAGE/TEMPERATURE for *external* sensors on
+            // channels 2+ (`EnvironmentSensorManager::querySensors`); those are
+            // not this node's base readings and must not overwrite them.
+            LPP_VOLTAGE if channel == TELEM_CHANNEL_SELF => {
+                // 0.01 V/LSB -> millivolts.
+                voltage_mv = Some(read_u16_be(&body[2..4]) as u32 * 10);
+            }
+            LPP_TEMPERATURE if channel == TELEM_CHANNEL_SELF => {
+                // 0.1 °C/LSB, two's complement.
+                temperature_c_x10 = Some(read_u16_be(&body[2..4]) as i16);
+            }
+            LPP_PERCENTAGE => {
                 percent = Some(body[2]);
-                body = &body[LPP_BYTE_ENTRY_LEN..];
             }
-            LPP_DIGITAL_INPUT if body.len() >= LPP_BYTE_ENTRY_LEN => {
+            LPP_DIGITAL_INPUT => {
                 charging = Some(body[2] != 0);
-                body = &body[LPP_BYTE_ENTRY_LEN..];
             }
-            LPP_PRESENCE if body.len() >= LPP_BYTE_ENTRY_LEN => {
+            LPP_PRESENCE => {
                 // "No GPS fix" marker — no data to extract, just consume it.
-                body = &body[LPP_BYTE_ENTRY_LEN..];
             }
-            LPP_GENERIC_SENSOR if body.len() >= LPP_U32_ENTRY_LEN => {
+            LPP_GENERIC_SENSOR => {
                 raw_mv = Some(read_u32_be(&body[2..6]));
-                body = &body[LPP_U32_ENTRY_LEN..];
             }
-            LPP_LUMINOSITY if body.len() >= LPP_U16_ENTRY_LEN => {
+            LPP_LUMINOSITY => {
                 held_raw_mv = Some(read_u16_be(&body[2..4]) as u32);
-                body = &body[LPP_U16_ENTRY_LEN..];
             }
-            LPP_DIGITAL_OUTPUT if body.len() >= LPP_BYTE_ENTRY_LEN => {
+            LPP_DIGITAL_OUTPUT => {
                 level = Some(body[2]);
-                body = &body[LPP_BYTE_ENTRY_LEN..];
             }
-            _ => break, // unknown/truncated entry — stop scanning defensively.
+            // Any other type (stock humidity/pressure/altitude/current/power/
+            // … , an env sensor on channel 2+, or a type nobody has defined
+            // yet): skip exactly its declared payload and keep scanning. No
+            // placeholder value is recorded — this struct is a typed field
+            // set, not a UI list, so silently skipping is the only outcome
+            // that cannot invent a reading.
+            _ => {}
         }
+        body = &body[entry_len..];
     }
 
     let battery = match (percent, charging) {
@@ -694,6 +813,8 @@ pub fn decode_telemetry_response_lpp(plaintext: &[u8]) -> Option<TelemetryRespon
         battery_raw_mv: raw_mv,
         battery_held_raw_mv: held_raw_mv,
         battery_level: level,
+        battery_voltage_mv: voltage_mv,
+        temperature_c_x10,
     })
 }
 
@@ -1377,6 +1498,264 @@ mod tests {
         );
         assert_eq!(resp.battery_held_raw_mv, Some(3_900));
         assert_eq!(resp.battery_level, Some(3));
+    }
+
+    // ── stock MeshCore base telemetry (LPP_VOLTAGE / LPP_TEMPERATURE) ─────────
+    //
+    // Byte sequences below are derived from UPSTREAM SOURCE, not captured from a
+    // device: the entry order and payload encoding come from MeshCore
+    // companion-v1.18.0 (commit 81dbae5) — `examples/companion_radio/MyMesh.cpp`
+    // `onContactRequest` writes `addVoltage(TELEM_CHANNEL_SELF, …)` FIRST, then
+    // `sensors.querySensors(...)` (`GPS` on channel 1,
+    // `src/helpers/sensors/EnvironmentSensorManager.cpp:688`), then
+    // `addTemperature(TELEM_CHANNEL_SELF, …)` — with payload sizes from
+    // `electroniccats/CayenneLPP @ 1.6.1` `src/CayenneLPP.h:56-82`
+    // (`platformio.ini` `lib_deps`).
+
+    /// A stock v1.18 base telemetry reply — `LPP_VOLTAGE` first (the entry that
+    /// used to abort decoding), then `LPP_GPS`, then `LPP_TEMPERATURE` — must
+    /// decode all three. Regression test for "stock reply decodes to all-`None`".
+    #[test]
+    fn decode_stock_v118_base_reply_decodes_voltage_temperature_and_gps() {
+        let tag = 0x0BAD_F00Du32;
+        let mut buf = [0u8; 32];
+        buf[..4].copy_from_slice(&tag.to_le_bytes());
+
+        // [ch=1, LPP_VOLTAGE(116), 0x01A3] -> 419 * 0.01 V = 4.19 V.
+        buf[4..8].copy_from_slice(&[TELEM_CHANNEL_SELF, 116, 0x01, 0xA3]);
+        // [ch=1, LPP_GPS(136), lat=481173 (0x075795), lon=115169 (0x01C1E1),
+        //  alt=0] — 3-byte big-endian two's complement each, 1e-4 deg / 0.01 m.
+        buf[8..19].copy_from_slice(&[
+            TELEM_CHANNEL_SELF,
+            136,
+            0x07,
+            0x57,
+            0x95, // 48.1173 deg
+            0x01,
+            0xC1,
+            0xE1, // 11.5169 deg
+            0x00,
+            0x00,
+            0x00, // 0 m altitude
+        ]);
+        // [ch=1, LPP_TEMPERATURE(103), 0x013B] -> 315 = 31.5 C.
+        buf[19..23].copy_from_slice(&[TELEM_CHANNEL_SELF, 103, 0x01, 0x3B]);
+
+        let resp = decode_telemetry_response_lpp(&buf[..23]).expect("must parse");
+        assert_eq!(resp.tag, tag);
+        assert_eq!(
+            resp.battery_voltage_mv,
+            Some(4_190),
+            "LPP_VOLTAGE must be decoded into millivolts"
+        );
+        assert_eq!(
+            resp.gps_e4,
+            Some((481_173, 115_169)),
+            "GPS after LPP_VOLTAGE must not be truncated away"
+        );
+        assert_eq!(
+            resp.temperature_c_x10,
+            Some(315),
+            "LPP_TEMPERATURE after LPP_VOLTAGE must not be truncated away"
+        );
+        // Nothing else in this reply — the encoder-only fields stay empty.
+        assert_eq!(resp.battery, None);
+        assert_eq!(resp.battery_raw_mv, None);
+        assert_eq!(resp.battery_held_raw_mv, None);
+        assert_eq!(resp.battery_level, None);
+    }
+
+    /// Sub-zero `LPP_TEMPERATURE` is two's complement (`isSigned(LPP_TEMPERATURE)`
+    /// is true, `src/helpers/sensors/LPPDataHelpers.h:119-123`).
+    #[test]
+    fn decode_stock_temperature_is_signed() {
+        let mut buf = [0u8; 16];
+        buf[..4].copy_from_slice(&1u32.to_le_bytes());
+        // -5.0 C -> raw -50 -> 0xFFCE big-endian.
+        buf[4..8].copy_from_slice(&[TELEM_CHANNEL_SELF, 103, 0xFF, 0xCE]);
+        let resp = decode_telemetry_response_lpp(&buf[..8]).expect("must parse");
+        assert_eq!(resp.temperature_c_x10, Some(-50));
+    }
+
+    /// Every Cayenne type this decoder skips only implicitly — stock environment
+    /// sensors (`addRelativeHumidity`, `addBarometricPressure`, `addAltitude`,
+    /// `addCurrent`, `addPower`, … `EnvironmentSensorManager.cpp`) — must be
+    /// stepped over by its true on-wire size so the fields after them survive.
+    /// `LPP_RELATIVE_HUMIDITY` is deliberately included: MeshCore's own
+    /// `LPPData::getDataSize` claims 2 payload bytes for it
+    /// (`LPPDataHelpers.h:91-105`) while its writer and reader use 1
+    /// ("1 byte, 0.5% unsigned", `LPPDataHelpers.h:15`), so a 1-byte skip here is
+    /// what keeps this test's trailing GPS entry aligned.
+    #[test]
+    fn decode_skips_undecoded_cayenne_types_and_keeps_later_fields() {
+        let mut buf = [0u8; 32];
+        buf[..4].copy_from_slice(&7u32.to_le_bytes());
+        let mut i = 4;
+        // [ch=1, LPP_VOLTAGE, 0x01A3]
+        buf[i..i + 4].copy_from_slice(&[TELEM_CHANNEL_SELF, 116, 0x01, 0xA3]);
+        i += 4;
+        // [ch=2, LPP_RELATIVE_HUMIDITY(104), 122] -> 61.0 % (1-byte payload).
+        buf[i..i + 3].copy_from_slice(&[2, 104, 122]);
+        i += 3;
+        // [ch=2, LPP_BAROMETRIC_PRESSURE(115), 0x27C7] -> 1018.3 hPa (2 bytes).
+        buf[i..i + 4].copy_from_slice(&[2, 115, 0x27, 0xC7]);
+        i += 4;
+        // [ch=2, LPP_CURRENT(117), 0x01F4] -> 0.500 A (2 bytes).
+        buf[i..i + 4].copy_from_slice(&[2, 117, 0x01, 0xF4]);
+        i += 4;
+        // [ch=1, LPP_TEMPERATURE(103), 0x013B]
+        buf[i..i + 4].copy_from_slice(&[TELEM_CHANNEL_SELF, 103, 0x01, 0x3B]);
+        i += 4;
+        let total = i;
+
+        let resp = decode_telemetry_response_lpp(&buf[..total]).expect("must parse");
+        assert_eq!(resp.battery_voltage_mv, Some(4_190));
+        assert_eq!(
+            resp.temperature_c_x10,
+            Some(315),
+            "temperature after three skipped entries must still decode"
+        );
+    }
+
+    /// An entirely unknown channel type must be skipped by upstream's own default
+    /// length (1 payload byte, `LPPData::getDataSize`'s fall-through at
+    /// `LPPDataHelpers.h:105`) and must NOT end the scan: the fields after it
+    /// still decode, and the unknown entry contributes no value at all.
+    #[test]
+    fn decode_skips_unknown_channel_type_and_keeps_later_fields() {
+        let mut buf = [0u8; 32];
+        buf[..4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        let mut i = 4;
+        // [ch=1, LPP_VOLTAGE, 0x01A3]
+        buf[i..i + 4].copy_from_slice(&[TELEM_CHANNEL_SELF, 116, 0x01, 0xA3]);
+        i += 4;
+        // [ch=9, type 126 (not a Cayenne LPP id), 0x2A] — unknown, 1-byte payload.
+        buf[i..i + 3].copy_from_slice(&[9, 126, 0x2A]);
+        i += 3;
+        // [ch=1, LPP_TEMPERATURE, 0x013B]
+        buf[i..i + 4].copy_from_slice(&[TELEM_CHANNEL_SELF, 103, 0x01, 0x3B]);
+        i += 4;
+        // [ch=1, LPP_GPS, lat/lon/alt]
+        buf[i..i + 11].copy_from_slice(&[
+            TELEM_CHANNEL_SELF,
+            136,
+            0x07,
+            0x57,
+            0x95,
+            0x01,
+            0xC1,
+            0xE1,
+            0x00,
+            0x00,
+            0x00,
+        ]);
+        i += 11;
+        let total = i;
+
+        let resp = decode_telemetry_response_lpp(&buf[..total]).expect("must parse");
+        assert_eq!(resp.battery_voltage_mv, Some(4_190));
+        assert_eq!(
+            resp.temperature_c_x10,
+            Some(315),
+            "field after the unknown entry must decode"
+        );
+        assert_eq!(
+            resp.gps_e4,
+            Some((481_173, 115_169)),
+            "field after the unknown entry must decode"
+        );
+        // The unknown entry is skipped silently, never surfaced as a value.
+        assert_eq!(resp.battery, None);
+        assert_eq!(resp.battery_raw_mv, None);
+    }
+
+    /// Truncation safety: a buffer that ends mid-entry must not panic, must not
+    /// read past its end, and must keep every field decoded before the cut. The
+    /// GPS entry is cut to 5 of its 11 bytes.
+    #[test]
+    fn decode_tolerates_buffer_ending_mid_gps_entry() {
+        let mut buf = [0u8; 32];
+        buf[..4].copy_from_slice(&3u32.to_le_bytes());
+        buf[4..8].copy_from_slice(&[TELEM_CHANNEL_SELF, 116, 0x01, 0xA3]);
+        buf[8..12].copy_from_slice(&[TELEM_CHANNEL_SELF, 103, 0x01, 0x3B]);
+        // [ch=1, LPP_GPS, lat(3B)] then the buffer simply stops.
+        buf[12..17].copy_from_slice(&[TELEM_CHANNEL_SELF, 136, 0x07, 0x57, 0x95]);
+
+        for cut in 12..17 {
+            let resp = decode_telemetry_response_lpp(&buf[..cut]).expect("must parse");
+            assert_eq!(
+                resp.battery_voltage_mv,
+                Some(4_190),
+                "prefix before the cut must still decode (cut={cut})"
+            );
+            assert_eq!(resp.temperature_c_x10, Some(315), "cut={cut}");
+            assert_eq!(
+                resp.gps_e4, None,
+                "truncated GPS must not decode (cut={cut})"
+            );
+        }
+    }
+
+    /// Truncation safety for a 2-byte-payload entry cut one byte short: the
+    /// partial `LPP_TEMPERATURE` must be dropped, not half-read.
+    #[test]
+    fn decode_tolerates_buffer_ending_mid_temperature_entry() {
+        let mut buf = [0u8; 16];
+        buf[..4].copy_from_slice(&5u32.to_le_bytes());
+        buf[4..8].copy_from_slice(&[TELEM_CHANNEL_SELF, 116, 0x01, 0xA3]);
+        buf[8..11].copy_from_slice(&[TELEM_CHANNEL_SELF, 103, 0x01]);
+
+        let resp = decode_telemetry_response_lpp(&buf[..11]).expect("must parse");
+        assert_eq!(resp.battery_voltage_mv, Some(4_190));
+        assert_eq!(resp.temperature_c_x10, None, "half an entry is no reading");
+
+        // ...and a lone trailing type byte with no payload at all.
+        let resp = decode_telemetry_response_lpp(&buf[..10]).expect("must parse");
+        assert_eq!(resp.battery_voltage_mv, Some(4_190));
+        assert_eq!(resp.temperature_c_x10, None);
+
+        // ...and a tag-only body (upstream's "no entries" floor).
+        let resp = decode_telemetry_response_lpp(&buf[..4]).expect("must parse");
+        assert_eq!(resp.battery_voltage_mv, None);
+        assert_eq!(resp.temperature_c_x10, None);
+    }
+
+    /// Upstream also emits `LPP_VOLTAGE`/`LPP_TEMPERATURE` for *external* sensors
+    /// on channels 2+ (`EnvironmentSensorManager::querySensors` assigns
+    /// `TELEM_CHANNEL_SELF + 1` upward, `EnvironmentSensorManager.cpp:685-698`).
+    /// Those are not the peer's base readings, so they must be skipped rather
+    /// than overwrite the channel-1 value.
+    #[test]
+    fn decode_ignores_voltage_and_temperature_on_other_channels() {
+        let mut buf = [0u8; 16];
+        buf[..4].copy_from_slice(&9u32.to_le_bytes());
+        // [ch=3, LPP_VOLTAGE, 0x1388] -> 50.00 V on an INA219 channel.
+        buf[4..8].copy_from_slice(&[3, 116, 0x13, 0x88]);
+        // [ch=2, LPP_TEMPERATURE, 0x00FA] -> 25.0 C on a BME280 channel.
+        buf[8..12].copy_from_slice(&[2, 103, 0x00, 0xFA]);
+
+        let resp = decode_telemetry_response_lpp(&buf[..12]).expect("must parse");
+        assert_eq!(resp.battery_voltage_mv, None);
+        assert_eq!(resp.temperature_c_x10, None);
+    }
+
+    /// The skip table must agree with the `LPP_*_ENTRY_LEN` constants the encoder
+    /// and the rest of this module are written against — otherwise "skip by
+    /// declared length" would quietly desynchronise the scan.
+    #[test]
+    fn lpp_entry_len_table_matches_entry_len_constants() {
+        assert_eq!(lpp_entry_len(LPP_DIGITAL_INPUT), LPP_BYTE_ENTRY_LEN);
+        assert_eq!(lpp_entry_len(LPP_DIGITAL_OUTPUT), LPP_BYTE_ENTRY_LEN);
+        assert_eq!(lpp_entry_len(LPP_PRESENCE), LPP_BYTE_ENTRY_LEN);
+        assert_eq!(lpp_entry_len(LPP_PERCENTAGE), LPP_BYTE_ENTRY_LEN);
+        assert_eq!(lpp_entry_len(LPP_LUMINOSITY), LPP_U16_ENTRY_LEN);
+        assert_eq!(lpp_entry_len(LPP_TEMPERATURE), LPP_U16_ENTRY_LEN);
+        assert_eq!(lpp_entry_len(LPP_VOLTAGE), LPP_U16_ENTRY_LEN);
+        assert_eq!(lpp_entry_len(LPP_GENERIC_SENSOR), LPP_U32_ENTRY_LEN);
+        assert_eq!(lpp_entry_len(LPP_GPS), LPP_GPS_ENTRY_LEN);
+        // Unknown types fall back to a 1-byte payload, as upstream does.
+        assert_eq!(lpp_entry_len(126), LPP_BYTE_ENTRY_LEN);
+        assert_eq!(lpp_entry_len(0xFF), LPP_BYTE_ENTRY_LEN);
     }
 
     // ── policy gate (documented, tested indirectly) ───────────────────────────
