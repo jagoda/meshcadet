@@ -51,6 +51,7 @@
 //! | [`ui::keyboard`]  | `ui::keyboard::KeyboardDriver` + `key_text` (Slint `Key`-coupled; see that module's doc) |
 //! | [`ui::theme`]     | *(none — this module is already 100% pure)*                    |
 //! | [`gps`]           | `gps::GpsDriver` (UART1, baud probing, NVS baud cache)          |
+//! | [`inbound_dm`]    | *(none — this module is already 100% pure)*                    |
 //! | [`inbound_replay`] | `firmware/src/main.rs`'s `handle_dm` gate + `inbound_replay_store.rs` (a small dedicated per-contact NVS store) |
 //! | [`battery`]       | `battery::BatteryDriver` (ADC1 sampling)                        |
 //! | [`runtime_settings_store`] | `runtime_settings_store::{load, save}` (`EspNvs`)     |
@@ -73,6 +74,7 @@ pub mod battery;
 pub mod config_store;
 pub mod dispatcher;
 pub mod gps;
+pub mod inbound_dm;
 pub mod inbound_replay;
 pub mod lock_store;
 pub mod notification;

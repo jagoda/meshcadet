@@ -141,21 +141,82 @@ mod tests {
         assert_eq!(h.0, 0x0D);
     }
 
+    /// Every (route type, payload-type nibble) pair the wire can express.
+    ///
+    /// This used to hard-code 6 of the 16 combinations, which is exactly how a
+    /// payload type could stop round-tripping without any test noticing (the
+    /// 0x00..=0x0F header-byte block below is the 16 pairs the old list drew
+    /// its 6 samples from). The loop is exhaustive instead: all 4 route types
+    /// (`RouteType` values 0x00..=0x03) x all 16 payload-type nibbles
+    /// (0x00..=0x0F) = every version-0 header byte 0x00..=0x3F, asserting
+    /// which nibbles map to a [`PayloadType`] and which are `None`.
     #[test]
     fn header_roundtrip_all_types() {
-        let cases = [
-            (RouteType::Flood, PayloadType::TxtMsg),
-            (RouteType::Flood, PayloadType::GrpTxt),
-            (RouteType::Direct, PayloadType::Ack),
-            (RouteType::Direct, PayloadType::Path),
-            (RouteType::Flood, PayloadType::Advert),
-            (RouteType::TransportFlood, PayloadType::AnonReq),
+        let routes = [
+            RouteType::TransportFlood,
+            RouteType::Flood,
+            RouteType::Direct,
+            RouteType::TransportDirect,
         ];
-        for (rt, pt) in cases {
-            let h = Header::new(rt, pt);
-            assert_eq!(h.route_type(), Some(rt), "rt={:?} pt={:?}", rt, pt);
-            assert_eq!(h.payload_type(), Some(pt), "rt={:?} pt={:?}", rt, pt);
+        // Payload-type nibble -> expected `payload_type()`. The gaps
+        // (0x0C..=0x0E) are undefined on the wire and must stay `None`;
+        // `Control` (0x0B) and `RawCustom` (0x0F) are the two defined values
+        // the old hand-listed cases never covered.
+        let payload_types: [(u8, Option<PayloadType>); 16] = [
+            (0x00, Some(PayloadType::Req)),
+            (0x01, Some(PayloadType::Response)),
+            (0x02, Some(PayloadType::TxtMsg)),
+            (0x03, Some(PayloadType::Ack)),
+            (0x04, Some(PayloadType::Advert)),
+            (0x05, Some(PayloadType::GrpTxt)),
+            (0x06, Some(PayloadType::GrpData)),
+            (0x07, Some(PayloadType::AnonReq)),
+            (0x08, Some(PayloadType::Path)),
+            (0x09, Some(PayloadType::Trace)),
+            (0x0A, Some(PayloadType::Multipart)),
+            (0x0B, Some(PayloadType::Control)),
+            (0x0C, None),
+            (0x0D, None),
+            (0x0E, None),
+            (0x0F, Some(PayloadType::RawCustom)),
+        ];
+        for route in routes {
+            for (nibble, expected_payload) in payload_types {
+                let byte = (nibble << constants::PH_TYPE_SHIFT) | (route as u8);
+                let h = Header(byte);
+                assert_eq!(h.route_type(), Some(route), "route for 0x{:02x}", byte);
+                assert_eq!(
+                    h.payload_type(),
+                    expected_payload,
+                    "payload type for 0x{:02x}",
+                    byte
+                );
+                assert_eq!(h.version(), 0, "version for 0x{:02x}", byte);
+                if let Some(pt) = expected_payload {
+                    assert_eq!(
+                        Header::new(route, pt).0,
+                        byte,
+                        "Header::new must reproduce 0x{:02x}",
+                        byte
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn header_low_nibble_block_is_the_16_route_type_pairs() {
+        // 0x00..=0x0F is 4 routes x payload types 0x00..=0x03 (REQ, RESPONSE,
+        // TXT_MSG, ACK) with version 0 — every value here is a defined pair,
+        // so both accessors return `Some` and the byte round-trips exactly.
+        for byte in 0x00u8..=0x0F {
+            let h = Header(byte);
+            let route = h.route_type().expect("every 0x00..=0x0F route is defined");
+            let pt = h
+                .payload_type()
+                .expect("every 0x00..=0x0F payload type is defined");
             assert_eq!(h.version(), 0);
+            assert_eq!(Header::new(route, pt).0, byte);
         }
     }
 

@@ -67,6 +67,38 @@ pub struct RxFrameHeader {
     pub payload_off: usize,
 }
 
+/// `Packet::hasTransportCodes()` (`src/Packet.cpp`): the 4 transport-code
+/// bytes are present only for the two transport route types.
+#[inline]
+fn route_carries_transport_codes(header_byte: u8) -> bool {
+    matches!(
+        Header(header_byte).route_type(),
+        Some(RouteType::TransportFlood) | Some(RouteType::TransportDirect)
+    )
+}
+
+/// The frame's `path_len` byte, read from its transport-aware offset — byte 1
+/// for a plain `FLOOD`/`DIRECT` frame, byte 5 behind a transport-coded frame's
+/// 4 transport-code bytes.
+///
+/// Returns `None` when the frame is too short to reach the byte at all (the
+/// same condition [`parse_rx_frame_header`] reports as
+/// [`RxFrameError::TooShortForPathLen`]). The byte itself is deliberately NOT
+/// validated here: `firmware/src/main.rs`'s signal-meter rx-tap reads it on
+/// every RxDone, *before* dedup and before [`parse_rx_frame_header`]'s own
+/// rejections, and only needs the hop count it encodes. Reading byte 1
+/// unconditionally (which that tap used to do) is wrong for a transport-coded
+/// frame: byte 1 is `transport_codes[0]`, not `path_len`.
+pub fn frame_path_len(frame: &[u8]) -> Option<PathLen> {
+    let &header_byte = frame.first()?;
+    let idx = 1 + if route_carries_transport_codes(header_byte) {
+        4
+    } else {
+        0
+    };
+    frame.get(idx).copied().map(PathLen)
+}
+
 /// Parse `frame`'s header far enough to locate the payload, per MeshCore's
 /// wire framing (see module doc). Branches on route type so a
 /// `ROUTE_TYPE_TRANSPORT_FLOOD`/`ROUTE_TYPE_TRANSPORT_DIRECT` frame's 4
@@ -78,19 +110,15 @@ pub fn parse_rx_frame_header(frame: &[u8]) -> Result<RxFrameHeader, RxFrameError
         return Err(RxFrameError::Empty);
     };
     let route_type = Header(header_byte).route_type();
-    let has_transport_codes = matches!(
-        route_type,
-        Some(RouteType::TransportFlood) | Some(RouteType::TransportDirect)
-    );
+    let has_transport_codes = route_carries_transport_codes(header_byte);
     let path_len_idx = 1 + if has_transport_codes { 4 } else { 0 };
-    if frame.len() <= path_len_idx {
+    let Some(path_len) = frame_path_len(frame) else {
         return Err(RxFrameError::TooShortForPathLen {
             frame_len: frame.len(),
             needed: path_len_idx + 1,
         });
-    }
-    let path_len_byte = frame[path_len_idx];
-    let path_len = PathLen(path_len_byte);
+    };
+    let path_len_byte = path_len.0;
     if !path_len.is_valid() {
         return Err(RxFrameError::InvalidPathLen { path_len_byte });
     }
@@ -124,6 +152,47 @@ mod tests {
         // header=(TXT_MSG<<2)|FLOOD, path_len=0x00 (zero hops), 3 payload bytes.
         let header = Header::new(RouteType::Flood, PayloadType::TxtMsg).0;
         vec![header, 0x00, 0xAA, 0xBB, 0xCC]
+    }
+
+    #[test]
+    fn frame_path_len_reads_byte_1_for_ordinary_routes() {
+        // FLOOD/DIRECT frames: `path_len` really is byte 1.
+        let frame = flood_txt_frame();
+        assert_eq!(frame_path_len(&frame), Some(PathLen(0x00)));
+
+        let header = Header::new(RouteType::Direct, PayloadType::TxtMsg).0;
+        let frame = vec![header, 0x42, 0x11, 0x22, 0x33, 0x44];
+        assert_eq!(frame_path_len(&frame), Some(PathLen(0x42)));
+    }
+
+    #[test]
+    fn frame_path_len_skips_transport_codes() {
+        // The signal-meter rx-tap used to read `frame[1]` unconditionally,
+        // which for a transport-coded frame is transport_codes[0] (0xDE here)
+        // — a garbage hop count of 30 (0xDE & 63). The parsed offset is 5.
+        let header = ((PayloadType::TxtMsg as u8) << 2) | (RouteType::TransportFlood as u8);
+        let frame = vec![header, 0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x11, 0x22, 0x33, 0x44];
+        assert_eq!(frame_path_len(&frame), Some(PathLen(0x42)));
+        assert_eq!(PathLen(frame[1]).hop_count(), 30, "the misread this fixes");
+        assert_eq!(PathLen(frame[5]).hop_count(), 2);
+
+        let header = ((PayloadType::Ack as u8) << 2) | (RouteType::TransportDirect as u8);
+        let frame = vec![header, 0x01, 0x02, 0x03, 0x04, 0x05];
+        assert_eq!(frame_path_len(&frame), Some(PathLen(0x05)));
+    }
+
+    #[test]
+    fn frame_path_len_is_none_when_the_byte_is_not_there() {
+        assert_eq!(frame_path_len(&[]), None);
+        // Transport-coded frame missing its path_len byte entirely.
+        let header = ((PayloadType::TxtMsg as u8) << 2) | (RouteType::TransportFlood as u8);
+        assert_eq!(frame_path_len(&[header, 0xDE, 0xAD, 0xBE]), None);
+        // Byte present but malformed: reported verbatim (validation is the
+        // parse's job, not the rx-tap's).
+        assert_eq!(
+            frame_path_len(&[header, 0x01, 0x02, 0x03, 0x04, 0xC0]),
+            Some(PathLen(0xC0))
+        );
     }
 
     #[test]

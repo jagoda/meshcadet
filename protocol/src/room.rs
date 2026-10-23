@@ -39,6 +39,7 @@
 
 use crate::codec::{
     compute_ack_hash, decode_dm_payload, decode_txt_msg_plaintext, encode_dm_payload, CodecError,
+    TxtType,
 };
 use crate::constants::PUB_KEY_SIZE;
 use crate::crypto::{encrypt_then_mac_var, mac_then_decrypt_var};
@@ -114,7 +115,7 @@ impl RoomPermission {
     }
 }
 
-// ── TXT_MSG flags (TxtDataHelpers.h @ MeshCore v1.16.0) ─────────────────────────
+// ── TXT_MSG flags (TxtDataHelpers.h @ MeshCore v1.18.0) ─────────────────────────
 
 /// Plain client-authored text (posts).
 pub const TXT_TYPE_PLAIN: u8 = 0;
@@ -122,6 +123,9 @@ pub const TXT_TYPE_PLAIN: u8 = 0;
 pub const TXT_TYPE_CLI_DATA: u8 = 1;
 /// Server-authored, author-attributed push (room posts pushed to clients).
 pub const TXT_TYPE_SIGNED_PLAIN: u8 = 2;
+/// Explicitly a CLI command (admin-only; out of scope for this crate). Added
+/// upstream in MeshCore v1.18.0 (`TxtDataHelpers.h`, absent from v1.17.1).
+pub const TXT_TYPE_CLI_COMMAND: u8 = 3;
 
 /// `REQ_TYPE_KEEP_ALIVE` request-type byte (`MyMesh.cpp:15`).
 pub const REQ_TYPE_KEEP_ALIVE: u8 = 0x02;
@@ -289,7 +293,7 @@ pub fn decode_room_push(
 ) -> Result<(u8, u8, RoomPush), RoomCodecError> {
     let (dest_hash, src_hash, pt_len) = decode_dm_payload(shared_secret, payload, plaintext_buf)?;
     let (post_ts, txt_type, attempt, off) = decode_txt_msg_plaintext(plaintext_buf, pt_len)?;
-    if txt_type != TXT_TYPE_SIGNED_PLAIN {
+    if txt_type != TxtType::SignedPlain {
         return Err(RoomCodecError::NotSignedPlain);
     }
     if pt_len < off + 4 {
@@ -824,8 +828,17 @@ impl RoomServerDouble {
         let mut pt = [0u8; 256];
         let (_dest, _src, pt_len) = decode_dm_payload(&shared_secret, payload, &mut pt).ok()?;
         let (timestamp, txt_type, attempt, off) = decode_txt_msg_plaintext(&pt, pt_len).ok()?;
-        if txt_type != TXT_TYPE_PLAIN {
-            return None; // CLI_DATA / unrecognized flags: out of scope for this double
+        if txt_type != TxtType::Plain {
+            // CLI_DATA (1), CLI_COMMAND (3) and any unrecognized subtype: out
+            // of scope for this room-server double. The real server's
+            // `onPeerDataRecv` handles CLI subtypes in their own arms and
+            // never ACKs them (`BaseChatMesh.cpp:258-289` @
+            // `companion-v1.18.0`), and drops unrecognized flags entirely —
+            // silently returning `None` (no ACK, no post) is exactly that
+            // observable behaviour. Kept as an explicit, named branch so a
+            // reader can tell the CLI case apart from the replay and
+            // permission drops below.
+            return None;
         }
         if timestamp < self.clients[idx].last_timestamp {
             return None; // possible replay attack

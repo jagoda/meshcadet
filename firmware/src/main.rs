@@ -2827,9 +2827,18 @@ fn run() -> anyhow::Result<()> {
                     // right below is about to drop — a dedup'd duplicate from a
                     // repeater still proves it is audible right now (decision 6
                     // in the ADR), so this MUST run before that drop, not after.
-                    // `frame_buf[1]` is the `path_len` byte (`n >= 2` guards the
-                    // index — a frame this short is truncated garbage the rest
-                    // of this match arm would reject anyway). `hop_count == 0`
+                    // `path_len` is NOT always `frame_buf[1]`: a
+                    // TRANSPORT_FLOOD/TRANSPORT_DIRECT frame carries 4
+                    // transport-code bytes first, so its `path_len` sits at
+                    // offset 5 (`Packet::readFrom`, mirrored by
+                    // `protocol::frame::parse_rx_frame_header`). Reading byte 1
+                    // unconditionally read `transport_codes[0]` as the
+                    // path_len byte for those frames and reported a garbage
+                    // hop count; `firmware_core::rx_frame::frame_path_len`
+                    // returns the byte from the correct offset (and `None` when
+                    // the frame is too short to hold one at all — a frame this
+                    // short is truncated garbage the rest of this match arm
+                    // would reject anyway). `hop_count == 0`
                     // (a zero-hop, direct-from-origin packet) is filtered out
                     // here explicitly, mirroring the ADR's "hop >= 1" gate —
                     // `SignalTracker::record` would also no-op on it internally,
@@ -2838,8 +2847,9 @@ fn run() -> anyhow::Result<()> {
                     // already decoded above; `now` is this dispatcher-loop
                     // iteration's real monotonic `esp_timer_get_time`-backed
                     // clock (`uptime_ms()`), never a loop-iteration counter.
-                    if n >= 2 {
-                        let hop_count = PathLen(frame_buf[1]).hop_count();
+                    if let Some(path_len) = firmware_core::rx_frame::frame_path_len(&frame_buf[..n])
+                    {
+                        let hop_count = path_len.hop_count();
                         if hop_count >= 1 {
                             signal_tracker.record(rssi_dbm as i16, snr_db as i8, hop_count, now);
                             rx_diag!(
@@ -4207,8 +4217,38 @@ fn handle_dm(
 
             let ts        = u32::from_le_bytes([dec_buf[0], dec_buf[1], dec_buf[2], dec_buf[3]]);
             let type_byte = dec_buf[4];
+            let txt_type  = protocol::TxtType::from_byte(type_byte >> 2);
             let text_region = &dec_buf[5..pt_len.min(dec_buf.len())];
             let text = c_str(text_region);
+
+            // ── Text-subtype gate (MeshCore v1.18.0 conformance) ──────────────
+            // The flags byte's upper 6 bits are the TXT_MSG text subtype
+            // (`TxtDataHelpers.h` @ `companion-v1.18.0`): 0 PLAIN, 1 CLI_DATA,
+            // 2 SIGNED_PLAIN, 3 CLI_COMMAND (new in v1.18.0), 4..=63 reserved.
+            // Upstream `BaseChatMesh::onPeerDataRecv` (`BaseChatMesh.cpp:239-300`)
+            // only reaches a message callback — and only computes/queues an ACK
+            // — for PLAIN and SIGNED_PLAIN; the CLI subtypes go to their own
+            // callbacks with "no ack expected", and unmatched flags are dropped.
+            // This gate sits AHEAD of the replay gate, history, UI event,
+            // telemetry-request check and ACK below, so dropping here means
+            // none of those side effects — and no replay-ring slot or
+            // `last_ts` advance — happens for non-chat traffic.
+            //
+            // The decision itself is a pure function in `firmware_core`
+            // (host-testable; this file's tests cannot run in CI), and
+            // `ignore_reason()` is `Some` for every non-accepted disposition.
+            if let Some(reason) =
+                firmware_core::inbound_dm::classify_inbound_dm(txt_type).ignore_reason()
+            {
+                log::info!(
+                    "RX DM from 0x{:02x} ts={}: {} (txt_type={}) — no ACK, no history, no UI",
+                    raw_src,
+                    ts,
+                    reason,
+                    txt_type.as_byte(),
+                );
+                return;
+            }
 
             let text_str = core::str::from_utf8(text).unwrap_or("<invalid utf8>");
             log::info!("RX DM from 0x{:02x} ts={}: \"{}\"", raw_src, ts, text_str);

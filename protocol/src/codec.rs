@@ -13,6 +13,8 @@
 //!
 //!   TXT_MSG plaintext:
 //!     [timestamp_le(4)] [txt_type_attempt(1)] [text...]
+//!     txt_type  = the flags byte's upper 6 bits — see [`TxtType`]
+//!     attempt   = the flags byte's lower 2 bits
 //!
 //!   ACK payload (v1.15 and v1.16 — see note on [`compute_ack_hash`]):
 //!     [ack_hash(4)] (+ 2 more bytes on v1.16, ignored by both versions' receivers)
@@ -29,7 +31,7 @@
 //!     extra_type 0x03 (ACK):      [ack_hash(4)]
 //!     extra_type 0x01 (RESPONSE): [13-byte RESPONSE plaintext] — the flood-login
 //!                                 reply bundle (`room::decode_login_response` input);
-//!                                 see `Mesh.cpp::createPathReturn` @ MeshCore v1.16.0.
+//!                                 see `Mesh.cpp::createPathReturn` @ MeshCore v1.18.0.
 //!     extra_type 0xFF:            [4 random bytes] (no bundled extra)
 
 use crate::crypto::{encrypt_then_mac_var, mac_then_decrypt_var, sha256, MacError};
@@ -109,10 +111,89 @@ pub fn decode_dm_payload(
     Ok((dest_hash, src_hash, pt_len))
 }
 
+// ── TXT_MSG text subtype ─────────────────────────────────────────────────────
+
+/// TXT_MSG text subtype — the upper 6 bits of the plaintext's
+/// `txt_type_attempt` flags byte.
+///
+/// Values mirror `src/helpers/TxtDataHelpers.h` @ MeshCore v1.18.0
+/// (`companion-v1.18.0`), the version that added `TXT_TYPE_CLI_COMMAND`:
+/// ```text
+/// TXT_TYPE_PLAIN        = 0   // a plain text message
+/// TXT_TYPE_CLI_DATA     = 1   // a CLI command -or- reply
+/// TXT_TYPE_SIGNED_PLAIN = 2   // plain text, signed by sender
+/// TXT_TYPE_CLI_COMMAND  = 3   // a CLI command (explicitly)
+/// ```
+///
+/// [`TxtType::Unknown`] is deliberately **not** a parse error: upstream
+/// `BaseChatMesh::onPeerDataRecv` (`BaseChatMesh.cpp:235-300` @
+/// `companion-v1.18.0`) decodes `flags` as a bare `uint8_t` and silently
+/// ignores any value its `if`/`else if` chain does not match, so a newer
+/// peer's reserved subtype must still parse here — it is the *disposition*
+/// (see `firmware_core::inbound_dm`) that decides what to do with it, not
+/// the codec. Rejecting unknown subtypes at decode time would turn
+/// legitimate forward-compatible traffic into a decode failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxtType {
+    /// `TXT_TYPE_PLAIN` (0) — client-authored chat text (`handle_dm`'s
+    /// original, only-ever-recognized case).
+    Plain,
+    /// `TXT_TYPE_CLI_DATA` (1) — CLI command **or** reply; MeshCadet has no
+    /// CLI surface, so it never renders or ACKs these.
+    CliData,
+    /// `TXT_TYPE_SIGNED_PLAIN` (2) — author-attributed text (room pushes;
+    /// `room::decode_room_push`'s only accepted subtype).
+    SignedPlain,
+    /// `TXT_TYPE_CLI_COMMAND` (3) — explicitly a CLI command; new in
+    /// MeshCore v1.18.0.
+    CliCommand,
+    /// Any other subtype (4..=63). Kept verbatim so a forward-compatible
+    /// peer's reserved value survives a decode/encode round trip.
+    Unknown(u8),
+}
+
+impl TxtType {
+    /// Classify a decoded flags byte's upper 6 bits.
+    pub const fn from_byte(raw: u8) -> Self {
+        match raw {
+            0 => TxtType::Plain,
+            1 => TxtType::CliData,
+            2 => TxtType::SignedPlain,
+            3 => TxtType::CliCommand,
+            other => TxtType::Unknown(other),
+        }
+    }
+
+    /// The subtype's on-air value — the exact byte [`Self::from_byte`] was
+    /// given, including for [`TxtType::Unknown`].
+    pub const fn as_byte(self) -> u8 {
+        match self {
+            TxtType::Plain => 0,
+            TxtType::CliData => 1,
+            TxtType::SignedPlain => 2,
+            TxtType::CliCommand => 3,
+            TxtType::Unknown(raw) => raw,
+        }
+    }
+
+    /// Whether this subtype carries displayable chat text — i.e. the two
+    /// subtypes upstream `onPeerDataRecv` routes to `onMessageRecv` /
+    /// `onSignedMessageRecv` and ACKs (`BaseChatMesh.cpp:239-256`, `:290-300`
+    /// @ `companion-v1.18.0`). CLI subtypes reach `onCommandDataRecv` /
+    /// `onCLICommandRecv` instead, and — explicitly — get **no** ACK.
+    pub const fn is_text(self) -> bool {
+        matches!(self, TxtType::Plain | TxtType::SignedPlain)
+    }
+}
+
 // ── TXT_MSG plaintext helper ─────────────────────────────────────────────────
 
 /// Encode a TXT_MSG plaintext: `[timestamp_le(4)] [txt_type_attempt(1)] [text...]`
 /// Returns the number of bytes written.
+///
+/// `txt_type` is the raw 6-bit subtype value (see [`TxtType::as_byte`]); the
+/// encoders keep taking a `u8` so the room codec's `TXT_TYPE_*` constants and
+/// every pre-existing call site stay byte-oriented.
 pub fn encode_txt_msg_plaintext(
     timestamp: u32,
     txt_type: u8,
@@ -132,16 +213,20 @@ pub fn encode_txt_msg_plaintext(
 
 /// Decode a TXT_MSG plaintext (after AES decryption).
 /// Returns `(timestamp, txt_type, attempt, text_start_offset)` or error.
+///
+/// The subtype is classified into [`TxtType`] rather than handed back as a
+/// raw `u8`: an unrecognized subtype is [`TxtType::Unknown`] and still
+/// **parses** (never an error) — see [`TxtType`]'s doc for why.
 pub fn decode_txt_msg_plaintext(
     plaintext: &[u8],
     plaintext_actual_len: usize,
-) -> Result<(u32, u8, u8, usize), CodecError> {
+) -> Result<(u32, TxtType, u8, usize), CodecError> {
     if plaintext_actual_len < 5 {
         return Err(CodecError::TruncatedPayload);
     }
     let timestamp = u32::from_le_bytes([plaintext[0], plaintext[1], plaintext[2], plaintext[3]]);
     let type_byte = plaintext[4];
-    let txt_type = type_byte >> 2;
+    let txt_type = TxtType::from_byte(type_byte >> 2);
     let attempt = type_byte & 0x03;
     Ok((timestamp, txt_type, attempt, 5))
 }
@@ -309,7 +394,7 @@ pub fn parse_channel_text(text: &[u8]) -> (Option<&[u8]>, &[u8]) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GrpTxtFields {
     pub timestamp: u32,
-    pub txt_type: u8,
+    pub txt_type: TxtType,
     pub attempt: u8,
     /// Start offset of text bytes within the `plaintext_buf` passed to `decode_grp_txt`.
     pub text_offset: usize,
@@ -609,9 +694,103 @@ mod tests {
         // Verify plaintext fields
         let (ts, txt_type, attempt, text_off) = decode_txt_msg_plaintext(&dec_buf, pt_len).unwrap();
         assert_eq!(ts, 0x0102_0304);
-        assert_eq!(txt_type, 0x00);
+        assert_eq!(txt_type, TxtType::Plain);
         assert_eq!(attempt, 0);
         assert_eq!(&dec_buf[text_off..text_off + 10], b"hello mesh");
+    }
+
+    // ── TxtType (TXT_MSG text subtype) ──────────────────────────────────
+
+    #[test]
+    fn txt_type_known_values_match_upstream() {
+        // `src/helpers/TxtDataHelpers.h` @ MeshCore v1.18.0.
+        assert_eq!(TxtType::Plain.as_byte(), 0);
+        assert_eq!(TxtType::CliData.as_byte(), 1);
+        assert_eq!(TxtType::SignedPlain.as_byte(), 2);
+        assert_eq!(TxtType::CliCommand.as_byte(), 3);
+        assert_eq!(TxtType::from_byte(0), TxtType::Plain);
+        assert_eq!(TxtType::from_byte(1), TxtType::CliData);
+        assert_eq!(TxtType::from_byte(2), TxtType::SignedPlain);
+        assert_eq!(TxtType::from_byte(3), TxtType::CliCommand);
+    }
+
+    #[test]
+    fn txt_type_round_trip_all_bytes() {
+        // Exhaustive over the whole 6-bit subtype space plus the two bits
+        // above it: `as_byte`/`from_byte` must be lossless for every value,
+        // including reserved ones — a forward-compatible peer's subtype has
+        // to survive a decode/encode round trip unchanged.
+        for raw in 0u8..=255 {
+            let txt_type = TxtType::from_byte(raw);
+            assert_eq!(txt_type.as_byte(), raw, "round trip for raw={}", raw);
+            assert_eq!(
+                TxtType::from_byte(txt_type.as_byte()),
+                txt_type,
+                "from_byte(as_byte(..)) for raw={}",
+                raw
+            );
+        }
+        // 4 and above are all `Unknown`, carrying the raw value verbatim.
+        for raw in 4u8..=255 {
+            assert_eq!(TxtType::from_byte(raw), TxtType::Unknown(raw));
+        }
+    }
+
+    #[test]
+    fn txt_type_is_text_only_for_plain_and_signed_plain() {
+        assert!(TxtType::Plain.is_text());
+        assert!(TxtType::SignedPlain.is_text());
+        assert!(!TxtType::CliData.is_text());
+        assert!(!TxtType::CliCommand.is_text());
+        assert!(!TxtType::Unknown(4).is_text());
+        for raw in 0u8..=255 {
+            let expected = raw == 0 || raw == 2;
+            assert_eq!(TxtType::from_byte(raw).is_text(), expected, "raw={}", raw);
+        }
+    }
+
+    #[test]
+    fn txt_msg_decode_classifies_cli_subtypes() {
+        // Subtype 1 (CLI_DATA) and 3 (CLI_COMMAND) — the two MeshCadet must not
+        // treat as chat — plus the attempt bits preserved independently.
+        for (raw, expected) in [(1u8, TxtType::CliData), (3u8, TxtType::CliCommand)] {
+            let mut pt = [0u8; 32];
+            let pt_len = encode_txt_msg_plaintext(7, raw, 2, b"?loc", &mut pt);
+            let (ts, txt_type, attempt, off) = decode_txt_msg_plaintext(&pt, pt_len).unwrap();
+            assert_eq!(ts, 7);
+            assert_eq!(txt_type, expected, "subtype {} must decode", raw);
+            assert_eq!(attempt, 2, "attempt bits stay independent of the subtype");
+            assert_eq!(&pt[off..pt_len], b"?loc");
+        }
+    }
+
+    #[test]
+    fn txt_msg_unknown_subtype_still_decodes() {
+        // Forward compatibility is deliberate: an unrecognized subtype is
+        // `Unknown(raw)`, never a `CodecError`. Upstream `onPeerDataRecv`
+        // treats the flags byte as a bare `uint8_t` and drops unmatched values
+        // at dispatch, so parsing must succeed here.
+        let mut pt = [0u8; 32];
+        let pt_len = encode_txt_msg_plaintext(9, 0x0C, 1, b"future", &mut pt);
+        let (ts, txt_type, attempt, off) = decode_txt_msg_plaintext(&pt, pt_len).unwrap();
+        assert_eq!(ts, 9);
+        assert_eq!(txt_type, TxtType::Unknown(0x0C));
+        assert_eq!(attempt, 1);
+        assert_eq!(&pt[off..pt_len], b"future");
+    }
+
+    #[test]
+    fn grp_txt_decode_reports_unknown_subtype_without_error() {
+        // Same forward-compat rule on the channel path: GRP_TXT's subtype is
+        // surfaced (as `TxtType::Unknown`), not rejected.
+        let channel_secret = [0x5Au8; 32];
+        let mut enc = [0u8; 256];
+        let n = encode_grp_txt(&channel_secret, 0xFEED, 0x2A, 0, b"chan", &mut enc);
+        let mut pt = [0u8; 256];
+        let fields = decode_grp_txt(&channel_secret, &enc[..n], &mut pt)
+            .expect("unknown GRP_TXT subtype must still decode");
+        assert_eq!(fields.txt_type, TxtType::Unknown(0x2A));
+        assert_eq!(fields.timestamp, 0xFEED);
     }
 
     #[test]
@@ -714,7 +893,7 @@ mod tests {
         let fields = decode_grp_txt(&channel_secret, &enc_buf[..n], &mut pt_buf).unwrap();
 
         assert_eq!(fields.timestamp, 0xDEAD);
-        assert_eq!(fields.txt_type, 0x00);
+        assert_eq!(fields.txt_type, TxtType::Plain);
         assert_eq!(fields.attempt, 0);
         assert_eq!(
             &pt_buf[fields.text_offset..fields.text_offset + fields.text_len],
