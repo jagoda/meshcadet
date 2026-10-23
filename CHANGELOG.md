@@ -8,6 +8,36 @@ Versioning is managed by [release-please](https://github.com/googleapis/release-
 The entry below documents everything landed before release-please's first
 `chore(release): vX.Y.Z` PR.
 
+## [0.9.0](https://github.com/jagoda/meshcadet/compare/v0.8.0...v0.9.0) (2026-10-23)
+
+
+### Added
+
+* **firmware-core:** classify inbound DM text subtypes purely ([42dec2f](https://github.com/jagoda/meshcadet/commit/42dec2fb99adacad5afe9e2957a2ba2c7a1e37c5))
+* **firmware:** emit region-scoped flood frames and handle region provisioning ([a135746](https://github.com/jagoda/meshcadet/commit/a135746d31728b797ab2ae281d823be3658b92a2))
+* **firmware:** emit region-scoped flood frames and handle region provisioning ([516d82a](https://github.com/jagoda/meshcadet/commit/516d82a677937e058810efc9e00dc832b9701776))
+* **protocol:** add a TxtType enum for the TXT_MSG text subtype ([84d6a4b](https://github.com/jagoda/meshcadet/commit/84d6a4bc7638370cdfa8ee36cfa288c24a915a92))
+* **protocol:** add upstream wire conformance vectors and regen tooling ([bb7c61b](https://github.com/jagoda/meshcadet/commit/bb7c61b65aeec5ae0bc1904f5dcece6416e1e409))
+* **protocol:** add upstream wire conformance vectors and regen tooling ([b8ed223](https://github.com/jagoda/meshcadet/commit/b8ed223b7bb32badb50195cb7f2e6cd35cd55fc1)), closes [#214](https://github.com/jagoda/meshcadet/issues/214)
+* **region:** add MeshCore region scoping codec and provisioning surfaces ([6359bb8](https://github.com/jagoda/meshcadet/commit/6359bb872ea64524a2e9a2ca95ccfdd3c38f152c))
+* **region:** add MeshCore region scoping provisioning surfaces ([678fed4](https://github.com/jagoda/meshcadet/commit/678fed48772a4a0b33bff9ce3b080edd1c0abb48))
+
+
+### Fixed
+
+* **firmware:** ignore CLI and unknown DM text subtypes (MeshCore v1.18.0 conformance) ([248b061](https://github.com/jagoda/meshcadet/commit/248b061cd1424ea95de2fc36fa0555f82ac7d352))
+* **firmware:** ignore CLI and unknown DM text subtypes in handle_dm ([2756ead](https://github.com/jagoda/meshcadet/commit/2756ead95a791c263c62bc40e9be0c98a752de31))
+* **firmware:** read path_len at its transport-aware offset for the signal meter ([1588fc2](https://github.com/jagoda/meshcadet/commit/1588fc25f3935f26c2c9b2492ea17bd8c68d9717))
+* **protocol:** skip unknown Cayenne LPP entries instead of truncating stock telemetry replies ([ea7c465](https://github.com/jagoda/meshcadet/commit/ea7c46579ee33677337d409edf756a56e6c80884))
+* **protocol:** skip unknown Cayenne LPP entries instead of truncating telemetry ([bea937b](https://github.com/jagoda/meshcadet/commit/bea937b52c55c3cbfb41a0c4bca9ff207041168f))
+
+
+### Documentation
+
+* **firmware:** retarget radio interop note to v1.18.0 ([5a47d76](https://github.com/jagoda/meshcadet/commit/5a47d766ada0aa1c3b67567e61518f9f90996a98))
+* retarget MeshCore currency claims to v1.18.0 ([c2b34ac](https://github.com/jagoda/meshcadet/commit/c2b34ac4128ceeeff4a7fcd7932f5f4b7fe43823))
+* retarget MeshCore currency claims to v1.18.0 ([de046aa](https://github.com/jagoda/meshcadet/commit/de046aaca4bf2a80a0bdcaca1918bc8c1c562d41))
+
 ## [0.8.0](https://github.com/jagoda/meshcadet/compare/v0.7.0...v0.8.0) (2026-09-25)
 
 
