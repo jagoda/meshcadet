@@ -104,9 +104,9 @@ combination. Confirmed by grepping the full merged appendix
 ## MeshCore / RadioLib — attribution, not a licensing conflict
 
 `protocol/` is a byte-exact Rust reimplementation of the MeshCore v1.15.0 wire format
-(framing, crypto, codec — see `protocol/src/lib.rs`'s module-level doc), prefix-compatible
-with v1.16/v1.17 (the current protocol target, v1.17.1 verified wire-unchanged from
-v1.16.0 — see `docs/adr/0001-charter.md` §1), and
+(framing, crypto, codec — see `protocol/src/lib.rs`'s module-level doc), wire-compatible
+through v1.18.0 (the current protocol target, released 2026-10-15; its on-air framing,
+constants and codecs are byte-identical to v1.17.1 — see `docs/adr/0001-charter.md` §1), and
 `firmware/src/radio.rs` cites specific RadioLib source behavior (register values, timing
 constants) it mirrors for SX1262 bring-up (see `firmware/src/radio.rs:38-39`). Both
 upstream projects — **MeshCore** (github.com/meshcore-dev/MeshCore) and **RadioLib**
