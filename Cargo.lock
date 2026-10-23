@@ -3531,6 +3531,8 @@ dependencies = [
  "hmac",
  "rand 0.8.6",
  "rand_core 0.6.4",
+ "serde",
+ "serde_json",
  "sha2",
  "x25519-dalek",
 ]
@@ -5554,6 +5556,7 @@ dependencies = [
  "hex",
  "protocol",
  "regex",
+ "serde_json",
 ]
 
 [[package]]

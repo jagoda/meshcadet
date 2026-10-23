@@ -1,0 +1,544 @@
+{
+  "generated_by": "cargo run -p xtask --bin xtask -- regen-wire-vectors --upstream <upstream-checkout> --tag companion-v1.18.0",
+  "inventory": {
+    "constants": {
+      "CIPHER_BLOCK_SIZE": 16,
+      "CIPHER_KEY_SIZE": 16,
+      "CIPHER_MAC_SIZE": 2,
+      "MAX_ADVERT_DATA_SIZE": 32,
+      "MAX_PACKET_PAYLOAD": 184,
+      "MAX_PATH_SIZE": 64,
+      "PATH_HASH_SIZE": 1,
+      "PUB_KEY_SIZE": 32,
+      "SIGNATURE_SIZE": 64
+    },
+    "payload_types": [
+      {
+        "name": "PAYLOAD_TYPE_REQ",
+        "value": 0
+      },
+      {
+        "name": "PAYLOAD_TYPE_RESPONSE",
+        "value": 1
+      },
+      {
+        "name": "PAYLOAD_TYPE_TXT_MSG",
+        "value": 2
+      },
+      {
+        "name": "PAYLOAD_TYPE_ACK",
+        "value": 3
+      },
+      {
+        "name": "PAYLOAD_TYPE_ADVERT",
+        "value": 4
+      },
+      {
+        "name": "PAYLOAD_TYPE_GRP_TXT",
+        "value": 5
+      },
+      {
+        "name": "PAYLOAD_TYPE_GRP_DATA",
+        "value": 6
+      },
+      {
+        "name": "PAYLOAD_TYPE_ANON_REQ",
+        "value": 7
+      },
+      {
+        "name": "PAYLOAD_TYPE_PATH",
+        "value": 8
+      },
+      {
+        "name": "PAYLOAD_TYPE_TRACE",
+        "value": 9
+      },
+      {
+        "name": "PAYLOAD_TYPE_MULTIPART",
+        "value": 10
+      },
+      {
+        "name": "PAYLOAD_TYPE_CONTROL",
+        "value": 11
+      },
+      {
+        "name": "PAYLOAD_TYPE_RAW_CUSTOM",
+        "value": 15
+      }
+    ],
+    "route_types": [
+      {
+        "name": "ROUTE_TYPE_TRANSPORT_FLOOD",
+        "value": 0
+      },
+      {
+        "name": "ROUTE_TYPE_FLOOD",
+        "value": 1
+      },
+      {
+        "name": "ROUTE_TYPE_DIRECT",
+        "value": 2
+      },
+      {
+        "name": "ROUTE_TYPE_TRANSPORT_DIRECT",
+        "value": 3
+      }
+    ]
+  },
+  "schema": 1,
+  "upstream_commit": "81dbae592ffad40b4212bc0b37e82b38da08f4bc",
+  "upstream_reference": "https://github.com/meshcore-dev/MeshCore",
+  "upstream_tag": "companion-v1.18.0",
+  "vectors": [
+    {
+      "derivation": "Mesh.cpp createAdvert builds [pubkey(32)][timestamp_le(4)][signature(64)][appdata(1..32)] with appdata = flags(0x81) || name; sendFlood sets header 0x11 (ADVERT|FLOOD) and path_len 0x00 (one-byte hash, zero hops). MeshCadet's build_self_advert_card emits the identical card.",
+      "direction": "encode",
+      "frame": {
+        "frame_hex": "11008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c040302010347c27580f4c231cc6d8185c4af41aadc5c19ef5bd8194aade123f7a90c9260aee5631ef6792d32e6daf711df44379bfa7a5984b0e771e3ef426cdcd2b94b0e814361646574",
+        "header": 17,
+        "path_hex": "",
+        "path_len": 0,
+        "payload_hex": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c040302010347c27580f4c231cc6d8185c4af41aadc5c19ef5bd8194aade123f7a90c9260aee5631ef6792d32e6daf711df44379bfa7a5984b0e771e3ef426cdcd2b94b0e814361646574"
+      },
+      "id": "advert_v118",
+      "inputs": {
+        "identity_seed_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+        "name": "Cadet",
+        "timestamp": 16909060
+      },
+      "kind": "advert",
+      "provenance": [
+        {
+          "file": "src/Mesh.cpp",
+          "line": 404,
+          "note": "payload layout: pubkey || timestamp_le || signature || appdata",
+          "snippet": "Packet* Mesh::createAdvert(const LocalIdentity& id"
+        },
+        {
+          "file": "src/Mesh.cpp",
+          "line": 413,
+          "note": "header carries ADVERT; sendFlood later ORs in ROUTE_TYPE_FLOOD",
+          "snippet": "packet->header = (PAYLOAD_TYPE_ADVERT << PH_TYPE_SHIFT);"
+        },
+        {
+          "file": "src/Mesh.cpp",
+          "line": 434,
+          "note": "Ed25519 signs pubkey || timestamp_le || appdata (header/path_len excluded)",
+          "snippet": "id.sign(signature, message, msg_len);"
+        },
+        {
+          "file": "src/Mesh.cpp",
+          "line": 637,
+          "note": "default path_hash_size = 1, zero hops -> path_len 0x00",
+          "snippet": "void Mesh::sendFlood(Packet* packet, uint32_t delay_millis, uint8_t path_hash_size)"
+        },
+        {
+          "file": "src/Mesh.cpp",
+          "line": 649,
+          "note": "path_len = ((1 - 1) << 6) | 0 = 0x00",
+          "snippet": "packet->setPathHashSizeAndCount(path_hash_size, 0);"
+        }
+      ],
+      "upstream": {
+        "commit": "81dbae592ffad40b4212bc0b37e82b38da08f4bc",
+        "tag": "companion-v1.18.0"
+      }
+    },
+    {
+      "derivation": "BaseChatMesh::sendMessage greets the recipient with temp = timestamp_le || TXT_TYPE_PLAIN(0) || text; Mesh::createDatagram prepends dest/src 1-byte hashes and encrypt-then-MACs the plaintext with the ECDH shared secret; sendFlood emits header 0x09 and path_len 0x00.",
+      "direction": "encode",
+      "frame": {
+        "frame_hex": "090021d0c4e662d0449514d638ce2f2d51147b2f3fc0762e0a97439de27a35b02e1c707183ea",
+        "header": 9,
+        "path_hex": "",
+        "path_len": 0,
+        "payload_hex": "21d0c4e662d0449514d638ce2f2d51147b2f3fc0762e0a97439de27a35b02e1c707183ea"
+      },
+      "id": "dm_txt_v118",
+      "inputs": {
+        "attempt": 0,
+        "recipient_seed_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+        "sender_seed_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+        "text": "hi from meshcadet",
+        "timestamp": 169552957,
+        "txt_type": 0
+      },
+      "kind": "dm_txt",
+      "provenance": [
+        {
+          "file": "src/helpers/BaseChatMesh.cpp",
+          "line": 473,
+          "note": "plaintext = timestamp_le(4) || txt_type_attempt(1) || text",
+          "snippet": "BaseChatMesh::sendMessage(const ContactInfo& recipient"
+        },
+        {
+          "file": "src/Mesh.cpp",
+          "line": 488,
+          "note": "payload = dest_hash || src_hash || encryptThenMAC(plaintext); the                        encrypt-then-MAC call is inside this function",
+          "snippet": "Packet* Mesh::createDatagram(uint8_t type"
+        },
+        {
+          "file": "src/Mesh.cpp",
+          "line": 637,
+          "note": "header (TXT_MSG<<2)|FLOOD = 0x09, path_len 0x00",
+          "snippet": "void Mesh::sendFlood(Packet* packet, uint32_t delay_millis, uint8_t path_hash_size)"
+        }
+      ],
+      "upstream": {
+        "commit": "81dbae592ffad40b4212bc0b37e82b38da08f4bc",
+        "tag": "companion-v1.18.0"
+      }
+    },
+    {
+      "compatibility_note": "This 4-byte ACK is byte-identical to upstream's ACK payload bytes 0..4. MeshCadet does not emit upstream's optional 2 trailing perturbation bytes; every stock receiver gates on payload_len >= 4 and copies exactly the first 4, so the 4-byte form is permanently compatible (see protocol/src/codec.rs::compute_ack_hash).",
+      "derivation": "The 4-byte ACK prefix is SHA256(sender plaintext || sender pubkey)[0..4] (BaseChatMesh.cpp:245). v1.16+ appends two perturbation bytes that no receiver reads (Mesh.cpp gates on payload_len >= 4 and memcpy's exactly 4), and MeshCadet deliberately emits the compatible 4-byte form; this vector pins those 4 bytes.",
+      "direction": "encode",
+      "frame": {
+        "frame_hex": "0d00dd70594d",
+        "header": 13,
+        "path_hex": "",
+        "path_len": 0,
+        "payload_hex": "dd70594d"
+      },
+      "id": "ack_v118",
+      "inputs": {
+        "attempt": 0,
+        "recipient_seed_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+        "sender_seed_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+        "text": "hi from meshcadet",
+        "timestamp": 169552957,
+        "txt_type": 0
+      },
+      "kind": "ack",
+      "provenance": [
+        {
+          "file": "src/helpers/BaseChatMesh.cpp",
+          "line": 245,
+          "note": "ACK = SHA256(timestamp || type_attempt || text || sender_pubkey)[0..4]",
+          "snippet": "mesh::Utils::sha256(ack_hash, 4, data, 5 + text_len, from.id.pub_key, PUB_KEY_SIZE);"
+        },
+        {
+          "file": "src/Mesh.cpp",
+          "line": 560,
+          "note": "ACK payload is the raw ack bytes; sendFlood -> header 0x0D",
+          "snippet": "Packet* Mesh::createAck(const uint8_t* ack, uint8_t len)"
+        }
+      ],
+      "upstream": {
+        "commit": "81dbae592ffad40b4212bc0b37e82b38da08f4bc",
+        "tag": "companion-v1.18.0"
+      }
+    },
+    {
+      "derivation": "BaseChatMesh::sendGroupMessage builds [timestamp_le][TXT_TYPE_PLAIN][\"<sender>: <text>\"]; Mesh::createGroupDatagram prefixes SHA256(channel_secret)[0] and encrypt-then-MACs with the channel secret; sendFlood emits header 0x15 and path_len 0x00.",
+      "direction": "encode",
+      "frame": {
+        "frame_hex": "15000c31834216033e36220b70c07c26d76dd8e6572908775bbd809069af463f07282e295e",
+        "header": 21,
+        "path_hex": "",
+        "path_len": 0,
+        "payload_hex": "0c31834216033e36220b70c07c26d76dd8e6572908775bbd809069af463f07282e295e"
+      },
+      "id": "grp_txt_v118",
+      "inputs": {
+        "channel_secret_hex": "6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d",
+        "sender_name": "Cadet",
+        "text": "hello mesh",
+        "timestamp": 3405691582
+      },
+      "kind": "grp_txt",
+      "provenance": [
+        {
+          "file": "src/helpers/BaseChatMesh.cpp",
+          "line": 518,
+          "note": "plaintext = timestamp_le || TXT_TYPE_PLAIN || \"<name>: <text>\"",
+          "snippet": "bool BaseChatMesh::sendGroupMessage(uint32_t timestamp, mesh::GroupChannel& channel"
+        },
+        {
+          "file": "src/helpers/BaseChatMesh.cpp",
+          "line": 523,
+          "note": "sender-name prefix is exactly \"<name>: \"",
+          "snippet": "sprintf((char *) &temp[5], \"%s: \", sender_name);"
+        },
+        {
+          "file": "src/helpers/BaseChatMesh.cpp",
+          "line": 531,
+          "note": "GRP_TXT frame carries the composed text",
+          "snippet": "auto pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, channel, temp, 5 + prefix_len + text_len);"
+        },
+        {
+          "file": "src/Mesh.cpp",
+          "line": 540,
+          "note": "payload = channel_hash(1) || encryptThenMAC(plaintext)",
+          "snippet": "Packet* Mesh::createGroupDatagram(uint8_t type, const GroupChannel& channel"
+        },
+        {
+          "file": "src/Mesh.cpp",
+          "line": 552,
+          "note": "channel hash is the first byte of SHA256(channel secret)",
+          "snippet": "memcpy(&packet->payload[len], channel.hash, PATH_HASH_SIZE);"
+        },
+        {
+          "file": "src/helpers/BaseChatMesh.cpp",
+          "line": 941,
+          "note": "256-bit channel hash = SHA256(32-byte secret)[0]",
+          "snippet": "mesh::Utils::sha256(channels[idx].channel.hash, sizeof(channels[idx].channel.hash), src.channel.secret, 32);"
+        }
+      ],
+      "upstream": {
+        "commit": "81dbae592ffad40b4212bc0b37e82b38da08f4bc",
+        "tag": "companion-v1.18.0"
+      }
+    },
+    {
+      "derivation": "BaseChatMesh::sendLogin's ADV_TYPE_ROOM arm sends [timestamp_le][sync_since_le][password] with tlen = 8 + password length (upstream never appends an explicit NUL; the AES zero-padded final block reads as one). Mesh::createAnonDatagram prefixes the server's 1-byte hash and the client's full 32-byte pubkey, then encrypt-then-MACs. sendFlood emits header 0x1D. A 10-byte password is used so upstream's 18-byte plaintext and MeshCadet's explicit-NUL 19-byte plaintext share the same AES block count and therefore identical ciphertext.",
+      "direction": "encode",
+      "frame": {
+        "frame_hex": "1d0048884b8857f4eaa1613c61504db34d4beaf346517a0e31de3cddd4d9b4201d9d0ba79a6202198da61c52f77959fa03fedfdbcd62481b65e7a87881a48107c82b56fc00",
+        "header": 29,
+        "path_hex": "",
+        "path_len": 0,
+        "payload_hex": "48884b8857f4eaa1613c61504db34d4beaf346517a0e31de3cddd4d9b4201d9d0ba79a6202198da61c52f77959fa03fedfdbcd62481b65e7a87881a48107c82b56fc00"
+      },
+      "id": "room_login_req_v118",
+      "inputs": {
+        "client_seed_hex": "2121212121212121212121212121212121212121212121212121212121212121",
+        "password": "opensesame",
+        "server_seed_hex": "3131313131313131313131313131313131313131313131313131313131313131",
+        "sync_since": 0,
+        "timestamp": 270544960
+      },
+      "kind": "room_login_req",
+      "provenance": [
+        {
+          "file": "src/helpers/BaseChatMesh.cpp",
+          "line": 603,
+          "note": "login request builder",
+          "snippet": "int BaseChatMesh::sendLogin(const ContactInfo& recipient"
+        },
+        {
+          "file": "src/helpers/BaseChatMesh.cpp",
+          "line": 614,
+          "note": "room plaintext = timestamp_le || sync_since_le || password (no explicit NUL; AES zero padding supplies it)",
+          "snippet": "tlen = 8 + len;"
+        },
+        {
+          "file": "src/helpers/BaseChatMesh.cpp",
+          "line": 621,
+          "note": "ANON_REQ envelope",
+          "snippet": "pkt = createAnonDatagram(PAYLOAD_TYPE_ANON_REQ, self_id, recipient.id"
+        },
+        {
+          "file": "src/Mesh.cpp",
+          "line": 512,
+          "note": "payload = dest_hash(1) || sender_pubkey(32) || encryptThenMAC(plaintext)",
+          "snippet": "Packet* Mesh::createAnonDatagram(uint8_t type, const LocalIdentity& sender"
+        }
+      ],
+      "upstream": {
+        "commit": "81dbae592ffad40b4212bc0b37e82b38da08f4bc",
+        "tag": "companion-v1.18.0"
+      }
+    },
+    {
+      "derivation": "simple_room_server replies to a direct login with a 13-byte RESPONSE plaintext [server_ts_le][code=0][legacy keepalive=0][role_code][permissions][random(4)][FIRMWARE_VER_LEVEL=1], wrapped by Mesh::createDatagram in [client_hash][server_hash][MAC][ciphertext]. The random 4 bytes are fixed here; upstream fills them from RNG. Header 0x06 (RESPONSE|DIRECT) is the direct leg.",
+      "direction": "decode",
+      "frame": {
+        "frame_hex": "06008848d85e5e00ce440d81d9db30faebb5854a50eb",
+        "header": 6,
+        "path_hex": "",
+        "path_len": 0,
+        "payload_hex": "8848d85e5e00ce440d81d9db30faebb5854a50eb"
+      },
+      "id": "room_login_resp_v118",
+      "inputs": {
+        "client_seed_hex": "2121212121212121212121212121212121212121212121212121212121212121",
+        "code": 0,
+        "firmware_ver_level": 1,
+        "legacy_keepalive": 0,
+        "permissions": 3,
+        "random_hex": "a1b2c3d4",
+        "role_code": 1,
+        "server_seed_hex": "3131313131313131313131313131313131313131313131313131313131313131",
+        "server_ts": 287454020
+      },
+      "kind": "room_login_resp",
+      "provenance": [
+        {
+          "file": "examples/simple_room_server/MyMesh.cpp",
+          "line": 383,
+          "note": "response plaintext starts with the server clock",
+          "snippet": "memcpy(reply_data, &now, 4);"
+        },
+        {
+          "file": "examples/simple_room_server/MyMesh.cpp",
+          "line": 385,
+          "note": "code byte = 0",
+          "snippet": "reply_data[4] = RESP_SERVER_LOGIN_OK;"
+        },
+        {
+          "file": "examples/simple_room_server/MyMesh.cpp",
+          "line": 387,
+          "note": "legacy role byte",
+          "snippet": "reply_data[6] = (client->isAdmin() ? 1 : (client->permissions == 0 ? 2 : 0));"
+        },
+        {
+          "file": "examples/simple_room_server/MyMesh.cpp",
+          "line": 389,
+          "note": "ACL permissions byte",
+          "snippet": "reply_data[7] = client->permissions;"
+        },
+        {
+          "file": "examples/simple_room_server/MyMesh.cpp",
+          "line": 390,
+          "note": "4 random bytes (fixed here for reproducibility)",
+          "snippet": "getRNG()->random(&reply_data[8], 4);"
+        },
+        {
+          "file": "examples/simple_room_server/MyMesh.cpp",
+          "line": 391,
+          "note": "firmware version level byte",
+          "snippet": "reply_data[12] = FIRMWARE_VER_LEVEL;"
+        },
+        {
+          "file": "examples/simple_room_server/MyMesh.cpp",
+          "line": 13,
+          "note": "simple_room_server advertises level 1",
+          "snippet": "#define FIRMWARE_VER_LEVEL       1"
+        },
+        {
+          "file": "examples/simple_room_server/MyMesh.cpp",
+          "line": 401,
+          "note": "direct-leg RESPONSE datagram (flood logins get a PATH return instead)",
+          "snippet": "mesh::Packet *reply = createDatagram(PAYLOAD_TYPE_RESPONSE, sender, client->shared_secret, reply_data, 13);"
+        }
+      ],
+      "upstream": {
+        "commit": "81dbae592ffad40b4212bc0b37e82b38da08f4bc",
+        "tag": "companion-v1.18.0"
+      }
+    },
+    {
+      "derivation": "BaseChatMesh::sendRequest(req_type) builds [tag_le(4)][req_type(1)][reserved 0(4)][random(4)] and wraps it as a REQ datagram. The random 4 bytes are fixed here. Header 0x01 (REQ|FLOOD), path_len 0x00.",
+      "direction": "decode",
+      "frame": {
+        "frame_hex": "010020c064308f85ab513a5950e45fd1d3c05606a70b",
+        "header": 1,
+        "path_hex": "",
+        "path_len": 0,
+        "payload_hex": "20c064308f85ab513a5950e45fd1d3c05606a70b"
+      },
+      "id": "telemetry_req_v118",
+      "inputs": {
+        "random_hex": "a1a2a3a4",
+        "req_type": 3,
+        "requester_seed_hex": "5151515151515151515151515151515151515151515151515151515151515151",
+        "reserved_hex": "00000000",
+        "responder_seed_hex": "5252525252525252525252525252525252525252525252525252525252525252",
+        "tag": 168496141
+      },
+      "kind": "telemetry_req",
+      "provenance": [
+        {
+          "file": "src/helpers/BaseChatMesh.cpp",
+          "line": 690,
+          "note": "telemetry request builder",
+          "snippet": "int  BaseChatMesh::sendRequest(const ContactInfo& recipient, uint8_t req_type"
+        },
+        {
+          "file": "src/helpers/BaseChatMesh.cpp",
+          "line": 696,
+          "note": "request type byte follows the 4-byte tag",
+          "snippet": "temp[4] = req_type;"
+        },
+        {
+          "file": "src/helpers/BaseChatMesh.cpp",
+          "line": 698,
+          "note": "4 random bytes after the 4 reserved bytes (fixed here for reproducibility)",
+          "snippet": "getRNG()->random(&temp[9], 4);"
+        },
+        {
+          "file": "examples/companion_radio/MyMesh.cpp",
+          "line": 1685,
+          "note": "companion apps issue REQ_TYPE_GET_TELEMETRY_DATA (0x03)",
+          "snippet": "int result = sendRequest(*recipient, REQ_TYPE_GET_TELEMETRY_DATA, tag, est_timeout);"
+        },
+        {
+          "file": "examples/companion_radio/MyMesh.cpp",
+          "line": 641,
+          "note": "responder reads req_type as the first byte after the tag",
+          "snippet": "if (data[0] == REQ_TYPE_GET_TELEMETRY_DATA) {"
+        }
+      ],
+      "upstream": {
+        "commit": "81dbae592ffad40b4212bc0b37e82b38da08f4bc",
+        "tag": "companion-v1.18.0"
+      }
+    },
+    {
+      "derivation": "A sensor node answering a telemetry REQ reflects the 4-byte tag then appends Cayenne-LPP entries; a GPS fix is channel 1, type 136, 24-bit big-endian lat/lon (degrees x1e4, truncated) and altitude (metres x1e2). MeshCadet does not track altitude, so this vector uses 0. Header 0x06 (RESPONSE|DIRECT), path_len 0x00.",
+      "direction": "decode",
+      "expect": {
+        "battery": null,
+        "gps_e4": [
+          37774,
+          -122419
+        ],
+        "tag": 168496141
+      },
+      "frame": {
+        "frame_hex": "0600c02038b42ba44501482adf75e8a0d5a5f26e96c1",
+        "header": 6,
+        "path_hex": "",
+        "path_len": 0,
+        "payload_hex": "c02038b42ba44501482adf75e8a0d5a5f26e96c1"
+      },
+      "id": "telemetry_resp_gps_v118",
+      "inputs": {
+        "altitude_m": 0,
+        "lat_e7": 37774900,
+        "lon_e7": -122419400,
+        "requester_seed_hex": "5151515151515151515151515151515151515151515151515151515151515151",
+        "responder_seed_hex": "5252525252525252525252525252525252525252525252525252525252525252",
+        "tag": 168496141
+      },
+      "kind": "telemetry_resp_gps",
+      "provenance": [
+        {
+          "file": "examples/companion_radio/MyMesh.cpp",
+          "line": 677,
+          "note": "response reflects the request tag as its first 4 bytes",
+          "snippet": "memcpy(reply, &sender_timestamp,"
+        },
+        {
+          "file": "examples/companion_radio/MyMesh.cpp",
+          "line": 680,
+          "note": "Cayenne-LPP entries are appended after the tag",
+          "snippet": "uint8_t tlen = telemetry.getSize();"
+        },
+        {
+          "file": "src/helpers/sensors/EnvironmentSensorManager.cpp",
+          "line": 688,
+          "note": "GPS telemetry is one LPP_GPS entry on channel 1",
+          "snippet": "telemetry.addGPS(TELEM_CHANNEL_SELF, node_lat, node_lon, node_altitude);"
+        },
+        {
+          "file": "src/helpers/sensors/LPPDataHelpers.h",
+          "line": 29,
+          "note": "LPP_GPS type byte",
+          "snippet": "#define LPP_GPS 136"
+        },
+        {
+          "file": "src/helpers/sensors/LPPDataHelpers.h",
+          "line": 266,
+          "note": "channel, type, then 24-bit big-endian lat/lon/alt (x1e4, x1e4, x1e2)",
+          "snippet": "bool writeGPS(uint8_t channel, float lat, float lon, float alt) {"
+        }
+      ],
+      "upstream": {
+        "commit": "81dbae592ffad40b4212bc0b37e82b38da08f4bc",
+        "tag": "companion-v1.18.0"
+      }
+    }
+  ]
+}

@@ -24,3 +24,5 @@ regex = "1"
 protocol.workspace = true
 # Hex encode/decode for golden-vector JSON fields (pubkeys, secrets, frame bytes).
 hex = "0.4"
+# Wire-vector fixture serialisation (upstream conformance generator, issue #214).
+serde_json = "1"
