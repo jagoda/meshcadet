@@ -94,7 +94,7 @@ use esp_idf_hal::{
 // see `send_ui_event` and the dispatcher-loop command-drain site below.
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use protocol::{
-    Header, PayloadType, RouteType, PathLen,
+    PayloadType, PathLen,
     encode_dm_payload, decode_dm_payload, encode_txt_msg_plaintext,
     compute_ack_hash, decode_grp_txt_var, channel_hash_var,
     decode_path_return, PathExtra,
@@ -194,6 +194,13 @@ mod runtime_settings_store;
 // above (HIL never provisions a lock PIN and never touches NVS for it).
 #[cfg(not(feature = "hil"))]
 mod lock_store;
+// MeshCore region-name store (NVS-backed, `mc_region` namespace) — production
+// builds only, same HIL exemption as `lock_store`/`identity_store` above (the
+// HIL rig never provisions a region, so it stays unscoped: plain
+// `ROUTE_TYPE_FLOOD`, byte-for-byte today's emission). See
+// `region_store.rs`'s module doc and ADR-0015.
+#[cfg(not(feature = "hil"))]
+mod region_store;
 // History store and admin USB-serial server — production builds only.
 // HIL rigs have no display, no NVS history, and no admin laptop.
 #[cfg(not(feature = "hil"))]
@@ -252,6 +259,7 @@ static ROOM_CLOCK_SOURCE: std::sync::Mutex<room_session::ClockSource> =
     std::sync::Mutex::new(room_session::ClockSource::None);
 
 use battery::BatteryDriver;
+use firmware_core::region_scope::RegionScope;
 use firmware_core::ui::battery_indicator::level_to_indicator_level;
 use dispatcher::{
     AirtimeBudget, DuplicateFilter, OutstandingKind, OutstandingSend,
@@ -986,6 +994,47 @@ fn run() -> anyhow::Result<()> {
     // persist back to flash.
     #[cfg(not(feature = "hil"))]
     let mut provisioned_config = config_store::ProvisionedConfig::empty();
+
+    // MeshCore region scope (ADR-0015 D1/D3/D4) — derived EXACTLY ONCE per
+    // boot, here, and then held by the dispatcher loop for its whole lifetime.
+    //
+    // Once-per-boot is a correctness requirement, not an optimisation: a
+    // flood frame's transport code (`code0`) is keyed on its payload and must
+    // stay byte-identical across every retry (`dispatcher::OutstandingSend`
+    // re-enqueues the originally-built bytes), so there is precisely one
+    // derivation point and no per-send or per-retry one anywhere. That also
+    // fixes the on-air application point of `SET_REGION`: the store persists
+    // immediately (either USB server), the radio applies it at the next boot
+    // — the same boot-snapshot posture as every other provisioned setting.
+    //
+    // The three outcomes are deliberately kept distinct (`RegionScope`), never
+    // collapsed into an `Option`: no region means "emit today's plain
+    // `ROUTE_TYPE_FLOOD` byte-for-byte" (D6), while a region that cannot be
+    // keyed must emit NOTHING (D4) — silently unscoping instead is the exact
+    // defect this feature exists to prevent, so it is not representable.
+    #[cfg(not(feature = "hil"))]
+    let region_scope = region_store::load_scope(nvs_partition.clone());
+    #[cfg(feature = "hil")]
+    let region_scope = RegionScope::unscoped();
+    // One boot-time log line stating which regime this device is in. The
+    // per-send fail-closed gate (`region_emission`, further down) logs the
+    // suppressed frame's own name too, so an operator seeing unexplained
+    // silence has both ends of the story.
+    match region_scope.emission() {
+        Ok(None) => log::info!(
+            "region: none provisioned — flood frames are unscoped (plain ROUTE_TYPE_FLOOD)"
+        ),
+        Ok(Some(_)) => log::info!(
+            "region: configured — flood frames are region-scoped (ROUTE_TYPE_TRANSPORT_FLOOD) \
+             from this boot"
+        ),
+        Err(e) => log::error!(
+            "region: FAIL CLOSED — a region is configured but no transport key can be derived \
+             ({:?}); ALL flood emission (DMs, channel, telemetry, ACKs, room login/post) is \
+             suppressed until it is fixed or cleared via `meshcadet set-region`, then reboot",
+            e,
+        ),
+    }
 
     // Room contacts' runtime state (login/session tracking) — see
     // `RoomRuntime`'s doc for why this is a separate, main-thread-owned
@@ -1968,6 +2017,14 @@ fn run() -> anyhow::Result<()> {
             let boot_ts =
                 room_session::room_tx_timestamp(boot_wall_clock_secs, room.session.last_room_ts);
             let shared = identity.ecdh_shared_secret(&room.pubkey);
+            // FAIL CLOSED (ADR-0015 D4): no region login either. Emitting an
+            // unscoped ANON_REQ into a region-managed mesh is the silent
+            // wrong-scope send this feature forbids, so a configured but
+            // unkeyable region suppresses the login entirely; the reflood path
+            // below is gated on the same call and logs the same way.
+            let Some(scope) = region_emission(&region_scope, "room login") else {
+                continue;
+            };
             let mut frame = [0u8; room_session::MAX_LOGIN_FRAME_LEN];
             let n = room_session::encode_room_login_frame(
                 &shared,
@@ -1976,6 +2033,7 @@ fn run() -> anyhow::Result<()> {
                 boot_ts,
                 room.session.sync_since,
                 &room.guest_password[..room.guest_password_len as usize],
+                scope,
                 &mut frame,
             );
             log_tx_queue_eviction(
@@ -2095,6 +2153,12 @@ fn run() -> anyhow::Result<()> {
                     "retrying unacked send with no ACK yet ({:?}, ack {}, attempt {})",
                     send.kind, hex4(&send.ack_hash), send.attempts + 1,
                 );
+                // Re-enqueue the ORIGINAL bytes verbatim (ADR-0015 D3): a
+                // region-scoped frame's `code0` is keyed on its payload, so a
+                // re-encode here would have to derive the same code again —
+                // replaying `send.frame` instead makes "byte-identical across
+                // retries" structural rather than a promise, and no transport
+                // code is ever computed on this path.
                 if let Some(dropped) = txq.enqueue(&send.frame[..send.frame_len], Some(send.ack_hash)) {
                     retry_evictions.push(dropped);
                 }
@@ -2416,6 +2480,12 @@ fn run() -> anyhow::Result<()> {
                 let ts =
                     room_session::room_tx_timestamp(room_wall_clock_secs, room.session.last_room_ts);
                 let shared = identity.ecdh_shared_secret(&room.pubkey);
+                // Same fail-closed gate as the boot login above; the reflood
+                // cadence still advances (below) so this does not hot-loop.
+                let Some(scope) = region_emission(&region_scope, "room re-flood login") else {
+                    room.last_reflood_ms = now;
+                    continue;
+                };
                 let mut frame = [0u8; room_session::MAX_LOGIN_FRAME_LEN];
                 let n = room_session::encode_room_login_frame(
                     &shared,
@@ -2424,6 +2494,7 @@ fn run() -> anyhow::Result<()> {
                     ts,
                     room.session.sync_since,
                     &room.guest_password[..room.guest_password_len as usize],
+                    scope,
                     &mut frame,
                 );
                 log_tx_queue_eviction(
@@ -2919,6 +2990,7 @@ fn run() -> anyhow::Result<()> {
                             &contact_display_names,
                             gps_verified_now,
                             &mut adopted_server_clock,
+                            &region_scope,
                         );
                         // Persist any DM ack flip to flash so it survives a
                         // power-cycle — before this fix, ACK matching
@@ -3175,10 +3247,32 @@ fn run() -> anyhow::Result<()> {
                                 to_hash,
                             ),
                             Some(contact_pubkey) => {
+                                // FAIL CLOSED (ADR-0015 D4): with a configured but
+                                // unkeyable region nothing is emitted. The optimistic
+                                // bubble `on_send_message` already pushed must not sit
+                                // pending forever, so resolve it as undelivered — the
+                                // ACK hash is a pure function of the plaintext, so the
+                                // builder is re-used here for its hash only and its
+                                // frame bytes are discarded unsent.
+                                let Some(scope) = region_emission(&region_scope, "UI DM") else {
+                                    if let Some((_, ack)) = build_ui_dm(
+                                        now, tx_epoch_base, &identity,
+                                        contact_pubkey, to_hash,
+                                        text.as_bytes(), None, &mut frame_buf,
+                                    ) {
+                                        send_ui_event(
+                                            &evt_tx, &mut evt_dropped,
+                                            ui::UiEvent::DmUndelivered {
+                                                to_hash, is_channel: false, ack_hash: ack,
+                                            },
+                                        );
+                                    }
+                                    continue;
+                                };
                                 match build_ui_dm(
                                     now, tx_epoch_base, &identity,
                                     contact_pubkey, to_hash,
-                                    text.as_bytes(), &mut frame_buf,
+                                    text.as_bytes(), scope, &mut frame_buf,
                                 ) {
                                     Some((n, ack)) => {
                                         log_tx_queue_eviction(
@@ -3265,9 +3359,17 @@ fn run() -> anyhow::Result<()> {
                             // prepend our node name as MeshCore expects ("<name>: <msg>")
                             // — without it the companion cannot attribute the body.
                             let sender_name = device_sender_name(&identity, nvs_partition.clone());
+                            // FAIL CLOSED (ADR-0015 D4): no channel frame either.
+                            // A GRP_TXT has no per-message ACK to resolve, so this
+                            // only logs + drops (nothing is appended to history,
+                            // matching the "never reaches the wire" rule below).
+                            let Some(scope) = region_emission(&region_scope, "UI channel message")
+                            else {
+                                continue;
+                            };
                             let n = build_ui_grp_txt(
                                 now, tx_epoch_base, channel_secret,
-                                sender_name.as_bytes(), text.as_bytes(), &mut frame_buf,
+                                sender_name.as_bytes(), text.as_bytes(), scope, &mut frame_buf,
                             );
                             log_tx_queue_eviction(
                                 txq.enqueue(&frame_buf[..n], None),
@@ -3365,6 +3467,25 @@ fn run() -> anyhow::Result<()> {
                                     );
                                     let shared = identity.ecdh_shared_secret(&room.pubkey);
                                     let last_room_ts = room.session.last_room_ts;
+                                    // FAIL CLOSED (ADR-0015 D4): a room post is a
+                                    // flood frame, so an unkeyable region suppresses it.
+                                    // Surface it to the UI exactly like the existing
+                                    // refusal path does (and like it, do NOT advance
+                                    // `last_room_ts` — nothing reached the wire).
+                                    let Some(scope) = region_emission(&region_scope, "room post")
+                                    else {
+                                        send_ui_event(
+                                            &evt_tx, &mut evt_dropped,
+                                            ui::UiEvent::RoomPostRefused {
+                                                room_hash,
+                                                reason: "this device's region is misconfigured, so \
+                                                         nothing is being transmitted — ask the operator \
+                                                         to re-provision or clear the region"
+                                                    .to_string(),
+                                            },
+                                        );
+                                        continue;
+                                    };
                                     match room_session::encode_room_post_checked(
                                         &shared,
                                         room.hash,
@@ -3373,6 +3494,7 @@ fn run() -> anyhow::Result<()> {
                                         last_room_ts,
                                         text.as_bytes(),
                                         &identity.pubkey,
+                                        scope,
                                         &mut frame_buf,
                                     ) {
                                         Ok((n, ack)) => {
@@ -3534,8 +3656,47 @@ fn run() -> anyhow::Result<()> {
 
 // ── Frame builders ────────────────────────────────────────────────────────────
 
+/// Fail-closed region-emission gate for one outbound flood frame (ADR-0015 D4).
+///
+/// Every flood send site calls this immediately before building its frame and
+/// hands the result to that builder as its `scope` argument:
+///
+/// - `Some(None)` — no region configured: build the plain unscoped
+///   `ROUTE_TYPE_FLOOD` frame, byte-for-byte the pre-region emission (D6).
+/// - `Some(Some(key))` — region configured: build the `ROUTE_TYPE_TRANSPORT_FLOOD`
+///   frame carrying `code0` derived from `key`.
+/// - `None` — a region IS configured but cannot be keyed: do NOT build or emit
+///   anything. This is the fail-closed state; the alternative (emitting the
+///   frame unscoped) is the silent wrong-scope defect the whole feature
+///   exists to prevent, and it is exactly why `RegionScope::emission` returns a
+///   `Result` instead of a bare `Option`.
+///
+/// The boot path (`run`'s `region_scope` local) already logged the underlying
+/// fault once in full; this logs per suppressed frame so the *symptom* ("my DM
+/// never went out") is traceable to its cause without reading boot history.
+/// Low rate by construction: only frames this device originates are affected.
+fn region_emission<'a>(
+    region_scope: &'a RegionScope,
+    what: &str,
+) -> Option<Option<&'a [u8; 16]>> {
+    match region_scope.emission() {
+        Ok(emission) => Some(emission),
+        Err(e) => {
+            log::error!(
+                "region: FAIL CLOSED — {} frame NOT emitted: configured region is unusable \
+                 ({:?}); no unscoped fallback (fix or clear it with `meshcadet set-region`) [ADR-0015 D4]",
+                what,
+                e,
+            );
+            None
+        }
+    }
+}
+
 /// Build a flooded DM frame for the TEST contact and the ACK hash we expect back.
-/// HIL only.
+/// HIL only — and deliberately always UNSCOPED (`None` scope below): the HIL rig
+/// has no region store and is a one-board bench setup, so it emits exactly the
+/// pre-region plain `ROUTE_TYPE_FLOOD` frame it always has (ADR-0015 D6).
 #[cfg(feature = "hil")]
 fn build_test_dm(
     now_ms: u64,
@@ -3552,10 +3713,7 @@ fn build_test_dm(
     let mut pt_buf = [0u8; 64];
     let pt_len = encode_txt_msg_plaintext(timestamp, 0, 0, text, &mut pt_buf);
 
-    let header   = Header::new(RouteType::Flood, PayloadType::TxtMsg);
     let path_len = PathLen::new(2, 0)?;
-    out[0] = header.0;
-    out[1] = path_len.0;
     let payload_off = 2;
 
     let dm_len = encode_dm_payload(
@@ -3566,18 +3724,31 @@ fn build_test_dm(
         &mut out[payload_off..],
     );
     let expected_ack = compute_ack_hash(timestamp, type_byte, text, &sender.pubkey);
-    Some((payload_off + dm_len, expected_ack))
+    // `None` scope: plain `ROUTE_TYPE_FLOOD`, no transport-code bytes.
+    let n = firmware_core::region_scope::assemble_flood_frame(
+        None,
+        out,
+        PayloadType::TxtMsg,
+        path_len,
+        dm_len,
+    );
+    Some((n, expected_ack))
 }
 
-/// Build an ACK frame: `[header(0x0D)] [path_len(0x40)] [ack_hash(4)]`.
+/// Build a flood ACK frame: `[header(0x0D)] [(codes)] [path_len(0x40)]
+/// [ack_hash(4)]`.
 /// The 4-byte hash is accepted by both v1.15 and v1.16 stock nodes (see
 /// `compute_ack_hash`'s doc comment in `protocol/src/codec.rs`).
-fn build_ack_frame(ack_hash: &[u8; 4], out: &mut [u8]) -> usize {
-    let header = Header::new(RouteType::Flood, PayloadType::Ack);
-    out[0] = header.0;
-    out[1] = PathLen::new(2, 0).map(|p| p.0).unwrap_or(0x40);
+///
+/// An ACK is a flood frame like any other for region purposes: `scope ==
+/// Some(key)` makes it `ROUTE_TYPE_TRANSPORT_FLOOD` with the four code bytes
+/// inserted before `path_len`, `None` leaves today's bytes untouched. The
+/// code is keyed on the 4-byte ACK hash payload — the same wire bytes either
+/// way — so a peer's RX path is unchanged.
+fn build_ack_frame(ack_hash: &[u8; 4], scope: Option<&[u8; 16]>, out: &mut [u8]) -> usize {
+    let path_len = PathLen::new(2, 0).expect("(hash_size 2, 0 hops) is always a valid path_len");
     out[2..6].copy_from_slice(ack_hash);
-    6
+    firmware_core::region_scope::assemble_flood_frame(scope, out, PayloadType::Ack, path_len, 4)
 }
 
 /// Map a resolved [`OutstandingSend`] to the `ui::UiEvent` that flips its
@@ -3682,6 +3853,11 @@ const MAX_UI_MSG_BYTES: usize = 120;
 ///   unknown contact.
 /// * `text`        — UTF-8 message body; truncated to [`MAX_UI_MSG_BYTES`] bytes
 ///   if longer (no mid-codepoint awareness needed at the wire level).
+/// * `scope`       — the boot-time region scope's transport key: `None` = the
+///   plain `ROUTE_TYPE_FLOOD` frame of today, `Some(key)` = the region-scoped
+///   `ROUTE_TYPE_TRANSPORT_FLOOD` frame (ADR-0015). Must come from
+///   [`region_emission`], never from a hand-rolled fallback: a configured but
+///   unusable region must not reach this function at all.
 ///
 /// Returns `(frame_len, expected_ack_hash)` or `None` if header encoding fails
 /// (only possible if `PathLen::new` returns `None`, which never happens with the
@@ -3693,6 +3869,7 @@ fn build_ui_dm(
     dest_pubkey: &[u8; 32],
     dest_hash: u8,
     text: &[u8],
+    scope: Option<&[u8; 16]>,
     out: &mut [u8; 255],
 ) -> Option<(usize, [u8; 4])> {
     let timestamp = tx_epoch_base.wrapping_add((now_ms / 1000) as u32);
@@ -3706,10 +3883,7 @@ fn build_ui_dm(
     let mut pt_buf = [0u8; 128];
     let pt_len = encode_txt_msg_plaintext(timestamp, 0, 0, text, &mut pt_buf);
 
-    let header   = Header::new(RouteType::Flood, PayloadType::TxtMsg);
     let path_len = PathLen::new(2, 0)?;
-    out[0] = header.0;
-    out[1] = path_len.0;
     let payload_off = 2;
 
     let dm_len = encode_dm_payload(
@@ -3719,9 +3893,17 @@ fn build_ui_dm(
         &pt_buf[..pt_len],
         &mut out[payload_off..],
     );
-    // ACK hash invariant: keyed on the SENDER's own pubkey (v1.15 §7.1).
+    // ACK hash invariant: keyed on the SENDER's own pubkey (v1.15 §7.1) — and
+    // outer-framing independent, so scoping cannot change it.
     let expected_ack = compute_ack_hash(timestamp, type_byte, text, &sender.pubkey);
-    Some((payload_off + dm_len, expected_ack))
+    let n = firmware_core::region_scope::assemble_flood_frame(
+        scope,
+        out,
+        PayloadType::TxtMsg,
+        path_len,
+        dm_len,
+    );
+    Some((n, expected_ack))
 }
 
 /// The device's own channel-sender display name.
@@ -3771,12 +3953,18 @@ fn device_sender_name(identity: &Identity, _nvs_partition: EspDefaultNvsPartitio
 /// The on-air text is `"<sender_name>: <body>"` (MeshCore channel convention,
 /// `BaseChatMesh::sendGroupMessage`), and the body is truncated so the whole
 /// prefixed text fits in [`MAX_UI_MSG_BYTES`] bytes.
+///
+/// `scope` behaves exactly as in [`build_ui_dm`]: `None` = plain
+/// `ROUTE_TYPE_FLOOD`; `Some(key)` = `ROUTE_TYPE_TRANSPORT_FLOOD` with the four
+/// code bytes inserted after the header. Only the outer framing moves — the
+/// channel ciphertext is identical either way.
 fn build_ui_grp_txt(
     now_ms: u64,
     tx_epoch_base: u32,
     channel_secret: &[u8],
     sender_name: &[u8],
     text: &[u8],
+    scope: Option<&[u8; 16]>,
     out: &mut [u8; 255],
 ) -> usize {
     let timestamp = tx_epoch_base.wrapping_add((now_ms / 1000) as u32);
@@ -3785,11 +3973,15 @@ fn build_ui_grp_txt(
     let mut text_buf = [0u8; 160];
     let composed = protocol::format_channel_text(sender_name, text, &mut text_buf);
     let composed = composed.min(MAX_UI_MSG_BYTES);
-    let header = Header::new(RouteType::Flood, PayloadType::GrpTxt);
-    out[0] = header.0;
-    out[1] = PathLen::new(2, 0).map(|p| p.0).unwrap_or(0x40);
-    let n = protocol::encode_grp_txt_var(channel_secret, timestamp, 0, 0, &text_buf[..composed], &mut out[2..]);
-    2 + n
+    let payload_len = protocol::encode_grp_txt_var(channel_secret, timestamp, 0, 0, &text_buf[..composed], &mut out[2..]);
+    let path_len = PathLen::new(2, 0).expect("(hash_size 2, 0 hops) is always a valid path_len");
+    firmware_core::region_scope::assemble_flood_frame(
+        scope,
+        out,
+        PayloadType::GrpTxt,
+        path_len,
+        payload_len,
+    )
 }
 
 /// Build a telemetry reply DM addressed back to `dest_hash`.
@@ -3799,12 +3991,17 @@ fn build_ui_grp_txt(
 /// ECDH shared secret derived from `contact_pubkey`.
 ///
 /// Returns `(frame_len)` or `None` if encoding fails.
+///
+/// `scope`: `None` = plain `ROUTE_TYPE_FLOOD`, `Some(key)` = region-scoped
+/// `ROUTE_TYPE_TRANSPORT_FLOOD` (ADR-0015) — the transport-code bytes are the
+/// only difference; the DM envelope and its plaintext are unchanged.
 fn build_telemetry_reply(
     now_ms: u64,
     tx_epoch_base: u32,
     our_id: &Identity,
     contact_pubkey: &[u8; 32],
     gps_snapshot: Option<(i32, i32, u32)>, // (lat_e7, lon_e7, age_secs)
+    scope: Option<&[u8; 16]>,
 ) -> Option<([u8; 255], usize)> {
     let shared = our_id.ecdh_shared_secret(contact_pubkey);
     let reply_ts = tx_epoch_base.wrapping_add((now_ms / 1000) as u32);
@@ -3825,8 +4022,6 @@ fn build_telemetry_reply(
     // DM payload: dest_hash = contact's pub_hash, src_hash = our pub_hash
     let dest_hash = contact_pubkey[0];
     let mut frame = [0u8; 255];
-    frame[0] = Header::new(RouteType::Flood, PayloadType::TxtMsg).0;
-    frame[1] = PathLen::new(2, 0)?.0;
     let payload_off = 2;
 
     let dm_len = encode_dm_payload(
@@ -3836,7 +4031,15 @@ fn build_telemetry_reply(
         &pt_buf[..pt_len],
         &mut frame[payload_off..],
     );
-    Some((frame, payload_off + dm_len))
+    let path_len = PathLen::new(2, 0)?;
+    let n = firmware_core::region_scope::assemble_flood_frame(
+        scope,
+        &mut frame,
+        PayloadType::TxtMsg,
+        path_len,
+        dm_len,
+    );
+    Some((frame, n))
 }
 
 /// Build a MeshCore-native telemetry RESPONSE (`PAYLOAD_TYPE_RESPONSE`, 0x01)
@@ -3870,6 +4073,7 @@ fn build_telemetry_reply(
 /// `raw_mv`.
 ///
 /// Encrypted with the ECDH shared secret; dest = the contact, src = us.
+/// `scope` works exactly as in [`build_telemetry_reply`] (outer framing only).
 /// Returns `(frame, len)` or `None` if the path-length field cannot be encoded.
 fn build_telemetry_response(
     our_id: &Identity,
@@ -3877,6 +4081,7 @@ fn build_telemetry_response(
     tag: u32,
     gps: Option<(i32, i32)>, // (lat_e7, lon_e7)
     battery: battery::BatteryStatus,
+    scope: Option<&[u8; 16]>,
 ) -> Option<([u8; 255], usize)> {
     let shared = our_id.ecdh_shared_secret(contact_pubkey);
 
@@ -3893,8 +4098,6 @@ fn build_telemetry_response(
 
     let dest_hash = contact_pubkey[0];
     let mut frame = [0u8; 255];
-    frame[0] = Header::new(RouteType::Flood, PayloadType::Response).0;
-    frame[1] = PathLen::new(2, 0)?.0;
     let payload_off = 2;
 
     let dm_len = encode_dm_payload(
@@ -3904,7 +4107,15 @@ fn build_telemetry_response(
         &pt_buf[..pt_len],
         &mut frame[payload_off..],
     );
-    Some((frame, payload_off + dm_len))
+    let path_len = PathLen::new(2, 0)?;
+    let n = firmware_core::region_scope::assemble_flood_frame(
+        scope,
+        &mut frame,
+        PayloadType::Response,
+        path_len,
+        dm_len,
+    );
+    Some((frame, n))
 }
 
 // ── Receive handler ───────────────────────────────────────────────────────────
@@ -3922,6 +4133,11 @@ fn build_telemetry_response(
 /// `contact_display_names` is only consulted on the `not(hil)` room-push leg
 /// (there are no rooms under `hil`) — see `handle_ack`'s identical
 /// `#[cfg_attr]` for why the `hil` build still needs the blanket allow.
+///
+/// `region_scope` is this boot's region emission scope, threaded down to every
+/// *reply* this handler can emit (the telemetry reply DM, the DM ACK, the
+/// telemetry RESPONSE and the room-push ACK): receiving is never region-gated
+/// (ADR-0015 D1), only emission is.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(feature = "hil", allow(unused_variables))]
 fn on_receive(
@@ -3941,6 +4157,7 @@ fn on_receive(
     contact_display_names: &std::collections::HashMap<u8, String>,
     gps_verified: bool,
     adopted_server_clock: &mut Option<room_session::AdoptedServerClock>,
+    region_scope: &RegionScope,
 ) {
     // Frame header parsing (route-type branch for transport-coded frames,
     // `PathLen::is_valid()` early-reject) lives in `firmware_core::rx_frame`
@@ -4011,17 +4228,18 @@ fn on_receive(
                     now_ms,
                     gps_verified,
                     adopted_server_clock,
+                    region_scope,
                 ) {
                     return;
                 }
             }
             handle_dm(
                 payload, our_id, policy, txq, outstanding, gps_snapshot, now_ms, tx_epoch_base,
-                ui_events, nvs_partition.clone(),
+                ui_events, nvs_partition.clone(), region_scope,
             )
         }
         x if x == PayloadType::Req as u8 => {
-            handle_req(payload, our_id, policy, txq, outstanding, ui_events, gps_snapshot, battery_snapshot)
+            handle_req(payload, our_id, policy, txq, outstanding, ui_events, gps_snapshot, battery_snapshot, region_scope)
         }
         x if x == PayloadType::Ack as u8 => {
             handle_ack(payload, outstanding, room_runtime, ui_events, now_ms)
@@ -4178,6 +4396,7 @@ fn handle_dm(
     tx_epoch_base: u32,
     ui_events: &mut Vec<ui::UiEvent>,
     nvs_partition: EspDefaultNvsPartition,
+    region_scope: &RegionScope,
 ) {
     let raw_dest = payload.get(0).copied().unwrap_or(0);
     let raw_src  = payload.get(1).copied().unwrap_or(0);
@@ -4328,26 +4547,34 @@ fn handle_dm(
                     // Fall through to ACK the DM itself.
                 } else {
                     // Telemetry enabled: build and enqueue a location reply DM.
-                    match build_telemetry_reply(now_ms, tx_epoch_base, our_id, contact_pubkey, gps_snapshot) {
-                        Some((reply_frame, reply_len)) => {
-                            log_tx_queue_eviction(
-                                txq.enqueue(&reply_frame[..reply_len], None),
-                                "telemetry reply",
-                                outstanding,
-                                |ev| ui_events.push(ev),
-                            );
-                            match gps_snapshot {
-                                Some((_, _, age_secs)) => log::info!(
-                                    "TX telemetry reply to 0x{:02x}: location (age={}s)",
-                                    raw_src, age_secs,
-                                ),
-                                None => log::info!(
-                                    "TX telemetry reply to 0x{:02x}: loc:nofix (no GPS fix yet)",
-                                    raw_src,
-                                ),
+                    // FAIL CLOSED (ADR-0015 D4): the reply is a flood frame, so a
+                    // configured-but-unkeyable region suppresses it. The DM itself is
+                    // still received/logged/ACK-gated below exactly as before — only
+                    // our own emission is constrained.
+                    if let Some(scope) = region_emission(region_scope, "telemetry reply") {
+                        match build_telemetry_reply(
+                            now_ms, tx_epoch_base, our_id, contact_pubkey, gps_snapshot, scope,
+                        ) {
+                            Some((reply_frame, reply_len)) => {
+                                log_tx_queue_eviction(
+                                    txq.enqueue(&reply_frame[..reply_len], None),
+                                    "telemetry reply",
+                                    outstanding,
+                                    |ev| ui_events.push(ev),
+                                );
+                                match gps_snapshot {
+                                    Some((_, _, age_secs)) => log::info!(
+                                        "TX telemetry reply to 0x{:02x}: location (age={}s)",
+                                        raw_src, age_secs,
+                                    ),
+                                    None => log::info!(
+                                        "TX telemetry reply to 0x{:02x}: loc:nofix (no GPS fix yet)",
+                                        raw_src,
+                                    ),
+                                }
                             }
+                            None => log::warn!("telemetry reply: frame encoding failed"),
                         }
-                        None => log::warn!("telemetry reply: frame encoding failed"),
                     }
                 }
             }
@@ -4357,15 +4584,23 @@ fn handle_dm(
             // contact (telemetry or plain text). Keyed on originator's pubkey.
             // `ack` was already computed above (also the replay gate's content
             // fingerprint) — reused here rather than recomputed.
-            let mut ack_frame = [0u8; 8];
-            let n = build_ack_frame(&ack, &mut ack_frame);
-            log_tx_queue_eviction(
-                txq.enqueue(&ack_frame[..n], None),
-                "DM ACK",
-                outstanding,
-                |ev| ui_events.push(ev),
-            );
-            log::info!("TX ACK queued for 0x{:02x}: ack_hash={}", raw_src, hex4(&ack));
+            //
+            // FAIL CLOSED (ADR-0015 D4): an ACK is a flood frame, so it is
+            // suppressed too — a device that cannot key its region sends nothing
+            // at all rather than defaulting to a wildcard broadcast.
+            if let Some(scope) = region_emission(region_scope, "DM ACK") {
+                // 12, not 8: a scoped ACK is `header + 4 codes + path_len +
+                // ack_hash` = 10 bytes (8 unscoped).
+                let mut ack_frame = [0u8; 12];
+                let n = build_ack_frame(&ack, scope, &mut ack_frame);
+                log_tx_queue_eviction(
+                    txq.enqueue(&ack_frame[..n], None),
+                    "DM ACK",
+                    outstanding,
+                    |ev| ui_events.push(ev),
+                );
+                log::info!("TX ACK queued for 0x{:02x}: ack_hash={}", raw_src, hex4(&ack));
+            }
         }
         Err(protocol::CodecError::MacMismatch) => {
             rx_diag!(
@@ -4408,6 +4643,7 @@ fn handle_req(
     ui_events: &mut Vec<ui::UiEvent>,
     gps_snapshot: Option<(i32, i32, u32)>,
     battery_snapshot: battery::BatteryStatus,
+    region_scope: &RegionScope,
 ) {
     let raw_dest = payload.get(0).copied().unwrap_or(0);
     let raw_src  = payload.get(1).copied().unwrap_or(0);
@@ -4475,8 +4711,15 @@ fn handle_req(
 
             // Build and enqueue the RESPONSE (reflect tag + GPS fix if any +
             // battery percent/charging/raw_mv, always).
+            //
+            // FAIL CLOSED (ADR-0015 D4): the RESPONSE is a flood frame, so a
+            // configured-but-unkeyable region suppresses it (the request itself
+            // was still received and logged).
             let gps = gps_snapshot.map(|(lat_e7, lon_e7, _age)| (lat_e7, lon_e7));
-            match build_telemetry_response(our_id, contact_pubkey, req.tag, gps, battery_snapshot) {
+            let Some(scope) = region_emission(region_scope, "telemetry RESPONSE") else {
+                return;
+            };
+            match build_telemetry_response(our_id, contact_pubkey, req.tag, gps, battery_snapshot, scope) {
                 Some((resp_frame, resp_len)) => {
                     log_tx_queue_eviction(
                         txq.enqueue(&resp_frame[..resp_len], None),
@@ -4961,6 +5204,7 @@ fn handle_room_push_frame(
     now_ms: u64,
     gps_verified: bool,
     adopted_server_clock: &mut Option<room_session::AdoptedServerClock>,
+    region_scope: &RegionScope,
 ) -> bool {
     // `on_receive` routes here on `src_hash` (`payload[1] == room.hash`)
     // alone, so every OTHER member's copy of the same push also reaches this
@@ -4997,19 +5241,26 @@ fn handle_room_push_frame(
             // ACK is non-negotiable: transmitted unconditionally, even for a
             // push `handle_room_push` recognises as an already-seen
             // duplicate (`outcome.entry: None`) — see that function's doc.
-            let mut ack_frame = [0u8; 8];
-            let n = build_ack_frame(&outcome.ack_hash, &mut ack_frame);
-            log_tx_queue_eviction(
-                txq.enqueue(&ack_frame[..n], None),
-                "room-push ACK",
-                outstanding,
-                |ev| ui_events.push(ev),
-            );
-            log::info!(
-                "TX room-push ACK queued for 0x{:02x}: ack_hash={}",
-                room.hash,
-                hex4(&outcome.ack_hash),
-            );
+            // FAIL CLOSED (ADR-0015 D4) is the one exception: it is a flood
+            // frame, so an unkeyable region suppresses it rather than sending
+            // it unscoped.
+            if let Some(scope) = region_emission(region_scope, "room-push ACK") {
+                // 12, not 8: a scoped ACK is `header + 4 codes + path_len +
+                // ack_hash` = 10 bytes (8 unscoped).
+                let mut ack_frame = [0u8; 12];
+                let n = build_ack_frame(&outcome.ack_hash, scope, &mut ack_frame);
+                log_tx_queue_eviction(
+                    txq.enqueue(&ack_frame[..n], None),
+                    "room-push ACK",
+                    outstanding,
+                    |ev| ui_events.push(ev),
+                );
+                log::info!(
+                    "TX room-push ACK queued for 0x{:02x}: ack_hash={}",
+                    room.hash,
+                    hex4(&outcome.ack_hash),
+                );
+            }
 
             // Phase D: classify BEFORE the dedup-gated content append below,
             // off the SAME `outcome` — `RoomSyncPhase::on_push_outcome`'s

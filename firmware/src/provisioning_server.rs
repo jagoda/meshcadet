@@ -35,11 +35,11 @@ use esp_idf_svc::nvs::{EspNvsPartition, NvsDefault};
 use protocol::provisioning::{
     FRAME_ADD_CHANNEL, FRAME_ADD_CONTACT, FRAME_ADD_ROOM, FRAME_COMMIT_PROVISIONING,
     FRAME_DEL_CHANNEL, FRAME_DEL_CONTACT, FRAME_DEL_ROOM, FRAME_QUERY_CHANNELS,
-    FRAME_QUERY_CONTACTS, FRAME_QUERY_ROOMS, FRAME_QUERY_STATUS,
+    FRAME_QUERY_CONTACTS, FRAME_QUERY_REGION, FRAME_QUERY_ROOMS, FRAME_QUERY_STATUS,
     FRAME_RSP_CHANNEL, FRAME_RSP_CHANNELS_DONE, FRAME_RSP_CONTACT, FRAME_RSP_CONTACTS_DONE,
-    FRAME_RSP_ERROR, FRAME_RSP_IDENTITY, FRAME_RSP_OK, FRAME_RSP_STATUS,
-    FRAME_SET_DEVICE_NAME, FRAME_SET_NOTIF_DEFAULTS, FRAME_SET_PIN,
-    FRAME_OVERHEAD, PROV_MAGIC,
+    FRAME_RSP_ERROR, FRAME_RSP_IDENTITY, FRAME_RSP_OK, FRAME_RSP_REGION, FRAME_RSP_STATUS,
+    FRAME_SET_DEVICE_NAME, FRAME_SET_NOTIF_DEFAULTS, FRAME_SET_PIN, FRAME_SET_REGION,
+    FRAME_OVERHEAD, MAX_REGION_NAME_LEN, PROV_MAGIC,
     decode_frame, encode_frame,
     decode_add_contact, decode_del_contact,
     decode_add_channel, decode_del_channel,
@@ -51,6 +51,7 @@ use protocol::provisioning::{
 };
 use protocol::channel_hash_var;
 
+use firmware_core::region_admin::{self, QueryRegionOutcome, SetRegionOutcome};
 use firmware_core::room_admin::{self, AddRoomOutcome, DelRoomOutcome};
 
 use crate::config_store::{
@@ -70,6 +71,13 @@ mod err {
     pub const CHANNEL_NOT_FOUND: u8 = 0x04;
     pub const DECODE_ERROR: u8      = 0x05;
     pub const STORAGE_ERROR: u8     = 0x06;
+    /// `FRAME_SET_REGION` carried a name the device will not key: over 31
+    /// bytes, a byte outside upstream's set, or a leading `$` (private
+    /// region — upstream has no keystore to key it with). Also used by
+    /// `FRAME_QUERY_REGION` when the *stored* name is unusable, so the host
+    /// status command surfaces the fail-closed state instead of a plausible
+    /// looking region (ADR-0015 D4). Mirrors `admin_server`'s code.
+    pub const REGION_INVALID: u8    = 0x08;
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -546,6 +554,48 @@ fn process_frame(
             }
         }
 
+        // ── QUERY_REGION ─────────────────────────────────────────────────────
+        // ADR-0015 D2/D5: the host CLI's `status` command and the web
+        // provisioner's status panel read the region back through this
+        // dedicated pair rather than a trailing `RSP_STATUS` field. Without
+        // this arm the frame fell through to the `unknown` arm below and the
+        // host timed out (`status` hung until its retry deadline). The stored
+        // name is read FRESH on every call — there is no staged copy because
+        // `SET_REGION` below persists immediately, so flash is the single
+        // source of truth — and the empty name is the no-region reply.
+        FRAME_QUERY_REGION => {
+            let (name, name_len) = match crate::region_store::load_name(nvs_partition.clone()) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::error!("prov_server: QUERY_REGION — region_store::load_name failed: {:?}", e);
+                    return send_error(out, err::STORAGE_ERROR, b"region store read failed");
+                }
+            };
+            let mut pbuf = [0u8; 1 + MAX_REGION_NAME_LEN];
+            match region_admin::handle_query_region(&name[..name_len as usize], &mut pbuf) {
+                QueryRegionOutcome::Encoded(plen) => {
+                    log::info!("prov_server: QUERY_REGION — name_len={}", name_len);
+                    send_frame(out, FRAME_RSP_REGION, &pbuf[..plen])?;
+                }
+                QueryRegionOutcome::StoredNameUnusable(e) => {
+                    // FAIL CLOSED surfacing (ADR-0015 D4): report the fault
+                    // rather than echoing a name every host-side decoder — and
+                    // this device's own boot-time key derivation — would
+                    // reject.
+                    log::error!(
+                        "prov_server: QUERY_REGION — stored region name unusable: {:?} — \
+                         flood emission is disabled until it is cleared or re-set",
+                        e,
+                    );
+                    return send_error(
+                        out,
+                        err::REGION_INVALID,
+                        b"stored region name is invalid; set-region --clear or set-region --name <name>",
+                    );
+                }
+            }
+        }
+
         // ── ADD_ROOM ─────────────────────────────────────────────────────────
         // Stage a room-server contact so a room can be provisioned in the
         // first-provisioning flow, not only by a post-provisioning admin edit
@@ -652,6 +702,67 @@ fn process_frame(
                 Err(e) => {
                     log::warn!("prov_server: SET_DEVICE_NAME decode: {:?}", e);
                     return send_error(out, err::DECODE_ERROR, b"set_device_name decode error");
+                }
+            }
+        }
+
+        // ── SET_REGION ───────────────────────────────────────────────────────
+        // MeshCore region scoping (ADR-0015 D2/D5). Persists IMMEDIATELY, like
+        // SET_DEVICE_NAME and unlike the staged SET_PIN/SET_NOTIF_DEFAULTS
+        // above: the region lives in its own `mc_region` NVS key, not in the
+        // provisioning blob, so it needs no CommitProvisioning to take effect
+        // on flash. It takes effect ON AIR at the next boot — the emission
+        // scope is derived exactly once at boot and held by the radio loop
+        // (`firmware_core::region_scope`), because a frame's transport code
+        // must stay byte-identical across its retries; on this first-boot path
+        // a `COMMIT_PROVISIONING` reboots anyway.
+        //
+        // An empty name is the explicit CLEAR command (there is no separate
+        // clear frame). Validation, the `$`-private rejection and the
+        // clear-as-empty semantics are all decided in `region_admin`
+        // (firmware-core, host-tested); this arm only owns the NVS write, the
+        // ack, and the log line — which never echoes the name at length, just
+        // its length, mirroring the other provisioning arms.
+        FRAME_SET_REGION => {
+            match region_admin::handle_set_region(payload) {
+                SetRegionOutcome::Apply(v) => {
+                    match crate::region_store::save(nvs_partition.clone(), &v.name, v.name_len) {
+                        Ok(()) => {
+                            log::info!(
+                                "prov_server: SET_REGION len={} — persisted (applies to on-air \
+                                 emission at next boot)",
+                                v.name_len,
+                            );
+                            send_ok(out)?;
+                        }
+                        Err(e) => {
+                            log::error!("prov_server: SET_REGION — region_store::save failed: {:?}", e);
+                            return send_error(out, err::STORAGE_ERROR, b"NVS save failed");
+                        }
+                    }
+                }
+                SetRegionOutcome::PrivateUnsupported => {
+                    log::warn!(
+                        "prov_server: SET_REGION — private ($) region refused (no upstream \
+                         private keystore)",
+                    );
+                    return send_error(
+                        out,
+                        err::REGION_INVALID,
+                        b"private ($) regions are unsupported; use a public region name",
+                    );
+                }
+                SetRegionOutcome::InvalidName(e) => {
+                    log::warn!("prov_server: SET_REGION — invalid region name: {:?}", e);
+                    return send_error(
+                        out,
+                        err::REGION_INVALID,
+                        b"invalid region name (1-31 chars: '-', '#', digits, 'A' and above)",
+                    );
+                }
+                SetRegionOutcome::DecodeError => {
+                    log::warn!("prov_server: SET_REGION decode error");
+                    return send_error(out, err::DECODE_ERROR, b"set_region decode error");
                 }
             }
         }
