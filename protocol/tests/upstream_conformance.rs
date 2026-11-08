@@ -51,7 +51,7 @@ use protocol::{
     encode_anon_req_login, encode_dm_payload, encode_grp_txt_var, encode_telemetry_response_lpp,
     encode_txt_msg_plaintext, format_channel_text, mac_then_decrypt, parse_channel_text,
     parse_rx_frame_header, parse_telemetry_req, Header, Identity, PathLen, RoomPermission,
-    RouteType, MAX_ADVERT_CARD_LEN,
+    RouteType, TxtType, MAX_ADVERT_CARD_LEN,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -422,7 +422,7 @@ fn check_dm_txt(v: &Vector) {
     let (rx_ts, rx_type, rx_attempt, off) =
         protocol::decode_txt_msg_plaintext(&decoded, decoded_len).unwrap();
     assert_eq!(rx_ts, timestamp, "{}: timestamp", v.id);
-    assert_eq!(rx_type, txt_type, "{}: txt_type", v.id);
+    assert_eq!(rx_type, TxtType::from_byte(txt_type), "{}: txt_type", v.id);
     assert_eq!(rx_attempt, attempt, "{}: attempt", v.id);
     assert_eq!(trim_nul(&decoded[off..decoded_len]), text, "{}: text", v.id);
 }
