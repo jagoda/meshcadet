@@ -3737,7 +3737,9 @@ fn build_test_dm(
 
 /// Build a flood ACK frame: `[header(0x0D)] [(codes)] [path_len(0x40)]
 /// [ack_hash(4)]`.
-/// The 4-byte hash is accepted by both v1.15 and v1.16 stock nodes (see
+/// The 4-byte hash is accepted by both v1.15 and v1.16 stock nodes, and by
+/// the current v1.18.0 target as well — the ACK-hash contract is identical
+/// between `companion-v1.17.1` and `companion-v1.18.0` (see
 /// `compute_ack_hash`'s doc comment in `protocol/src/codec.rs`).
 ///
 /// An ACK is a flood frame like any other for region purposes: `scope ==
@@ -4252,8 +4254,8 @@ fn on_receive(
             // route-direct REQ_TYPE_KEEP_ALIVE probe), but a stock room
             // server answers `REQ_TYPE_KEEP_ALIVE` with an ACK, never a
             // RESPONSE (`examples/simple_room_server/MyMesh.cpp:550-575` @
-            // companion-v1.17.1), so nothing legitimate besides a room login
-            // reply is expected here.
+            // `companion-v1.17.1` and `companion-v1.18.0`), so nothing
+            // legitimate besides a room login reply is expected here.
             #[cfg(not(feature = "hil"))]
             handle_room_login_response(
                 payload,
@@ -4326,9 +4328,11 @@ fn on_receive(
 /// contact, regardless of whether the text is a telemetry request or a plain
 /// text message.  ACK is computed on the decrypted timestamp + type + text and
 /// keyed on the originator's public key (MeshCore v1.15 §7.1 — unchanged in
-/// v1.16). This is dual-compat with no version detection or negotiation:
-/// MeshCadet's 4-byte ACK is accepted by both stock v1.15 and v1.16 nodes
-/// (see `compute_ack_hash`'s doc comment in `protocol/src/codec.rs`).
+/// v1.16, and the contract is byte-identical through `companion-v1.17.1` and
+/// `companion-v1.18.0`). This is dual-compat with no version detection or
+/// negotiation: MeshCadet's 4-byte ACK is accepted by both stock v1.15 and
+/// v1.16 nodes, and by the current v1.18.0 target for the same reason (see
+/// `compute_ack_hash`'s doc comment in `protocol/src/codec.rs`).
 
 /// Append one entry to the shared rotating `HISTORY` store (production builds
 /// only — `HISTORY`/`HistoryStore` don't exist under `hil`).
@@ -5861,6 +5865,12 @@ mod tests {
     /// (`ack_hash[0..4]` + extended-attempt byte + random byte). `handle_ack`
     /// must accept it and prefix-match on the first 4 bytes only, exactly as
     /// it does for a v1.15 4-byte payload.
+    ///
+    /// Still true at the current v1.18.0 target: `companion-v1.18.0` emits the
+    /// same 6-byte form (identical to `companion-v1.17.1`). See
+    /// `docs/upstream-conformance.md` ("Deliberate compatibility notes") for
+    /// the size and receiver-strictness contract; this test pins only the
+    /// prefix-match.
     #[test]
     fn handle_ack_accepts_and_prefix_matches_a_6_byte_v1_16_ack() {
         let mut outstanding = OutstandingSends::new();
