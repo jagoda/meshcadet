@@ -28,10 +28,14 @@ setup. Summary:
 ## Continuous integration
 
 `.github/workflows/ci.yml` runs on every pull request and every push to
-`main`, as four separate jobs: `cargo test --workspace`,
-`cargo fmt --all -- --check`, and
-`cargo clippy --workspace --all-targets -- -D warnings` against the
-host-native workspace, plus a dedicated `firmware` job. `firmware/` is a
+`main`, as nine jobs: `changes` (the path filter that decides which lanes
+run), `version-drift-guard`, `cargo-lock-sync-guard`,
+`flash-runner-guard`, `vocabulary-hygiene`, `test` (`cargo test
+--workspace --locked`), `fmt` (`cargo fmt --all -- --check`), `clippy`
+(`cargo clippy --workspace --all-targets --locked -- -D warnings`), and
+`firmware`. The first five are fast metadata/static guards; `test`, `fmt`,
+and `clippy` exercise the host-native workspace, and `firmware` is the
+dedicated cross-compile job. `firmware/` is a
 DETACHED workspace (its own `[workspace]` table in `firmware/Cargo.toml`),
 so none of the root-workspace jobs above ever touch it, and — since it
 cross-compiles for `xtensa-esp32s3-espidf` under the Espressif `esp` Rust
