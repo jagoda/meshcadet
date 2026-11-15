@@ -126,6 +126,15 @@ on:
       - "site/**"
       - ".github/workflows/pages-check.yml"
       - ".github/workflows/pages-deploy.yml"
+  # Weekly archive-drift probe: Ubuntu removes superseded package versions
+  # from the live archive without touching this repo, so the release-container
+  # pin-resolution lane must run even when no Dockerfile change exists. The
+  # `changes` filter step below is skipped on schedule (its outputs stay
+  # empty), so only the unconditional release-container pin/apt-layer jobs run
+  # while the path-filtered Cargo/firmware/image jobs skip. workflow_dispatch
+  # still forces the full suite as before.
+  schedule:
+    - cron: '17 6 * * 1'
   # Lets a maintainer (or CI verification tooling) kick a run on-demand from
   # any branch without needing an open PR — `gh workflow run ci.yml --ref
   # <branch>`. Purely additive to the required pull_request/push triggers.
@@ -159,6 +168,13 @@ jobs:
 
       - uses: dorny/paths-filter@v4
         id: filter
+        # A scheduled run exists only to re-check the live Ubuntu archive
+        # against the release-container pins (see the `schedule` trigger
+        # above), so there is no meaningful diff to filter. Skipping this step
+        # leaves every output empty; the gated jobs below then see a successful
+        # `changes` job with all-empty outputs and skip, while the
+        # unconditional pin/apt-layer jobs still run.
+        if: github.event_name != 'schedule'
         with:
           # `some-with-excludes` (not the `some` default) is what makes
           # `host`'s trailing `'!firmware/**'` below actually SUBTRACT from
@@ -370,9 +386,9 @@ jobs:
       contents: read
     # Deliberately NOT path-filtered. Ubuntu can supersede a pinned package
     # between the PR that added the pin and the next release tag, so this
-    # guard runs on every PR/push (and reads the live Ubuntu package indexes
-    # each time). It only parses the Dockerfile and those indexes; it
-    # does not build anything, so it belongs in the cheap set.
+    # guard runs on every PR/push and on the weekly schedule (and reads the
+    # live Ubuntu package indexes each time). It only parses the Dockerfile and
+    # those indexes; it does not build anything, so it belongs in the cheap set.
     steps:
       - uses: actions/checkout@v7
 
@@ -390,7 +406,8 @@ jobs:
     # the Packages indexes the script reads. It derives a throwaway
     # Dockerfile containing only the real FROM, the ARG defaults, and the
     # apt-get install RUN — no ESP-IDF/espup/ldproxy layer — so it stays in
-    # the minutes range instead of competing with the full image build below.
+    # the minutes range instead of competing with the full image build below,
+    # and it is cheap enough to keep on the weekly schedule.
     steps:
       - uses: actions/checkout@v7
 

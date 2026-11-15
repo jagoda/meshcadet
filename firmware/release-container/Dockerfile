@@ -29,7 +29,7 @@
 # the pinned freetype/dejavu package versions below, which makes old tags stop
 # rebuilding; that doc's "Archive churn and old releases" section covers the
 # snapshot.ubuntu.com recovery path).
-FROM ubuntu:22.10@sha256:e322f4808315c387868a9135beeb11435b5b83130a8599fd7d0014452c34f489
+FROM ubuntu:22.04@sha256:0e0a0fc6d18feda9db1590da249ac93e8d5abfea8f4c3c0c849ce512b5ef8982
 
 # Fail the build immediately if any command in a pipeline fails (not just the
 # last one) — e.g. the `curl | sh` rustup install below silently "succeeds"
