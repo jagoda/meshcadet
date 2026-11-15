@@ -28,7 +28,7 @@
 # procedure if this ever needs to move (e.g. Ubuntu 22.04's apt archive prunes
 # the pinned freetype/dejavu package versions below; see that doc's fallback
 # via snapshot.ubuntu.com).
-FROM ubuntu:22.04@sha256:0e0a0fc6d18feda9db1590da249ac93e8d5abfea8f4c3c0c849ce512b5ef8982
+FROM ubuntu:26.04@sha256:065aa8626841f16057b78b027b464cd59c4fac36c204c72dcbf48d66f5fa8a96
 
 # Fail the build immediately if any command in a pipeline fails (not just the
 # last one) — e.g. the `curl | sh` rustup install below silently "succeeds"
