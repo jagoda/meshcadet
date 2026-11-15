@@ -47,12 +47,15 @@ updates:
       - dependency-name: "curve25519-dalek"
         versions:
           - ">=5.0.0"
+      # rand/rand_core 0.9 is an intermediate breaking step of the atomic
+      # rand/rand_core 0.10 + RustCrypto 0.11 migration; do not let it land
+      # separately (the >=0.10.0 floors left it exposed).
       - dependency-name: "rand"
         versions:
-          - ">=0.10.0"
+          - ">=0.9.0"
       - dependency-name: "rand_core"
         versions:
-          - ">=0.10.0"
+          - ">=0.9.0"
 
   - package-ecosystem: "cargo"
     directory: "/firmware"
@@ -83,15 +86,18 @@ updates:
       - dependency-name: "i-slint-core"
         versions:
           - ">=1.17.0"
+      # Pre-1.0 crates: a 0.x minor bump is breaking (0.37 -> 0.38, 0.46 ->
+      # 0.47, 0.52 -> 0.53), and each tracks a different ESP-IDF release.
+      # Use explicit floors rather than semver-major update-types.
       - dependency-name: "esp-idf-sys"
-        update-types:
-          - "version-update:semver-major"
+        versions:
+          - ">=0.38.0"
       - dependency-name: "esp-idf-hal"
-        update-types:
-          - "version-update:semver-major"
+        versions:
+          - ">=0.47.0"
       - dependency-name: "esp-idf-svc"
-        update-types:
-          - "version-update:semver-major"
+        versions:
+          - ">=0.53.0"
       - dependency-name: "color_quant"
         versions:
           - ">=2.0.0"
@@ -113,12 +119,14 @@ updates:
       - dependency-name: "curve25519-dalek"
         versions:
           - ">=5.0.0"
+      # Same atomic-migration guardrail as the root Cargo entry: 0.9 is a
+      # breaking intermediate step, not a standalone upgrade.
       - dependency-name: "rand"
         versions:
-          - ">=0.10.0"
+          - ">=0.9.0"
       - dependency-name: "rand_core"
         versions:
-          - ">=0.10.0"
+          - ">=0.9.0"
 
   - package-ecosystem: "github-actions"
     directory: "/"
@@ -159,3 +167,10 @@ updates:
         update-types:
           - "minor"
           - "patch"
+    # The release container's base is digest-pinned and only moves as a
+    # deliberate reproducibility re-baseline (docs/release-reproducibility.md);
+    # never automate the Ubuntu tag major move (22.04 -> 26.04).
+    ignore:
+      - dependency-name: "ubuntu"
+        update-types:
+          - "version-update:semver-major"
