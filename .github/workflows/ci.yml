@@ -413,7 +413,24 @@ jobs:
     needs: changes
     # See the `changes` job above and the fail-safe note on `test`'s `if:`.
     if: github.event_name == 'workflow_dispatch' || needs.changes.result != 'success' || needs.changes.outputs.full == 'true' || needs.changes.outputs.firmware == 'true'
-    runs-on: ubuntu-latest
+    # Pinned to 24.04, not `ubuntu-latest` — deliberately. `ubuntu-latest`
+    # now resolves to Ubuntu 26.04, which ships libxml2 only as
+    # libxml2.so.16. ESP-IDF v5.2.2's bootstrap installs prebuilt
+    # esp-clang@16.0.1 (esp-idf-sys asks idf_tools.py for it unconditionally,
+    # for bindgen), and that tool's lib/libLLVM-16.so has a hard NEEDED on
+    # libxml2.so.2. No package on 26.04 supplies that old soname, so
+    # `clang --version` exits 127 and the whole ESP-IDF bootstrap aborts with
+    # "Could not install all requested Tools" — exactly the failure that broke
+    # release PR #221's firmware job (runner image: ubuntu-26.04).
+    #
+    # 24.04 is the newest LTS runner whose libxml2 package still provides
+    # libxml2.so.2. ubuntu-22.04 also has .2, but it is in GitHub's
+    # deprecation window (unsupported 2027-04-17). The apt step below installs
+    # libxml2 explicitly so this does not depend on the image's transitive
+    # package set. Do NOT float this back to ubuntu-latest: move the pin
+    # together with an ESP-IDF/esp-idf-sys bump that ships an esp-clang built
+    # against the newer libxml2.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -437,12 +454,18 @@ jobs:
 
       # Same native build.rs prerequisites as the host jobs (see comment
       # above `test`) — firmware/build.rs runs the identical FreeType/DejaVu
-      # emoji-font gen step.
+      # emoji-font gen step — plus libxml2, the runtime dependency of the
+      # prebuilt esp-clang that esp-idf-sys installs for bindgen (see the
+      # runner-image comment above). The `libxml2` package supplies
+      # libxml2.so.2 on the pinned 24.04 image; `libxml2-dev` is not needed
+      # because nothing links against it, only the already-built clang binary
+      # loads it.
       - name: Install native build prerequisites
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config libfreetype6-dev fonts-dejavu-core
+            build-essential pkg-config libfreetype6-dev fonts-dejavu-core \
+            libxml2
 
       # Installs the Espressif `esp` Rust fork (Xtensa target support) via
       # espup, restricted to esp32s3 since that's the only MCU this project
