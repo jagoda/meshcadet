@@ -24,7 +24,7 @@ x25519-dalek = { version = "2", default-features = false, features = ["static_se
 # alloc+precomputed-tables for correctness + reasonable speed; firmware has an allocator
 curve25519-dalek = { version = "4", default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
 # RNG trait for key generation (caller-supplied RNG; no concrete RNG here)
-rand_core = { version = "0.6", default-features = false }
+rand_core = { version = "0.9", default-features = false }
 
 [dev-dependencies]
 # Concrete RNG for tests
