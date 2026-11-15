@@ -13,8 +13,11 @@
 # instead, and which recovery procedure to follow.
 #
 # What it checks:
-#   1. Every `FROM` is digest-pinned (`@sha256:<64 hex>`), and that digest is
-#      still pullable from Docker Hub.
+#   1. Every `FROM` is digest-pinned (`@sha256:<64 hex>`), that digest is
+#      still pullable from Docker Hub, and the first stage's Ubuntu tag is
+#      the expected `22.04` LTS. A tag move to a different Ubuntu release
+#      (e.g. Dependabot's 22.04 -> 22.10 kinetic bump) is a deliberate
+#      reproducibility re-baseline, never an automated dependency update.
 #   2. Every `pkg=version` in the Dockerfile's `apt-get install` lines uses an
 #      `ARG` default (or literal) that resolves to a concrete version, and
 #      that exact version is present in at least one of the base image's
@@ -54,9 +57,15 @@ script_dir="$(cd "$(dirname "${script_path}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
 default_dockerfile="${repo_root}/firmware/release-container/Dockerfile"
 
-# Ubuntu release tag -> apt suite. The release container currently builds
-# from ubuntu:22.04 (jammy); mapping the tag rather than hardcoding jammy
-# means a future base-image bump fails loudly here until this table (and the
+# The release container is deliberately on Ubuntu 22.04 LTS. A base-tag move
+# is a reproducibility re-baseline (new digest, re-verified apt pins, docs),
+# not a dependency bump; assert the exact expected tag so a tag that happens
+# to have an entry in UBUNTU_SUITES (e.g. 24.04) cannot slip in through an
+# automated PR either.
+expected_base_tag="22.04"
+
+# Ubuntu release tag -> apt suite. Mapping the tag rather than hardcoding
+# jammy means a future base-image move fails here until this table (and the
 # documented recovery procedure) are updated, instead of silently checking
 # the new image's pins against the old release's archive. `jammy-backports`
 # is intentionally absent from the derived suite list: `apt-get install`
@@ -381,6 +390,9 @@ resolve_ubuntu_suites() {
   if [[ -z "${tag}" ]]; then
     die "cannot derive an Ubuntu apt suite from FROM ${ref}: no ubuntu:<release> tag (e.g. ubuntu:22.04@sha256:...). Add a tag or teach UBUNTU_SUITES in this script about the new image."
   fi
+  if [[ "${tag}" != "${expected_base_tag}" ]]; then
+    die "FROM ${ref} uses Ubuntu tag '${tag}', but the release container is expected to stay on ubuntu:${expected_base_tag}. A base-image move is a deliberate reproducibility re-baseline (new digest, re-verified apt pins, UBUNTU_SUITES, docs), not a Dependabot bump; update expected_base_tag here together with the Dockerfile and ${doc_section} if that is intended."
+  fi
   if [[ -z "${UBUNTU_SUITES[${tag}]+x}" ]]; then
     die "FROM ${ref} uses Ubuntu tag '${tag}', which this script has no apt suite mapping for. Add it to UBUNTU_SUITES (and update the documented recovery procedure) before changing the release container's base image."
   fi
@@ -677,7 +689,7 @@ run_case() {
 }
 
 self_test() {
-  local tmp good superseded unpinned malformed missing_digest unresolved emitted
+  local tmp good superseded unpinned malformed missing_digest wrong_tag unresolved emitted
   tmp="$(mktemp -d)"
   TMPDIRS+=("${tmp}")
   SELF_TEST_INDEX="${tmp}/index.tsv"
@@ -744,6 +756,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       "fonts-dejavu-core=${DEJAVU_CORE_VERSION}"
 EOF
 
+  wrong_tag="${tmp}/wrong-base-tag.Dockerfile"
+  cat >"${wrong_tag}" <<'EOF'
+FROM ubuntu:22.10@sha256:e322f4808315c387868a9135beeb11435b5b83130a8599fd7d0014452c34f489
+ARG FREETYPE_DEV_VERSION=1.0.0
+ARG DEJAVU_CORE_VERSION=2.0.0
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      "libfreetype6-dev=${FREETYPE_DEV_VERSION}" \
+      "fonts-dejavu-core=${DEJAVU_CORE_VERSION}"
+EOF
+
   unpinned_required="${tmp}/unpinned-required.Dockerfile"
   cat >"${unpinned_required}" <<'EOF'
 FROM ubuntu:22.04@sha256:0e0a0fc6d18feda9db1590da249ac93e8d5abfea8f4c3c0c849ce512b5ef8982
@@ -768,6 +790,7 @@ EOF
   run_case "removing a required byte-reproducibility pin fails" "${unpinned_required}" nonzero "required byte-reproducibility package" "fonts-dejavu-core"
   run_case "a malformed ARG fails" "${malformed}" nonzero "malformed ARG"
   run_case "a FROM without a digest fails" "${missing_digest}" nonzero "not digest-pinned"
+  run_case "a base tag other than the expected 22.04 LTS fails" "${wrong_tag}" nonzero "expected to stay on ubuntu:22.04" "22.10"
   run_case "an apt pin referencing an undefined ARG fails" "${unresolved}" nonzero "not defined" "MISSING_VERSION"
 
   emitted="${tmp}/emitted.Dockerfile"
