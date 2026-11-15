@@ -45,11 +45,12 @@ name: CI
 #
 # ── Path filter: skip entirely on site-only changes ──────────────────────
 #
-# All five jobs below build/test/lint the Rust workspace or the firmware
-# cross-compile — none of them touch `site/` or the pages-*.yml workflows, so
-# a PR whose diff is scoped to the GitHub Pages landing site gets nothing
-# useful from running them. `paths-ignore` skips the WHOLE workflow (all five
-# jobs) when every changed file matches the ignore list; any change outside
+# All nine jobs below build/test/lint the Rust workspace or the firmware
+# cross-compile, or run a repo-wide version/script guard — none of them touch
+# `site/` or the pages-*.yml workflows, so a PR whose diff is scoped to the
+# GitHub Pages landing site gets nothing useful from running them.
+# `paths-ignore` skips the WHOLE workflow (all nine jobs) when every changed
+# file matches the ignore list; any change outside
 # it (any Rust/firmware file, or ci.yml itself) still triggers the full suite
 # unchanged. `pages-check.yml`'s own `check` job already covers site-only
 # PRs.
@@ -151,7 +152,7 @@ jobs:
       host: ${{ steps.filter.outputs.host }}
       firmware: ${{ steps.filter.outputs.firmware }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -224,7 +225,7 @@ jobs:
     # human hand-editing one file, or `extra-files` ever misfiring — instead
     # of the drift going unnoticed until release time.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Compare root workspace version to firmware/Cargo.toml version
         run: |
@@ -257,7 +258,7 @@ jobs:
     # tmpdir), so it never touches this repo's real lockfiles and needs no
     # path-filter gating.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Self-test scripts/sync-cargo-lock-versions.sh
         run: scripts/sync-cargo-lock-versions.test.sh
@@ -279,7 +280,7 @@ jobs:
     # above. Self-contained (its own tmpdir fixture + fake espflash), so it
     # needs no path-filter gating either.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Self-test firmware/scripts/flash-with-partition-table.sh
         run: firmware/scripts/flash-with-partition-table.test.sh
@@ -315,7 +316,7 @@ jobs:
     # scripts/banned-vocabulary.sh), so the scan's scope — not just its term
     # list — can never drift apart between local and CI.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Self-test scripts/check-vocabulary-leak.sh
         # Regression guard on the shared script itself (isolated throwaway
@@ -344,7 +345,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || needs.changes.result != 'success' || needs.changes.outputs.full == 'true' || needs.changes.outputs.host == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Native prerequisites for the host-native workspace's build.rs steps
       # (ui_sim / ui_perf embed real Slint markup + assets at compile time via
@@ -375,7 +376,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || needs.changes.result != 'success' || needs.changes.outputs.full == 'true' || needs.changes.outputs.host == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install pinned toolchain
         run: rustup show
@@ -390,7 +391,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || needs.changes.result != 'success' || needs.changes.outputs.full == 'true' || needs.changes.outputs.host == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install native build prerequisites
         run: |
@@ -432,7 +433,7 @@ jobs:
     # against the newer libxml2.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # `test`'s job-level `if:` (above) only runs `cargo test --workspace`
       # — which is where all 17 xtask static guards (pm_apb_lock_gate,
@@ -491,7 +492,7 @@ jobs:
       # sysroot into ~/.espressif and firmware/.embuild on first build.
       # Without caching it, every run rebuilds the sysroot from source.
       - name: Cache ESP-IDF sysroot
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.espressif

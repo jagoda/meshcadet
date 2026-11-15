@@ -347,9 +347,9 @@ a different FreeType/DejaVu build silently changes those baked-in bytes.
 (`docker build` + `docker run` + `sha256sum` compare against the published
 `SHA256SUMS`).
 
-`actions/attest-build-provenance@v1` (needing `id-token: write` +
+`actions/attest-build-provenance@v4` (needing `id-token: write` +
 `attestations: write`, granted at the workflow level) attests SLSA build
-provenance over the three published assets. `docs/release-reproducibility.md`
+provenance over the ten published assets. `docs/release-reproducibility.md`
 documents the `gh attestation verify <asset> --repo jagoda/meshcadet`
 third-party re-check, and is explicit that attestation (provenance: who
 built this, from what source) and the rebuild-and-compare recipe

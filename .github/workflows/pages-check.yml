@@ -31,11 +31,17 @@ on:
 permissions:
   contents: read
 
+# Node 20 reached end-of-life on 2026-04-30. Both setup-node steps below
+# consume this single pin, so the two jobs can never drift onto different
+# Node majors.
+env:
+  NODE_VERSION: "24"
+
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Reject root-absolute asset/href paths
         # This is a PROJECT Pages site (served at /meshcadet/, not a root
@@ -49,9 +55,9 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: ${{ env.NODE_VERSION }}
 
       - name: upgrade-gate.js validates update-meta.json before the Upgrade path is ever offered
         # site/upgrade-gate.js's isValidUpdateMeta is the safety-critical gate
@@ -219,7 +225,7 @@ jobs:
     # site/provisioner/codec.conformance.test.mjs's own header for how to
     # reproduce this locally.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Resolves rust-toolchain.toml (channel + rustfmt/clippy components) —
       # the toolchain pin lives there, not in this workflow. Same pattern as
@@ -231,9 +237,9 @@ jobs:
         with:
           workspaces: ". -> target"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: ${{ env.NODE_VERSION }}
 
       - name: Generate golden vectors from the real Rust codec
         run: cargo run -q -p xtask --bin gen-prov-golden-vectors --locked > /tmp/prov-golden-vectors.json

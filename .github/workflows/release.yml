@@ -112,7 +112,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Fails fast (before the expensive container build below) if the tag
       # doesn't match what's actually checked out — the release-please.yml /
@@ -182,7 +182,7 @@ jobs:
             "${{ steps.version.outputs.tag }}" "${{ steps.sde.outputs.epoch }}"
 
       - name: Upload merged image artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: merged-image
           path: dist/meshcadet-${{ steps.version.outputs.tag }}-merged.bin
@@ -193,7 +193,7 @@ jobs:
       # both directly, since layout_hash needs the raw bootloader.bin/
       # partition-table.bin bytes only available inside the build container.
       - name: Upload update-artifact + metadata
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: update-artifacts
           path: |
@@ -206,14 +206,14 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: merged-image
           path: dist
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: update-artifacts
           path: dist
@@ -319,7 +319,7 @@ jobs:
       # docs/release-reproducibility.md for the `gh attestation verify`
       # third-party re-check this pairs with.
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             dist/meshcadet-${{ github.ref_name }}-merged.bin
