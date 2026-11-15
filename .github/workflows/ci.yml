@@ -151,6 +151,7 @@ jobs:
       full: ${{ steps.filter.outputs.full }}
       host: ${{ steps.filter.outputs.host }}
       firmware: ${{ steps.filter.outputs.firmware }}
+      release_container: ${{ steps.filter.outputs.release_container }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -188,6 +189,10 @@ jobs:
               - 'firmware/Cargo.lock'
               - 'rust-toolchain.toml'
               - 'firmware/rust-toolchain.toml'
+              # Release-container inputs are release-critical and rare enough
+              # to get the full host+firmware suite too, even though only the
+              # dedicated release-container lane builds them.
+              - 'firmware/release-container/**'
               - '.github/workflows/**'
             # Root-workspace members `firmware/` does NOT path-dep on (see
             # Cargo.toml's `members` list) — only test/fmt/clippy need to
@@ -210,6 +215,16 @@ jobs:
               - '!firmware/**'
             firmware:
               - 'firmware/**'
+            # The release container is its own build surface: no host/firmware
+            # Cargo job compiles its Dockerfile, but a stale apt pin there
+            # silently blocks the tag-fired release (the v0.9.0 FreeType rot
+            # this lane exists to catch). The apt-pin check and fast apt-layer
+            # build below are deliberately unconditional, because Ubuntu can
+            # supersede a pin on a PR that never touches this directory; this
+            # output only gates the full image build, which is expensive and
+            # genuinely depends on these files.
+            release_container:
+              - 'firmware/release-container/**'
 
   version-drift-guard:
     name: firmware/Cargo.toml version matches workspace version
@@ -285,6 +300,25 @@ jobs:
       - name: Self-test firmware/scripts/flash-with-partition-table.sh
         run: firmware/scripts/flash-with-partition-table.test.sh
 
+  release-container-pins-self-test:
+    name: check-release-container-pins.sh self-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Offline fixtures for scripts/check-release-container-pins.sh: a good
+    # Dockerfile passes, a superseded pin fails with the available versions,
+    # an unpinned package is warned about (not failed — see the script's
+    # header for why), removing a required byte-reproducibility pin fails, a
+    # malformed ARG fails, a FROM without a digest fails, and an apt pin
+    # referencing an undefined ARG fails. No network, so this
+    # stays in the always-cheap self-test cluster alongside the other
+    # *-guard jobs above.
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Self-test scripts/check-release-container-pins.sh
+        run: scripts/check-release-container-pins.sh --self-test
+
   vocabulary-hygiene:
     name: no internal-ops vocabulary leaks in public docs
     runs-on: ubuntu-latest
@@ -328,6 +362,52 @@ jobs:
 
       - name: Grep for internal-ops vocabulary
         run: scripts/check-vocabulary-leak.sh
+
+  release-container-pins:
+    name: release-container apt pins resolve
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Deliberately NOT path-filtered. Ubuntu can supersede a pinned package
+    # between the PR that added the pin and the next release tag, so this
+    # guard runs on every PR/push (and reads the live Ubuntu package indexes
+    # each time). It only parses the Dockerfile and those indexes; it
+    # does not build anything, so it belongs in the cheap set.
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check release-container apt pins against the live jammy archive
+        run: scripts/check-release-container-pins.sh
+
+  release-container-apt-layer:
+    name: release-container apt layer builds
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Also unconditional, for the same archive-drift reason: this is the real
+    # `docker build` proof that `apt-get install pkg=version` still resolves
+    # against the actual digest-pinned ubuntu:22.04 base, not just against
+    # the Packages indexes the script reads. It derives a throwaway
+    # Dockerfile containing only the real FROM, the ARG defaults, and the
+    # apt-get install RUN — no ESP-IDF/espup/ldproxy layer — so it stays in
+    # the minutes range instead of competing with the full image build below.
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Emit the apt-only Dockerfile from the real release Dockerfile
+        run: |
+          set -euo pipefail
+          scripts/check-release-container-pins.sh --emit-apt-layer > "${RUNNER_TEMP}/release-container-apt.Dockerfile"
+          cat "${RUNNER_TEMP}/release-container-apt.Dockerfile"
+
+      - name: docker build (FROM + ARG defaults + apt-get install only)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/empty-context"
+          docker build \
+            --file "${RUNNER_TEMP}/release-container-apt.Dockerfile" \
+            --tag release-container-apt-check \
+            "${RUNNER_TEMP}/empty-context"
 
   test:
     name: cargo test --workspace --locked
@@ -551,3 +631,33 @@ jobs:
       # toolchain correctly via rustup's per-directory rust-toolchain.toml.
       - name: cargo run -p xtask -- verify-partition-budget
         run: cargo run -p xtask --bin xtask -- verify-partition-budget
+
+  release-container-image:
+    name: release-container image builds
+    needs: changes
+    # See the `changes` job above and the fail-safe note on `test`'s `if:`.
+    # Only the release-container lane can change this image, so this is
+    # path-filtered to firmware/release-container/** — not run on every PR —
+    # and workflow_dispatch forces it for an on-demand verification. It is
+    # deliberately not gated on `full`: a Cargo.lock/workflow change cannot
+    # alter these image layers, and this is the one genuinely slow job in
+    # this family (it bootstraps rustup + the esp toolchain + ldproxy).
+    if: github.event_name == 'workflow_dispatch' || needs.changes.result != 'success' || needs.changes.outputs.release_container == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Cold runners spend several minutes on the rustup/espup/ldproxy layers;
+    # 30 minutes leaves room for a slow mirror without letting a hung build
+    # occupy a runner indefinitely.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: docker build firmware/release-container/Dockerfile
+        run: |
+          set -euo pipefail
+          docker build \
+            --file firmware/release-container/Dockerfile \
+            --tag meshcadet-release-builder:ci \
+            firmware
+          docker image inspect meshcadet-release-builder:ci --format 'built image size: {{.Size}} bytes'
