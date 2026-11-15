@@ -25,9 +25,10 @@
 # BASE IMAGE: pinned by digest (not just tag) so the underlying rootfs never
 # drifts under this Dockerfile. Digest resolved from `docker pull ubuntu:22.04`
 # on 2026-07-11 — see docs/release-reproducibility.md for the refresh
-# procedure if this ever needs to move (e.g. Ubuntu 22.04's apt archive prunes
-# the pinned freetype/dejavu package versions below; see that doc's fallback
-# via snapshot.ubuntu.com).
+# procedure if this ever needs to move (e.g. Ubuntu 22.04's live archive prunes
+# the pinned freetype/dejavu package versions below, which makes old tags stop
+# rebuilding; that doc's "Archive churn and old releases" section covers the
+# snapshot.ubuntu.com recovery path).
 FROM ubuntu:22.04@sha256:0e0a0fc6d18feda9db1590da249ac93e8d5abfea8f4c3c0c849ce512b5ef8982
 
 # Fail the build immediately if any command in a pipeline fails (not just the
@@ -37,12 +38,22 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # Pinned exact package versions for the byte-reproducibility-critical pair
 # (see header comment). Versions current in the Ubuntu 22.04 (jammy) archive
-# as of 2026-07-11 — verified via `rmadison` / Launchpad prior to landing this
-# file. `apt-get install pkg=version` fails loudly (not silently upgrades) if
-# either version is ever pruned from the archive, which is the correct
-# failure mode for a reproducibility-critical pin: see
-# docs/release-reproducibility.md for the recovery procedure.
-ARG FREETYPE_DEV_VERSION=2.11.1+dfsg-1ubuntu0.3
+# as of 2026-11-15 — verified against the jammy, jammy-updates and
+# jammy-security Packages indexes and their .deb URLs.
+#
+# FREETYPE_DEV_VERSION bumped 2.11.1+dfsg-1ubuntu0.3 -> ...0.4 on 2026-11-15:
+# Ubuntu published 0.4 to jammy-security/jammy-updates on 2026-10-06 and
+# removed 0.3 from all three live pockets, so the old pin no longer resolved
+# and would have failed the v0.9.0 release build. DEJAVU_CORE_VERSION is
+# unchanged and still current in the jammy release pocket.
+#
+# These pins are exact but the live archive is mutable: `apt-get install
+# pkg=version` fails loudly (not silently upgrades) once Ubuntu supersedes a
+# version, which is the correct failure mode for a reproducibility-critical
+# pin — but it also means an old tag is not rebuildable from the live archive
+# after that happens. See docs/release-reproducibility.md's "Archive churn and
+# old releases" section for the snapshot.ubuntu.com recovery procedure.
+ARG FREETYPE_DEV_VERSION=2.11.1+dfsg-1ubuntu0.4
 ARG DEJAVU_CORE_VERSION=2.37-2build1
 
 # `esp` Rust toolchain fork version (espup --toolchain-version). Independent

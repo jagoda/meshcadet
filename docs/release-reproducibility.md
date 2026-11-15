@@ -1,13 +1,17 @@
 # Reproducing and verifying a MeshCadet firmware release
 
 This is the recipe for (a) rebuilding a published `vX.Y.Z` release's merged
-firmware image byte-for-byte on your own machine, and (b) verifying its SLSA
-build provenance attestation. It describes exactly what
+firmware image and comparing it byte-for-byte with the published artifact, and
+(b) verifying its SLSA build provenance attestation. It describes exactly what
 `.github/workflows/release.yml` does — if the two ever disagree, the workflow
 is buggy, not this doc. See `docs/adr/0004-release-architecture.md` §7/§8 for
 the design rationale.
 
-## Why this is reproducible at all
+A rebuild can only reproduce a release byte-for-byte while the exact Ubuntu
+package versions that release's Dockerfile pins are still available from the
+archive it names; see "Archive churn and old releases" below.
+
+## Why this is designed to be reproducible
 
 A firmware image is a lot of bytes with a lot of opportunities for a rebuild
 to differ from the original — compile timestamps, absolute build paths baked
@@ -40,12 +44,56 @@ build-time-generated bitmap font. Five levers close each hole:
    change across FreeType or DejaVu Sans versions even with (1)-(4) all held
    constant, so the container pins `libfreetype6-dev` and `fonts-dejavu-core`
    to exact package versions (see the Dockerfile's header comment for the
-   exact versions and where they were resolved from).
+   exact versions and where they were resolved from). Those pins make a build
+   fail loudly if a version disappears, but they cannot make an old tag
+   rebuildable once Ubuntu has removed that version from the live archive —
+   see "Archive churn and old releases" below.
 
 The ESP-IDF version (`v5.2.2`) and the `esp` Rust toolchain fork version are
 *already* pinned independent of any of this — see
 `firmware/.cargo/config.toml`'s `ESP_IDF_VERSION` and the Dockerfile's
 `ESP_TOOLCHAIN_VERSION` build-arg.
+
+## Archive churn and old releases
+
+The container's apt pins are exact, but they resolve against Ubuntu's *live*
+archive, which is mutable. When Ubuntu publishes a security or stable update,
+it removes the superseded `.deb` from the release/updates/security pockets and
+only the new version remains. `apt-get install pkg=version` then fails loudly
+(`Version '...' for 'pkg' was not found`) instead of silently substituting a
+different version — the correct failure mode for a reproducibility-sensitive
+build, but it means **a previous release tag stops being byte-rebuildable from
+the live archive as soon as any package it pins is superseded**. The published
+artifact and its provenance attestation remain verifiable; only the independent
+rebuild-and-compare step is affected.
+
+This is not hypothetical: the v0.9.0 release container originally pinned
+`libfreetype6-dev=2.11.1+dfsg-1ubuntu0.3`, which Ubuntu superseded with
+`2.11.1+dfsg-1ubuntu0.4` (published 2026-10-06) and removed from the live
+pockets. v0.9.0 updates the pin to `0.4`; tags still pinning `0.3` need a
+snapshot to rebuild.
+
+[snapshot.ubuntu.com](https://snapshot.ubuntu.com/) keeps timestamped archive
+states. To rebuild an old tag, temporarily point its apt sources at a snapshot
+timestamp where the tag's exact versions exist. For example, this substitution
+points the `0.4`-pinned v0.9.0 container at the 2026-11-15 snapshot:
+
+```sh
+# Insert after the FROM line and before the apt-get update RUN step.
+ARG UBUNTU_SNAPSHOT=20261115T000000Z
+RUN sed -i \
+      -e "s|http://archive.ubuntu.com/ubuntu|https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}|g" \
+      -e "s|http://security.ubuntu.com/ubuntu|https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}|g" \
+      /etc/apt/sources.list
+```
+
+For a tag pinning `0.3`, use a timestamp before the supersession (for example
+`20261001T000000Z`, verified to carry `0.3`). Snapshot timestamps are
+permanent, so this is a durable recovery path. It is deliberately a manual
+recovery step rather than the committed default: switching the release
+container's apt sources to `snapshot.ubuntu.com` changes the image's package
+provenance and needs its own verified image build (including confirming the
+base image's apt source layout) before it can replace the live archive.
 
 ## Rebuilding a release
 
@@ -74,15 +122,11 @@ not by this container (they're pure text, no build output needed) — so
 there's nothing to reproduce-and-compare for those two, only to diff against
 the published copy.
 
-**If `docker build` fails to install the pinned `libfreetype6-dev`/
-`fonts-dejavu-core` versions** because Ubuntu's archive has since pruned
-them: the exact versions are still available via
-[snapshot.ubuntu.com](https://snapshot.ubuntu.com/) — pin an
-`archive.ubuntu.com` snapshot timestamp in `firmware/release-container/
-Dockerfile`'s `apt-get` step (via an additional `/etc/apt/sources.list.d/
-snapshot.list` pointing at the matching `https://snapshot.ubuntu.com/ubuntu/
-<timestamp>/` mirror) instead of the live archive, then re-resolve and update
-this doc + the Dockerfile's `ARG` defaults together in one PR.
+**If `docker build` fails to install a pinned `libfreetype6-dev`/
+`fonts-dejavu-core` version** with `Version ... was not found`, Ubuntu has
+superseded that version in the live archive. Use the snapshot procedure in
+"Archive churn and old releases" above; do not relax the pin to a floating
+version.
 
 ## Verifying the provenance attestation
 
