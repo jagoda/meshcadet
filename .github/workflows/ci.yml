@@ -491,7 +491,7 @@ jobs:
       # sysroot into ~/.espressif and firmware/.embuild on first build.
       # Without caching it, every run rebuilds the sysroot from source.
       - name: Cache ESP-IDF sysroot
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.espressif
