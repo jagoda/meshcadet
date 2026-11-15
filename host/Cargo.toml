@@ -28,7 +28,7 @@ qrcode = { version = "0.14", default-features = false }
 chrono = "0.4"
 # CSPRNG for `gen-channel-secret` (OsRng, matches firmware/src/identity_store.rs's
 # and protocol/src/identity.rs's use of the same crate/RNG for key material).
-rand = { version = "0.8", features = ["std"] }
+rand = { version = "0.9", features = ["std"] }
 
 [dev-dependencies]
 # Signature verification for the advert-card integration tests (mirrors
