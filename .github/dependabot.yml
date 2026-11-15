@@ -1,0 +1,161 @@
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "05:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    groups:
+      cargo-minor-patch:
+        applies-to: "version-updates"
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      - dependency-name: "slint"
+        versions:
+          - ">=1.17.0"
+      - dependency-name: "slint-build"
+        versions:
+          - ">=1.17.0"
+      - dependency-name: "i-slint-core"
+        versions:
+          - ">=1.17.0"
+      - dependency-name: "aes"
+        versions:
+          - ">=0.9.0"
+      - dependency-name: "sha2"
+        versions:
+          - ">=0.11.0"
+      - dependency-name: "hmac"
+        versions:
+          - ">=0.13.0"
+      - dependency-name: "ed25519-dalek"
+        versions:
+          - ">=3.0.0"
+      - dependency-name: "x25519-dalek"
+        versions:
+          - ">=3.0.0"
+      - dependency-name: "curve25519-dalek"
+        versions:
+          - ">=5.0.0"
+      - dependency-name: "rand"
+        versions:
+          - ">=0.10.0"
+      - dependency-name: "rand_core"
+        versions:
+          - ">=0.10.0"
+
+  - package-ecosystem: "cargo"
+    directory: "/firmware"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "05:15"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    groups:
+      firmware-minor-patch:
+        applies-to: "version-updates"
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      - dependency-name: "slint"
+        versions:
+          - ">=1.17.0"
+      - dependency-name: "slint-build"
+        versions:
+          - ">=1.17.0"
+      - dependency-name: "i-slint-core"
+        versions:
+          - ">=1.17.0"
+      - dependency-name: "esp-idf-sys"
+        update-types:
+          - "version-update:semver-major"
+      - dependency-name: "esp-idf-hal"
+        update-types:
+          - "version-update:semver-major"
+      - dependency-name: "esp-idf-svc"
+        update-types:
+          - "version-update:semver-major"
+      - dependency-name: "color_quant"
+        versions:
+          - ">=2.0.0"
+      - dependency-name: "aes"
+        versions:
+          - ">=0.9.0"
+      - dependency-name: "sha2"
+        versions:
+          - ">=0.11.0"
+      - dependency-name: "hmac"
+        versions:
+          - ">=0.13.0"
+      - dependency-name: "ed25519-dalek"
+        versions:
+          - ">=3.0.0"
+      - dependency-name: "x25519-dalek"
+        versions:
+          - ">=3.0.0"
+      - dependency-name: "curve25519-dalek"
+        versions:
+          - ">=5.0.0"
+      - dependency-name: "rand"
+        versions:
+          - ">=0.10.0"
+      - dependency-name: "rand_core"
+        versions:
+          - ">=0.10.0"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "05:30"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    groups:
+      github-actions-minor-patch:
+        applies-to: "version-updates"
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "docker"
+    directory: "/firmware/release-container"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "05:45"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 1
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    groups:
+      docker-base-image-minor-patch:
+        applies-to: "version-updates"
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
